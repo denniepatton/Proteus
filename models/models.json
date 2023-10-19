@@ -1,0 +1,66 @@
+[
+  {
+    "--name": "full-avg2",
+    "--modalities": "images",
+    "--epochs": 10,
+    "--learning_rate": 0.00001,
+    "--use_full_data": "",
+    "--use_avg_pool": ""
+  },
+  {
+    "--name": "full-quick-avg2",
+    "--modalities": "images",
+    "--epochs": 3,
+    "--learning_rate": 0.00001,
+    "--use_full_data": "",
+    "--use_avg_pool": ""
+  },
+  {
+    "--name": "full-max2",
+    "--modalities": "images",
+    "--epochs": 15,
+    "--learning_rate": 0.0001,
+    "--use_full_data": ""
+  },
+  {
+    "--name": "full-quick-max2",
+    "--modalities": "images",
+    "--epochs": 3,
+    "--learning_rate": 0.0001,
+    "--use_full_data": ""
+  },
+  {
+    "--name": "full-5-convs2",
+    "--modalities": "images",
+    "--epochs": 15,
+    "--learning_rate": 0.0001,
+    "--use_full_data": "",
+    "--n_convolutions": 5
+  },
+  {
+    "--name": "full-quick-5-convs2",
+    "--modalities": "images",
+    "--epochs": 3,
+    "--learning_rate": 0.0001,
+    "--use_full_data": "",
+    "--n_convolutions": 5
+  },
+  {
+    "--name": "full-5-convs-8-filters2",
+    "--modalities": "images",
+    "--epochs": 15,
+    "--learning_rate": 0.0001,
+    "--use_full_data": "",
+    "--n_convolutions": 5,
+    "--n_filters": 8
+  },
+  {
+    "--name": "full-quick-5-convs-8-filters2",
+    "--modalities": "images",
+    "--epochs": 3,
+    "--learning_rate": 0.0001,
+    "--use_full_data": "",
+    "--n_convolutions": 5,
+    "--n_filters": 8
+  }
+]
