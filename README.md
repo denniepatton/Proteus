@@ -1,10 +1,10 @@
 # Proteus <img src="misc/logo_v1.png" width="140" align="left">
-A CNN-based methodology for predicting gene expression and activity from cell free DNA (cfDNA), Proteus uses biomarkers and signals output by [Triton](https://github.com/denniepatton/Triton) to infer coverage, nucleosome occupancy, sequence context, and fragmentation profiles from regions of interest.
+A CNN-based methodology for predicting gene expression and activity from cell free DNA (cfDNA), Proteus uses biomarkers and signals output by [Triton](https://github.com/GavinHaLab/Triton) to infer coverage, nucleosome occupancy, sequence context, and fragmentation profiles from regions of interest.
 <br/><br/>
 
 
 # TritonCNNv3
-This is the newest working repo for the 3rd version of TritonCNN, working title "Proteus" (Another Greek god / merman like Triton who is prophetic and changing). Until we have a finalized model and are cleaning up and testing, let's use this README to track jobs and status, at the coding level. More general ideas about architectures, larger tasks, and scientific analyses will be stored in the Ha Lab One Drive in TritonCNN/OngoingIdeas.docx, while that parent directory will hold figures, write-ups, etc. See [Triton](https://github.com/denniepatton/Triton) for specifics on input data formatting; TritonCNNv3 is currently setup to use default output data/directory formatting from Triton. Akira's previous README can be found below for reference - let's leave it in until it becomes obsolete.
+This is the newest working repo for the 3rd version of TritonCNN, working title "Proteus" (Another Greek god / merman like Triton who is prophetic and changing). Until we have a finalized model and are cleaning up and testing, let's use this README to track jobs and status, at the coding level. More general ideas about architectures, larger tasks, and scientific analyses will be stored in the Ha Lab One Drive in TritonCNN/OngoingIdeas.docx, while that parent directory will hold figures, write-ups, etc. See [Triton](https://github.com/GavinHaLab/Triton) for specifics on input data formatting; TritonCNNv3 is currently setup to use default output data/directory formatting from Triton. Akira's previous README can be found below for reference - let's leave it in until it becomes obsolete.
 
 ## NOTES AND TO-DO
 First read the REPO STRUCTURE section below.
@@ -12,6 +12,8 @@ First read the REPO STRUCTURE section below.
 It would be good to confirm the structure of this repo is following best practices, and correct it as needed. There may be subtlties to Tensorflow/deep repos we should adhere to!
 
 For now, let's keep everything hard coded in TritonCNN.py, the primary wrapper, and assume runs are local with a GPU (e.g. use grabnode for now with no bash or snakemake submission protocol).
+
+I have a dedicated local conda venv for working on this project, which can be loaded with the conda_environment.yml - eventually this should be a proper environment.yml with clear dependencies!
 
 ### Task 1: Flesh out TritonCNN.py (main wrapper)
 
@@ -24,7 +26,7 @@ The TritonCNN.py script is designed to be a wrapper for running pre-processing r
 Furthermore TritonCNN.py should do no heavy lifting, but only contain a main and wrapper functions which call the scripts in analysis / models / preprocessing
 
 A. Pre-process data:
-I've already implimented a main in the wrapper which contains some hardcoded paths and data modalities; calling generate_data() should pre-process all data in those modalities by calling preprocessing/generate_scalars.py and preprocessing/generate_images.py (made by Akira, already tested and working). Those scripts made by Akira need to be double-checked and cleaned up (see #TODO:'s), and a third script "generate_image-panels.py" needs to be made to process the 3D TFBS tensors, and then incorporated into generate_data().
+I've already implemented a main in the wrapper which contains some hardcoded paths and data modalities; calling generate_data() should pre-process all data in those modalities by calling preprocessing/generate_scalars.py and preprocessing/generate_images.py (made by Akira, already tested and working). Those scripts made by Akira need to be double-checked and cleaned up (see #TODO:'s), and a third script "generate_image-panels.py" needs to be made to process the 3D TFBS tensors, and then incorporated into generate_data().
 
 B. Split pre-processed data and make easy-access:
 This step was previously done by preprocessing/compile_data.py - let's make that script callable in the main, and move any inputs for it into the wrapper. A single function in TritonCNN.py should match labels via this script and make the outputs, possibly in a labeled sub folder in data/
@@ -35,7 +37,7 @@ This should be an easily modifiable function that calls OR ABSORBS preprocessing
 D. Code in method for testing multiple models:
 Eventually the TritonCNN.py script should take in inputs which define a specific model and training attributes, but for now let's just hard code a method for doing this within. This is similar to what Akira was doing with models/test_model.py in conjunction with models/models.json, but should make it easier to make the main a true script when everything is finished. When D is finished, the main should call at most a single config file.
 
-E. Impliment basic output analysis:
+E. Implement basic output analysis:
 Confirm all basic outputs we want are happening by default, including interpretibility work. Should call or absorb analysis/visualization_clusters_NYC.py and analysis/akira_analysis_notebook_NYC.pynb.
 
 F. Streamline outputs:
@@ -90,6 +92,8 @@ Contains reference files used by TritonCNN
 - HousekeepingGenes.txt: list of housekeeping genes for subsetting
 - NonHousekeepingGenes.txt: list of non-housekeeping genes for subsetting
 - Ensembl109_reference.bed: reference BED file (which should match version used by Triton) used for getting transcript length and exon count scalar labels
+
+N.B. these aren't uploading due to size limits, but we can leave them "here" while everything is hardcoded to point to my fast user folder.
 
 ### results
 Will be populated by outputs, but only this folder needs to go in the repo (not its innards)
