@@ -168,10 +168,33 @@ def save_data(combined, images_path, scalars_path, labels_path, output):
             images=i, scalars=s, labels=l)
     
 
+def compile(images_path, scalars_path, labels_path, output):
+     logging.basicConfig(filename="compile_data.log", filemode='w', level=logging.INFO, force=True,
+                        format='%(asctime)s - %(levelname)s - %(message)s', 
+                        datefmt='%Y-%m-%d %H:%M:%S')
+    # calculate sample to gene dictionarys for images, scalars, labels
+    i, s, l = create_gene_json(images_path, scalars_path, labels_path, output)
+    # remove samples not found in all three modalities
+    combined = {}
+    for sample in i:
+        if sample in s and sample in l:
+            i_genes, s_genes, l_genes = set(i[sample]), set(s[sample]), set(l[sample])
+            common_genes = list(i_genes.intersection(s_genes, l_genes))
+            combined[sample] = common_genes
+    # remove samples with less than 50 genes available
+    combined_filtered = {}
+    for sample in combined:
+        if len(combined[sample]) > 50:
+            combined_filtered[sample] = combined[sample]
+        else:
+            logging.info(f"removing sample {sample}...")
+    save_data(combined_filtered, images_path, scalars_path, labels_path, output) 
 
+    logging.info("Complete")
 
 def main():
-    logging.basicConfig(filename="compile_data.log", filemode='w', level=logging.INFO, force=True,
+    pass
+"""     logging.basicConfig(filename="compile_data.log", filemode='w', level=logging.INFO, force=True,
                         format='%(asctime)s - %(levelname)s - %(message)s', 
                         datefmt='%Y-%m-%d %H:%M:%S')
     # calculate sample to gene dictionarys for images, scalars, labels
@@ -194,7 +217,7 @@ def main():
             combined_filtered[sample] = combined[sample]
         else:
             logging.info(f"removing sample {sample}...")
-    save_data(combined_filtered, IMAGES_PATH, SCALARS_PATH, LABELS_PATH, OUTPUT)
+    save_data(combined_filtered, IMAGES_PATH, SCALARS_PATH, LABELS_PATH, OUTPUT) """
 
 
     # USE_SMALL_DATA = False
@@ -310,7 +333,7 @@ def main():
     # np.savez(os.path.join(output, "testing.npz"), 
     #         ids=id_test, samples=samples_test, genes=genes_test,
     #         images=i_test, scalars=s_test, labels=l_test)
-    logging.info("Complete")
+    #logging.info("Complete")
 
 if __name__ == "__main__":
     main()

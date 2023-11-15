@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 import models
-from preprocessing import generate_scalars, generate_images
+from preprocessing import generate_scalars, generate_images, compile_data
 
 process_data = True
 
@@ -22,7 +22,7 @@ def generate_data(home, name, regions, ref_path):
     """
     Generate data for the CNN from the LuCaP data. This function will generate the data for each region
     in the regions dictionary, and save the data as a numpy array in the home directory.
-    :param home: the home directory where the data will be saved
+    :param home: the home directory where the data will be saved #ERROR??
     :param name: the name of the data set
     :param regions: a dictionary of regions to be processed, with the region name as the key and a list of
     data types as the value
@@ -42,8 +42,19 @@ def generate_data(home, name, regions, ref_path):
                 generate_scalars.generate(out_dir, data_dir, ref_path)
             if data_type == 'images':
                 generate_images.generate(out_dir, data_dir)
-    print('Finished.')
+    print('Finished generating data.')
 
+def preprocess_data(images_path, scalars_path, labels_path, output):
+    """
+    Preprocess the data. This function calls preprocessing/compile_data.py and preprocessing/splits.py to 
+    compile and convert all data into an , and split into customizable test/train sets. Full compiled data 
+    is stored as compiled_data.npz in output location, while train/test splits are stored as ??.npz in ?? location
+    :param ?: ?
+    :return: None
+    """
+    print('Compiling Data, storing outputs in '+ output)
+    compile_data.compile(images_path, scalars_path, labels_path, output)
+    print('Finished compiling data.')
 
 def main():
     """
@@ -58,9 +69,17 @@ def main():
     #                     'TFBS': ['image-panels']}
     
     training_regions = {'TSS': ['images', 'scalars']}
+
+    images_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/images'
+    scalars_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/scalars'
+    labels_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/labels/labels_continuous_tpm.csv'
+    output = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/continuous'
     
     if process_data:
-        generate_data(training_home, training_name, training_regions, reference_path)
+        #generate_data(training_home, training_name, training_regions, reference_path)
+        preprocess_data(images_path, scalars_path, labels_path, output)
+
+
 
     quit()
 
