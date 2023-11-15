@@ -72,8 +72,8 @@ def main():
     scalars_file = out_dir + 'activity_scalars.npy'
     labels_file = out_dir + 'activity_labels.npy'
     idents_file = out_dir + 'activity_identifiers.npy'
-    # labels_ref = '/fh/fast/ha_g/user/rpatton/references/LuCaP_activity_z-fpkm.tsv'
-    labels_ref = '/fh/fast/ha_g/user/rpatton/references/LuCaP_AvgL2FPKM.tsv'
+    # labels_ref = '/fh/fast/ha_g/user/rpatton/references/LuCaP/LuCaP_activity_z-fpkm.tsv'
+    labels_ref = '/fh/fast/ha_g/user/rpatton/references/LuCaP/LuCaP_AvgL2FPKM.tsv'
     if not os.path.isfile(images_file) or not os.path.isfile(labels_file) or not os.path.isfile(scalars_file):
         # process fresh data into easily accessible image/scalar and label files (with shared indices)
         input_folder = '/fh/fast/ha_g/user/rpatton/LuCaP_data/Triton_TSS/results/'
