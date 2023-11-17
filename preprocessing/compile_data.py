@@ -9,9 +9,18 @@ import numpy as np
 from functools import partial
 from concurrent.futures import ThreadPoolExecutor
 
+"""
+This script compiles data from the images, scalars, and labels into a single, efficient to use, output .npz file stored in the output directory. 
+Also, it saves JSON files with images, scalar, and labels data.
+
+Main function:
+    - compile(images_path, scalars_path, labels_path, output)
+
+"""
 ### LOGGING CONFIGURATION
 # logging.basicConfig(filename="convert_to_tensors.log", filemode='w', level=logging.INFO,format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 ### ---------------------
+
 def get_sample_and_gene(filename):
     filename = filename.replace(".csv", "")
     s = filename.split("_")
@@ -24,6 +33,15 @@ def calculate_genes_across_samples_images(path_to_images):
     """
     Generates a dictionary mapping each sample to a list of 
     genes with imaging data available for that sample
+
+    Args:
+        path_to_images (str): The path to the images directory.
+    
+    Calls:
+        get_sample_and_gene
+
+    Returns:
+        out: A dictionary mapping each sample to a list of genes with imaging data available for that sample
     """
     out = {}
     # samples = os.listdir(path_to_images)
@@ -35,6 +53,14 @@ def calculate_genes_across_samples_scalars(path_to_scalars):
     """
     Generates a dictionary mapping each sample to a list of 
     genes with scalar data available for that sample
+
+    Args:
+        path_to_scalars (str): The path to the scalars directory.
+    
+    Calls:
+
+    Returns:
+        out: A dictionary mapping each sample to a list of genes with scalar data available for that sample
     """
     out = {}
     samples = os.listdir(path_to_scalars)
@@ -47,6 +73,14 @@ def calculate_genes_across_samples_labels(path_to_labels):
     """
     Generates a dictionary mapping each sample to a list of 
     genes with label data available for that sample
+
+    Args:
+        path_to_labels (str): The path to the labels file.
+    
+    Calls:
+
+    Returns:
+        out: A dictionary mapping each sample to a list of genes with label data available for that sample
     """
     out = {}
     y = pd.read_csv(path_to_labels, index_col=0)
@@ -58,6 +92,27 @@ def calculate_genes_across_samples_labels(path_to_labels):
     return out
 
 def create_gene_json(path_to_images, path_to_scalars, path_to_labels, output):
+    """
+    Writes JSON files containing information about the genes available for each sample in the images, scalars, 
+    and labels to the output folder
+
+    Args:
+        path_to_images (str): The path to the images directory.
+        path_to_scalars (str): The path to the scalars directory.
+        path_to_labels (str): The path to the labels file.
+        output (str): The path to the output directory.
+
+    Calls:
+        calculate_genes_across_samples_images
+        calculate_genes_across_samples_scalars
+        calculate_genes_across_samples_labels
+    
+    Returns:
+        tuple: A tuple containing three dictionaries:
+            - i: A dictionary mapping each sample to a list of genes with imaging data available for that sample.
+            - s: A dictionary mapping each sample to a list of genes with scalar data available for that sample.
+            - l: A dictionary mapping each sample to a list of genes with label data available for that sample.
+    """
     # images
     i = calculate_genes_across_samples_images(path_to_images)
     with open(os.path.join(output, "genes_images.json"), 'w') as f:
@@ -73,6 +128,23 @@ def create_gene_json(path_to_images, path_to_scalars, path_to_labels, output):
     return i, s, l
 
 def process_gene(gene, sample, images_path, scalars_path, y):
+    """
+    Process a gene for a given sample. Loads data from the images and scalars directories as np array, packages 
+    it into a tuple, and returns it.
+
+    Args:
+        gene (str): The name of the gene to process.
+        sample (str): The name of the sample.
+        images_path (str): The path to the directory containing the images.
+        scalars_path (str): The path to the directory containing the scalar values.
+        y (pandas.DataFrame): The DataFrame containing the labels.
+    
+    Calls:
+
+    Returns:
+        tuple or None: A tuple containing the processed data, including the sample-gene identifier,
+        sample name, gene name, image data, scalar data, and label. Returns None if there are missing values.
+    """
     logging.info(f"Processing gene {gene} for sample {sample}")
     # load images
     image = np.array(pd.read_csv(os.path.join(images_path, sample, f"{sample}_{gene}.csv"), index_col=0), dtype=np.float32).T
@@ -96,17 +168,34 @@ def process_gene(gene, sample, images_path, scalars_path, y):
         return (f"{sample}_{gene}", sample, gene, image, scalar, label)
 
 def process_sample(sample, combined, images_path, scalars_path, y):
+    """
+    Process a sample by iterating over its genes and performing gene-specific processing in parallel.
+
+    Args:
+        sample (str): The sample identifier.
+        combined (dict): A dictionary containing the combined data for all samples.
+        images_path (str): The path to the images directory.
+        scalars_path (str): The path to the scalars directory.
+        y (int): The target (label) variable.
+    
+    Calls:
+        process_gene
+
+    Returns:
+        tuple: A tuple containing the processed data for the sample, including the following elements:
+            - ids_sample (list): A list of IDs.
+            - samples_sample (list): A list of samples.
+            - genes_sample (list): A list of genes.
+            - i_sample (list): A list of i values.
+            - s_sample (list): A list of s values.
+            - l_sample (list): A list of l values.
+    """
     logging.info(f"Starting sample {sample}")
     genes = combined[sample]
     n_genes=len(genes)
     logging.info(f"Processing {n_genes} genes")
     
-    ids_sample = []
-    samples_sample = []
-    genes_sample = []
-    i_sample = []
-    s_sample = []
-    l_sample = []
+    ids_sample, samples_sample, genes_sample, i_sample, s_sample, l_sample = [], [], [], [], [], []
     
     # You can specify the number of threads based on the number of available cores
     num_threads = 64
@@ -120,15 +209,25 @@ def process_sample(sample, combined, images_path, scalars_path, y):
     logging.info(f"Completed sample {sample}, processed {n_genes} genes")
     return ids_sample, samples_sample, genes_sample, i_sample, s_sample, l_sample
 
-
-
 def save_data(combined, images_path, scalars_path, labels_path, output):
-    ids = []
-    samples = []
-    genes = []
-    i = []
-    s = []
-    l = []
+    """
+    Process samples and save compiled data to a .npz file at the ouput path.
+
+    Args:
+        combined (dict): A dictionary containing combined data.
+        images_path (str): Path to the images directory.
+        scalars_path (str): Path to the scalars directory.
+        labels_path (str): Path to the labels file.
+        output (str): Path to the output directory.
+
+    Calls:
+        process_sample
+
+    Returns:
+        None
+    """
+    ids, samples, genes = [], [], []
+    i, s, l = [], [], []
     y = pd.read_csv(labels_path, index_col=0)
     cols = y.columns
     renamed = []
@@ -137,6 +236,7 @@ def save_data(combined, images_path, scalars_path, labels_path, output):
         renamed.append(sample_label)
     y.columns = renamed
 
+    # Call the process_sample function with the images_path, scalars_path, combined, and labels (y) data
     process_sample_partial = partial(
         process_sample,
         images_path=images_path,
@@ -148,7 +248,6 @@ def save_data(combined, images_path, scalars_path, labels_path, output):
     with Pool(processes=50) as pool:
         results = pool.map(process_sample_partial, combined.keys())
 
-
     for ids_sample, samples_sample, genes_sample, i_sample, s_sample, l_sample in results:
         ids.extend(ids_sample)
         samples.extend(samples_sample)
@@ -157,19 +256,33 @@ def save_data(combined, images_path, scalars_path, labels_path, output):
         s.extend(s_sample)
         l.extend(l_sample)
 
-    ids = np.array(ids)
-    samples = np.array(samples)
-    genes = np.array(genes)
-    i = np.array(i)
-    s = np.array(s)
-    l = np.array(l)
+    ids, samples, genes = np.array(ids), np.array(samples), np.array(genes)
+    i, s, l = np.array(i), np.array(s), np.array(l)
     np.savez(os.path.join(output, "compiled_data.npz"), 
             ids=ids, samples=samples, genes=genes,
             images=i, scalars=s, labels=l)
     
 
 def compile(images_path, scalars_path, labels_path, output):
-     logging.basicConfig(filename="compile_data.log", filemode='w', level=logging.INFO, force=True,
+    """
+    Main compile data function. Compiles data from images, scalars, and labels into a single, 
+    efficient to use, output .npz file stored in the output directory. Also, saves JSON files 
+    with images, scalar, and labels data.
+
+    Args:
+        images_path (str): The path to the directory containing the images.
+        scalars_path (str): The path to the file containing the scalar data.
+        labels_path (str): The path to the file containing the labels.
+        output (str): The path to the output file.
+
+    Calls:
+        create_gene_json
+        save_data
+
+    Returns:
+        None
+    """
+    logging.basicConfig(filename="compile_data.log", filemode='w', level=logging.INFO, force=True,
                         format='%(asctime)s - %(levelname)s - %(message)s', 
                         datefmt='%Y-%m-%d %H:%M:%S')
     # calculate sample to gene dictionarys for images, scalars, labels
@@ -191,34 +304,6 @@ def compile(images_path, scalars_path, labels_path, output):
     save_data(combined_filtered, images_path, scalars_path, labels_path, output) 
 
     logging.info("Complete")
-
-def main():
-    pass
-"""     logging.basicConfig(filename="compile_data.log", filemode='w', level=logging.INFO, force=True,
-                        format='%(asctime)s - %(levelname)s - %(message)s', 
-                        datefmt='%Y-%m-%d %H:%M:%S')
-    # calculate sample to gene dictionarys for images, scalars, labels
-    IMAGES_PATH = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/images'
-    SCALARS_PATH = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/scalars'
-    LABELS_PATH = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/labels/labels_continuous_tpm.csv'
-    OUTPUT = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/continuous'
-    i, s, l = create_gene_json(IMAGES_PATH, SCALARS_PATH, LABELS_PATH, OUTPUT )
-    # remove samples not found in all three modalities
-    combined = {}
-    for sample in i:
-        if sample in s and sample in l:
-            i_genes, s_genes, l_genes = set(i[sample]), set(s[sample]), set(l[sample])
-            common_genes = list(i_genes.intersection(s_genes, l_genes))
-            combined[sample] = common_genes
-    # remove samples with less than 50 genes available
-    combined_filtered = {}
-    for sample in combined:
-        if len(combined[sample]) > 50:
-            combined_filtered[sample] = combined[sample]
-        else:
-            logging.info(f"removing sample {sample}...")
-    save_data(combined_filtered, IMAGES_PATH, SCALARS_PATH, LABELS_PATH, OUTPUT) """
-
 
     # USE_SMALL_DATA = False
     # REGRESSION = False
@@ -334,6 +419,3 @@ def main():
     #         ids=id_test, samples=samples_test, genes=genes_test,
     #         images=i_test, scalars=s_test, labels=l_test)
     #logging.info("Complete")
-
-if __name__ == "__main__":
-    main()

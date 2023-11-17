@@ -21,13 +21,23 @@ process_data = True
 def generate_data(home, name, regions, ref_path):
     """
     Generate data for the CNN from the LuCaP data. This function will generate the data for each region
-    in the regions dictionary, and save the data as a numpy array in the home directory.
-    :param home: the home directory where the data will be saved #ERROR??
-    :param name: the name of the data set
-    :param regions: a dictionary of regions to be processed, with the region name as the key and a list of
-    data types as the value
-    :param ref_path: the path to the reference file
-    :return: None
+    in the regions dictionary, and save the data as CSV to a locally created directory called /data/.
+
+    Args:
+        home (str): The home directory to which the original Triton output data is stored.
+        name (str): The name of the data set (e.g. LuCaP). Defines the folder name for the output data.
+        regions (dict): A dictionary of regions to be processed, with the region name as the key and a list of
+                        data types as the value (e.g. {'TSS': ['images', 'scalars']}).
+        ref_path (str): The path to the reference file.
+
+    Calls:
+        generate_scalars.generate(out_dir, data_dir, ref_path): A function to generate scalar data, which is 
+                                                                stored as a CSV to out_dir.
+        generate_images.generate(out_dir, data_dir): A function to generate image data, which is stored as a CSV to 
+                                                    out_dir along with a JSON containing the images counts data.
+
+    Returns:
+        None
     """
     if not os.path.isdir('data/'):
         os.mkdir('data/')
@@ -46,11 +56,21 @@ def generate_data(home, name, regions, ref_path):
 
 def preprocess_data(images_path, scalars_path, labels_path, output):
     """
-    Preprocess the data. This function calls preprocessing/compile_data.py and preprocessing/splits.py to 
-    compile and convert all data into an , and split into customizable test/train sets. Full compiled data 
-    is stored as compiled_data.npz in output location, while train/test splits are stored as ??.npz in ?? location
-    :param ?: ?
-    :return: None
+    Preprocess the data by compiling the image, scalar, and label data to an .np array and splitting into customizable test/train sets. 
+    Full compiled data is stored as compiled_data.npz in output location, while train/test splits are stored as ??.npz in ?? location
+    
+    Args:
+        images_path (str): path to images folder
+        scalars_path (str): path to scalars folder
+        labels_path (str): path to labels file
+        output (str): path to output location
+
+    Calls:
+        compile_data.compile(images_path, scalars_path, labels_path, output): A function to compile the data into a single .npz file and 
+        create JSON files for gene image, scalar and label data.
+
+    Returns:
+        None
     """
     print('Compiling Data, storing outputs in '+ output)
     compile_data.compile(images_path, scalars_path, labels_path, output)
