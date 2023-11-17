@@ -5,6 +5,15 @@ import logging
 import multiprocessing
 import concurrent.futures
 
+"""
+This script generates images from the NPZ files from Triton stored in data_dir. 
+The generated images are saved as CSV to output_dir, along with a JSON file containing image counts information.
+
+Main Function
+    - generate(output_dir, data_dir)
+
+"""
+
 ### LOGGING CONFIGURATION
 logging.basicConfig(filename="generate_images.log", filemode='w', level=logging.INFO)
 ### ---------------------
@@ -13,18 +22,21 @@ def read_npz(filepath):
     npz = np.load(filepath)
     return npz
 
-def process_npz(input_object, identifier = "", tss_window_size = 2000, min_seq_depth = 10):
+def process_npz(input_object, identifier="", tss_window_size=2000, min_seq_depth=10):
     """
-    Cleans a npz input
+    Cleans a npz input.
 
     Args:
-        input_object (_type_): _description_
-        identifier (_type_): _description_
-        tss_window_size (int, optional): _description_. Defaults to 2000.
-        min_seq_depth (int, optional): _description_. Defaults to 10.
+        input_object (np.ndarray): The input object to be cleaned.
+        identifier (str, optional): An identifier for the input object. Defaults to "".
+        tss_window_size (int, optional): The size of the TSS (Transcription Start Site) window. Defaults to 2000.
+        min_seq_depth (int, optional): The minimum sequence depth required in the profile. Defaults to 10.
+    
+    Calls:
+        normalize_v2
 
     Returns:
-        _type_: _description_
+        dict: A dictionary containing the cleaned profiles that meet the clean-up criteria.
     """
     out_dict = {}
     logging.info('Cleaning sample ' + identifier + ': ' +
@@ -62,6 +74,22 @@ def normalize_v2(input_array):
 
 
 def get_samples(triton_results_path):
+    """
+    This function retrieves sample names and their corresponding paths from a specified directory. 
+    The function iterates over all files in the given directory, splits the filename on the string 
+    "_TritonProfiles.npz", and if the split results in two parts, it assumes the first part is a 
+    sample name and adds it to the samples list. The full path to the file is also added to the 
+    paths list.
+
+    Args:
+        triton_results_path (str): The path to the directory containing the files.
+        
+    Calls:
+
+    Returns:
+        tuple: A tuple containing two lists. The first list contains the sample names, and the 
+        second list contains the corresponding paths to the files.
+    """
     samples = []
     paths = []
     for p in os.listdir(triton_results_path):
@@ -71,7 +99,24 @@ def get_samples(triton_results_path):
             paths.append(os.path.join(triton_results_path, p))
     return samples, paths
 
+import os
+import logging
+
 def make_sample_folders(output_directory, samples):
+    """
+    Create folders for each sample in the output directory.
+
+    Args:
+        output_directory (str): The path to the output directory where the sample folders will be created.
+        samples (str or list): The samples for which the folders will be created. If a string is provided, 
+            it is assumed to be a file path containing a list of samples.
+    
+    Calls:
+        get_samples
+
+    Returns:
+        None
+    """
     if isinstance(samples, str):
         samples = get_samples(samples)
     assert isinstance(samples, list)
@@ -83,6 +128,18 @@ def make_sample_folders(output_directory, samples):
             logging.warning(f"Directory exists for sample {sample}")
 
 def save_as_table(processed_data, output):
+    """
+    Save processed data as tables in CSV format.
+
+    Args:
+        processed_data (dict): A dictionary containing processed data.
+        output (str): The output directory where the CSV files will be saved.
+    
+    Calls:
+
+    Returns:
+        None
+    """
     image_vars = ["depth", "probable-nucleosome-center-profile", "phased-nucleosome-profile", "fragment-short-long-ratio", "fragment-diversity", \
               "fragment-entropy", "peak-location", "A-freq", "C-freq", "G-freq", "T-freq"]
     for k in processed_data:
@@ -92,6 +149,23 @@ def save_as_table(processed_data, output):
         df.to_csv(os.path.join(output, f"{k}.csv"))
         
 def process_sample_path_pair(sample, path, out_dir):
+    """
+    Process a sample and its corresponding path.
+    Also, save the counts information to a JSON file.
+
+    Args:
+        sample (str): The identifier of the sample.
+        path (str): The path to the NPZ file.
+        out_dir (str): The output directory.
+
+    Calls:
+        read_npz
+        process_npz
+        save_as_table
+
+    Returns:
+        None
+    """
     npz = read_npz(path)
     proc_npz = process_npz(npz, identifier=sample)
     with open(out_dir + 'counts_images.json', 'a') as f:
@@ -100,16 +174,25 @@ def process_sample_path_pair(sample, path, out_dir):
     logging.info(f"Saved tables for sample {sample}.")
 
 def generate(output_dir, data_dir):
+    """
+    Main generate images function. Generate images from the given data directory and save them to 
+    the output directory.
+
+    Args:
+        output_dir (str): The directory where the generated images will be saved.
+        data_dir (str): The directory containing the input data.
+        
+    Calls:
+        get_samples
+        make_sample_folders
+        process_sample_path_pair
+
+    Returns:
+        None
+    """
     samples, paths = get_samples(data_dir)
     make_sample_folders(output_dir, samples)
     with concurrent.futures.ThreadPoolExecutor() as executor:
         futures = [executor.submit(process_sample_path_pair, sample, path, output_dir) for sample, path in zip(samples, paths)]
         concurrent.futures.wait(futures)
     logging.info(f"Complete")
-
-def main():
-    pass
-
-if __name__ == "__main__":
-    main()
-
