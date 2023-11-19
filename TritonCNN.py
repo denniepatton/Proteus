@@ -14,20 +14,30 @@ import numpy as np
 import pandas as pd
 
 import models
-from preprocessing import generate_scalars, generate_images
+from preprocessing import generate_scalars, generate_images, compile_data
 
 process_data = True
 
 def generate_data(home, name, regions, ref_path):
     """
     Generate data for the CNN from the LuCaP data. This function will generate the data for each region
-    in the regions dictionary, and save the data as a numpy array in the home directory.
-    :param home: the home directory where the data will be saved
-    :param name: the name of the data set
-    :param regions: a dictionary of regions to be processed, with the region name as the key and a list of
-    data types as the value
-    :param ref_path: the path to the reference file
-    :return: None
+    in the regions dictionary, and save the data as CSV to a locally created directory called /data/.
+
+    Args:
+        home (str): The home directory to which the original Triton output data is stored.
+        name (str): The name of the data set (e.g. LuCaP). Defines the folder name for the output data.
+        regions (dict): A dictionary of regions to be processed, with the region name as the key and a list of
+                        data types as the value (e.g. {'TSS': ['images', 'scalars']}).
+        ref_path (str): The path to the reference file.
+
+    Calls:
+        generate_scalars.generate(out_dir, data_dir, ref_path): A function to generate scalar data, which is 
+                                                                stored as a CSV to out_dir.
+        generate_images.generate(out_dir, data_dir): A function to generate image data, which is stored as a CSV to 
+                                                    out_dir along with a JSON containing the images counts data.
+
+    Returns:
+        None
     """
     if not os.path.isdir('data/'):
         os.mkdir('data/')
@@ -42,8 +52,29 @@ def generate_data(home, name, regions, ref_path):
                 generate_scalars.generate(out_dir, data_dir, ref_path)
             if data_type == 'images':
                 generate_images.generate(out_dir, data_dir)
-    print('Finished.')
+    print('Finished generating data.')
 
+def preprocess_data(images_path, scalars_path, labels_path, output):
+    """
+    Preprocess the data by compiling the image, scalar, and label data to an .np array and splitting into customizable test/train sets. 
+    Full compiled data is stored as compiled_data.npz in output location, while train/test splits are stored as ??.npz in ?? location
+    
+    Args:
+        images_path (str): path to images folder
+        scalars_path (str): path to scalars folder
+        labels_path (str): path to labels file
+        output (str): path to output location
+
+    Calls:
+        compile_data.compile(images_path, scalars_path, labels_path, output): A function to compile the data into a single .npz file and 
+        create JSON files for gene image, scalar and label data.
+
+    Returns:
+        None
+    """
+    print('Compiling Data, storing outputs in '+ output)
+    compile_data.compile(images_path, scalars_path, labels_path, output)
+    print('Finished compiling data.')
 
 def main():
     """
@@ -58,9 +89,17 @@ def main():
     #                     'TFBS': ['image-panels']}
     
     training_regions = {'TSS': ['images', 'scalars']}
+
+    images_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/images'
+    scalars_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/scalars'
+    labels_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/labels/labels_continuous_tpm.csv'
+    output = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/continuous'
     
     if process_data:
-        generate_data(training_home, training_name, training_regions, reference_path)
+        #generate_data(training_home, training_name, training_regions, reference_path)
+        preprocess_data(images_path, scalars_path, labels_path, output)
+
+
 
     quit()
 
@@ -72,8 +111,8 @@ def main():
     scalars_file = out_dir + 'activity_scalars.npy'
     labels_file = out_dir + 'activity_labels.npy'
     idents_file = out_dir + 'activity_identifiers.npy'
-    # labels_ref = '/fh/fast/ha_g/user/rpatton/references/LuCaP_activity_z-fpkm.tsv'
-    labels_ref = '/fh/fast/ha_g/user/rpatton/references/LuCaP_AvgL2FPKM.tsv'
+    # labels_ref = '/fh/fast/ha_g/user/rpatton/references/LuCaP/LuCaP_activity_z-fpkm.tsv'
+    labels_ref = '/fh/fast/ha_g/user/rpatton/references/LuCaP/LuCaP_AvgL2FPKM.tsv'
     if not os.path.isfile(images_file) or not os.path.isfile(labels_file) or not os.path.isfile(scalars_file):
         # process fresh data into easily accessible image/scalar and label files (with shared indices)
         input_folder = '/fh/fast/ha_g/user/rpatton/LuCaP_data/Triton_TSS/results/'
