@@ -1,4 +1,0 @@
-name: TritonCNN
-channels:
-  - defaults
-prefix: /home/rpatton/.conda/envs/TritonCNN

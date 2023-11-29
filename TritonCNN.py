@@ -1,240 +1,265 @@
-# v3.0.0, 10/06/2023
+# v3.0.1, 11/23/2023
 # Robert D Patton, rpatton@fredhutch.org
 # Ha Lab, Fred Hutchinson Cancer Research Center
 
 """
-Newest version of the Trion-based CNN. This provides a main and wrapper for running
-TritonCNN and associated pre-processing and post-processing steps, and was modified from TritonCNN_Huang.py.
-This version is built on the imporvements made by Akira Nair.
+Newest version of the Trion-based CNN.
+This provides a main and wrapper for running TritonCNN and associated pre-processing and post-processing steps.
+Should me modified to work with batch submission to workflow managers (e.g. SLURM, SGE, etc.),
+and/or run as a standlone script with command line arguments.
 """
 
 import os
-from glob import glob
-import numpy as np
+import csv
 import pandas as pd
+import tensorflow as tf
+from multiprocessing import Pool, cpu_count
 
 import models
-from preprocessing import generate_scalars, generate_images, compile_data
+from preprocessing.compile_sample_data import *
+from preprocessing.generate_tf_splits import *
 
-process_data = True
-
-def generate_data(home, name, regions, ref_path):
+def generate_data(regions_dict, ref_path, overwrite=False):
     """
-    Generate data for the CNN from the LuCaP data. This function will generate the data for each region
-    in the regions dictionary, and save the data as CSV to a locally created directory called /data/.
+    Generates data for each modality, for each sample. Each sample is saved as an h5 file, and nested to mimic a dictionary
+    structure where the outer keys are genes, and the inner key:value pairs are modalities:data.
 
     Args:
-        home (str): The home directory to which the original Triton output data is stored.
-        name (str): The name of the data set (e.g. LuCaP). Defines the folder name for the output data.
-        regions (dict): A dictionary of regions to be processed, with the region name as the key and a list of
-                        data types as the value (e.g. {'TSS': ['images', 'scalars']}).
+        regions_dict (dict): A dictionary where each key is a label and the value is a list of modality and path.
         ref_path (str): The path to the reference file.
-
-    Calls:
-        generate_scalars.generate(out_dir, data_dir, ref_path): A function to generate scalar data, which is 
-                                                                stored as a CSV to out_dir.
-        generate_images.generate(out_dir, data_dir): A function to generate image data, which is stored as a CSV to 
-                                                    out_dir along with a JSON containing the images counts data.
+        overwrite (bool, optional): If True, overwrite existing processed data. Defaults to False.
 
     Returns:
         None
     """
-    if not os.path.isdir('data/'):
-        os.mkdir('data/')
-    for region, data_types in regions.items():
-        for data_type in data_types:
-            print('Processing ' + region + ' ' + data_type + ' data . . .')
-            out_dir = 'data/' + name + '_' + region + '_' + data_type + '/'
-            data_dir = home + 'Triton_' + region + '/results/'
-            if not os.path.isdir(out_dir):
-                os.mkdir(out_dir)
-            if data_type == 'scalars':
-                generate_scalars.generate(out_dir, data_dir, ref_path)
-            if data_type == 'images':
-                generate_images.generate(out_dir, data_dir)
-    print('Finished generating data.')
+    out_dir = 'data/samples/'
+    os.makedirs(out_dir, exist_ok=True)
 
-def preprocess_data(images_path, scalars_path, labels_path, output):
+    # Find common samples across all modalities
+    common_samples = set()
+    for _, modal in regions_dict.items():
+        samples = get_samples(modal)
+        if not common_samples:
+            common_samples = set(samples)
+        elif samples:
+            common_samples &= set(samples)
+
+    print(f'Found {len(common_samples)} common samples across all modalities.')
+    print(f'Samples: {common_samples}')
+
+    # Create a pool of workers and process each sample
+    args = [(sample, regions_dict, ref_path, out_dir, overwrite) for sample in common_samples]
+    # with Pool(1) as p:  # for debugging
+    with Pool(cpu_count()) as p:
+        print(f'Using {cpu_count()} cores to process samples . . .')
+        p.starmap(process_sample, args)
+
+def generate_sets(name, strat_method, sample_data_path, use_modes, validation_samples, folds=5):
     """
-    Preprocess the data by compiling the image, scalar, and label data to an .np array and splitting into customizable test/train sets. 
-    Full compiled data is stored as compiled_data.npz in output location, while train/test splits are stored as ??.npz in ?? location
-    
+    Generates sets of data for training, validation, and testing.
+
     Args:
-        images_path (str): path to images folder
-        scalars_path (str): path to scalars folder
-        labels_path (str): path to labels file
-        output (str): path to output location
-
-    Calls:
-        compile_data.compile(images_path, scalars_path, labels_path, output): A function to compile the data into a single .npz file and 
-        create JSON files for gene image, scalar and label data.
+        name (str): The name of the dataset.
+        strat_method (str): The strategy for splitting the data ('gene' or 'sample').
+        sample_data_path (str): The path to the sample data.
+        use_modes (list): The list of modalities to use.
+        validation_samples (list): The list of samples to use for validation.
+        folds (int, optional): The number of folds for cross-validation. Defaults to 5.
 
     Returns:
         None
     """
-    print('Compiling Data, storing outputs in '+ output)
-    compile_data.compile(images_path, scalars_path, labels_path, output)
-    print('Finished compiling data.')
+    out_dir = 'data/' + name + '/'
+    os.makedirs(out_dir, exist_ok=True)
+    # Write the arguments to a TSV file
+    with open(f'{out_dir}{name}.tsv', 'w', newline='') as f:
+        writer = csv.writer(f, delimiter='\t')
+        writer.writerow(['name', 'sample_data_path', 'use_modes', 'validation_samples', 'folds'])
+        writer.writerow([name, sample_data_path, use_modes, validation_samples, folds])
+
+    # Get all files in the directory
+    all_files = os.listdir(sample_data_path)
+    # Filter the list of files
+    data_files = [f for f in all_files if f.endswith('_CompiledProcessedData.h5')]
+    samples = [f.replace('_CompiledProcessedData.h5', '') for f in data_files]
+    # Filter out validation samples and their corresponding data files
+    samples, data_files = zip(*[(sample, data_file) for sample, data_file in zip(samples, data_files) if sample not in validation_samples])
+
+    if os.path.exists(out_dir + 'gene_sample_df.tsv'):
+        print('Loading existing gene-sample DataFrame . . .')
+        gene_sample_df = pd.read_csv(out_dir + 'gene_sample_df.tsv', sep='\t', index_col=0)
+    else:
+        # create a dictionary to hold what genes have no NaN values for all modalities for each sample
+        # N.B. that ALL available modalities are saved so long as those specified with use_modes have no NaN values
+        print('Checking samples for NaN values in modalities specified . . .')
+        with Pool(cpu_count()) as p:
+            results = p.map(check_sample_genes, zip(samples, data_files, [sample_data_path]*len(samples), [use_modes]*len(samples)))
+        # Create a DataFrame to hold the results
+        gene_sample_df = pd.DataFrame()
+        # Loop over the results
+        for result in results:
+            # Get the sample name from one of the values in the dictionary
+            first_key = next(iter(result), None)
+            if first_key is None:
+                continue
+            sample = result[first_key]
+            # Create a DataFrame for this result
+            result_df = pd.DataFrame({sample: {gene: True for gene in result.keys()}})
+            # Concatenate the result DataFrame to the main DataFrame
+            gene_sample_df = pd.concat([gene_sample_df, result_df], axis=1)
+        # Fill NaN values with False
+        gene_sample_df.fillna(False, inplace=True)
+        # Sort the DataFrame by row and column indices
+        gene_sample_df.sort_index(axis=0, inplace=True)
+        gene_sample_df.sort_index(axis=1, inplace=True)
+        gene_sample_df.to_csv(out_dir + 'gene_sample_df.tsv', sep='\t')
+
+    if strat_method == 'gene':
+        # Split the DataFrame into folds
+        folds_df = split_df_gene(gene_sample_df, folds)
+    elif strat_method == 'sample':
+        # Split the DataFrame into folds
+        folds_df = split_df_sample(gene_sample_df, folds)
+    folds_df.to_csv(out_dir + 'folds_df.tsv', sep='\t')
+    # Flatten the DataFrame into a Series
+    flattened = pd.Series(folds_df.values.flatten())
+    # Get the count of each unique value
+    value_counts = flattened.value_counts()
+    # Print the counts
+    print('Fold counts:')
+    print(value_counts)
+    
+    # Loop through folds_df by sample, open up the corresponding sample .h5 file from data/samples, 
+    # and write the data to the corresponding .tf record file based on the fold specified in folds_df
+    print('Starting new .tf splits . . .')
+
+    args_list = [(folds_df, sample_name, samples, sample_data_path, data_files, out_dir) for sample_name in folds_df.columns]
+    with Pool(cpu_count()) as p:
+        # Use the pool to process each sample in parallel
+        p.starmap(process_sample_folds, args_list)
+
+    print('Merge the .tf splits by fold . . .')
+    # Combine the tfrecords for each fold
+    for fold_number in range(1, folds + 1):
+        combine_tfrecords(fold_number, out_dir)
+    print('Finished generating sets.')
+
+
+def generate_validation(name, sample_data_path, use_modes, validation_samples):
+    """
+    Generates validation data.
+
+    Args:
+        name (str): The name of the dataset.
+        sample_data_path (str): The path to the sample data.
+        use_modes (list): The list of modalities to use.
+        validation_samples (list): The list of samples to use for validation.
+
+    Returns:
+        None
+    """
+    out_dir = 'data/' + name + '/'
+    os.makedirs(out_dir, exist_ok=True)
+    # Get all files in the directory
+    all_files = os.listdir(sample_data_path)
+    # Filter the list of files
+    data_files = [f for f in all_files if f.endswith('_CompiledProcessedData.h5')]
+    samples = [f.replace('_CompiledProcessedData.h5', '') for f in data_files]
+    # Filter out validation samples and their corresponding data files
+    samples, data_files = zip(*[(sample, data_file) for sample, data_file in zip(samples, data_files) if sample in validation_samples])
+    print('Starting new validation .tf . . .')
+    args_list = [(sample, sample_data, sample_data_path, use_modes, out_dir) for sample, sample_data in zip(samples, data_files)]
+    with Pool(cpu_count()) as p:
+        # Use the pool to process each sample in parallel
+        p.starmap(process_validation_sample, args_list)
+    print('Finished generating validation data.')
+        
 
 def main():
     """
-    First, process the data into a format that is easily accessible by the CNN.
-    . . . flesh out this docstring
+    The main function to process the data into a format that is easily accessible by the CNN, 
+    and then generate the training, validation, and test sets.
+    . . .
     """
-    reference_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/reference/Ensembl109_reference.bed'
+    # Define paths and parameters
+    process_data = False  # if True, will check but not overwrite existing data
+    use_set = 'GeneStrat_CompleteInputs_11-21-2023'
+    scalars_reference_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/reference/Ensembl109_reference.bed'
     training_home = '/fh/fast/ha_g/user/rpatton/LuCaP_data/'
-    training_name = 'LuCaP'
-    # training_regions = {'TSS': ['images', 'scalars'],
-    #                     'GB': ['scalars'],
-    #                     'TFBS': ['image-panels']}
+    sample_data_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/data/samples/'
+
+    # the outer structure of the saved, sample-level data will be a dictionary with gene names as keys
+    # the inner structure of the saved, sample-level data will be a dictionary with the following keys (per gene):
+    modality_dict = {'TSS_image': ['image', training_home + 'Triton_TSS/results/'],
+                     'TSS_scalars': ['scalars', training_home + 'Triton_TSS/results/'],
+                     'GB_scalars': ['scalars', training_home + 'Triton_GB/results/'],
+                     'ref_scalars': ['ref', ['exon_count', 'transcript_length'], scalars_reference_path],
+                     'continuous_label': ['label', '/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/labels/continuous_tpm.tsv'],
+                     'binary_label': ['label', '/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/labels/binary_zfpkm.tsv']}
+    # 'TFBS_panel': ['panel', training_home + 'Triton_TFBS/results/']
     
-    training_regions = {'TSS': ['images', 'scalars']}
+     # Process the data if necessary
+    if process_data == True:
+        print('Starting data processing . . .')
+        generate_data(modality_dict, scalars_reference_path, overwrite=False)
+        print('Finished processing data.')
 
-    images_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/images'
-    scalars_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/scalars'
-    labels_path = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/labels/labels_continuous_tpm.csv'
-    output = '/fh/fast/ha_g/user/rpatton/TritonCNN/cfDNA-gene-exp-inference/data/continuous'
-    
-    if process_data:
-        #generate_data(training_home, training_name, training_regions, reference_path)
-        preprocess_data(images_path, scalars_path, labels_path, output)
+    # TODO: this is the kinda stuff that should go in a config file, ultimately
+    if use_set == 'GeneStrat_CompleteInputs_11-21-2023':
+        # define train/test/vallidation set generation parameters
+        strat_method = 'gene' # 'gene' or 'sample'
+        folds = 5
+        # N.B. that use_modes are which features are required to contain no NaNs for a feature to pass, but that all modes are saved
+        use_modes = ['TSS_image', 'TSS_scalars', 'GB_scalars', 'ref_scalars', 'continuous_label', 'binary_label']
+        validation_samples = ['LuCaP_93', 'LuCaP_235-3']  # LuCaP 93 and 235-3 are the deepest NEPC and ARPC samples, respectively
 
+        # Check if the output files already exist
+        output_files_exist = all(os.path.exists(f'data/{use_set}/combined_fold-{i}.tfrecord') for i in range(1, folds + 1))
+        # Only run generate_sets if the output files do not exist
+        if not output_files_exist:
+            generate_sets(use_set, strat_method, sample_data_path, use_modes, validation_samples, folds=folds)
+            print('Finished generating sets.')
+        else:
+            print('Data already exists. Continuing.')
 
+        # Check if the output files (validation) already exist
+        output_valids_exist = all(os.path.exists(f'data/{use_set}/{i}.tfrecord') for i in validation_samples)
+        # Only run generate_sets if the output files do not exist
+        if not output_valids_exist:
+            generate_validation(use_set, sample_data_path, use_modes, validation_samples)
+            print('Finished generating sets.')
+        else:
+            print('Data already exists. Continuing.')
+    elif use_set == 'SampleStrat_CompleteInputs_11-21-2023':
+        # define train/test/vallidation set generation parameters
+        strat_method = 'sample' # 'gene' or 'sample'
+        folds = 5
+        # N.B. that use_modes are which features are required to contain no NaNs for a feature to pass, but that all modes are saved
+        use_modes = ['TSS_image', 'TSS_scalars', 'GB_scalars', 'ref_scalars', 'continuous_label', 'binary_label']
+        validation_samples = ['LuCaP_93', 'LuCaP_235-3']  # LuCaP 93 and 235-3 are the deepest NEPC and ARPC samples, respectively
+        
+        # Check if the output files already exist
+        output_files_exist = all(os.path.exists(f'data/{use_set}/combined_fold-{i}.tfrecord') for i in range(1, folds + 1))
+        # Only run generate_sets if the output files do not exist
+        if not output_files_exist:
+            generate_sets(use_set, strat_method, sample_data_path, use_modes, validation_samples, folds=folds)
+            print('Finished generating sets.')
+        else:
+            print('Data already exists. Continuing.')
 
-    quit()
-
-
-
-
-    out_dir = '/fh/fast/ha_g/user/rpatton/CNNTesting/Triton_Activity_TSS/'
-    images_file = out_dir + 'activity_images.npy'
-    scalars_file = out_dir + 'activity_scalars.npy'
-    labels_file = out_dir + 'activity_labels.npy'
-    idents_file = out_dir + 'activity_identifiers.npy'
-    # labels_ref = '/fh/fast/ha_g/user/rpatton/references/LuCaP/LuCaP_activity_z-fpkm.tsv'
-    labels_ref = '/fh/fast/ha_g/user/rpatton/references/LuCaP/LuCaP_AvgL2FPKM.tsv'
-    if not os.path.isfile(images_file) or not os.path.isfile(labels_file) or not os.path.isfile(scalars_file):
-        # process fresh data into easily accessible image/scalar and label files (with shared indices)
-        input_folder = '/fh/fast/ha_g/user/rpatton/LuCaP_data/Triton_TSS/results/'
-        print('Processing data fresh from ' + input_folder + ' . . .')
-        images_dict = {}
-        input_paths = [y for x in os.walk(input_folder) for y in glob(os.path.join(x[0], '*TritonProfiles.npz'))]
-        samples = [os.path.basename(path).split('_TritonProfiles.npz')[0] for path in input_paths]
-        scalars_df = pd.read_table(input_folder + 'TritonCompositeFM.tsv', sep='\t', index_col=0)
-        print(scalars_df)
-        for sample, input_path in zip(samples, input_paths):
-            sample = sample.replace('_LuCaP', '')
-            temp_data = np.load(input_path)
-            images_dict.update(clean_input(temp_data, sample))
-        labels = pd.read_table(labels_ref, sep='\t', index_col=0)
-        labels_dict = {}
-        # TODO: you left off here . . . need to match scalar data and save as a 1D array
-        for _, row in pd.melt(labels.reset_index(), id_vars='index').iterrows():
-            labels_dict[row['variable'] + '_' + row['index']] = row['value']
-        images_input, labels_input, idents = [], [], []
-        for key, val in images_dict.items():
-            if key in labels_dict:
-                images_input.append(val)
-                labels_input.append(labels_dict[key])
-                idents.append(key)
-        images_input, labels_input, idents = np.stack(images_input), np.stack(labels_input), np.stack(idents)
-        np.save(images_file, images_input)
-        np.save(labels_file, labels_input)
-        np.save(idents_file, idents)
-        print('Finished.')
+        # Check if the output files (validation) already exist
+        output_valids_exist = all(os.path.exists(f'data/{use_set}/{i}.tfrecord') for i in validation_samples)
+        # Only run generate_sets if the output files do not exist
+        if not output_valids_exist:
+            generate_validation(use_set, sample_data_path, use_modes, validation_samples)
+            print('Finished generating sets.')
+        else:
+            print('Data already exists. Continuing.')
     else:
-        images_input, labels_input, idents = np.load(images_file), np.load(labels_file), np.load(idents_file)
-    # KEEP below lines for subsetting for future TSS sites
-    # if os.path.isfile(images_file) and os.path.isfile(labels_file) and not subset:
-    #     print("Loading " + images_file + ' and matched ' + labels_file + ' . . .')
-    #     images_input, labels_input = np.load(images_file), np.load(labels_file)
-    #     print('Finished.')
-    # elif os.path.isfile('subset_' + images_file) and os.path.isfile('subset_' + labels_file):
-    #     print("Loading " + 'subset_' + images_file + ' and matched ' + 'subset_' + labels_file + ' . . .')
-    #     images_input, labels_input = np.load('subset_' + images_file), np.load('subset_' + labels_file)
-    #     print('Finished.')
-    # elif not subset:
-    #
-    # else:
-    #     print('Subsetting and saving data from established file . . .')
-    #     images_input, labels_input = np.load(images_file), np.load(labels_file)
-    #     subset_idx = random.sample(range(len(images_input)), 50000)
-    #     images_input, labels_input = images_input[subset_idx], labels_input[subset_idx]
-    #     np.save('subset_' + images_file, images_input)
-    #     np.save('subset_' + labels_file, labels_input)
-    #     print('Finished.')
-    print('Total inputs: ' + str(len(images_input)))
-    print(images_input.shape)
-    with open('/fh/fast/ha_g/user/rpatton/references/PSMA44.txt') as f:
-        ho_sites = f.read().splitlines()
-    ho_idx = []
-    for site in ho_sites:
-        ho_idx += [i for i, x in enumerate(idents.flatten().tolist()) if '_' + site in x]
-    ho_images, ho_labels, ho_idents =\
-        images_input.take(ho_idx, axis=0), labels_input.take(ho_idx, axis=0), idents.take(ho_idx, axis=0)
-    images_input, labels_input, idents = \
-        np.delete(images_input, ho_idx, axis=0), np.delete(labels_input, ho_idx, axis=0), np.delete(idents, ho_idx, axis=0)
-    print('Hold out set dimensions:')
-    print(ho_images.shape)
-    idx = np.random.permutation(len(images_input))
-    images_input, labels_input, idents = images_input[idx], labels_input[idx], idents[idx]
-    active_count = np.count_nonzero(labels_input == 1.0)
-    print('Total active in training set: ' + str(round(100*active_count/len(images_input))) + '%')
-    # TEST/evaluate finished models:
-    images_2d = np.expand_dims(ho_images, axis=-1)
-    test_model_activity(images_2d, ho_labels, 'Activity_TSS', 'bio_2d')
-    # save/evaluate model . . .
-    # 1D CNN models: ###################################################################################################
-    # save_model_activity(images_input, labels_input, 'Activity_TSS', 'bio')
-    # save_model_activity(images_input, labels_input, 'Activity_TSS', '1DRN')
-    # save_model_activity(images_input, labels_input, 'Activity_TSS', 'inception')
-    # save_model_activity(images_input, labels_input, 'Activity_TSS', 'bio_inception')
-    # # no sequence
-    # save_model_activity(np.delete(images_input, [9, 10, 11, 12], 2), labels_input, 'Activity_TSS_no-seq', 'bio')
-    # save_model_activity(np.delete(images_input, [9, 10, 11, 12], 2), labels_input, 'Activity_TSS_no-seq', '1DRN')
-    # save_model_activity(np.delete(images_input, [9, 10, 11, 12], 2), labels_input, 'Activity_TSS_no-seq', 'inception')
-    # save_model_activity(np.delete(images_input, [9, 10, 11, 12], 2), labels_input, 'Activity_TSS_no-seq', 'bio_inception')
-    # # nucleosome and hetero signals, only
-    # save_model_activity(np.delete(images_input, [0, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12], 2), labels_input,
-    #                     'Activity_TSS_signals', 'bio')
-    # save_model_activity(np.delete(images_input, [0, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12], 2), labels_input,
-    #                     'Activity_TSS_signals', '1DRN')
-    # save_model_activity(np.delete(images_input, [0, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12], 2), labels_input,
-    #                     'Activity_TSS_signals', 'inception')
-    # save_model_activity(np.delete(images_input, [0, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12], 2), labels_input,
-    #                     'Activity_TSS_signals', 'bio_inception')
-    # 2D CNN models: ###################################################################################################
-    # images_2d = np.expand_dims(images_input, axis=-1)
-    # save_model_activity(images_2d, labels_input, 'Activity_TSS', 'bio_2d')
-    # no sequence
-    # images_2d = np.expand_dims(np.delete(images_input, [9, 10, 11, 12], 2), axis=-1)
-    # save_model_activity(images_2d, labels_input, 'Activity_TSS_no-seq', 'bio_2d')
-    # nucleosome and hetero signals, only
-    # images_2d = np.expand_dims(np.delete(images_input, [0, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12], 2), axis=-1)
-    # save_model_activity(images_2d, labels_input, 'Activity_TSS_signals', 'bio_2d')
-    # Deep models: #####################################################################################################
-    # Combination models: ##############################################################################################
-    ####################################################################################################################
-    """
-    to remove specific lines from the signal profile, pass the following [lines to delete]:                
-    np.delete(images_input, [1, 2, 3, 4, 5, 6, 7, 8, 9], 2) -> 2 here refers to the second dim of the array
-    1: Depth (GC-corrected, if provided)
-    2: Nucleosome-level phased profile
-    3: Nucleosome center profile (GC-corrected, if provided)
-    4: Mean fragment size
-    5: Fragment size Shannon entropy
-    6: Fragment heterogeneity (unique fragment lengths / total fragments)
-    7: Fragment MAD (Mean Absolute Deviation)
-    8: Short:long ratio (x <= 120 / 140 <= x <= 250)
-    9: Peak locations (-1: trough, 1: peak, -2: minus-one peak, 2: plus-one peak, 3: inflection point)***
-    10: A (Adenine) frequency**
-    11: C (Cytosine) frequency**
-    12: G (Guanine) frequency**
-    13: T (Tyrosine) frequency**
-    """
+        print('No set specified. Exiting.')
 
-
-    print('Finished.')
+    # TODO: to load data for a specific model train/test/run, we'll use get_dataset() from generate_tf_splits.py
+    # TODO: which can load all train files at once and shuffle them, as well as individual test files
 
 
 if __name__ == "__main__":

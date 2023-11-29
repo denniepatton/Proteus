@@ -1,0 +1,338 @@
+# v1.0.0, 11/28/2023
+# Robert D Patton, rpatton@fredhutch.org
+# Ha Lab, Fred Hutchinson Cancer Research Center
+
+"""
+Contains functions for generating the training and testing splits for the TF model and saving them as .tfrecord files.
+"""
+
+import os
+import h5py
+import glob
+import numpy as np
+import tensorflow as tf
+
+
+def check_sample_genes(sample_data_file_path_modes):
+    """
+    Checks the genes in a sample data file and returns a dictionary of valid genes.
+
+    Args:
+        sample_data_file_path_modes (tuple): A tuple containing the sample name, data file name, 
+                                             path to the sample data, and list of modalities to use.
+
+    Returns:
+        dict: A dictionary where each key is a valid gene and the value is the sample name.
+    """
+    sample, data_file, sample_data_path, use_modes = sample_data_file_path_modes
+    valid_genes = {}
+
+    with h5py.File(f'{sample_data_path}{data_file}', 'r') as f:
+        for gene in f.keys():
+            if all(modality in f[gene] and not np.isnan(np.array(f[gene][modality])).any() for modality in use_modes):
+                valid_genes[gene] = sample
+
+    return valid_genes
+
+
+def split_df_gene(df, folds):
+    """
+    Splits the data into folds, stratified by gene name.
+
+    Args:
+        df (pandas.DataFrame): The DataFrame to split. Each row corresponds to a gene, 
+                               and each column corresponds to a sample.
+        folds (int): The number of folds to split the data into.
+
+    Returns:
+        pandas.DataFrame: The split DataFrame, where each True value has been replaced 
+                          with the fold number it belongs to.
+    """
+    print('Splitting the data into folds (stratified by gene name) . . .')
+
+    # Loop over the rows in the DataFrame
+    for row in df.itertuples(index=True):
+        # Get the indices of the True values in the row
+        true_indices = [i for i, x in enumerate(row[1:]) if x]
+
+        # Create a list of fold numbers for this row
+        fold_numbers = np.tile(range(1, folds + 1), len(true_indices) // folds + 1)
+        np.random.shuffle(fold_numbers)
+        fold_numbers = fold_numbers[:len(true_indices)]
+
+        # Assign a fold number to each True value in the row
+        for i, fold in zip(true_indices, fold_numbers):
+            df.at[row[0], df.columns[i]] = fold
+
+    return df
+
+
+def split_df_sample(df, folds):
+    """
+    Splits the data into folds, grouping samples together.
+
+    Args:
+        df (pandas.DataFrame): The DataFrame to split. Each row corresponds to a gene, 
+                               and each column corresponds to a sample.
+        folds (int): The number of folds to split the data into.
+
+    Returns:
+        pandas.DataFrame: The split DataFrame, where each True value has been replaced 
+                          with the fold number it belongs to.
+    """
+    print('Splitting the data into folds (grouping samples together) . . .')
+
+    # Calculate the sum of True values in each column (total number of genes for each sample)
+    sums = df.sum()
+
+    # Sort the samples based on the total number of genes
+    sorted_samples = sums.sort_values().index.tolist()
+
+    # Initialize a list to hold the total number of genes for each fold
+    fold_sums = [0] * folds
+
+    # Initialize a dictionary to hold the fold number for each sample
+    sample_folds = {}
+
+    # Assign each sample to the fold with the least total number of genes so far
+    for sample in sorted_samples:
+        fold = fold_sums.index(min(fold_sums))
+        sample_folds[sample] = fold + 1
+        fold_sums[fold] += sums[sample]
+
+    # Replace the True values in the DataFrame with the fold numbers
+    for sample, fold in sample_folds.items():
+        df[sample] = df[sample].replace(True, fold)
+
+    return df
+
+
+def serialize_example(feature_dict):
+    """
+    Creates a tf.Example message ready to be written to a file.
+
+    Args:
+        feature_dict (dict): A dictionary where each key is a feature name and each value is a feature value.
+
+    Returns:
+        bytes: The serialized tf.Example message.
+    """
+    # Create a dictionary to hold the features
+    features = {}
+
+    # For each feature in the feature_dict
+    for key, value in feature_dict.items():
+        # Check the type of the value
+        if isinstance(value, np.ndarray):
+            # Flatten the array and store it
+            value = value.ravel()
+            if value.dtype == np.float32 or value.dtype == np.float64:
+                features[key] = _float_feature(value)
+            elif value.dtype == np.int64:
+                features[key] = _int64_feature(value)
+        elif isinstance(value, (int, np.integer)):
+            features[key] = _int64_feature(value)
+        elif isinstance(value, (float, np.floating)):
+            features[key] = _float_feature(value)
+        else:
+            raise ValueError(f'Unknown type for feature "{key}"')
+
+    # Create a Features message using tf.train.Example.
+    example_proto = tf.train.Example(features=tf.train.Features(feature=features))
+    return example_proto.SerializeToString()
+
+
+def _float_feature(value):
+    """Returns a float_list from a float / double."""
+    if isinstance(value, (float, np.floating)):
+        value = [value]
+    return tf.train.Feature(float_list=tf.train.FloatList(value=value))
+
+
+def _int64_feature(value):
+    """Returns an int64_list from a bool / enum / int / uint."""
+    if isinstance(value, (int, np.integer)):
+        value = [value]
+    return tf.train.Feature(int64_list=tf.train.Int64List(value=value))
+
+
+def load_key_from_hdf5(key, h5file):
+    """
+    Loads a key from an HDF5 file.
+
+    Args:
+        key (str): The key to load.
+        h5file (h5py.File): The HDF5 file to load the key from.
+
+    Returns:
+        dict: A dictionary where each key is a subkey of the key in the HDF5 file and each value is the corresponding data.
+        If the key is not found in the HDF5 file, returns None.
+    """
+    if key in h5file:
+        # Load the inner dictionary
+        inner_dict = {}
+        for inner_key, item in h5file[key].items():
+            inner_dict[inner_key] = item[()]
+        return inner_dict
+    else:
+        print(f'Key "{key}" not found in the file.')
+        return None
+    
+
+def parse_serialized_example(serialized_example):
+    """
+    Parses a serialized tf.Example message.
+
+    Args:
+        serialized_example (bytes): The serialized tf.Example message.
+
+    Returns:
+        dict: A dictionary where each key is a feature name and each value is the corresponding feature value.
+    """
+    # Define the feature description dictionary
+    feature_description = {
+        'TSS_image': tf.io.FixedLenFeature([2000, 11], tf.float32),
+        'TSS_scalars': tf.io.FixedLenFeature([12], tf.float32),
+        'GB_scalars': tf.io.FixedLenFeature([12], tf.float32),
+        'ref_scalars': tf.io.FixedLenFeature([2], tf.float32),
+        'continuous_label': tf.io.FixedLenFeature([], tf.float32),
+        'binary_label': tf.io.FixedLenFeature([], tf.int64)
+    }
+
+    # Parse the serialized example
+    example = tf.io.parse_single_example(serialized_example, feature_description)
+
+    return example
+
+
+def process_sample_folds(folds_df, sample_name, samples, sample_data_path, data_files, out_dir):
+    """
+    Processes the folds for a given sample and writes the data to TFRecord files.
+
+    Args:
+        folds_df (pandas.DataFrame): The DataFrame containing the fold assignments.
+        sample_name (str): The name of the sample to process.
+        samples (list): The list of all sample names.
+        sample_data_path (str): The path to the sample data files.
+        data_files (list): The list of all data file names.
+        out_dir (str): The directory to write the TFRecord files to.
+    """
+    print(f'Processing {sample_name} . . .')
+
+    # Group the genes by fold
+    groups = folds_df[folds_df[sample_name] != False].groupby(sample_name)
+    folds_dict = {fold: group.index.tolist() for fold, group in groups}
+
+    # Get the index of the sample in the samples list
+    sample_index = samples.index(sample_name)
+
+    # Open the HDF5 file for the sample
+    with h5py.File(sample_data_path + data_files[sample_index], 'r') as f:
+        # For each fold
+        for fold in folds_dict.keys():
+            # Create a TFRecord file for the fold
+            out_file = f'{out_dir}{sample_name}_fold-{fold}.tfrecord'
+            with tf.io.TFRecordWriter(out_file) as writer:
+                # For each gene in the fold
+                for gene in folds_dict[fold]:
+                    # Load the gene data from the HDF5 file
+                    gene_data = load_key_from_hdf5(gene, f)
+                    # Serialize the gene data
+                    serialized = serialize_example(gene_data)
+                    # Write the serialized data to the TFRecord file
+                    writer.write(serialized)
+
+
+def process_validation_sample(sample, sample_data, sample_data_path, use_modes, out_dir):
+    """
+    Processes a validation sample and writes the data to a TFRecord file.
+
+    Args:
+        sample (str): The name of the sample to process.
+        sample_data (str): The name of the sample data file.
+        sample_data_path (str): The path to the sample data files.
+        use_modes (list): The list of modes to use.
+        out_dir (str): The directory to write the TFRecord file to.
+    """
+    print(f'Processing {sample} . . .')
+
+    with h5py.File(f'{sample_data_path}{sample_data}', 'r') as f:
+        # Create a dictionary of valid genes
+        valid_genes = {gene: sample for gene in f.keys() if all(modality in f[gene] and not np.isnan(np.array(f[gene][modality])).any() for modality in use_modes)}
+
+        # Create a TFRecord file for the sample
+        out_file = f'{out_dir}{sample}.tfrecord'
+        with tf.io.TFRecordWriter(out_file) as writer:
+            # For each valid gene
+            for gene in valid_genes.keys():
+                # Load the gene data from the HDF5 file
+                gene_data = load_key_from_hdf5(gene, f)
+                # Serialize the gene data
+                serialized = serialize_example(gene_data)
+                # Write the serialized data to the TFRecord file
+                writer.write(serialized)
+
+
+def combine_tfrecords(fold_number, out_dir):
+    """
+    Combines all TFRecord files for a given fold into a single TFRecord file.
+
+    Args:
+        fold_number (int): The fold number.
+        out_dir (str): The directory containing the TFRecord files.
+
+    Note:
+        The original TFRecord files are deleted after they have been combined.
+    """
+    print(f'Combining TFRecord files for fold {fold_number} . . .')
+
+    # Get all .tfrecord files for the given fold
+    tfrecord_files = glob.glob(f'{out_dir}*fold-{fold_number}.tfrecord')
+
+    # Create a new .tfrecord file to write the combined data
+    with tf.io.TFRecordWriter(f'{out_dir}combined_fold-{fold_number}.tfrecord') as writer:
+        for tfrecord_file in tfrecord_files:
+            # Read the .tfrecord file
+            for record in tf.data.TFRecordDataset(tfrecord_file):
+                # Write the record to the new file
+                writer.write(record.numpy())
+
+    # Delete the original .tfrecord files
+    for tfrecord_file in tfrecord_files:
+        os.remove(tfrecord_file)
+
+
+def get_dataset(fold_numbers, use_set, shuffle=True, batch_size=32):
+    """
+    Loads and prepares a dataset from TFRecord files.
+
+    Args:
+        fold_numbers (list): The fold numbers to load.
+        use_set (str): The (named) split-set to use.
+        shuffle (bool, optional): Whether to shuffle the data. Defaults to True.
+        batch_size (int, optional): The batch size. Defaults to 32.
+
+    Returns:
+        tf.data.Dataset: The prepared dataset.
+    """
+    print(f'Loading dataset for fold(s) {fold_numbers} from {use_set} set . . .')
+
+    # Load the .tfrecord file for the given fold(s)
+    files = [f'data/{use_set}/combined_fold-{fold_number}.tfrecord' for fold_number in fold_numbers]
+    ds = tf.data.TFRecordDataset(files)
+    ds = ds.cache()
+
+    # Shuffle the data if specified
+    if shuffle: 
+        ds = ds.shuffle(1024*8)
+        opt = tf.data.Options()
+        opt.experimental_deterministic = False
+        ds = ds.with_options(opt)
+
+    # Parse the data
+    ds = ds.map(parse_serialized_example)
+
+    # Batch the data
+    ds = ds.batch(batch_size)
+
+    return ds
