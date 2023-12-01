@@ -14,7 +14,7 @@ from keras.layers import Dense, Flatten, Dropout, Input, BatchNormalization, Act
 from keras.regularizers import l1, l2, l1_l2
 from keras.layers.convolutional import Conv1D, Conv2D, MaxPooling1D, AveragePooling1D
 import numpy as np
-import utils
+import models.utils
 
 def get_model_type(args):
     if args.model_version is not None:
@@ -83,9 +83,9 @@ def classification_only_images(input_dim=(2000, 11), output_dim=3, learning_rate
     # Create the model
     model = Model(inputs=sequential_input, outputs=output)
     optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
-    model.compile(loss='categorical_crossentropy',
+    model.compile(loss='binary_crossentropy',
                   optimizer=optimizer, 
-                  metrics=['categorical_accuracy'])
+                  metrics=['accuracy'])
     return model
 
 def classification_only_scalars(input_dim=14, output_dim=3, learning_rate=1e-3, n_hidden=1):

@@ -22,7 +22,7 @@ from keras.utils import set_random_seed
 reduce_lr = keras.callbacks.ReduceLROnPlateau(
             monitor='val_loss', factor=0.5, patience=10, min_lr=0.001)
 es = keras.callbacks.EarlyStopping(
-            monitor='val_categorical_accuracy', mode='max', patience=7, verbose=1)
+            monitor='val_accuracy', mode='max', patience=7, verbose=1)
 es_rg = keras.callbacks.EarlyStopping(
             monitor='val_mse', mode='min', patience=7, verbose=1)
 # logging callback
@@ -30,9 +30,9 @@ class LoggerCallback(Callback):
     def on_epoch_end(self, epoch, logs=None):
         epoch_number = epoch + 1
         loss = logs['loss']
-        accuracy = logs['categorical_accuracy']
+        accuracy = logs['accuracy']
         val_loss = logs['val_loss']
-        val_accuracy = logs['val_categorical_accuracy']
+        val_accuracy = logs['val_accuracy']
         logging.info(f"Epoch {epoch_number}: "
                      f"Train Loss = {loss:.4f}, Train Accuracy = {accuracy:.4f}, "
                      f"Val Loss = {val_loss:.4f}, Val Accuracy = {val_accuracy:.4f}")
@@ -71,8 +71,8 @@ def plot_model(model, output, filename = "architecture"):
     keras.utils.plot_model(model, to_file = os.path.join(output, f"{filename}.png"), show_shapes=True, show_layer_activations=True)
 
 def plot_convergence(history, output, filename = "model"):
-    plt.plot(history.history['categorical_accuracy'])
-    plt.plot(history.history['val_categorical_accuracy'])
+    plt.plot(history.history['accuracy'])
+    plt.plot(history.history['val_accuracy'])
     plt.title('Model Accuracy')
     plt.ylabel('categorical accuracy')
     plt.xlabel('epoch')

@@ -1,13 +1,26 @@
+# Alex Netzley
+# 12/01/2023
 #!/usr/bin/env python
-'''
-@File    :   run_model.py
-@Author  :   Alex Netzley, adapted from Akira Nair
-'''
+# '''
+# @File    :   run_model.py
+# @Author  :   Alex Netzley, adapted from Akira Nair
+# '''
+import os
+import pandas as pd
+import tensorflow as tf
 
 import argparse
 import sys
 import json
 import pickle
+
+import numpy as np
+import logging
+
+from preprocessing.generate_tf_splits import get_dataset
+from models.utils import *
+from models.classification_models import *
+import os
 # tf.compat.v1.disable_eager_execution()
 # tf.compat.v1.enable_eager_execution()
 
@@ -15,7 +28,7 @@ import pickle
 def args_parse(args):
     parser = argparse.ArgumentParser(description="Run deep learning model on Triton output to infer gene expression.")
     parser.add_argument("-n", "--name", required=True, help="Specify a name for the model (REQUIRED)")
-    parser.add_argument("-o", "--output", default="/fh/fast/users/anetzley/TritonCNNv3/model/_models", help="Output folder for model")
+    parser.add_argument("-o", "--output", default="/fh/fast/ha_g/user/anetzley/TritonCNNv3/model/_models", help="Output folder for model")
     #parser.add_argument("-d", "--data", default=None, help="Path to .npz file with compiled data")
     parser.add_argument("--model_version", default=None, type=str, help="If specified, uses a pre-defined architecture")
     parser.add_argument("--modalities", choices=["images", "scalars", "all"], default="images", help="Which modalities to include in the model")
@@ -31,13 +44,9 @@ def args_parse(args):
 
 def run(args):
     ### init... ###
-    import numpy as np
-    import logging
-    import tensorflow as tf
-    import utils
-    import os
-    OUTPUT = utils.init(output=args.output, name=args.name, use_time=True)
-    utils.set_seed(args.seed)
+    
+    OUTPUT = init(output=args.output, name=args.name, use_time=True)
+    set_seed(args.seed)
     logging.info(f"***SETTINGS --- {args}")
     
     
@@ -57,24 +66,32 @@ def run(args):
     # data = np.load(data_path)
     # filtered_training, filtered_validation, filtered_testing = utils.open_data(data, args.split, keys=args.modalities)
     # logging.info("Loaded data.")
-    import sys
-    sys.path.append("..")
-    from preprocessing.generate_tf_splits import *
-
+    
 
     ### Prepare data for model input ###
     if args.modalities == "images":
-        full_trainset = get_dataset(fold_numbers = [1, 2, 3, 4], use_set = 'GeneStrat_CompleteInputs_11-21-2023', shuffle=True, batch_size=32)
-        full_testset = get_dataset(fold_numbers = [5], use_set = 'GeneStrat_CompleteInputs_11-21-2023', shuffle=True, batch_size=32)
+        full_trainset = get_dataset(fold_numbers = [1, 2, 3, 4], use_set = 'GeneStrat_CompleteInputs_11-21-2023', shuffle=True, batch_size=256)
+        full_testset = get_dataset(fold_numbers = [5], use_set = 'GeneStrat_CompleteInputs_11-21-2023', shuffle=True, batch_size=256)
         print('Completed Extracting Full Sets')
 
         
         # Extract only the features you need
+        
         def extract_features(batch):
             return {'input_1': batch['TSS_image']}, {'dense_2': batch['binary_label']}
 
         trainset = full_trainset.map(extract_features)
         testset = full_testset.map(extract_features)
+
+
+        #Extract the first element from the dataset so we can get the shape of the input
+        # Take one element from the dataset
+        one_element = next(iter(trainset.take(1)))
+
+        # Get the shape of the input tensor
+        input_shape = one_element[0]['input_1'].shape
+        print('Input shape:', input_shape)
+        args.i_shape = ([input_shape[1], input_shape[2]])
         # images_train = tf.convert_to_tensor(filtered_training["images"])
         # images_val = tf.convert_to_tensor(filtered_validation["images"])
         # images_test = tf.convert_to_tensor(filtered_testing["images"])
@@ -110,7 +127,7 @@ def run(args):
         
         # get model
         model = regression_models.get_model_type(args)
-        utils.plot_model(model, OUTPUT)
+        plot_model(model, OUTPUT)
         
         # convert labels to floats for regression
         labels_train = tf.convert_to_tensor(filtered_training["labels"], dtype=tf.float32)
@@ -123,29 +140,30 @@ def run(args):
                             epochs=args.epochs, batch_size=args.batch_size, verbose=1,
                             shuffle=True, validation_data=(model_val_inputs, labels_val), 
                             callbacks=[utils.RegLoggerCallback(), utils.es_rg])
-        utils.plot_convergence_regression(history, OUTPUT)
+        plot_convergence_regression(history, OUTPUT)
     
     ### Classification task ###
     else:
-        import classification_models
+        
         logging.info(f"Creating a classification model to predict {args.task} classes with {args.modalities}.")
         
         # get model
-        model = classification_models.get_model_type(args)
-        utils.plot_model(model, OUTPUT)
+        args.task = 1
+        model = get_model_type(args)
+        plot_model(model, OUTPUT)
         
         ## convert labels to one-hot encodings for classifications
         #labels_train_ohe = tf.one_hot(tf.convert_to_tensor(filtered_training["labels"], dtype=tf.int8), depth=args.task)
         #labels_val_ohe = tf.one_hot(tf.convert_to_tensor(filtered_validation["labels"], dtype=tf.int8), depth=args.task)
 
         # model training
-        logging.info(f"Training on {len(labels_train_ohe)}, validating on {len(labels_val_ohe)}")
+        #logging.info(f"Training on {len(labels_train)}, validating on {len(labels_test)}")
         logging.info(f"Training model for {args.epochs} epochs...")
         history = model.fit(trainset, 
                             epochs=args.epochs, batch_size=args.batch_size, verbose=1,
                             shuffle=True, validation_data=testset, 
-                            callbacks=[utils.LoggerCallback(), utils.es])
-        utils.plot_convergence(history, OUTPUT)
+                            callbacks=[LoggerCallback(), es])
+        plot_convergence(history, OUTPUT)
         
     ### Save model ###
     model.save_weights(os.path.join(OUTPUT, "weights.hdf5"))
@@ -194,3 +212,4 @@ def main(args):
 
 if __name__ == "__main__":
     main(sys.argv[1:])
+    #main(['test_classifier', '/fh/fast/users/anetzley/TritonCNNv3/model/_models', 'GeneStrat_CompleteInputs_11-21-2023', 'images', '0', '1', '32', '1e-3', '0', '206'])
