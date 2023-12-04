@@ -7,7 +7,7 @@ from keras.regularizers import l1, l2, l1_l2
 from keras.layers.convolutional import Conv1D, Conv2D, MaxPooling1D, AveragePooling1D
 from keras.losses import MeanSquaredError
 # from . import utils
-import utils
+#import utils
 import argparse
 import logging
 import numpy as np
@@ -16,6 +16,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils import class_weight
 import os
 import sys
+import models.utils
 
 def get_model_type(args):
     if args.model_version is not None:
@@ -56,7 +57,7 @@ def get_model_type(args):
 
 
 def regression_only_images(input_dim=(2000, 11), learning_rate=1e-3, n_filters=64, n_convolutions=1):
-    sequential_input = Input(shape=input_dim)
+    sequential_input = Input(shape=input_dim, name='TSS_image')
     x = Reshape((input_dim[0], input_dim[1], 1))(sequential_input)
     bp_model = Sequential([
         Flatten(),
@@ -76,7 +77,7 @@ def regression_only_images(input_dim=(2000, 11), learning_rate=1e-3, n_filters=6
     x = Flatten()(x)
     x = BatchNormalization()(x)
     x = Dense(100, activation='relu')(x)
-    output = Dense(1)(x)
+    output = Dense(1, name='output')(x)
 
     # Create the model
     model = Model(inputs=sequential_input, outputs=output)
@@ -103,7 +104,7 @@ def regression_only_scalars(input_dim=14, learning_rate=1e-3, n_hidden=1):
     return model
 
 def regression_all(input_dim_i=(2000, 11), input_dim_s=14, learning_rate=1e-3, n_filters=64, n_convolutions=1, n_hidden=1):
-    sequential_input = Input(shape=input_dim_i)
+    sequential_input = Input(shape=input_dim_i, name='TSS_image')
     x = Reshape((input_dim_i[0], input_dim_i[1], 1))(sequential_input)
     bp_model = Sequential([
         Flatten(),
@@ -124,7 +125,7 @@ def regression_all(input_dim_i=(2000, 11), input_dim_s=14, learning_rate=1e-3, n
     x = BatchNormalization()(x)
     x = Dense(100, activation='relu')(x)
     
-    scalars_in = Input(shape=(input_dim_s,))
+    scalars_in = Input(shape=(input_dim_s,), name='TSS_scalars')
     y = Dense(50, activation='relu')(scalars_in)
     y = BatchNormalization()(y)
     for _ in range(n_hidden-1):
@@ -133,7 +134,7 @@ def regression_all(input_dim_i=(2000, 11), input_dim_s=14, learning_rate=1e-3, n
     
     z = Concatenate()([x, y])
     z = Dense(200, activation='relu')(z)
-    output = Dense(1)(z)
+    output = Dense(1, name='output')(z)
 
     # Create model
     model = Model(inputs=[sequential_input, scalars_in], outputs=output)

@@ -58,7 +58,7 @@ def get_model_type(args):
 
 
 def classification_only_images(input_dim=(2000, 11), output_dim=3, learning_rate=1e-3, n_filters=64, n_convolutions=1):
-    sequential_input = Input(shape=input_dim)
+    sequential_input = Input(shape=input_dim, name='TSS_image')
     x = Reshape((input_dim[0], input_dim[1], 1))(sequential_input)
     bp_model = Sequential([
         Flatten(),
@@ -78,7 +78,7 @@ def classification_only_images(input_dim=(2000, 11), output_dim=3, learning_rate
     x = Flatten()(x)
     x = BatchNormalization()(x)
     x = Dense(100, activation='relu')(x)
-    output = Dense(output_dim, activation='softmax')(x)
+    output = Dense(output_dim, activation='softmax', name='output')(x)
 
     # Create the model
     model = Model(inputs=sequential_input, outputs=output)
@@ -89,24 +89,24 @@ def classification_only_images(input_dim=(2000, 11), output_dim=3, learning_rate
     return model
 
 def classification_only_scalars(input_dim=14, output_dim=3, learning_rate=1e-3, n_hidden=1):
-    scalars_in = Input(shape=(input_dim,))
+    scalars_in = Input(shape=(input_dim,), name ='TSS_scalars')
     x = Dense(50, activation='relu')(scalars_in)
     x = BatchNormalization()(x)
     for _ in range(n_hidden-1):
         x = Dense(50, activation='relu')(x)
         x = BatchNormalization()(x)
-    output = Dense(output_dim, activation='softmax')(x)
+    output = Dense(output_dim, activation='softmax', name='output')(x)
     
     # Create the model
     model = Model(inputs=scalars_in, outputs=output)
     optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
-    model.compile(loss='categorical_crossentropy',
+    model.compile(loss='binary_crossentropy',
                   optimizer=optimizer, 
-                  metrics=['categorical_accuracy'])
+                  metrics=['accuracy'])
     return model
 
 def classification_all(input_dim_i=(2000, 11), input_dim_s=14, output_dim=3, learning_rate=1e-3, n_filters=64, n_convolutions=1, n_hidden=1):
-    sequential_input = Input(shape=input_dim_i)
+    sequential_input = Input(shape=input_dim_i, name='TSS_image')
     x = Reshape((input_dim_i[0], input_dim_i[1], 1))(sequential_input)
     bp_model = Sequential([
         Flatten(),
@@ -127,7 +127,7 @@ def classification_all(input_dim_i=(2000, 11), input_dim_s=14, output_dim=3, lea
     x = BatchNormalization()(x)
     x = Dense(100, activation='relu')(x)
     
-    scalars_in = Input(shape=(input_dim_s,))
+    scalars_in = Input(shape=(input_dim_s,), name ='TSS_scalars')
     y = Dense(50, activation='relu')(scalars_in)
     y = BatchNormalization()(y)
     for _ in range(n_hidden-1):
@@ -136,13 +136,13 @@ def classification_all(input_dim_i=(2000, 11), input_dim_s=14, output_dim=3, lea
     
     z = Concatenate()([x, y])
     z = Dense(200, activation='relu')(z)
-    output = Dense(output_dim, activation='softmax')(z)
+    output = Dense(output_dim, activation='softmax', name='output')(z)
     # Create the model
     model = Model(inputs=[sequential_input, scalars_in], outputs=output)
     optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
-    model.compile(loss='categorical_crossentropy',
+    model.compile(loss='binary_crossentropy',
                   optimizer=optimizer, 
-                  metrics=['categorical_accuracy'])
+                  metrics=['accuracy'])
     return model
 
 def classification_only_images_attention(input_dim=(2000, 11), output_dim=3, learning_rate=1e-3):
