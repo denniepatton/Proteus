@@ -1,6 +1,7 @@
 # project specific
 /data/**
 /results/**
+/logs/cluster/**
 .DS_Store
 
 # Byte-compiled / optimized / DLL files

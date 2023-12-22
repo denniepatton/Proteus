@@ -1,0 +1,27 @@
+# cluster_slurm.yaml for run_parallel_training.smk, for use on Fred Hutch servers
+# Robert Patton, rpatton@fredhutch.org (Ha Lab)
+# v1.0 12/21/2023
+
+__default__:
+    partition: campus-new
+    time: "24:0:0"
+    mem: 64G
+    ncpus: 1
+    ntasks: 1
+    output: logs/cluster/{rule}.%A.out
+    JobName: "{rule}"
+
+run_fold:
+    output: logs/cluster/{rule}.%A.out
+    job-name: "{rule}"
+    ntasks: 1
+    time: "120:00:00"
+    gpus: "rtx2080ti:1"
+
+run_test:
+    output: logs/cluster/{rule}.%A.out
+    job-name: "{rule}"
+    ntasks: 1
+    time: "120:00:00"
+    gpus: "rtx2080ti:1"
+

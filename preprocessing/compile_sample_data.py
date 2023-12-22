@@ -1,12 +1,16 @@
-# v1.0.0, 11/28/2023
-# Robert D Patton, rpatton@fredhutch.org
-# Ha Lab, Fred Hutchinson Cancer Research Center
-
 """
-Contains functions for compiling sample data from raw Triton and reference files into a single HDF5 file.
+compile_sample_data.py
+v1.0.1, 12/14/2023
+Author: Robert D Patton, rpatton@fredhutch.org
+Ha Lab, Fred Hutchinson Cancer Research Center
+
+This script contains functions for compiling sample data from raw Triton and reference files into a single HDF5 file.
 """
 
+# Standard library imports
 import os
+
+# Third party imports
 import h5py
 import numpy as np
 import pandas as pd
@@ -115,7 +119,6 @@ def _process_image(filepath):
 
     Args:
         filepath (str): The path to the image file.
-        min_seq_depth (int, optional): The minimum sequence depth. Defaults to 10.
 
     Returns:
         dict: A dictionary where each key is a 'site' and the value is a 2D numpy array of the signals.

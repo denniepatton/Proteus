@@ -1,14 +1,19 @@
-# v1.0.0, 11/28/2023
-# Robert D Patton, rpatton@fredhutch.org
-# Ha Lab, Fred Hutchinson Cancer Research Center
-
 """
-Contains functions for generating the training and testing splits for the TF model and saving them as .tfrecord files.
+generate_tf_splits.py
+v1.0.1, 12/14/2023
+Author: Robert D Patton, rpatton@fredhutch.org
+Ha Lab, Fred Hutchinson Cancer Research Center
+
+This script contains functions for generating the training and testing splits 
+for TensorFlow models and saving them as .tfrecord files.
 """
 
+# Standard library imports
 import os
-import h5py
 import glob
+
+# Third party imports
+import h5py
 import numpy as np
 import tensorflow as tf
 
@@ -107,7 +112,7 @@ def split_df_sample(df, folds):
     return df
 
 
-def serialize_example(feature_dict):
+def serialize_example(feature_dict, gene_name):
     """
     Creates a tf.Example message ready to be written to a file.
 
@@ -119,6 +124,7 @@ def serialize_example(feature_dict):
     """
     # Create a dictionary to hold the features
     features = {}
+    features['gene_name'] = tf.train.Feature(bytes_list=tf.train.BytesList(value=[gene_name.encode('utf-8')]))
 
     # For each feature in the feature_dict
     for key, value in feature_dict.items():
@@ -191,12 +197,13 @@ def parse_serialized_example(serialized_example):
     """
     # Define the feature description dictionary
     feature_description = {
+        'gene_name': tf.io.FixedLenFeature([], tf.string),
         'TSS_image': tf.io.FixedLenFeature([2000, 11], tf.float32),
         'TSS_scalars': tf.io.FixedLenFeature([12], tf.float32),
         'GB_scalars': tf.io.FixedLenFeature([12], tf.float32),
         'ref_scalars': tf.io.FixedLenFeature([2], tf.float32),
         'continuous_label': tf.io.FixedLenFeature([], tf.float32),
-        'binary_label': tf.io.FixedLenFeature([], tf.int64)
+        'binary_label': tf.io.FixedLenFeature([], tf.float32)
     }
 
     # Parse the serialized example
@@ -238,7 +245,7 @@ def process_sample_folds(folds_df, sample_name, samples, sample_data_path, data_
                     # Load the gene data from the HDF5 file
                     gene_data = load_key_from_hdf5(gene, f)
                     # Serialize the gene data
-                    serialized = serialize_example(gene_data)
+                    serialized = serialize_example(gene_data, gene)
                     # Write the serialized data to the TFRecord file
                     writer.write(serialized)
 
@@ -268,7 +275,7 @@ def process_validation_sample(sample, sample_data, sample_data_path, use_modes, 
                 # Load the gene data from the HDF5 file
                 gene_data = load_key_from_hdf5(gene, f)
                 # Serialize the gene data
-                serialized = serialize_example(gene_data)
+                serialized = serialize_example(gene_data, gene)
                 # Write the serialized data to the TFRecord file
                 writer.write(serialized)
 
@@ -302,7 +309,7 @@ def combine_tfrecords(fold_number, out_dir):
         os.remove(tfrecord_file)
 
 
-def get_dataset(fold_numbers, use_set, shuffle=True, batch_size=32):
+def get_dataset(use_set, fold_numbers=None, samples=None, shuffle=True, batch_size=32):
     """
     Loads and prepares a dataset from TFRecord files.
 
@@ -315,10 +322,18 @@ def get_dataset(fold_numbers, use_set, shuffle=True, batch_size=32):
     Returns:
         tf.data.Dataset: The prepared dataset.
     """
-    print(f'Loading dataset for fold(s) {fold_numbers} from {use_set} set . . .')
+    if samples is not None:
+        print(f'Loading dataset for samples {samples} from {use_set} set . . .')
+        # Load the .tfrecord file for each sample
+        files = [f'data/{use_set}/{sample}.tfrecord' for sample in samples]
+    elif fold_numbers is not None:
+        print(f'Loading dataset for fold(s) {fold_numbers} from {use_set} set . . .')
+        # Load the .tfrecord file for the given fold(s)
+        files = [f'data/{use_set}/combined_fold-{fold_number}.tfrecord' for fold_number in fold_numbers]
+    else:
+        print('Neither samples nor fold numbers were specified.')
+        return None
 
-    # Load the .tfrecord file for the given fold(s)
-    files = [f'data/{use_set}/combined_fold-{fold_number}.tfrecord' for fold_number in fold_numbers]
     ds = tf.data.TFRecordDataset(files)
     ds = ds.cache()
 
@@ -336,3 +351,6 @@ def get_dataset(fold_numbers, use_set, shuffle=True, batch_size=32):
     ds = ds.batch(batch_size)
 
     return ds
+
+def extract_gene_names(batch):
+    return batch['gene_name']
