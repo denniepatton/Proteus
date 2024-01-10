@@ -175,6 +175,9 @@ def _process_scalar(filepath, sample, drop_list=None):
     """
     Processes a scalar file and returns the data as a dictionary.
 
+    N.B. mean-depth and ONLY mean-depth is not standard scaled as this has an absolute meaning and
+    is also used downstream for thresholding and plotting.
+
     Args:
         filepath (str): The path to the scalar file.
         sample (str): The name of the sample to process.
@@ -184,7 +187,6 @@ def _process_scalar(filepath, sample, drop_list=None):
 
     Returns:
         dict: A dictionary where each key is a 'site' and the value is a 1D numpy array of the values.
-              Only sites with no NaN values are included.
     """
     # Default drop list: these features are NaN for gene bodies and may be NaN for noisy promoters
     if drop_list is None:
@@ -207,16 +209,11 @@ def _process_scalar(filepath, sample, drop_list=None):
 
     # Apply StandardScaler to each feature across all sites
     scaler = StandardScaler()
-    df[df.columns] = scaler.fit_transform(df[df.columns])
+    columns_to_scale = df.columns.difference(['mean-depth'])
+    df[columns_to_scale] = scaler.fit_transform(df[columns_to_scale])
 
     # Convert the DataFrame to a dictionary where each key is a 'site' and the value is a 1D numpy array of the values
     site_dict = {site: np.array(df.loc[site].values) for site in df.index}
-
-    # Remove all key-value pairs in site_dict where any of the values within a pair's values are nan
-    # site_dict = {key: value for key, value in site_dict.items() if not np.isnan(value).any()}
-    """
-    Moved NaN checking to later so we don't have to re-run to change scalars used.
-    """
 
     return site_dict
 

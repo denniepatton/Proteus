@@ -1,6 +1,8 @@
 # project specific
 /data/**
 /results/**
+/results_old/**
+/scraps/
 /logs/cluster/**
 .DS_Store
 

@@ -1,6 +1,6 @@
 """
 generate_tf_splits.py
-v1.0.1, 12/14/2023
+v1.0.2, 1/9/2024
 Author: Robert D Patton, rpatton@fredhutch.org
 Ha Lab, Fred Hutchinson Cancer Research Center
 
@@ -15,6 +15,7 @@ import glob
 # Third party imports
 import h5py
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 
 
@@ -27,17 +28,28 @@ def check_sample_genes(sample_data_file_path_modes):
                                              path to the sample data, and list of modalities to use.
 
     Returns:
-        dict: A dictionary where each key is a valid gene and the value is the sample name.
+        tuple: A tuple containing the sample name and a DataFrame containing the valid genes.
+            
     """
-    sample, data_file, sample_data_path, use_modes = sample_data_file_path_modes
-    valid_genes = {}
-
+    sample, data_file, sample_data_path, use_modes, min_depth = sample_data_file_path_modes
+    gene_data = []
     with h5py.File(f'{sample_data_path}{data_file}', 'r') as f:
         for gene in f.keys():
-            if all(modality in f[gene] and not np.isnan(np.array(f[gene][modality])).any() for modality in use_modes):
-                valid_genes[gene] = sample
+            if 'continuous_label' in f[gene]:
+                zero_tpm = f[gene]['continuous_label'][()] == 0.0
+            else:
+                continue  # skip genes without a continuous label, i.e. not represented in the truth labels
+            no_nans = all(modality in f[gene] and not np.isnan(np.array(f[gene][modality])).any() for modality in use_modes)
+            if 'TSS_scalars' in f[gene]:
+                min_depth_met = f[gene]['TSS_scalars'][7] >= min_depth  # see extract_gene_depths() below
+            else:
+                min_depth_met = False  # no depth data does not meet min_depth
+            
+            gene_data.append({'gene': gene, 'no_nans': no_nans, 'min_depth': min_depth_met, 'zero_tpm': zero_tpm})
 
-    return valid_genes
+    df = pd.DataFrame(gene_data).set_index('gene')
+
+    return sample, df
 
 
 def split_df_gene(df, folds):
@@ -185,7 +197,7 @@ def load_key_from_hdf5(key, h5file):
         return None
     
 
-def parse_serialized_example(serialized_example):
+def parse_serialized_example(serialized_example, labeled=True):
     """
     Parses a serialized tf.Example message.
 
@@ -196,15 +208,24 @@ def parse_serialized_example(serialized_example):
         dict: A dictionary where each key is a feature name and each value is the corresponding feature value.
     """
     # Define the feature description dictionary
-    feature_description = {
-        'gene_name': tf.io.FixedLenFeature([], tf.string),
-        'TSS_image': tf.io.FixedLenFeature([2000, 11], tf.float32),
-        'TSS_scalars': tf.io.FixedLenFeature([12], tf.float32),
-        'GB_scalars': tf.io.FixedLenFeature([12], tf.float32),
-        'ref_scalars': tf.io.FixedLenFeature([2], tf.float32),
-        'continuous_label': tf.io.FixedLenFeature([], tf.float32),
-        'binary_label': tf.io.FixedLenFeature([], tf.float32)
-    }
+    if labeled:
+        feature_description = {
+            'gene_name': tf.io.FixedLenFeature([], tf.string),
+            'TSS_image': tf.io.FixedLenFeature([2000, 11], tf.float32),
+            'TSS_scalars': tf.io.FixedLenFeature([12], tf.float32),
+            'GB_scalars': tf.io.FixedLenFeature([12], tf.float32),
+            'ref_scalars': tf.io.FixedLenFeature([2], tf.float32),
+            'continuous_label': tf.io.FixedLenFeature([], tf.float32),
+            'binary_label': tf.io.FixedLenFeature([], tf.float32)
+        }
+    else:
+        feature_description = {
+            'gene_name': tf.io.FixedLenFeature([], tf.string),
+            'TSS_image': tf.io.FixedLenFeature([2000, 11], tf.float32),
+            'TSS_scalars': tf.io.FixedLenFeature([12], tf.float32),
+            'GB_scalars': tf.io.FixedLenFeature([12], tf.float32),
+            'ref_scalars': tf.io.FixedLenFeature([2], tf.float32)
+        }
 
     # Parse the serialized example
     example = tf.io.parse_single_example(serialized_example, feature_description)
@@ -250,7 +271,7 @@ def process_sample_folds(folds_df, sample_name, samples, sample_data_path, data_
                     writer.write(serialized)
 
 
-def process_validation_sample(sample, sample_data, sample_data_path, use_modes, out_dir):
+def process_validation_sample(sample, sample_data, sample_data_path, use_modes, out_dir, min_depth=0.0, zero_tpm=True):
     """
     Processes a validation sample and writes the data to a TFRecord file.
 
@@ -260,12 +281,17 @@ def process_validation_sample(sample, sample_data, sample_data_path, use_modes, 
         sample_data_path (str): The path to the sample data files.
         use_modes (list): The list of modes to use.
         out_dir (str): The directory to write the TFRecord file to.
+        min_depth (float, optional): The minimum depth to use. Defaults to 0.0.
+        zero_tpm (bool, optional): Whether to include genes with TPM = 0. Defaults to False.
     """
     print(f'Processing {sample} . . .')
 
     with h5py.File(f'{sample_data_path}{sample_data}', 'r') as f:
         # Create a dictionary of valid genes
-        valid_genes = {gene: sample for gene in f.keys() if all(modality in f[gene] and not np.isnan(np.array(f[gene][modality])).any() for modality in use_modes)}
+        valid_genes = {gene: sample for gene in f.keys()
+                    if all(modality in f[gene] and not np.isnan(np.array(f[gene][modality])).any() for modality in use_modes)
+                    and f[gene]['TSS_scalars'][7] >= min_depth
+                    and (f[gene]['continuous_label'][()] > 0.0 if not zero_tpm else True)}
 
         # Create a TFRecord file for the sample
         out_file = f'{out_dir}{sample}.tfrecord'
@@ -309,7 +335,7 @@ def combine_tfrecords(fold_number, out_dir):
         os.remove(tfrecord_file)
 
 
-def get_dataset(use_set, fold_numbers=None, samples=None, shuffle=True, batch_size=32):
+def get_dataset(use_set, fold_numbers=None, samples=None, shuffle=True, batch_size=32, labeled=True):
     """
     Loads and prepares a dataset from TFRecord files.
 
@@ -345,7 +371,8 @@ def get_dataset(use_set, fold_numbers=None, samples=None, shuffle=True, batch_si
         ds = ds.with_options(opt)
 
     # Parse the data
-    ds = ds.map(parse_serialized_example)
+    ds = ds.map(lambda x: parse_serialized_example(x, labeled))
+    # ds = ds.map(parse_serialized_example, labeled)
 
     # Batch the data
     ds = ds.batch(batch_size)
@@ -354,3 +381,24 @@ def get_dataset(use_set, fold_numbers=None, samples=None, shuffle=True, batch_si
 
 def extract_gene_names(batch):
     return batch['gene_name']
+
+def extract_gene_depths(batch):
+    """ ASSUMES:
+    drop_list = ["central-diversity", "central-depth", "central-loc", 
+                 "plus-minus-ratio", "minus-one-pos", "plus-one-pos"]
+    leaving 12 features which are sorted alphanumericlaly by default, so 'mean-depth' is index 7
+
+    0: fragment-diversity
+    1: fragment-entropy
+    2: fragment-mad
+    3: fragment-mean
+    4: fragment-median
+    5: fragment-ratio
+    6: fragment-stdev
+    7: mean-depth
+    8: np-amplitude
+    9: np-period
+    10: np-score
+    11: var-ratio
+    """
+    return batch['TSS_scalars'][:, 7]

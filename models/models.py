@@ -1,6 +1,6 @@
 """
-regression_models.py
-v2.0.1, 12/14/2023
+models.py
+v2.0.2, 1/9/2024
 Author: Robert D Patton, rpatton@fredhutch.org
 with help from: Akira Nair, Alex Netzley
 Ha Lab, Fred Hutchinson Cancer Research Center
@@ -19,16 +19,14 @@ Available features are:
 """
 
 # Third party imports
-import numpy as np
-import tensorflow as tf
+from tensorflow import keras
 
 # Keras imports
-import keras
 from keras import backend as K
-from keras.models import Sequential, Model
-from keras.layers import (Dense, Flatten, Dropout, Input, BatchNormalization, Conv2D,
-                          Reshape, Concatenate, MultiHeadAttention, TimeDistributed,
-                          Lambda, Attention, Add, DepthwiseConv2D, LSTM, Conv1D, MaxPooling1D, MaxPooling2D)
+from keras.models import Model
+from keras.layers import (Dense, Flatten, Input, BatchNormalization,
+                          Reshape, Concatenate, 
+                          Lambda, DepthwiseConv2D, LSTM, Conv1D, MaxPooling1D)
 from keras.regularizers import l1_l2
 from keras.losses import MeanSquaredError
 from kerastuner import HyperModel
@@ -36,29 +34,65 @@ from kerastuner import HyperModel
 # Local application imports
 from .model_utils import ScalarAttention, CrossModalAttention
 
-def get_model_from_string(model_name):
+def get_model_instance(model_name):
+    """
+    Function to get an instance of a model class from its name.
+
+    Parameters:
+    model_name (str): The name of the model class.
+
+    Returns:
+    object: An instance of the model class.
+    """
     # Get the class from globals and instantiate it
-    model_class = globals()[model_name]
+    model_class = globals().get(model_name)
+    
+    if model_class is None:
+        raise ValueError(f"No model found with name: {model_name}")
+
     model_instance = model_class()
     return model_instance
 
 
 class BioCNN(HyperModel):
+    """
+    This class represents a biological Convolutional Neural Network (BioCNN) model.
+    It extends the HyperModel class from Keras Tuner, allowing hyperparameter tuning.
+    """
 
     def build_default(self, regression_output=True):
+        """
+        This method builds the default BioCNN model.
+
+        Parameters:
+        regression_output (bool): Whether the model should output regression predictions.
+
+        Returns:
+        tf.keras.Model: The default BioCNN model.
+        """
         return self.bio_cnn(regression_output=regression_output)
 
+
     def build(self, hp):
+        """
+        This method builds a BioCNN model with hyperparameters.
+
+        Parameters:
+        hp (kerastuner.HyperParameters): The hyperparameters for the model.
+
+        Returns:
+        tf.keras.Model: The BioCNN model with hyperparameters.
+        """
         # Define the hyperparameters
-        signal_filters = hp.Int('signal_filters', min_value=8, max_value=32, step=8)
-        relational_filters = hp.Int('relational_filters', min_value=8, max_value=32, step=8)
-        n_output_channels = hp.Int('n_output_channels', min_value=0, max_value=128, step=16)
-        n_reductions = hp.Int('n_reductions', min_value=0, max_value=3, step=1)
-        n_lstms = hp.Int('n_lstms', min_value=0, max_value=3, step=1)
+        signal_filters = hp.Int('signal_filters', min_value=32, max_value=64, step=16)
+        relational_filters = hp.Int('relational_filters', min_value=8, max_value=64, step=8)
+        n_output_channels = hp.Int('n_output_channels', min_value=0, max_value=64, step=16)
+        n_reductions = hp.Int('n_reductions', min_value=0, max_value=6, step=1)
+        n_lstms = hp.Int('n_lstms', min_value=0, max_value=0, step=1)
         lstm_channels = hp.Int('lstm_channels', min_value=64, max_value=256, step=64)
-        n_hidden_signals = hp.Int('n_hidden_signals', min_value=1, max_value=3, step=1)
-        n_hidden_scalars = hp.Int('n_hidden_scalars', min_value=1, max_value=3, step=1)
-        n_hidden_combined = hp.Int('n_hidden_combined', min_value=1, max_value=3, step=1)
+        n_hidden_signals = hp.Int('n_hidden_signals', min_value=0, max_value=3, step=1)
+        n_hidden_scalars = hp.Int('n_hidden_scalars', min_value=0, max_value=3, step=1)
+        n_hidden_combined = hp.Int('n_hidden_combined', min_value=0, max_value=3, step=1)
         use_image_attention = hp.Boolean('use_image_attention')
         use_scalar_attention = hp.Boolean('use_scalar_attention')
         use_cross_modal_attention = hp.Boolean('use_cross_modal_attention')
@@ -77,6 +111,16 @@ class BioCNN(HyperModel):
         return model
     
     def feature_extraction(self, batch, regression_output=True):
+        """
+        This method extracts features from a batch of data.
+
+        Parameters:
+        batch (tf.data.Dataset): The batch of data.
+        regression_output (bool): Whether the model should output regression predictions.
+
+        Returns:
+        str: The name of the output label.
+        """
         if regression_output:
             output_label = 'continuous_label'
         else:
@@ -85,10 +129,26 @@ class BioCNN(HyperModel):
                 'TSS_scalars': batch['TSS_scalars'],
                 'GB_scalars': batch['GB_scalars'],
                 'ref_scalars': batch['ref_scalars'],}, batch[output_label]
+    
+    def patient_feature_extraction(self, batch):
+        """
+        This method extracts features from a batch of data EXCLUDING TRUTH LABELS.
 
-    def bio_cnn(self, signal_filters=32, relational_filters=16, n_reductions=0, n_lstms=0, lstm_channels=128,
-                n_hidden_signals=1, n_hidden_scalars=1, n_hidden_combined=1, n_output_channels=64, use_image_attention=False,
-                use_scalar_attention=False, use_cross_modal_attention=False, learning_rate=1e-3, regression_output=True,
+        Parameters:
+        batch (tf.data.Dataset): The batch of data.
+        regression_output (bool): Whether the model should output regression predictions.
+
+        Returns:
+        str: The name of the output label.
+        """
+        return {'TSS_image': batch['TSS_image'],
+                'TSS_scalars': batch['TSS_scalars'],
+                'GB_scalars': batch['GB_scalars'],
+                'ref_scalars': batch['ref_scalars']}
+
+    def bio_cnn(self, signal_filters=48, relational_filters=32, n_reductions=0, n_lstms=0, lstm_channels=64,
+                n_hidden_signals=0, n_hidden_scalars=0, n_hidden_combined=0, n_output_channels=48, use_image_attention=False,
+                use_scalar_attention=True, use_cross_modal_attention=False, learning_rate=1e-3, regression_output=True,
                 dense_l1=0.01, dense_l2=0.01, conv_l1=0.01, conv_l2=0.01):
         """ SIGNAL PROCESSING BLOCK:
         Takes in the 11 signal channels and applies a 1D convolution to each channel independently in order to smooth/extract
