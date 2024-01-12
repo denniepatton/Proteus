@@ -4,6 +4,8 @@ v1.4.1, 1/9/2024
 Author: Robert D Patton, rpatton@fredhutch.org
 with help from: Alex Netzley
 Ha Lab, Fred Hutchinson Cancer Research Center
+
+export XLA_FLAGS=--xla_gpu_cuda_data_dir=/app/software/CUDA/12.0.0
 """
 
 # Standard library imports
@@ -213,7 +215,7 @@ def generate_validation(sample_data_path, use_modes, validation_samples, out_dir
     print('Finished generating validation data.')
 
 
-def train_model(model_name, use_set, folds, test_fold=None, regression_output=True, tune_hyperparameters=True):
+def train_model(model_name, use_set, folds, test_fold=None, tune_hyperparameters=True):
     """
     Trains a model using the specified dataset and folds.
 
@@ -222,7 +224,6 @@ def train_model(model_name, use_set, folds, test_fold=None, regression_output=Tr
         use_set (str): The name of the dataset to use.
         folds (int): The number of folds for cross-validation.
         test_fold (int, optional): If specified, will only conduct the CV with test_fold as test. Defaults to None.
-        regression_output (bool, optional): If True, the model will output regression values. Defaults to True.
         tune_hyperparameters (bool, optional): If True, hyperparameters will be tuned. Defaults to True.
 
     Returns:
@@ -241,10 +242,10 @@ def train_model(model_name, use_set, folds, test_fold=None, regression_output=Tr
     # with strategy.scope():
 
     # Everything that creates variables should be under the strategy scope
-    model = hypermodel.build_default(regression_output=regression_output)
+    model = hypermodel.build_default()
 
     def extract_features_wrapper(batch):
-        return hypermodel.feature_extraction(batch, regression_output)
+        return hypermodel.feature_extraction(batch)
     
     # Print the model summary
     print('Model summary (base model if tuning hyperparameters):')
@@ -314,10 +315,8 @@ def train_model(model_name, use_set, folds, test_fold=None, regression_output=Tr
         history = model.fit(trainset, epochs=100, batch_size=32, verbose=1, shuffle=True, validation_data=valset, callbacks=[early_stopping, reduce_lr])
         model.save_weights(os.path.join(fold_dir, f"validation-fold_{val_fold[0]}_weights.hdf5"))
         print('Finished training model.')
-
         # Plot the training and validation loss
-        if regression_output:
-            plot_utils.plot_model_loss(history, fold_dir, f"validation-fold_{val_fold[0]}")
+        plot_utils.plot_model_loss(history, fold_dir, f"validation-fold_{val_fold[0]}")
 
         # Generate predictions on the validation set
         predictions = model.predict(valset).flatten()
@@ -331,11 +330,9 @@ def train_model(model_name, use_set, folds, test_fold=None, regression_output=Tr
         np.save(os.path.join(fold_dir, f"validation-fold_{val_fold[0]}_true_labels.npy"), true_labels)
 
         # Plot the output predictions
-        if regression_output:
-            plot_utils.scatter_plot(true_labels, predictions, fold_dir, f"scatter_validation-fold_{val_fold[0]}", val_fold[0])
-            plot_utils.residuals_plot(true_labels, predictions, fold_dir, f"scatter_validation-fold_{val_fold[0]}", val_fold[0])
-        else:
-            plot_utils.roc_plot([(true_labels, predictions)], fold_dir, f"ROC_validation-fold_{val_fold[0]}")
+        plot_utils.scatter_plot(true_labels, predictions, fold_dir, f"validation-fold_{val_fold[0]}_predictions-scatter", val_fold[0])
+        plot_utils.residuals_plot(true_labels, predictions, fold_dir, f"validation-fold_{val_fold[0]}_residuals-scatter", val_fold[0])
+
 
         # Check if this model has better validation performance than the current best model (always will if doing seperate folds)
         val_performance = np.min(history.history['val_loss']) 
@@ -353,7 +350,7 @@ def train_model(model_name, use_set, folds, test_fold=None, regression_output=Tr
     return
 
 
-def test_model(model_name, use_set, validation_samples, gene_sets, regression_output=True):
+def test_model(model_name, use_set, validation_samples, gene_sets):
     """
     Tests a model using the specified dataset and validation samples.
 
@@ -362,7 +359,6 @@ def test_model(model_name, use_set, validation_samples, gene_sets, regression_ou
         use_set (str): The name of the dataset to use.
         validation_samples (list): The list of samples to use for validation.
         gene_sets (list): The list of gene sets to use.
-        regression_output (bool, optional): If True, the model will output regression values. Defaults to True.
 
     Returns:
         None
@@ -373,7 +369,7 @@ def test_model(model_name, use_set, validation_samples, gene_sets, regression_ou
 
     hypermodel = get_model_instance(model_name)
     def extract_features_wrapper(batch):
-        return hypermodel.feature_extraction(batch, regression_output)
+        return hypermodel.feature_extraction(batch)
 
     # Loop through the validation samples
     prediction_data = []
@@ -404,17 +400,11 @@ def test_model(model_name, use_set, validation_samples, gene_sets, regression_ou
         df = pd.DataFrame({'true_label': true_labels, 'prediction': predictions, 'tss_depth': gene_depths_list}, index=gene_names_list)
         df.to_csv(os.path.join(sample_dir, f'validation-{sample}_predictions.tsv'), sep='\t')
 
-        if regression_output:
-            plot_utils.subset_scatter_plot(df, sample_dir, f"scatter_validation_{sample}", gene_sets)
-            plot_utils.subset_residuals_plot(df, sample_dir, f"residual_validation_{sample}", gene_sets)
-            plot_utils.subset_residuals_plot(df, sample_dir, f"residual-depth_validation_{sample}", gene_sets, var="tss_depth")
-        else:
-            plot_utils.subset_roc_plot(df, sample_dir, f"ROC_validation_{sample}", gene_sets)
+        plot_utils.subset_scatter_plot(df, sample_dir, f"scatter_validation_{sample}", gene_sets)
+        plot_utils.subset_residuals_plot(df, sample_dir, f"residual_validation_{sample}", gene_sets)
+        plot_utils.subset_residuals_plot(df, sample_dir, f"residual-depth_validation_{sample}", gene_sets, var="tss_depth")
             
         print(f'Finished testing model for {sample}.')
-
-    if not regression_output:  # Plot the composite ROC curve
-        plot_utils.roc_plot(prediction_data, out_dir, 'ROC_all_validation_samples', curve_names=validation_samples)
     print('Finished testing model.')
 
 
@@ -509,9 +499,8 @@ def main():
     parser.add_argument("--scalars_reference_path", type=str, default="/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/reference/Ensembl109_reference.bed", help="Path to the scalars reference file")
     parser.add_argument("--training_home", type=str, default="/fh/fast/ha_g/user/rpatton/LuCaP_data/", help="Path to the training home directory")
     parser.add_argument("--model_name", type=str, default="BioCNN", help="Name of the model to use (in models/models.py))")
-    parser.add_argument("--use_set", type=str, default='GeneStrat_0x_IncZeros', help="The set_parameters dataset to use (see Proteus.py main() for options)")
-    # parser.add_argument("--use_set", type=str, default='GeneStrat_CompleteInputs_10x_01-04-2023', help="The set_parameters dataset to use (see Proteus.py main() for options)")
-    parser.add_argument("--process_data", type=bool, default=True, help="If True, will check but not overwrite existing sample-level h5 data")
+    parser.add_argument("--use_set", type=str, default='GeneStrat_10x_NonZeros', help="The set_parameters dataset to use (see Proteus.py main() for options)")
+    parser.add_argument("--process_data", type=bool, default=False, help="If True, will check but not overwrite existing sample-level h5 data")
     parser.add_argument("--test_fold", type=int, default=None, help="Specify the test fold for parallel training on different GPU nodes")
     parser.add_argument("--set_parameters", type=str, default='data/set_parameters.tsv', help="Path to the set_parameters.tsv file")
     parser.add_argument("--run_mode", type=str, default='train', help="Specify whether to 'train' or 'run' the model")
@@ -652,7 +641,8 @@ def main():
     # Run Proteus.py in run mode if specified
     elif args.run_mode == 'run':
         ### Patient data ###
-        patient_home = '/fh/fast/ha_g/user/rpatton/PSMA_data/'    
+        patient_home = '/fh/fast/ha_g/user/rpatton/PSMA_data/'
+        min_val_depth = 0.0
         modality_dict = {'TSS_image': ['image', patient_home + 'Triton_TSS/results/'],
                         'TSS_scalars': ['scalars', patient_home + 'Triton_TSS/results/'],
                         'GB_scalars': ['scalars', patient_home + 'Triton_GB/results/'],
@@ -663,7 +653,8 @@ def main():
         print('Finished processing data.')
         # Get list of files in each directory
         samples_files = os.listdir('data/samples_patient/')
-        validation_path = f'data/validation_patient_{min_depth}x/'
+        validation_path = f'data/validation_patient_{min_val_depth}x/'
+        os.makedirs(validation_path, exist_ok=True)
         validation_files = os.listdir(validation_path)
         # Remove file extensions and keep only unique names
         samples_names = set([f.replace('_CompiledProcessedData.h5', '') for f in samples_files])
@@ -671,8 +662,8 @@ def main():
         # Find names that are in samples_names but not in validation_names
         missing_names = samples_names - validation_names
         # Call generate_validation with missing_names
-        generate_validation('data/samples_patient/', use_modes, list(missing_names), validation_path, min_depth=0.0, filter_samples=True)
-        model_path = 'results/BioCNN_GeneStrat_CompleteInputs_12-14-2023_RESULTS-1/best_model.h5'
+        generate_validation('data/samples_patient/', use_modes, list(missing_names), validation_path, min_depth=min_val_depth, filter_samples=True)
+        model_path = 'results_old/BioCNN_GeneStrat_CompleteInputs_12-14-2023_RESULTS-1/best_model.h5'
         run_model(model_path, validation_path, 'results_holdout/BioCNN_GeneStrat_CompleteInputs_12-14-2023_RESULTS-1')
 
 

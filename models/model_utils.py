@@ -10,7 +10,8 @@ This file contains utility functions for models.
 
 # Third party imports
 import numpy as np
-from tensorflow.keras.layers import Layer, Dense, Multiply
+import tensorflow as tf
+from tensorflow.keras.layers import Layer, Dense, Multiply, Conv1D, Concatenate
 
 
 class ScalarAttention(Layer):
@@ -55,40 +56,39 @@ class ScalarAttention(Layer):
         return input_shape
     
 
-class CrossModalAttention(Layer):
+class TemporalAttention(Layer):
     """
-    This class implements a cross-modal attention mechanism as a Keras Layer.
-    It computes attention scores using a dense layer with softmax activation,
-    and applies these scores to the input signals.
+    This class implements a temporal attention mechanism as a Keras Layer.
+    It computes attention scores using a 1D convolutional layer with softmax activation,
+    and applies these scores to the input. This allows the model to consider the spatial 
+    relationship between timesteps when computing the attention scores.
+
+    The attention scores are computed independently for each channel in the input.
     """
     def build(self, input_shape):
         """
-        This method creates the dense layer with softmax activation.
+        This method creates the 1D convolutional layer with softmax activation.
         It is called by Keras once the input shape is known.
 
         Parameters:
-        input_shape (Tuple): The shape of the input. It should be a tuple of two tuples,
-                             where the first tuple is the shape of the signals and the second
-                             tuple is the shape of the scalars.
+        input_shape (Tuple): The shape of the input. Expected to be (batch_size, timesteps, channels)
         """
-        self.dense = Dense(input_shape[1][-1], activation='softmax')
+        self.conv = Conv1D(input_shape[-1], kernel_size=3, padding='same', activation='softmax')
         super().build(input_shape)
 
-    def call(self, inputs):
+    def call(self, x):
         """
         This method computes and applies the attention scores.
         It is called by Keras for each input batch.
 
         Parameters:
-        inputs (Tuple): The input tensors. It should be a tuple of two tensors,
-                        where the first tensor is the signals and the second tensor is the scalars.
+        x (Tensor): The input tensor. Shape: (batch_size, timesteps, channels)
 
         Returns:
-        Tensor: The output tensor. Shape: (batch_size, num_signals)
+        Tensor: The output tensor. Shape: (batch_size, timesteps, channels)
         """
-        signals, scalars = inputs
-        attention_scores = self.dense(scalars)
-        return Multiply()([signals, attention_scores])
+        attention_scores = self.conv(x)
+        return attention_scores * x
 
     def compute_output_shape(self, input_shape):
         """
@@ -101,7 +101,60 @@ class CrossModalAttention(Layer):
         Returns:
         Tuple: The shape of the output.
         """
-        return input_shape[0]
+        return input_shape
+
+
+class CrossModalAttention(Layer):
+    """
+    This class implements a cross-modal attention mechanism as a Keras Layer.
+    It computes attention scores from one input and applies these scores to another input.
+    This allows the model to focus more on certain elements of one input based on the values of the other input.
+
+    The attention scores are computed using a dense layer with softmax activation.
+    """
+    def build(self, input_shape):
+        """
+        This method creates the dense layer with softmax activation.
+        It is called by Keras once the input shape is known.
+
+        Parameters:
+        input_shape (Tuple): The shape of the input. Expected to be a tuple of two shapes, 
+                             each representing the shape of one of the inputs.
+        """
+        self.dense = Dense(1, activation='softmax')
+        super().build(input_shape)
+
+    def call(self, inputs):
+        """
+        This method computes and applies the attention scores.
+        It is called by Keras for each input batch.
+
+        Parameters:
+        inputs (List[Tensor]): The list of input tensors. Expected to contain two tensors.
+
+        Returns:
+        Tensor: The output tensor. Shape: (batch_size, timesteps + channels)
+        """
+        x, y = inputs
+        attention_scores = self.dense(y)
+        attention_scores = tf.expand_dims(attention_scores, -1)
+        x = Multiply()([x, attention_scores])
+        x = tf.squeeze(x, axis=1)
+        return Concatenate()([x, y])
+
+    def compute_output_shape(self, input_shape):
+        """
+        This method returns the output shape.
+        It is called by Keras to determine the output shape of the Layer.
+
+        Parameters:
+        input_shape (Tuple): The shape of the input.
+
+        Returns:
+        Tuple: The shape of the output.
+        """
+        x_shape, y_shape = input_shape
+        return (x_shape[0], x_shape[1] + y_shape[1])
 
 
 def print_continuous_label_distribution(dataset):

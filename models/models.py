@@ -13,8 +13,7 @@ Available features are:
     'TSS_scalars': tf.io.FixedLenFeature([12], tf.float32),
     'GB_scalars': tf.io.FixedLenFeature([12], tf.float32),
     'ref_scalars': tf.io.FixedLenFeature([2], tf.float32),
-    'continuous_label': tf.io.FixedLenFeature([], tf.float32),
-    'binary_label': tf.io.FixedLenFeature([], tf.float32)
+    'continuous_label': tf.io.FixedLenFeature([], tf.float32)
 
 """
 
@@ -26,13 +25,13 @@ from keras import backend as K
 from keras.models import Model
 from keras.layers import (Dense, Flatten, Input, BatchNormalization,
                           Reshape, Concatenate, 
-                          Lambda, DepthwiseConv2D, LSTM, Conv1D, MaxPooling1D)
+                          Lambda, DepthwiseConv2D, Conv1D, MaxPooling1D)
 from keras.regularizers import l1_l2
 from keras.losses import MeanSquaredError
 from kerastuner import HyperModel
 
 # Local application imports
-from .model_utils import ScalarAttention, CrossModalAttention
+from .model_utils import ScalarAttention, TemporalAttention, CrossModalAttention
 
 def get_model_instance(model_name):
     """
@@ -60,7 +59,7 @@ class BioCNN(HyperModel):
     It extends the HyperModel class from Keras Tuner, allowing hyperparameter tuning.
     """
 
-    def build_default(self, regression_output=True):
+    def build_default(self):
         """
         This method builds the default BioCNN model.
 
@@ -70,7 +69,7 @@ class BioCNN(HyperModel):
         Returns:
         tf.keras.Model: The default BioCNN model.
         """
-        return self.bio_cnn(regression_output=regression_output)
+        return self.bio_cnn()
 
 
     def build(self, hp):
@@ -84,15 +83,14 @@ class BioCNN(HyperModel):
         tf.keras.Model: The BioCNN model with hyperparameters.
         """
         # Define the hyperparameters
-        signal_filters = hp.Int('signal_filters', min_value=32, max_value=64, step=16)
+        signal_filters = hp.Int('signal_filters', min_value=8, max_value=64, step=8)
         relational_filters = hp.Int('relational_filters', min_value=8, max_value=64, step=8)
-        n_output_channels = hp.Int('n_output_channels', min_value=0, max_value=64, step=16)
         n_reductions = hp.Int('n_reductions', min_value=0, max_value=6, step=1)
-        n_lstms = hp.Int('n_lstms', min_value=0, max_value=0, step=1)
-        lstm_channels = hp.Int('lstm_channels', min_value=64, max_value=256, step=64)
+        n_hidden_start = hp.Int('n_hidden_start', min_value=64, max_value=256, step=64)
         n_hidden_signals = hp.Int('n_hidden_signals', min_value=0, max_value=3, step=1)
         n_hidden_scalars = hp.Int('n_hidden_scalars', min_value=0, max_value=3, step=1)
         n_hidden_combined = hp.Int('n_hidden_combined', min_value=0, max_value=3, step=1)
+        n_output_channels = hp.Int('n_output_channels', min_value=0, max_value=64, step=16)
         use_image_attention = hp.Boolean('use_image_attention')
         use_scalar_attention = hp.Boolean('use_scalar_attention')
         use_cross_modal_attention = hp.Boolean('use_cross_modal_attention')
@@ -101,16 +99,14 @@ class BioCNN(HyperModel):
         conv_l1 = hp.Float('conv_l1', min_value=1e-5, max_value=1, sampling='LOG')
         conv_l2 = hp.Float('conv_l2', min_value=1e-5, max_value=1, sampling='LOG')
         learning_rate = hp.Float('learning_rate', min_value=1e-5, max_value=1e-2, sampling='LOG')
-        # Define non-hyperparameter arguments
-        regression_output = hp.Fixed('regression_output', value=True)  # or value=False for binary classification
         # Call your function with the hyperparameters
-        model = self.bio_cnn(signal_filters, relational_filters, n_reductions, n_lstms, lstm_channels,
+        model = self.bio_cnn(signal_filters, relational_filters, n_reductions, n_hidden_start,
                              n_hidden_signals, n_hidden_scalars, n_hidden_combined, n_output_channels, use_image_attention,
-                             use_scalar_attention, use_cross_modal_attention, learning_rate, regression_output,
+                             use_scalar_attention, use_cross_modal_attention, learning_rate,
                              dense_l1, dense_l2, conv_l1, conv_l2)
         return model
     
-    def feature_extraction(self, batch, regression_output=True):
+    def feature_extraction(self, batch):
         """
         This method extracts features from a batch of data.
 
@@ -121,14 +117,10 @@ class BioCNN(HyperModel):
         Returns:
         str: The name of the output label.
         """
-        if regression_output:
-            output_label = 'continuous_label'
-        else:
-            output_label = 'binary_label'
         return {'TSS_image': batch['TSS_image'],
                 'TSS_scalars': batch['TSS_scalars'],
                 'GB_scalars': batch['GB_scalars'],
-                'ref_scalars': batch['ref_scalars'],}, batch[output_label]
+                'ref_scalars': batch['ref_scalars'],}, batch['continuous_label']
     
     def patient_feature_extraction(self, batch):
         """
@@ -146,9 +138,9 @@ class BioCNN(HyperModel):
                 'GB_scalars': batch['GB_scalars'],
                 'ref_scalars': batch['ref_scalars']}
 
-    def bio_cnn(self, signal_filters=48, relational_filters=32, n_reductions=0, n_lstms=0, lstm_channels=64,
-                n_hidden_signals=0, n_hidden_scalars=0, n_hidden_combined=0, n_output_channels=48, use_image_attention=False,
-                use_scalar_attention=True, use_cross_modal_attention=False, learning_rate=1e-3, regression_output=True,
+    def bio_cnn(self, signal_filters=32, relational_filters=16, n_reductions=1, n_hidden_start=128,
+                n_hidden_signals=2, n_hidden_scalars=2, n_hidden_combined=2, n_output_channels=48, use_image_attention=False,
+                use_scalar_attention=False, use_cross_modal_attention=True, learning_rate=1e-3,
                 dense_l1=0.01, dense_l2=0.01, conv_l1=0.01, conv_l2=0.01):
         """ SIGNAL PROCESSING BLOCK:
         Takes in the 11 signal channels and applies a 1D convolution to each channel independently in order to smooth/extract
@@ -199,34 +191,25 @@ class BioCNN(HyperModel):
         Apply self-attention across timesteps.
         """
         if use_image_attention:
-            x = ScalarAttention()(x)
+            x = TemporalAttention()(x)
         """ TIME-REDUCTION BLOCK [optional]:
-        Apply a series of MaxPooling1D and Conv1D layers to reduce the number of time steps and increase the number
-        of channels. This is done to reduce the number of parameters in the model and to increase the number of channels, which
-        may also be helpful for downstream LSTMs, if used.
+        Apply a series of MaxPooling1D and Conv1D layers to reduce the number of time steps.
+        Then, flatten the signals into a single vector before going into hidden layers.
         """
         for _ in range(n_reductions):
             x = MaxPooling1D(pool_size=2)(x)
             x = Conv1D(filters=signal_filters, kernel_size=3, activation='relu', kernel_regularizer=l1_l2(l1=conv_l1, l2=conv_l2))(x)
             x = BatchNormalization()(x)
-        """ LSTM BLOCK [optional]:
-        Apply a series of LSTM layers to the signals to find more complex time-dependent relationships between the signals.
-        """
-        if n_lstms > 0:  # use LSTM layers to flatten the signals
-            for _ in range(n_lstms-1):
-                x = LSTM(lstm_channels, return_sequences=True)(x)
-            x = LSTM(lstm_channels)(x)
-        else:  # simply flatten the signals
-            x = Flatten()(x)
+        x = Flatten()(x)
         """ SIGNALS' HIDDEN LAYERS BLOCK:
         Apply hidden layers to the flattened signals before combining with scalars.
         """
         for i in range(n_hidden_signals):
-            # start with the number of channels corresponding the number of LSTM channels (if or if not used) and reduce by half each time
-            n_dense = int(lstm_channels / (2**i))
+            # start with n_hidden_start and reduce by half each time
+            n_dense = int(n_hidden_start / (2**i))
             x = Dense(n_dense, activation='relu', kernel_regularizer=l1_l2(l1=dense_l1, l2=dense_l2))(x)
             x = BatchNormalization()(x)
-        """ SCLARS' HIDDEN LAYERS BLOCK:
+        """ SCALARS' HIDDEN LAYERS BLOCK:
         Separate input for scalars and apply hidden layers to the scalars.
         """
         # Process scalars
@@ -244,13 +227,14 @@ class BioCNN(HyperModel):
             y = Dense(n_dense_scalars, activation='relu', kernel_regularizer=l1_l2(l1=dense_l1, l2=dense_l2))(y)
             y = BatchNormalization()(y)
         """ COMBINE AND FINAL HIDDEN LAYERS BLOCK:
-        Concatenate the signals and scalars and apply hidden layers to the combined data.
+        Concatenate the signals and scalars and apply hidden layers to the combined data. If cross-modal attention is used,
+        signals are weighted by scalars' attention mechanism before concatenation.
         """
         if use_cross_modal_attention:
             z = CrossModalAttention()([x, y])
         else:
             z = Concatenate()([x, y])
-        n_dense_combined_start = 80
+        n_dense_combined_start = 128
         for i in range(n_hidden_combined):
             # start with n = 80 channels and reduce by half each time
             n_dense_combined = int(n_dense_combined_start / (2**i))
@@ -259,16 +243,13 @@ class BioCNN(HyperModel):
         """ OUTPUT BLOCK:
         Final output uses softplus activation to ensure positive values for log2(TPM + 1) with more range close to 0.
         """
-        if regression_output:
-            output = Dense(1, activation='softplus', name='output')(z)
-        else:
-            output = Dense(1, activation='sigmoid', name='output')(z)
+        output = Dense(1, activation='softplus', name='output')(z)
         # Create model
         model = Model(inputs=[signal_input, tss_scalars, gb_scalars, ref_scalars], outputs=output, name='BioCNN')
         optimizer = keras.optimizers.Adam(learning_rate=learning_rate)
         model.compile(loss=MeanSquaredError(),
-                    optimizer=optimizer, 
-                    metrics=['mse'])
+                      optimizer=optimizer, 
+                      metrics=['mse'])
         return model
     
 def main():

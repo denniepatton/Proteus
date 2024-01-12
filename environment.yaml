@@ -1,4 +1,5 @@
-# ml GCC/12.2.0 CUDA/12.0.0 cuDNN/8.8.0.121-CUDA-12.0.0
+ml GCC/12.2.0 CUDA/12.0.0 cuDNN/8.8.0.121-CUDA-12.0.0
+export XLA_FLAGS=--xla_gpu_cuda_data_dir=/app/software/CUDA/12.0.0
 name: tfenv
 channels:
   - bioconda

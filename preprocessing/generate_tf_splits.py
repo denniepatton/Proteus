@@ -215,8 +215,7 @@ def parse_serialized_example(serialized_example, labeled=True):
             'TSS_scalars': tf.io.FixedLenFeature([12], tf.float32),
             'GB_scalars': tf.io.FixedLenFeature([12], tf.float32),
             'ref_scalars': tf.io.FixedLenFeature([2], tf.float32),
-            'continuous_label': tf.io.FixedLenFeature([], tf.float32),
-            'binary_label': tf.io.FixedLenFeature([], tf.float32)
+            'continuous_label': tf.io.FixedLenFeature([], tf.float32)
         }
     else:
         feature_description = {
