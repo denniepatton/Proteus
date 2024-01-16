@@ -65,7 +65,7 @@ def generate_data(regions_dict, ref_path, out_dir, overwrite=False):
         p.starmap(process_sample, args)
 
 
-def generate_sets(name, strat_method, sample_data_path, use_modes, validation_samples, folds=5, min_depth=0.0, use_zeros=True):
+def generate_sets(name, strat_method, sample_data_path, use_modes, validation_samples, folds=5, min_depth=0.0, min_label=1.1):
     """
     Generates sets of data for training. Will use all available samples in the sample_data_path passed, excluding those in the
     validation_samples list. Will split the data into folds according to the stratification method specified.
@@ -90,8 +90,8 @@ def generate_sets(name, strat_method, sample_data_path, use_modes, validation_sa
     # Write the arguments to a TSV file
     with open(f'{out_dir}{name}.tsv', 'w', newline='') as f:
         writer = csv.writer(f, delimiter='\t')
-        writer.writerow(['name', 'sample_data_path', 'use_modes', 'validation_samples', 'folds', 'min_depth', 'use_zeros'])
-        writer.writerow([name, sample_data_path, use_modes, validation_samples, folds, min_depth, use_zeros])
+        writer.writerow(['name', 'sample_data_path', 'use_modes', 'validation_samples', 'folds', 'min_depth', 'min_label'])
+        writer.writerow([name, sample_data_path, use_modes, validation_samples, folds, min_depth, min_label])
 
     # Get all files in the directory and filter the list of files
     all_files = os.listdir(sample_data_path)
@@ -110,15 +110,15 @@ def generate_sets(name, strat_method, sample_data_path, use_modes, validation_sa
         # N.B. that ALL available modalities are saved so long as those specified with use_modes have no NaN values and threhsolds are met.
         print('Checking samples for minimum depth, 0 labels, and NaN values in modalities specified . . .')
         with Pool(cpu_count()) as p:
-            results = p.map(check_sample_genes, zip(samples, data_files, [sample_data_path]*len(samples), [use_modes]*len(samples), [min_depth]*len(samples)))
+            results = p.map(check_sample_genes, zip(samples, data_files, [sample_data_path]*len(samples), [use_modes]*len(samples), [min_depth]*len(samples), [min_label]*len(samples)))
         # Create dataframes to hold the results
         gene_sample_df = pd.DataFrame()
-        summary_df = pd.DataFrame(columns=['valid_genes', 'invalid_nans', 'invalid_depth', 'zero_tpm'])
+        summary_df = pd.DataFrame(columns=['valid_genes', 'invalid_nans', 'invalid_depth', 'invalid_label'])
         # Loop over the results
         for sample, df in results:
             # Create a new column 'valid' that is True if no_nans and min_depth are both True 
             # and zero_tpm is EITHER True or False if use_zeros==True or False if use_zeros==False
-            df['valid'] = df['no_nans'] & df['min_depth'] & (use_zeros | ~df['zero_tpm'])
+            df['valid'] = df['no_nans'] & df['min_depth'] & df['min_label']
             # Add the 'valid' column to the gene_sample_df DataFrame
             gene_sample_df[sample] = df['valid']
 
@@ -126,10 +126,10 @@ def generate_sets(name, strat_method, sample_data_path, use_modes, validation_sa
             valid_genes = df['valid'].sum()
             invalid_nans = (~df['no_nans']).sum()
             invalid_depth = (~df['min_depth']).sum()
-            zero_tpm = df['zero_tpm'].sum()
+            invalid_label = (~df['min_label']).sum()
 
             # Add the summary statistics to the summary DataFrame
-            summary_df.loc[sample] = [valid_genes, invalid_nans, invalid_depth, zero_tpm]
+            summary_df.loc[sample] = [valid_genes, invalid_nans, invalid_depth, invalid_label]
 
     # Write the summary DataFrame to a CSV file
     summary_df.to_csv(out_dir + 'valid_genes_summary.csv')
@@ -170,7 +170,7 @@ def generate_sets(name, strat_method, sample_data_path, use_modes, validation_sa
     print('Finished generating sets.')
 
 
-def generate_validation(sample_data_path, use_modes, validation_samples, out_dir, min_depth=0.0, use_zeros=True, filter_samples=True):
+def generate_validation(sample_data_path, use_modes, validation_samples, out_dir, min_depth=0.0, min_label=1.1, filter_samples=True):
     """
     Generates validation data.
 
@@ -206,7 +206,7 @@ def generate_validation(sample_data_path, use_modes, validation_samples, out_dir
     print('Starting new validation .tf . . .')
 
     # Prepare arguments for multiprocessing
-    args_list = [(sample, sample_data, sample_data_path, use_modes, out_dir, min_depth, use_zeros) for sample, sample_data in zip(samples, data_files)]
+    args_list = [(sample, sample_data, sample_data_path, use_modes, out_dir, min_depth, min_label) for sample, sample_data in zip(samples, data_files)]
 
     # Create a pool of workers and process each sample
     with Pool(cpu_count()) as p:
@@ -485,22 +485,20 @@ def main():
     The `use_set` parameter is a key in the `set_parameters` dictionary defined in the function. This dictionary defines
     the parameters for the dataset to be used in the model training/testing. Here are the current options:
 
-    GeneStrat_0x_IncZeros
-    GeneStrat_0x_NonZeros
-    GeneStrat_10x_IncZeros
-    GeneStrat_10x_NonZeros
-    SampleStrat_0x_IncZeros
-    SampleStrat_0x_NonZeros
-    SampleStrat_10x_IncZeros
-    SampleStrat_10x_NonZeros
+    GeneStrat_0x
+    GeneStrat_10x
+    SampleStrat_0x
+    SampleStrat_10x
+    TissueHO_10x
     """
     # Create the parser and add the arguments
     parser = argparse.ArgumentParser(description="Run Proteus")
     parser.add_argument("--scalars_reference_path", type=str, default="/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/reference/Ensembl109_reference.bed", help="Path to the scalars reference file")
-    parser.add_argument("--training_home", type=str, default="/fh/fast/ha_g/user/rpatton/LuCaP_data/", help="Path to the training home directory")
+    # parser.add_argument("--training_home", type=str, default="/fh/fast/ha_g/user/rpatton/LuCaP_data/", help="Path to the training home directory")
+    parser.add_argument("--training_home", type=str, default="/fh/fast/ha_g/user/rpatton/SCLC_data/", help="Path to the training home directory")
     parser.add_argument("--model_name", type=str, default="BioCNN", help="Name of the model to use (in models/models.py))")
     parser.add_argument("--use_set", type=str, default='GeneStrat_10x_NonZeros', help="The set_parameters dataset to use (see Proteus.py main() for options)")
-    parser.add_argument("--process_data", type=bool, default=False, help="If True, will check but not overwrite existing sample-level h5 data")
+    parser.add_argument("--process_data", type=bool, default=True, help="If True, will check but not overwrite existing sample-level h5 data")
     parser.add_argument("--test_fold", type=int, default=None, help="Specify the test fold for parallel training on different GPU nodes")
     parser.add_argument("--set_parameters", type=str, default='data/set_parameters.tsv', help="Path to the set_parameters.tsv file")
     parser.add_argument("--run_mode", type=str, default='train', help="Specify whether to 'train' or 'run' the model")
@@ -523,8 +521,9 @@ def main():
                      'TSS_scalars': ['scalars', args.training_home + 'Triton_TSS/results/'],
                      'GB_scalars': ['scalars', args.training_home + 'Triton_GB/results/'],
                      'ref_scalars': ['ref', ['exon_count', 'transcript_length'], args.scalars_reference_path],
-                     'continuous_label': ['label', '/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/labels/LuCaP_Log2TPMp1.tsv']}
-    
+                     'continuous_label': ['label', '/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/labels/SCLC_Log2TPMp1.tsv']}
+#                     'continuous_label': ['label', '/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/labels/LuCaP_Log2TPMp1.tsv']}    
+
     # Define the set parameters / use_sets
     """ KEYS: these are pre-defined, hard-coded fold splits with different holdout strategies and stratification methods.
     min_depth is used to enforce a depth cutoff for heldout ('run') data as well if specfied. use_zeros applies only to training."""
@@ -536,7 +535,7 @@ def main():
             set_parameters[row[0]] = {
                 'strat_method': row[1],
                 'min_depth': float(row[2]),
-                'use_zeros': row[3].lower() == 'true',
+                'min_label': float(row[3]),
                 'validation_samples': row[4].split(',')
             }
 
@@ -558,8 +557,8 @@ def main():
             # Get the parameters for this use_set
             strat_method = set_parameters[args.use_set]['strat_method']
             min_depth = set_parameters[args.use_set]['min_depth']
+            min_label = set_parameters[args.use_set]['min_label']
             validation_samples = set_parameters[args.use_set]['validation_samples']
-            use_zeros = set_parameters[args.use_set]['use_zeros']
             # Define common parameters
             folds = 5
             use_modes = ['TSS_image', 'TSS_scalars', 'GB_scalars', 'ref_scalars', 'continuous_label']
@@ -567,7 +566,7 @@ def main():
             output_files_exist = all(os.path.exists(f'data/{args.use_set}/combined_fold-{i}.tfrecord') for i in range(1, folds + 1))
             # Only run generate_sets if the output files do not exist
             if not output_files_exist:
-                generate_sets(args.use_set, strat_method, 'data/samples_training/', use_modes, validation_samples, folds=folds, min_depth=min_depth, use_zeros=use_zeros)
+                generate_sets(args.use_set, strat_method, 'data/samples_training/', use_modes, validation_samples, folds=folds, min_depth=min_depth, min_label=min_label)
                 print('Finished generating sets.')
             else:
                 print('Training data already exists. Continuing.')
@@ -582,7 +581,7 @@ def main():
 
         # Only run generate_sets if the output files do not exist
         if not output_valids_exist:
-            generate_validation('data/samples_training/', use_modes, validation_samples, validation_data_path, min_depth=min_depth, use_zeros=use_zeros)
+            generate_validation('data/samples_training/', use_modes, validation_samples, validation_data_path, min_depth=min_depth, min_label=min_label)
             print('Finished generating sets.')
         else:
             print('Holdout data already exists. Continuing.')

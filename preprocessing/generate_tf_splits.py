@@ -31,12 +31,12 @@ def check_sample_genes(sample_data_file_path_modes):
         tuple: A tuple containing the sample name and a DataFrame containing the valid genes.
             
     """
-    sample, data_file, sample_data_path, use_modes, min_depth = sample_data_file_path_modes
+    sample, data_file, sample_data_path, use_modes, min_depth, min_label = sample_data_file_path_modes
     gene_data = []
     with h5py.File(f'{sample_data_path}{data_file}', 'r') as f:
         for gene in f.keys():
             if 'continuous_label' in f[gene]:
-                zero_tpm = f[gene]['continuous_label'][()] == 0.0
+                min_label_met = f[gene]['continuous_label'][()] >= min_label
             else:
                 continue  # skip genes without a continuous label, i.e. not represented in the truth labels
             no_nans = all(modality in f[gene] and not np.isnan(np.array(f[gene][modality])).any() for modality in use_modes)
@@ -45,7 +45,7 @@ def check_sample_genes(sample_data_file_path_modes):
             else:
                 min_depth_met = False  # no depth data does not meet min_depth
             
-            gene_data.append({'gene': gene, 'no_nans': no_nans, 'min_depth': min_depth_met, 'zero_tpm': zero_tpm})
+            gene_data.append({'gene': gene, 'no_nans': no_nans, 'min_depth': min_depth_met, 'min_label': min_label_met})
 
     df = pd.DataFrame(gene_data).set_index('gene')
 

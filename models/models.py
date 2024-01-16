@@ -85,11 +85,11 @@ class BioCNN(HyperModel):
         # Define the hyperparameters
         signal_filters = hp.Int('signal_filters', min_value=8, max_value=64, step=8)
         relational_filters = hp.Int('relational_filters', min_value=8, max_value=64, step=8)
-        n_reductions = hp.Int('n_reductions', min_value=0, max_value=6, step=1)
+        n_reductions = hp.Int('n_reductions', min_value=1, max_value=10, step=1)
         n_hidden_start = hp.Int('n_hidden_start', min_value=64, max_value=256, step=64)
-        n_hidden_signals = hp.Int('n_hidden_signals', min_value=0, max_value=3, step=1)
-        n_hidden_scalars = hp.Int('n_hidden_scalars', min_value=0, max_value=3, step=1)
-        n_hidden_combined = hp.Int('n_hidden_combined', min_value=0, max_value=3, step=1)
+        n_hidden_signals = hp.Int('n_hidden_signals', min_value=0, max_value=4, step=1)
+        n_hidden_scalars = hp.Int('n_hidden_scalars', min_value=0, max_value=4, step=1)
+        n_hidden_combined = hp.Int('n_hidden_combined', min_value=0, max_value=4, step=1)
         n_output_channels = hp.Int('n_output_channels', min_value=0, max_value=64, step=16)
         use_image_attention = hp.Boolean('use_image_attention')
         use_scalar_attention = hp.Boolean('use_scalar_attention')
@@ -138,10 +138,10 @@ class BioCNN(HyperModel):
                 'GB_scalars': batch['GB_scalars'],
                 'ref_scalars': batch['ref_scalars']}
 
-    def bio_cnn(self, signal_filters=32, relational_filters=16, n_reductions=1, n_hidden_start=128,
-                n_hidden_signals=2, n_hidden_scalars=2, n_hidden_combined=2, n_output_channels=48, use_image_attention=False,
+    def bio_cnn(self, signal_filters=48, relational_filters=24, n_reductions=6, n_hidden_start=128,
+                n_hidden_signals=0, n_hidden_scalars=0, n_hidden_combined=3, n_output_channels=0, use_image_attention=False,
                 use_scalar_attention=False, use_cross_modal_attention=True, learning_rate=1e-3,
-                dense_l1=0.01, dense_l2=0.01, conv_l1=0.01, conv_l2=0.01):
+                dense_l1=1e-4, dense_l2=1e-4, conv_l1=1e-3, conv_l2=1e-3):
         """ SIGNAL PROCESSING BLOCK:
         Takes in the 11 signal channels and applies a 1D convolution to each channel independently in order to smooth/extract
         features from the signals. Then, the 11 channels are concatenated back into a single tensor with signal_filters channels.
