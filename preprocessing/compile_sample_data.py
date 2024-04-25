@@ -116,6 +116,8 @@ def process_sample(sample, regions_dict, ref_path, out_dir, overwrite):
 def _process_image(filepath):
     """
     Processes an image file and returns the data as a dictionary.
+    N.B. that "non-functional" means Triton did not report a signal matrix,
+    which means the corresponding region lacked >90% base pair coverage.
 
     Args:
         filepath (str): The path to the image file.
@@ -128,25 +130,23 @@ def _process_image(filepath):
     # Load the NPZ file
     input_object = np.load(filepath, allow_pickle=True)
 
+    counter = 0
     out_dict = {}
     for key, signals in input_object.items():
-        # Check if signals is a functional input matrix (Triton or TritonMe)
+        # Check if signals is a functional input matrix (Triton or TritonMe) - will be empty if not
         if signals.shape == (11, 2000) or signals.shape == (15, 2000):
             signals = signals.T 
         else:
+            counter += 1
             continue
 
         # Normalize to mean = 1 all signals, excluding peak locs and nucleotide freqs
-        for col in range(7):
+        for col in range(6):
             signals[:, col] = _scale_signal(signals[:, col])
 
-        # Check if there are no NaN values
-        # if not np.isnan(signals).any():
-        """
-        Moved NaN checking to later so we don't have to re-run to change signals used.
-        """
         out_dict[key] = signals
 
+    print(f'Found {counter} non-functional input matrices.')
     return out_dict
 
 def _scale_signal(input_array):
@@ -157,18 +157,14 @@ def _scale_signal(input_array):
         input_array (numpy.ndarray): The input array to be scaled.
 
     Returns:
-        numpy.ndarray: The scaled array. If the standard deviation or mean of the input array is 0, 
-                       returns an array of NaNs of the same shape as the input array.
+        numpy.ndarray: The scaled array.
     """
     
-    if input_array.size > 0 and not np.isnan(input_array).all():
-        mean_val, std_val = np.nanmean(input_array), np.nanstd(input_array)
-        if std_val != 0 and mean_val != 0:
-            return input_array / mean_val
-        else:
-            return np.full(input_array.shape, np.nan)
+    mean_val = np.mean(input_array)
+    if mean_val != 0:
+        return input_array / mean_val
     else:
-        return np.full(input_array.shape, np.nan)
+        return input_array
 
 
 def _process_scalar(filepath, sample, drop_list=None):
@@ -243,13 +239,13 @@ def _process_label(filepath, sample):
     return label_dict
 
 
-def _process_ref(filepath, cols=['exon_count', 'transcript_length']):
+def _process_ref(filepath, cols=['NumExons', 'transcript_length', 'mRNA_size']):
     """
     Processes a reference file and returns the data as a dictionary.
 
     Args:
         filepath (str): The path to the reference file.
-        cols (list, optional): A list of column names to process. Defaults to ['exon_count', 'transcript_length'].
+        cols (list, optional): A list of column names to process. Defaults to ['NumExons', 'transcript_length', 'mRNA_size'].
 
     Returns:
         dict: A dictionary where each key is a 'name' and the value is a 1D numpy array of the values.
@@ -262,12 +258,15 @@ def _process_ref(filepath, cols=['exon_count', 'transcript_length']):
     # Coerce the values in cols to numeric
     df[cols] = df[cols].apply(lambda x: pd.to_numeric(x, errors='coerce'))
 
+    # Drop rows with NaNs in cols
+    df = df.dropna(subset=cols)
+
     # Apply StandardScaler to the columns indicated by cols
     scaler = StandardScaler()
     df[cols] = scaler.fit_transform(df[cols])
 
-    # Write a dictionary where the keys come from the column 'name' and the values are 1D numpy arrays based on the values for that row/name in cols
-    ref_dict = {row['name']: np.array(row[cols].values, dtype=float) for _, row in df.iterrows()}
+    # Write a dictionary where the keys come from the column 'symbol' and the values are 1D numpy arrays based on the values for that row/dymbol in cols
+    ref_dict = {row['symbol']: np.array(row[cols].values, dtype=float) for _, row in df.iterrows()}
 
     return ref_dict
 

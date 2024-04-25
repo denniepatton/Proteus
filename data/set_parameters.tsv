@@ -1,0 +1,5 @@
+Key	StratMethod	MinDepth	MinLabel	ValidationSamples
+GeneStrat_0x	gene	0.0	1.0	LuCaP_93,LuCaP_136,LuCaP_96,NCI109B,FHSC04
+SampleStrat_0x	sample	0.0	1.0	LuCaP_93,LuCaP_136,LuCaP_96,NCI109B,FHSC04
+PC-HO_0x	gene	0.0	1.0	PLUS_LuCaP
+SCLC-HO_0x	gene	0.0	1.0	MINUS_LuCaP

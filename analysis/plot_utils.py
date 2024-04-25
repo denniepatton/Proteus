@@ -102,70 +102,6 @@ def plot_residuals(residuals, output_dir, filename="residuals"):
     plt.close()
 
 
-def plot_roc_curves(data, output_dir, filename, curve_names=None):
-    """
-    Function to plot ROC curves for multiple datasets.
-
-    Parameters:
-    data (list of tuples): Each tuple contains two arrays: the true labels and the predicted probabilities.
-    output_dir (str): The directory where the plot will be saved.
-    filename (str): The name of the file.
-    curve_names (list of str, optional): The names of the curves. Defaults to None.
-
-    Returns:
-    None
-    """
-    plt.figure()
-
-    for i, (truths, predictions) in enumerate(data):
-        fpr, tpr, _ = roc_curve(truths, predictions)
-        roc_auc = auc(fpr, tpr)
-        label = f'ROC curve for {curve_names[i]} (area = {roc_auc:.2f})' if curve_names else f'ROC curve (area = {roc_auc:.2f})'
-        plt.plot(fpr, tpr, color=plt.cm.tab10(i), lw=2, label=label)
-
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Receiver Operating Characteristic')
-    plt.legend(loc="lower right")
-    plt.savefig(os.path.join(output_dir, f"{filename}.pdf"))
-    plt.close()
-
-
-def plot_roc_curves(data, output_dir, filename, curve_names=None):
-    """
-    Function to plot ROC curves for multiple datasets.
-
-    Parameters:
-    data (list of tuples): Each tuple contains two arrays: the true labels and the predicted probabilities.
-    output_dir (str): The directory where the plot will be saved.
-    filename (str): The name of the file.
-    curve_names (list of str, optional): The names of the curves. Defaults to None.
-
-    Returns:
-    None
-    """
-    plt.figure()
-
-    for i, (truths, predictions) in enumerate(data):
-        fpr, tpr, _ = roc_curve(truths, predictions)
-        roc_auc = auc(fpr, tpr)
-        label = f'ROC curve for {curve_names[i]} (area = {roc_auc:.2f})' if curve_names else f'ROC curve (area = {roc_auc:.2f})'
-        plt.plot(fpr, tpr, color=plt.cm.tab10(i), lw=2, label=label)
-
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Receiver Operating Characteristic')
-    plt.legend(loc="lower right")
-    plt.savefig(os.path.join(output_dir, f"{filename}.pdf"))
-    plt.close()
-
-
 def scatter_plot(y_true, y_pred, output_dir, filename, title, annotations=None):
     """
     Function to create a scatter plot of true vs predicted values, with point densities.
@@ -202,8 +138,8 @@ def scatter_plot(y_true, y_pred, output_dir, filename, title, annotations=None):
         for i, txt in enumerate(annotations):
             plt.annotate(txt, (y_true[i], y_pred[i]), fontsize='small')
 
-    plt.xlabel('True Values in Log2(TPM + 1)')
-    plt.ylabel('Predicted Values in Log2(TPM + 1)')
+    plt.xlabel('True Values in Log2(CPM + 1)')
+    plt.ylabel('Predicted Values in Log2(CPM + 1)')
     plt.title(title)
     plt.colorbar(label='Density')
 
@@ -285,7 +221,7 @@ def residuals_plot(y_true, y_pred, output_dir, filename, title, annotations=None
         for i, txt in enumerate(annotations):
             plt.annotate(txt, (y_pred[i] if var is None else var[i], residuals[i]), fontsize='small')
 
-    plt.xlabel('Predicted Values in Log2(TPM + 1)' if var is None else 'Standard Scaled ' + var.name)
+    plt.xlabel('Predicted Values in Log2(CPM + 1)' if var is None else 'Standard Scaled ' + var.name)
     plt.ylabel('Residuals')
     plt.title(title)
     plt.colorbar(label='Density')

@@ -1,12 +1,10 @@
 # project specific
-/data/**
-/results/**
-/results_old/**
+/analysis/*/
+/data/*/
+/results_old/
 /results_training/**
 /results_holdout/**
 /scraps/
-/logs/cluster/**
-.DS_Store
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

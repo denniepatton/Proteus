@@ -36,12 +36,12 @@ def check_sample_genes(sample_data_file_path_modes):
     with h5py.File(f'{sample_data_path}{data_file}', 'r') as f:
         for gene in f.keys():
             if 'continuous_label' in f[gene]:
-                min_label_met = f[gene]['continuous_label'][()] >= min_label
+                min_label_met = f[gene]['continuous_label'][()] >= np.log2(min_label)  # labels stored as log2(TPM+1), so min_label 1.1 means min TPM of 0.1
             else:
                 continue  # skip genes without a continuous label, i.e. not represented in the truth labels
             no_nans = all(modality in f[gene] and not np.isnan(np.array(f[gene][modality])).any() for modality in use_modes)
-            if 'TSS_scalars' in f[gene]:
-                min_depth_met = f[gene]['TSS_scalars'][7] >= min_depth  # see extract_gene_depths() below
+            if 'TSS_scalars' in f[gene]:  # Also reports false for unmatched genes
+                min_depth_met = f[gene]['TSS_scalars'][7] >= min_depth  # see extract_gene_depths() below: mean-depth is raw (not scaled)
             else:
                 min_depth_met = False  # no depth data does not meet min_depth
             
@@ -85,6 +85,7 @@ def split_df_gene(df, folds):
 
 
 def split_df_sample(df, folds):
+    # TODO: with the same input paradigm split_df_sample produces folds with fewer total examples than split_df_gene - what gives?
     """
     Splits the data into folds, grouping samples together.
 
@@ -124,7 +125,7 @@ def split_df_sample(df, folds):
     return df
 
 
-def serialize_example(feature_dict, gene_name):
+def serialize_example(feature_dict, gene_name, sample_name):
     """
     Creates a tf.Example message ready to be written to a file.
 
@@ -137,6 +138,7 @@ def serialize_example(feature_dict, gene_name):
     # Create a dictionary to hold the features
     features = {}
     features['gene_name'] = tf.train.Feature(bytes_list=tf.train.BytesList(value=[gene_name.encode('utf-8')]))
+    features['sample_name'] = tf.train.Feature(bytes_list=tf.train.BytesList(value=[sample_name.encode('utf-8')]))
 
     # For each feature in the feature_dict
     for key, value in feature_dict.items():
@@ -193,7 +195,7 @@ def load_key_from_hdf5(key, h5file):
             inner_dict[inner_key] = item[()]
         return inner_dict
     else:
-        print(f'Key "{key}" not found in the file.')
+        print(f'WARNING: Key "{key}" not found in HDF5 file: {h5file.filename}')
         return None
     
 
@@ -211,19 +213,21 @@ def parse_serialized_example(serialized_example, labeled=True):
     if labeled:
         feature_description = {
             'gene_name': tf.io.FixedLenFeature([], tf.string),
+            'sample_name': tf.io.FixedLenFeature([], tf.string),
             'TSS_image': tf.io.FixedLenFeature([2000, 11], tf.float32),
             'TSS_scalars': tf.io.FixedLenFeature([12], tf.float32),
             'GB_scalars': tf.io.FixedLenFeature([12], tf.float32),
-            'ref_scalars': tf.io.FixedLenFeature([2], tf.float32),
+            'ref_scalars': tf.io.FixedLenFeature([3], tf.float32),
             'continuous_label': tf.io.FixedLenFeature([], tf.float32)
         }
     else:
         feature_description = {
             'gene_name': tf.io.FixedLenFeature([], tf.string),
+            'sample_name': tf.io.FixedLenFeature([], tf.string),
             'TSS_image': tf.io.FixedLenFeature([2000, 11], tf.float32),
             'TSS_scalars': tf.io.FixedLenFeature([12], tf.float32),
             'GB_scalars': tf.io.FixedLenFeature([12], tf.float32),
-            'ref_scalars': tf.io.FixedLenFeature([2], tf.float32)
+            'ref_scalars': tf.io.FixedLenFeature([3], tf.float32)
         }
 
     # Parse the serialized example
@@ -264,13 +268,15 @@ def process_sample_folds(folds_df, sample_name, samples, sample_data_path, data_
                 for gene in folds_dict[fold]:
                     # Load the gene data from the HDF5 file
                     gene_data = load_key_from_hdf5(gene, f)
+                    if gene_data is None:
+                        continue  
                     # Serialize the gene data
-                    serialized = serialize_example(gene_data, gene)
+                    serialized = serialize_example(gene_data, gene, sample_name)
                     # Write the serialized data to the TFRecord file
                     writer.write(serialized)
 
 
-def process_validation_sample(sample, sample_data, sample_data_path, use_modes, out_dir, min_depth=0.0, zero_tpm=True):
+def process_validation_sample(sample, sample_data, sample_data_path, use_modes, out_dir, min_depth=0.0):
     """
     Processes a validation sample and writes the data to a TFRecord file.
 
@@ -281,7 +287,6 @@ def process_validation_sample(sample, sample_data, sample_data_path, use_modes, 
         use_modes (list): The list of modes to use.
         out_dir (str): The directory to write the TFRecord file to.
         min_depth (float, optional): The minimum depth to use. Defaults to 0.0.
-        zero_tpm (bool, optional): Whether to include genes with TPM = 0. Defaults to False.
     """
     print(f'Processing {sample} . . .')
 
@@ -289,8 +294,7 @@ def process_validation_sample(sample, sample_data, sample_data_path, use_modes, 
         # Create a dictionary of valid genes
         valid_genes = {gene: sample for gene in f.keys()
                     if all(modality in f[gene] and not np.isnan(np.array(f[gene][modality])).any() for modality in use_modes)
-                    and f[gene]['TSS_scalars'][7] >= min_depth
-                    and (f[gene]['continuous_label'][()] > 0.0 if not zero_tpm else True)}
+                    and f[gene]['TSS_scalars'][7] >= min_depth}
 
         # Create a TFRecord file for the sample
         out_file = f'{out_dir}{sample}.tfrecord'
@@ -300,7 +304,7 @@ def process_validation_sample(sample, sample_data, sample_data_path, use_modes, 
                 # Load the gene data from the HDF5 file
                 gene_data = load_key_from_hdf5(gene, f)
                 # Serialize the gene data
-                serialized = serialize_example(gene_data, gene)
+                serialized = serialize_example(gene_data, gene, sample)
                 # Write the serialized data to the TFRecord file
                 writer.write(serialized)
 
@@ -380,6 +384,9 @@ def get_dataset(use_set, fold_numbers=None, samples=None, shuffle=True, batch_si
 
 def extract_gene_names(batch):
     return batch['gene_name']
+
+def extract_sample_names(batch):
+    return batch['sample_name']
 
 def extract_gene_depths(batch):
     """ ASSUMES:
