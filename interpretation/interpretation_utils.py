@@ -31,6 +31,10 @@ import matplotlib.patches as patches
 # Packages for SHAP
 import shap
 import pickle
+
+import sys
+sys.path.append("..") 
+
 from preprocessing.generate_tf_splits import *
 from preprocessing.compile_sample_data import *
 
