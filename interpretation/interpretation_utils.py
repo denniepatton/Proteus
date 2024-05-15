@@ -255,7 +255,8 @@ def get_gene_subset(input_data, gene_list_path):
 ######################################
 def plot_nucleotide_conv_filters(model, folder_path=None):
     """
-    Plots all the 2D convolutional filters for the nucleotide layer.
+    Plots all the 2D convolutional filters for the nucleotide layer. 
+    (Requires num_filters to be at least 8, and a multiple of 8)
 
     Args:
         model (Model): The Keras model.
@@ -264,9 +265,12 @@ def plot_nucleotide_conv_filters(model, folder_path=None):
     conv_layer_name = [layer.name for layer in model.layers if layer.name.startswith('conv2d')]
     actg_conv_layer = model.get_layer(name=conv_layer_name[0])
     weights = actg_conv_layer.get_weights()[0]
+    num_filters = actg_conv_layer.filters
+
+    subplot_height = int(num_filters / 8)
     #print(weights.shape)
-    fig, axs = plt.subplots(4, 8, figsize=(15, 7))
-    for j in range(4):
+    fig, axs = plt.subplots(subplot_height, 8, figsize=(15, 7))
+    for j in range(subplot_height):
         for i in range(8):
             axs[j, i].imshow(weights[:, :, 0, 8*j + i], cmap='viridis')
             axs[j, i].set_yticks(np.arange(4))
@@ -274,7 +278,7 @@ def plot_nucleotide_conv_filters(model, folder_path=None):
     cbar = fig.colorbar(axs[0, 0].imshow(weights[:, :, 0, 0], cmap='viridis'), ax=axs, orientation='vertical', fraction=0.05)
     # Add in a label on the y axis of each plot
     cbar.set_label('Weight')
-    fig.suptitle(f'Nucleotide Conv Filters (32)', fontsize=16)
+    fig.suptitle(f'Nucleotide Conv Filters ({num_filters})', fontsize=16)
     if folder_path is not None:
         plt.savefig(os.path.join(folder_path, 'nucleotide_conv_filters.png'))
     else:
@@ -290,7 +294,7 @@ def plot_signal_kernels(best_model, folder_path=None):
         folder_path (str, optional): The base folder location to save the figure. (default: None)
     """
     ## Visualizing all 7 signal first layer 3x1 kernels
-    triton_signals = ['depth', 'nucleosome cp', 'phased-nucleosome cp', 'fl short/long ratio', 'fl diversity', 'fl entropy', 'peak locations']
+    triton_signals = ['depth', 'nucleosome cp', 'fl ends', 'fl short/long ratio', 'fl diversity', 'fl entropy', 'peak locations']
 
     for signal_num in range(len(triton_signals)):
         #Extract the weights of the corresponding first convolutional layer
@@ -333,20 +337,22 @@ def plot_signal_combination_conv3d_filters(model, folder_path=None):
     conv3d_layer = model.get_layer(name=conv_layer_name[0])
     weights = conv3d_layer.get_weights()[0]
     #print(weights.shape)
+
+    #Hardcoded to index at 0
     fig, axs = plt.subplots(4, 2, figsize=(25,5))
     for j in range(4):
         for i in range(2):
-            axs[j, i].imshow(np.squeeze(weights[:, :, :, :, 4*j + i]), cmap='viridis')
+            axs[j, i].imshow(np.squeeze(weights[0, :, :, :, 4*j + i]), cmap='viridis')
             axs[j, i].set_yticks(np.arange(8))
             if i == 0:
-                axs[j, i].set_yticklabels(['depth', 'nucleosome cp', 'phased-nucleosome cp', 'fl short/long ratio', 'fl diversity', 'fl entropy', 'peak locations', 'nucleotides'])
+                axs[j, i].set_yticklabels(['depth', 'nucleosome cp', 'fl-ends', 'fl short/long ratio', 'fl diversity', 'fl entropy', 'peak locations', 'nucleotides'])
             else:
                 axs[j, i].set_yticklabels([])
-    cbar = fig.colorbar(axs[0, 0].imshow(np.squeeze(weights[:, :, :, :, 0]), cmap='viridis'), ax=axs, orientation='vertical', fraction=0.05)
+    cbar = fig.colorbar(axs[0, 0].imshow(np.squeeze(weights[0, :, :, :, 0]), cmap='viridis'), ax=axs, orientation='vertical', fraction=0.05)
     # Add in a label on the y axis of each plot
     #plt.subplots_adjust(hspace=0.5)
     cbar.set_label('Weight')
-    fig.suptitle(f'Depthwise-Conv Filters ({(j+1)*(i+1)} of 128)', fontsize=16)
+    fig.suptitle(f'Depthwise-Conv Filters ({(j+1)*(i+1)} of {weights.shape[4]})', fontsize=16)
     if folder_path is not None:
         fig.savefig(os.path.join(folder_path, 'signal_combination_conv3d_filters.png'))
     else:
@@ -355,6 +361,7 @@ def plot_signal_combination_conv3d_filters(model, folder_path=None):
 def plot_summed_signal_combination_conv3d_filters(model, folder_path=None):
     """
     Plots the summed signal combination conv3d filters.
+    (Requires num_filters to be at least 32, and a multiple of 32)
 
     Args:
         model (Model): The Keras model.
@@ -365,21 +372,23 @@ def plot_summed_signal_combination_conv3d_filters(model, folder_path=None):
     conv3d_layer = model.get_layer(name=conv_layer_name[0])
     weights = conv3d_layer.get_weights()[0]
     #print(weights.shape)
-    fig, axs = plt.subplots(4, 32, figsize=(25,5))
-    for j in range(4):
+    num_filters = conv3d_layer.filters
+    subplot_height = int(num_filters / 32)
+    fig, axs = plt.subplots(subplot_height, 32, figsize=(25,5))
+    for j in range(subplot_height):
         for i in range(32):
-            axs[j, i].imshow(np.sum(np.squeeze(weights[:, :, :, :, 4*j + i]), axis=1)[:, np.newaxis], cmap='viridis')
+            axs[j, i].imshow(np.sum(np.squeeze(weights[0, :, :, :, 32*j + i]), axis=1)[:, np.newaxis], cmap='viridis')
             axs[j, i].set_yticks(np.arange(8))
             axs[j, i].set_xticks([])
             if i == 0:
-                axs[j, i].set_yticklabels(['depth', 'nucleosome cp', 'phased-nucleosome cp', 'fl short/long ratio', 'fl diversity', 'fl entropy', 'peak locations', 'nucleotides'])
+                axs[j, i].set_yticklabels(['depth', 'nucleosome cp', 'fl ends', 'fl short/long ratio', 'fl diversity', 'fl entropy', 'peak locations', 'nucleotides'])
             else:
                 axs[j, i].set_yticklabels([])
-    cbar = fig.colorbar(axs[0, 0].imshow(np.sum(np.squeeze(weights[:, :, :, :, 0]), axis=1)[:, np.newaxis], cmap='viridis'), ax=axs, orientation='vertical', fraction=0.05)
+    cbar = fig.colorbar(axs[0, 0].imshow(np.sum(np.squeeze(weights[0, :, :, :, 0]), axis=1)[:, np.newaxis], cmap='viridis'), ax=axs, orientation='vertical', fraction=0.05)
     # Add in a label on the y axis of each plot
     #plt.subplots_adjust(hspace=0.5)
     cbar.set_label('Weight')
-    fig.suptitle(f'Summed Depthwise-Conv Filters ({(j+1)*(i+1)} of 128)', fontsize=16)
+    fig.suptitle(f'Summed Depthwise-Conv Filters ({(j+1)*(i+1)} of {weights.shape[4]})', fontsize=16)
     if folder_path is not None:
         fig.savefig(os.path.join(folder_path, 'summed_signal_combination_conv3d_filters.png'))
     else:
@@ -393,6 +402,7 @@ def plot_summed_signal_combination_conv3d_filters(model, folder_path=None):
 def plot_nucleotide_motifs(model, folder_path=None):
     """
     Plots all the motif plots for the Conv2d Nucleotide filter.
+    (Requires num_filters to be at least 8, and a multiple of 8)
 
     Args:
         model (Model): The Keras model.
@@ -402,6 +412,8 @@ def plot_nucleotide_motifs(model, folder_path=None):
     conv_layer_name = [layer.name for layer in model.layers if layer.name.startswith('conv2d')]
     actg_conv_layer = model.get_layer(name=conv_layer_name[0])
     weights = actg_conv_layer.get_weights()[0]
+    num_filters = actg_conv_layer.filters
+    subplot_height = int(num_filters / 8)
 
     # Data Preprocessing
     def shift(x): # column shift
@@ -457,12 +469,12 @@ def plot_nucleotide_motifs(model, folder_path=None):
         return p
 
     # Plotting the motif filters
-    fig, axs = plt.subplots(4, 8, figsize=(20,6))
+    fig, axs = plt.subplots(subplot_height, 8, figsize=(20,6))
 
     all_scores = processed_motif_data_list
 
     #All values shifted postive, scaled to [0,1]
-    for j in range(4):
+    for j in range(subplot_height):
         for i in range(8):
             #Extract a specfic filter
             all_scores = processed_motif_data[j*8 + i]
@@ -487,7 +499,7 @@ def plot_nucleotide_motifs(model, folder_path=None):
             axs[j, i].set_xlim((0, x))
             axs[j, i].set_ylim((-0.8, 1))  
 
-    plt.suptitle('Motif Plots for the Nucleotide Conv Filters (32)', fontsize=16)
+    plt.suptitle(f'Motif Plots for the Nucleotide Conv Filters ({num_filters})', fontsize=16)
     if folder_path is not None:
         plt.savefig(os.path.join(folder_path, 'nucleotide_motifs.png'))
     else:
@@ -527,7 +539,7 @@ def plot_shap_TSS_Images(shap_values, folder_path=None):
     images_t = np.transpose(images, (2,0,1))
     means = np.mean(np.abs(images_t), axis=1)
     plt.clf()
-    cols = ['1. Depth', '2. Probable Nucleosome Center Profile', '3. Phased Nucleosome Profile', '4. Fragment Length Short:Long Ratio', '5. Fragment Length Diversity', '6. Fragment Length Entropy', '7. Peaks', '8. A-Adenine', '9. C-Cytosine', '10. G-Guanine', '11. T-Tyrosine']
+    cols = ['1. Depth', '2. Probable Nucleosome Center Profile', '3. Fragment Ends', '4. Fragment Length Short:Long Ratio', '5. Fragment Length Diversity', '6. Fragment Length Entropy', '7. Peaks', '8. A-Adenine', '9. C-Cytosine', '10. G-Guanine', '11. T-Tyrosine']
     plt.figure(figsize=(6, 4))
     plt.imshow(means, cmap='viridis', aspect='auto', interpolation='nearest')
 
@@ -563,7 +575,7 @@ def plot_shap_images_nucleotide(shap_values, folder_path=None):
     #print(new_images_t.shape)
 
     plt.clf()
-    new_cols = ['1. Depth', '2. Probable Nucleosome Center Profile', '3. Phased Nucleosome Profile', '4. Fragment Length Short:Long Ratio', '5. Fragment Length Diversity', '6. Fragment Length Entropy', '7. Peaks', '8. Nucleotide']
+    new_cols = ['1. Depth', '2. Probable Nucleosome Center Profile', '3. Fragment Ends', '4. Fragment Length Short:Long Ratio', '5. Fragment Length Diversity', '6. Fragment Length Entropy', '7. Peaks', '8. Nucleotide']
     plt.figure(figsize=(6, 4))
     plt.imshow(new_means, cmap='viridis', aspect='auto', interpolation='nearest')
 
@@ -597,7 +609,7 @@ def plot_shap_images_individual(shap_values, folder_path=None):
     new_images_t = new_images_t[:8]
     new_means = np.mean(np.abs(new_images_t), axis=1)
     plt.clf()
-    new_cols = ['1. Depth', '2. PNuc CP', '3. PNuc P', '4. FL S:L R', '5. FL Div', '6. FL Ent', '7. Peaks', '8. Nucleotide']
+    new_cols = ['1. Depth', '2. PNuc CP', '3. F End', '4. FL S:L R', '5. FL Div', '6. FL Ent', '7. Peaks', '8. Nucleotide']
     plt.figure(figsize=(6, 4))
     fig, axs = plt.subplots(8, 1, figsize=(20,8))
     for j in range(8):
@@ -633,7 +645,7 @@ def plot_shap_global(shap_values, include_images, scale_include_images = False, 
     new_images_t = new_images_t[:8]
 
     # Plot mean abs SHAP Values for the TSS Scalars, GB Scalars, and Reference Scalars, and summed signals
-    TSS_image_cols = ['1. Depth', '2. Probable Nucleosome Center Profile', '3. Phased Nucleosome Profile', '4. Fragment Length Short:Long Ratio', '5. Fragment Length Diversity', '6. Fragment Length Entropy', '7. Peaks', '8. Nucleotide']
+    TSS_image_cols = ['1. Depth', '2. Probable Nucleosome Center Profile', '3. Fragment Ends', '4. Fragment Length Short:Long Ratio', '5. Fragment Length Diversity', '6. Fragment Length Entropy', '7. Peaks', '8. Nucleotide']
     TSS_scalar_cols = ['1. fragment-diversity', '2. fragment-entropy', '3. fragment-mad', '4. fragment-mean', '5. fragment-median', '6. fragment-ratio', '7. fragment-stdev', '8. mean-depth', '9. np-amplitude', '10. np-period', '11. np-score', '12. var-ratio' ]
     ref_scalar_cols = ['1. numexons', '2. transcript_length', '3. mRNA_size']
     
@@ -935,7 +947,7 @@ def plot_gradient_updated_images(num_trials, original_data, updated_data, folder
         folder_path (str, optional): The base folder location to save the figures. (default: None)
     """
     plt.clf()
-    cols = ['1. Depth', '2. Probable Nucleosome Center Profile', '3. Phased Nucleosome Profile', '4. Fragment Length Short:Long ratio', '5. Fragment Length Diversity', '6. Fragment Length Entropy', '7. Peaks']
+    cols = ['1. Depth', '2. Probable Nucleosome Center Profile', '3. Fragment Ends', '4. Fragment Length Short:Long ratio', '5. Fragment Length Diversity', '6. Fragment Length Entropy', '7. Peaks']
     for trial in range(num_trials):
         fig, axs = plt.subplots(len(cols), 1, figsize=(12, 8))
         for i in range(len(cols)):
