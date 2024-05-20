@@ -22,6 +22,7 @@ from tensorflow import keras
 from tensorflow.keras.optimizers.schedules import LearningRateSchedule
 
 import sys
+import argparse
 sys.path.append("..") 
 
 # Loading In Model
@@ -47,33 +48,43 @@ from preprocessing.generate_tf_splits import *
 from preprocessing.compile_sample_data import *
 from interpretation_utils import *
 
-#model_path = "/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/results_holdout/UW-WGS_data/model.h5"
-#model_path = "/fh/fast/ha_g/user/rpatton/TritonCNN/TritonCNNv3/results_holdout/UW-WGS_data/best_model.h5"
-#best_model = tf.keras.models.load_model(model_path, custom_objects={'CosineDecay': CosineDecay, 'ScalarAttention': ScalarAttention, 'CrossModalAttention': CrossModalAttention, 'TemporalAttention': TemporalAttention})
-# print(best_model.summary())
-
-#filepath = "/fh/fast/ha_g/user/rpatton/TritonCNN/Proteus/data/composite_training/AllSamples_0x_0CPM.tfrecord"
-
-#Optional load filepaths
-#save_filepath = '/fh/fast/ha_g/user/anetzley/data_for_shap/full_dataset/input_data_CPM_Full.npz'
-
-#input_data = get_data(filepath, regenerate_data=True, regenerate_num_samples=None, save_filepath=save_filepath)
-
-# input_ASCL1 = get_gene_subset_data("/fh/fast/ha_g/user/rpatton/TritonCNN/Proteus/data/composite_training/AllSamples_0x_0CPM.tfrecord", gene_list_filepath=['ASCL1'], regenerate_data=True, save_filepath='/fh/fast/ha_g/user/anetzley/data_for_shap/ASCL1/ascl1_cpm.npz')
-
-def interpretation_analysis(model, data, save_filepath, background_size=5000, test_size=1000,  kernel_viz=True, shap=True):
+def interpretation_analysis(model, data, save_filepath, background_size=1000, test_size=100,  kernel_viz=False, shap=False):
     """ 
+    Perform interpretation analysis on the model using kernel visualization and SHAP analysis.
     """
     # Kernel Visualization
     if kernel_viz:
-        kernel_visualization(best_model, save_filepath)
+        kernel_visualization(model, save_filepath)
+        
     # SHAP Analysis
     if shap:
-        shap_analysis(best_model, input_data, background_size=5000, test_size=1000, save_filepath=save_filepath)
+        shap_analysis(model, data, background_size=background_size, test_size=test_size, save_filepath=save_filepath)
 
-#Define folder loaciton, extract model and data
-save_filepath = os.path.join(os.path.dirname(os.getcwd())+'/interpretation_results/')
-best_model = tf.keras.models.load_model(os.path.join(os.pardir, 'final_models', 'TPU-0x_model.h5'), custom_objects={'CosineDecay': CosineDecay, 'ScalarAttention': ScalarAttention, 'CrossModalAttention': CrossModalAttention, 'TemporalAttention': TemporalAttention})
-input_data = get_data('/fh/fast/ha_g/user/anetzley/data_for_shap/full_dataset/input_data_CPM.npz')
+def main():
+    parser = argparse.ArgumentParser(description='Interpretation Analysis')
+    parser.add_argument('--kernel_viz', action='store_true', default=False, help='Whether to perform kernel visualization')
+    parser.add_argument('--shap', action='store_true', default=False, help='Whether to perform SHAP analysis')
+    parser.add_argument('--background_size', type=int, default=1000, help='Size of background for SHAP analysis')
+    parser.add_argument('--test_size', type=int, default=100, help='Size of test set for SHAP analysis')
+    args = parser.parse_args()
 
-interpretation_analysis(best_model, input_data, save_filepath=save_filepath, background_size=5000, test_size=1000 )
+    #Define folder loaciton, extract model and data
+    save_filepath = os.path.join(os.path.dirname(os.getcwd())+'/interpretation_results/')
+    best_model = tf.keras.models.load_model(os.path.join(os.pardir, 'final_models', 'TPU-0x_model.h5'), 
+                                            custom_objects={'CosineDecay': CosineDecay, 
+                                                            'ScalarAttention': ScalarAttention, 
+                                                            'CrossModalAttention': CrossModalAttention, 
+                                                            'TemporalAttention': TemporalAttention})
+    
+    #TODO think about how to remove this hardcooding (assuming we won't be hosting the data on git? but maybe we will be)
+    input_data = get_data('/fh/fast/ha_g/user/anetzley/data_for_shap/full_dataset/input_data_CPM.npz')
+
+    #print(args.kernel_viz, args.shap, args.background_size, args.test_size)
+    interpretation_analysis(best_model, input_data, save_filepath=save_filepath, background_size=args.background_size, test_size=args.test_size, kernel_viz=args.kernel_viz, shap=args.shap)
+
+    #print('All Done!')
+
+
+if __name__ == "__main__":
+    main()
+
