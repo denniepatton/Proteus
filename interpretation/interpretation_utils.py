@@ -1,5 +1,12 @@
-# Alex Netzley
-# 2/26/2024
+"""
+interpretation_utils.py
+v1.0.0, 5/20/2024
+Author: Alexander Netzley, anetzley@fredhutch.org
+Ha Lab, Fred Hutchinson Cancer Research Center
+
+This module provides all the function code for Proteus interpretability analysis, including
+kernel visualization, SHAP, and gradient ascent.
+"""
 
 import os
 import csv
