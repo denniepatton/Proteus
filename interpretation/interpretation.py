@@ -54,7 +54,7 @@ def interpretation_analysis(model, data, save_filepath, background_size=1000, te
     """
     # Kernel Visualization
     if kernel_viz:
-        kernel_visualization(model, save_filepath)
+        kernel_visualization(model, data, save_filepath)
         
     # SHAP Analysis
     if shap:
@@ -62,28 +62,34 @@ def interpretation_analysis(model, data, save_filepath, background_size=1000, te
 
 def main():
     parser = argparse.ArgumentParser(description='Interpretation Analysis')
+    parser.add_argument('--model_name', type=str, default='TPU-0x_model', help='Name of model to perform analysis on')
     parser.add_argument('--kernel_viz', action='store_true', default=False, help='Whether to perform kernel visualization')
     parser.add_argument('--shap', action='store_true', default=False, help='Whether to perform SHAP analysis')
-    parser.add_argument('--background_size', type=int, default=1000, help='Size of background for SHAP analysis')
+    parser.add_argument('--background_size', type=int, default=500, help='Size of background for SHAP analysis')
     parser.add_argument('--test_size', type=int, default=100, help='Size of test set for SHAP analysis')
     args = parser.parse_args()
 
     #Define folder loaciton, extract model and data
-    save_filepath = os.path.join(os.path.dirname(os.getcwd())+'/interpretation_results/')
-    best_model = tf.keras.models.load_model(os.path.join(os.pardir, 'final_models', 'TPU-0x_model.h5'), 
+    save_filepath = os.path.join(os.path.dirname(os.getcwd())+f'/interpretation_results/{args.model_name}/')
+    os.makedirs(save_filepath, exist_ok=True)
+    best_model = tf.keras.models.load_model(os.path.join(os.pardir, 'final_models', f'{args.model_name}.h5'), 
                                             custom_objects={'CosineDecay': CosineDecay, 
                                                             'ScalarAttention': ScalarAttention, 
                                                             'CrossModalAttention': CrossModalAttention, 
                                                             'TemporalAttention': TemporalAttention})
     
-    #TODO think about how to remove this hardcooding (assuming we won't be hosting the data on git? but maybe we will be)
+    #TODO think about how to remove this hardcoding (assuming we won't be hosting the data on git? but maybe we will be)
+    # Define input data (if it has already been generate, then just load the .npz like below)
     input_data = get_data('/fh/fast/ha_g/user/anetzley/data_for_shap/full_dataset/input_data_CPM.npz')
+    #input_data = get_data(Location_of_.tfrecord, regenerate_data = True, regenerate_num_samples=?, save_filepath=Location_to_save_.npz_for_future_use)
 
-    #print(args.kernel_viz, args.shap, args.background_size, args.test_size)
-    interpretation_analysis(best_model, input_data, save_filepath=save_filepath, background_size=args.background_size, test_size=args.test_size, kernel_viz=args.kernel_viz, shap=args.shap)
-
-    #print('All Done!')
-
+    interpretation_analysis(best_model, 
+                            input_data, 
+                            save_filepath=save_filepath, 
+                            background_size=args.background_size, 
+                            test_size=args.test_size, 
+                            kernel_viz=args.kernel_viz, 
+                            shap=args.shap)
 
 if __name__ == "__main__":
     main()

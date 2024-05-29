@@ -37,6 +37,7 @@ from matplotlib.patches import PathPatch
 from matplotlib.font_manager import FontProperties
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import logomaker
 
 # Packages for SHAP
 import shap
@@ -406,113 +407,191 @@ def plot_summed_signal_combination_conv3d_filters(model, folder_path=None):
 ################################
 ### Motif Plotting Functions ###
 ################################
-def plot_nucleotide_motifs(model, folder_path=None):
+
+def compute_PWM(model, data, save_filepath=None):
     """
-    Plots all the motif plots for the Conv2d Nucleotide filter.
-    (Requires num_filters to be at least 8, and a multiple of 8)
+    Wrapper function to compute and visualize PWM for the model 1st layer nucleotide conv filters.
 
     Args:
         model (Model): The Keras model.
-        folder_path (str, optional): The base folder location to save the figure. (default: None)
+        data (np.array): The input data (or a subset) for computing activations
+        save_filepath (str, optional): The base folder location to save the figures. (default: None)
     """
-    #Extract the Weights
+
+    def kernel_2_PWM(kernel):
+        #helper function to split the nucleotide sequnce up into the 1998 length 3 windows
+        nucleotide_windows = []
+        for i in range(nucleotides.shape[0] - 3):
+            nucleotide_windows.append(nucleotides[i:i+3])
+
+        activated_sequences = np.zeros((3, 4, 0))
+        for window in nucleotide_windows:
+            activation = np.sum(window.T * kernel)
+            if activation > 0:
+                activated_sequences = np.concatenate((activated_sequences, window[:, :, np.newaxis]), axis=2)
+
+        activated_sequences_prob = np.mean(activated_sequences, axis=2)
+        return activated_sequences_prob
+
     conv_layer_name = [layer.name for layer in model.layers if layer.name.startswith('conv2d')]
     actg_conv_layer = model.get_layer(name=conv_layer_name[0])
     weights = actg_conv_layer.get_weights()[0]
     num_filters = actg_conv_layer.filters
     subplot_height = int(num_filters / 8)
+    pwm_filters_alldata = np.zeros((3, 4, num_filters, 0))
 
-    # Data Preprocessing
-    def shift(x): # column shift
-        x = x - np.min(x, axis=0)  # Subtracting the min value from each column to make each column non-negative
-        return x / x.sum(axis=0)
+    #Calculate background frequencies of each nucleotide
+    nuc_freqs = np.zeros((4, 0))
+    for data_entry in range(data[0].shape[0]):
+        nucleotides_freq = np.mean(data[0][data_entry, :, 7:].squeeze(), axis=0)
+        nuc_freqs = np.concatenate((nuc_freqs, nucleotides_freq[:, np.newaxis]), axis=1)
+    background_nucleotide_frequency = np.mean(nuc_freqs, axis=1)
 
-    max_weight = np.max(weights)
-    min_weight = np.min(weights)
-    diff  = max_weight - min_weight
+    #Loop through all data to compute PWM scores
+    num_entires = data[0].shape[0]
+    for data_entry in range(10):
+        nucleotides = data[0][data_entry, :, 7:].squeeze()
 
-    def global_shift(x, diff = diff): 
-        return x / diff # global shift # Divide each value by the max - min of all filter values across all filters
+        pwm_filters = np.zeros((3, 4, 0))
+        #loop through and apply all 16 kernels
+        for filt in range(num_filters):
+            conv_filter = weights[:, :, 0, filt].squeeze()
+            activated_sequences_prob = kernel_2_PWM(conv_filter)
+            pwm_filters = np.concatenate((pwm_filters, activated_sequences_prob[:, :, np.newaxis]), axis=2)
 
-    processed_motif_data = {}
-    for filter_number in range(weights.shape[3]):
-        #print(filter_number)
-        processed_filter = global_shift(weights[:, :, 0, filter_number])
+        pwm_filters_alldata = np.concatenate((pwm_filters_alldata, pwm_filters[:, :, :, np.newaxis]), axis=3)
 
-        processed_motif_data_list = []
-        for position in range(weights.shape[1]):
-            processed_motif_data_list.append([
-                ('A', processed_filter[0, position]),
-                ('C', processed_filter[1, position]),
-                ('G', processed_filter[2, position]),
-                ('T', processed_filter[3, position])
-            ])
-        processed_motif_data[filter_number] = processed_motif_data_list
+    pwm_filters_average = np.mean(pwm_filters_alldata, axis=3)
 
-
-    # Define Letter-Drawing Patch Code
-    globscale = 1.35
-    LETTERS = { "T" : TextPath((-0.305, 0), "T", size=1),
-                "G" : TextPath((-0.384, 0), "G", size=1),
-                "A" : TextPath((-0.35, 0), "A", size=1),
-                "C" : TextPath((-0.366, 0), "C", size=1) }
-    COLOR_SCHEME = {'G': 'orange', 
-                    'A': 'red', 
-                    'C': 'blue', 
-                    'T': 'darkgreen'}
-
-    def letterAt(letter, x, y, yscale=1, ax=None, neg=False):
-        text = LETTERS[letter]
-        if neg and yscale <= 0: # If the yscale is negative, flip the letter ONLY when neg is True
-            t = mpl.transforms.Affine2D().scale(1*globscale, -yscale*globscale) + \
-                mpl.transforms.Affine2D().translate(x, y) + ax.transData
-        else:
-            t = mpl.transforms.Affine2D().scale(1*globscale, yscale*globscale) + \
-                mpl.transforms.Affine2D().translate(x,y) + ax.transData
-                
-        p = PathPatch(text, lw=0, fc=COLOR_SCHEME[letter],  transform=t)
-        if ax != None:
-            ax.add_artist(p)
-        return p
-
-    # Plotting the motif filters
-    fig, axs = plt.subplots(subplot_height, 8, figsize=(20,6))
-
-    all_scores = processed_motif_data_list
-
-    #All values shifted postive, scaled to [0,1]
+    subplot_height = int(num_filters / 8)
+    fig, axs = plt.subplots(subplot_height, 8, figsize=(15, 7))
     for j in range(subplot_height):
         for i in range(8):
-            #Extract a specfic filter
-            all_scores = processed_motif_data[j*8 + i]
-            x = 1
-            maxi = 0
-            for scores in all_scores:
-                y_down_score = 0
-                y_up_score = 0
-                for base, score in scores:
-                    if score > 0:
-                        letter = letterAt(base, x, y_up_score, score, axs[j, i], True)
-                        y_up_score += score
-                    else:
-                        y_down_score += score
-                        letter = letterAt(base, x, y_down_score, score, axs[j, i], True)
+            axs[j, i].imshow(pwm_filters_average[:, :, 8*j + i].T, cmap='viridis')
+            axs[j, i].set_yticks(np.arange(4))
+            axs[j, i].set_yticklabels(['A', 'C', 'G', 'T'])
+    cbar = fig.colorbar(axs[0, 0].imshow(pwm_filters_average[:, :, 0].T, cmap='viridis'), ax=axs, orientation='vertical', fraction=0.05)
+    # Add in a label on the y axis of each plot
+    cbar.set_label('Weight')
+    fig.suptitle(f'Nucleotide PWM ({num_filters})', fontsize=16)
 
-                    axs[j, i].add_patch(letter)
-                    axs[j, i].add_patch(patches.Rectangle((0, -1), 4,1,alpha = 0.05)) #transparency
-                x += 1
-
-            axs[j, i].set_xticks(range(1, x))
-            axs[j, i].set_xlim((0, x))
-            axs[j, i].set_ylim((-0.8, 1))  
-
-    plt.suptitle(f'Motif Plots for the Nucleotide Conv Filters ({num_filters})', fontsize=16)
-    if folder_path is not None:
-        plt.savefig(os.path.join(folder_path, 'nucleotide_motifs.png'))
+    if save_filepath is not None:
+        plt.savefig(os.path.join(save_filepath, 'nucleotide_motifs_PWM.png'))
     else:
         plt.show()
 
-def kernel_visualization(model, save_filepath=None):
+    return pwm_filters_average, background_nucleotide_frequency
+
+def export_PWM_to_MEME(pwm_filters_average, background_nucleotide_frequency, save_filepath = None):
+    """
+    Export the PWM to a MEME formatted file.
+
+    Args:
+        pwm_filters_average (np.array): The averaged PWM filters for the nucleotide layer.
+        background_nucleotide_frequency (np.array): The background nucleotide frequencies.
+        save_filepath (str, optional): The base folder location to save the MEME file. (default: None)
+    """
+    # Background frequencies (for A, C, G, T)
+    background_frequencies = {
+        'A': background_nucleotide_frequency[0],
+        'C': background_nucleotide_frequency[1],
+        'G': background_nucleotide_frequency[2],
+        'T': background_nucleotide_frequency[3]
+    }
+
+    # Create MEME formatted string
+    meme_str = "MEME version 4\n\n"
+    meme_str += "ALPHABET= ACGT\n\n"
+    meme_str += "strands: + -\n\n"
+    meme_str += "Background letter frequencies\n"
+    for base, freq in background_frequencies.items():
+        meme_str += f"{base} {freq:.4f} "
+    meme_str += "\n\n"
+
+    # Add each PWM to the MEME string
+    for i in range(pwm_filters_average.shape[2]):
+        pwm = pwm_filters_average[:, :, i].squeeze()
+        motif_name = f"kernel_{i+1}"
+        motif_length = pwm.shape[0]
+        
+        meme_str += f"MOTIF {motif_name}\n"
+        meme_str += f"letter-probability matrix: alength= 4 w= {motif_length}\n"
+        
+        for col in range(motif_length):
+            for row in range(4):
+                meme_str += f"{pwm[col, row]:.6f} "
+            meme_str += "\n"
+        meme_str += "\n"
+
+    # Write to a file
+    if save_filepath is not None:
+        with open(os.path.join(save_filepath, 'pwm_motif.meme'), "w") as f:
+            f.write(meme_str)
+
+def plot_nucleotide_motifs(model, pwm_filters_average, save_filepath=None):
+    """
+    Plot the nucleotide motifs for the model.
+
+    Args:
+        model (Model): The Keras model.
+        pwm_filters_average (np.array): The averaged PWM filters for the nucleotide layer.
+        save_filepath (str, optional): The base folder location to save the figures. (default: None)
+    """
+
+    conv_layer_name = [layer.name for layer in model.layers if layer.name.startswith('conv2d')]
+    actg_conv_layer = model.get_layer(name=conv_layer_name[0])
+    weights = actg_conv_layer.get_weights()[0]
+    num_filters = actg_conv_layer.filters
+
+    subplot_height = int(num_filters / 8)
+    fig_1, axs_1 = plt.subplots(subplot_height, 8, figsize=(16, 4))
+    fig_2, axs_2 = plt.subplots(subplot_height, 8, figsize=(16, 4))
+    for j in range(subplot_height):
+        for i in range(8):
+            filt_df = pd.DataFrame(pwm_filters_average[:, :, 8*j + i].squeeze(),columns=['A','C','G','T'])
+            filt_df_info = logomaker.transform_matrix(filt_df,from_type='probability',to_type='information')
+            logomaker.Logo(filt_df_info, ax = axs_1[j,i])
+            axs_1[j, i].set_ylim(0, 2)
+            axs_1[j, i].set_yticks([0, 1, 2])
+            axs_1[j, i].set_ylabel('bits')
+            axs_1[j, i].set_title(f'kernel {8*j + i + 1}')
+
+            logomaker.Logo(filt_df, ax = axs_2[j,i])
+            axs_2[j, i].set_ylim(0, 1)
+            axs_2[j, i].set_yticks([0, 0.5, 1])
+            axs_2[j, i].set_ylabel('probability')
+            axs_2[j, i].set_title(f'kernel {8*j + i + 1}')
+
+    fig_1.subplots_adjust(hspace=0.2)
+    fig_1.suptitle('PWMs in Information Content', fontsize=16)
+    fig_1.tight_layout()
+
+    fig_2.subplots_adjust(hspace=0.2)
+    fig_2.suptitle('PWMs in Probability', fontsize=16)
+    fig_2.tight_layout()
+
+    if save_filepath is not None:
+        fig_1.savefig(os.path.join(save_filepath, 'nucleotide_motifs_PWM_IC.png'))
+        fig_2.savefig(os.path.join(save_filepath, 'nucleotide_motifs_PWM_Prob.png'))
+    else:
+        fig_1.show()
+        fig_2.show()
+
+def plot_motifs(model, data, save_filepath=None):
+    """
+    Wrapper function to compute and visualize PWM for the model 1st layer nucleotide conv filters.
+
+    Args:
+        model (Model): The Keras model.
+        data (np.array): The input data (or a subset) for computing activations
+        save_filepath (str, optional): The base folder location to save the figures. (default: None)
+    """
+    pwm_filters_average, background_nucleotide_frequency = compute_PWM(model, data, save_filepath)
+    export_PWM_to_MEME(pwm_filters_average, background_nucleotide_frequency, save_filepath)
+    plot_nucleotide_motifs(model, pwm_filters_average, save_filepath)
+
+
+def kernel_visualization(model, data, save_filepath=None):
     """
     Wrapper function to visualizes the kernels for the model.
 
@@ -529,7 +608,7 @@ def kernel_visualization(model, save_filepath=None):
     plot_nucleotide_conv_filters(model, folder_path)
     plot_signal_combination_conv3d_filters(model, folder_path)
     plot_summed_signal_combination_conv3d_filters(model, folder_path)
-    plot_nucleotide_motifs(model, folder_path)
+    plot_motifs(model, data, folder_path)
 
 ######################
 ### SHAP Functions ###
