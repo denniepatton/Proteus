@@ -1,6 +1,6 @@
 """
 generate_tf_splits.py
-v1.0.2, 1/9/2024
+v1.0.3, 6/6/2024
 Author: Robert D Patton, rpatton@fredhutch.org
 Ha Lab, Fred Hutchinson Cancer Research Center
 
@@ -24,19 +24,19 @@ def check_sample_genes(sample_data_file_path_modes):
     Checks the genes in a sample data file and returns a dictionary of valid genes.
 
     Args:
-        sample_data_file_path_modes (tuple): A tuple containing the sample name, data file name, 
+        sample_data_file_path_modes (tuple): A tuple containing the sample name,
                                              path to the sample data, and list of modalities to use.
 
     Returns:
         tuple: A tuple containing the sample name and a DataFrame containing the valid genes.
             
     """
-    sample, data_file, sample_data_path, use_modes, min_depth, min_label = sample_data_file_path_modes
+    sample, data_file, use_modes, min_depth, min_label = sample_data_file_path_modes
     gene_data = []
-    with h5py.File(f'{sample_data_path}{data_file}', 'r') as f:
+    with h5py.File(data_file, 'r') as f:
         for gene in f.keys():
-            if 'continuous_label' in f[gene]:
-                min_label_met = f[gene]['continuous_label'][()] >= np.log2(min_label)  # labels stored as log2(TPM+1), so min_label 1.1 means min TPM of 0.1
+            if 'truth_labels' in f[gene]:
+                min_label_met = f[gene]['truth_labels'][()] >= np.log2(min_label)  # labels stored as log2(TPM+1), so min_label 1.1 means min TPM of 0.1, etc.
             else:
                 continue  # skip genes without a continuous label, i.e. not represented in the truth labels
             no_nans = all(modality in f[gene] and not np.isnan(np.array(f[gene][modality])).any() for modality in use_modes)
@@ -52,7 +52,7 @@ def check_sample_genes(sample_data_file_path_modes):
     return sample, df
 
 
-def split_df_gene(df, folds):
+def split_df_gene(df, folds, gene_set=None):
     """
     Splits the data into folds, stratified by gene name.
 
@@ -60,6 +60,7 @@ def split_df_gene(df, folds):
         df (pandas.DataFrame): The DataFrame to split. Each row corresponds to a gene, 
                                and each column corresponds to a sample.
         folds (int): The number of folds to split the data into.
+        gene_set (string, optional): Path to a txt file with genes of interest to restrict to, one per line.
 
     Returns:
         pandas.DataFrame: The split DataFrame, where each True value has been replaced 
@@ -67,25 +68,31 @@ def split_df_gene(df, folds):
     """
     print('Splitting the data into folds (stratified by gene name) . . .')
 
+    # If gene_set is not None, load the gene names from the .txt file
+    if gene_set is not None:
+        with open(gene_set, 'r') as f:
+            gene_set = [line.strip() for line in f]
+
     # Loop over the rows in the DataFrame
     for row in df.itertuples(index=True):
-        # Get the indices of the True values in the row
-        true_indices = [i for i, x in enumerate(row[1:]) if x]
+        # If gene_set is not None and the gene for this row is not in gene_set, cast all True values to False
+        if gene_set is not None and row[0] not in gene_set:
+            df.loc[row[0]] = False
+        else:
+            # Get the indices of the True values in the row
+            true_indices = [i for i, x in enumerate(row[1:]) if x]
 
-        # Create a list of fold numbers for this row
-        fold_numbers = np.tile(range(1, folds + 1), len(true_indices) // folds + 1)
-        np.random.shuffle(fold_numbers)
-        fold_numbers = fold_numbers[:len(true_indices)]
+            # Draw a random sample of fold numbers for this row
+            fold_numbers = np.random.choice(range(1, folds + 1), len(true_indices), replace=True)
 
-        # Assign a fold number to each True value in the row
-        for i, fold in zip(true_indices, fold_numbers):
-            df.at[row[0], df.columns[i]] = fold
+            # Assign a fold number to each True value in the row
+            for i, fold in zip(true_indices, fold_numbers):
+                df.at[row[0], df.columns[i]] = fold
 
     return df
 
 
 def split_df_sample(df, folds):
-    # TODO: with the same input paradigm split_df_sample produces folds with fewer total examples than split_df_gene - what gives?
     """
     Splits the data into folds, grouping samples together.
 
@@ -214,20 +221,22 @@ def parse_serialized_example(serialized_example, labeled=True):
         feature_description = {
             'gene_name': tf.io.FixedLenFeature([], tf.string),
             'sample_name': tf.io.FixedLenFeature([], tf.string),
-            'TSS_image': tf.io.FixedLenFeature([2000, 11], tf.float32),
+            'TSS_images': tf.io.FixedLenFeature([2000, 11], tf.float32),
             'TSS_scalars': tf.io.FixedLenFeature([12], tf.float32),
             'GB_scalars': tf.io.FixedLenFeature([12], tf.float32),
             'ref_scalars': tf.io.FixedLenFeature([3], tf.float32),
-            'continuous_label': tf.io.FixedLenFeature([], tf.float32)
+            'TFX_label': tf.io.FixedLenFeature([], tf.float32),
+            'truth_labels': tf.io.FixedLenFeature([], tf.float32)
         }
     else:
         feature_description = {
             'gene_name': tf.io.FixedLenFeature([], tf.string),
             'sample_name': tf.io.FixedLenFeature([], tf.string),
-            'TSS_image': tf.io.FixedLenFeature([2000, 11], tf.float32),
+            'TSS_images': tf.io.FixedLenFeature([2000, 11], tf.float32),
             'TSS_scalars': tf.io.FixedLenFeature([12], tf.float32),
             'GB_scalars': tf.io.FixedLenFeature([12], tf.float32),
-            'ref_scalars': tf.io.FixedLenFeature([3], tf.float32)
+            'ref_scalars': tf.io.FixedLenFeature([3], tf.float32),
+            'TFX_label': tf.io.FixedLenFeature([], tf.float32)
         }
 
     # Parse the serialized example
@@ -236,7 +245,7 @@ def parse_serialized_example(serialized_example, labeled=True):
     return example
 
 
-def process_sample_folds(folds_df, sample_name, samples, sample_data_path, data_files, out_dir):
+def process_sample_folds(folds_df, sample_name, samples, data_files, out_dir):
     """
     Processes the folds for a given sample and writes the data to TFRecord files.
 
@@ -244,8 +253,7 @@ def process_sample_folds(folds_df, sample_name, samples, sample_data_path, data_
         folds_df (pandas.DataFrame): The DataFrame containing the fold assignments.
         sample_name (str): The name of the sample to process.
         samples (list): The list of all sample names.
-        sample_data_path (str): The path to the sample data files.
-        data_files (list): The list of all data file names.
+        data_files (list): The list of all data file paths.
         out_dir (str): The directory to write the TFRecord files to.
     """
     print(f'Processing {sample_name} . . .')
@@ -258,7 +266,7 @@ def process_sample_folds(folds_df, sample_name, samples, sample_data_path, data_
     sample_index = samples.index(sample_name)
 
     # Open the HDF5 file for the sample
-    with h5py.File(sample_data_path + data_files[sample_index], 'r') as f:
+    with h5py.File(data_files[sample_index], 'r') as f:
         # For each fold
         for fold in folds_dict.keys():
             # Create a TFRecord file for the fold
@@ -276,21 +284,20 @@ def process_sample_folds(folds_df, sample_name, samples, sample_data_path, data_
                     writer.write(serialized)
 
 
-def process_validation_sample(sample, sample_data, sample_data_path, use_modes, out_dir, min_depth=0.0):
+def process_holdout_sample(sample, sample_data, use_modes, out_dir, min_depth=0.0):
     """
-    Processes a validation sample and writes the data to a TFRecord file.
+    Processes a holdout (or single) sample and writes the data to a TFRecord file.
 
     Args:
         sample (str): The name of the sample to process.
-        sample_data (str): The name of the sample data file.
-        sample_data_path (str): The path to the sample data files.
+        sample_data (str): The path to the sample data file.
         use_modes (list): The list of modes to use.
         out_dir (str): The directory to write the TFRecord file to.
         min_depth (float, optional): The minimum depth to use. Defaults to 0.0.
     """
     print(f'Processing {sample} . . .')
 
-    with h5py.File(f'{sample_data_path}{sample_data}', 'r') as f:
+    with h5py.File(sample_data, 'r') as f:
         # Create a dictionary of valid genes
         valid_genes = {gene: sample for gene in f.keys()
                     if all(modality in f[gene] and not np.isnan(np.array(f[gene][modality])).any() for modality in use_modes)

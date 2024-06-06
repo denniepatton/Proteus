@@ -1,6 +1,6 @@
 # Proteus <img src="misc/logo_v2.png" width="140" align="left">
 As a CNN-based gene expression model, Proteus utilizes information contained in the cell-free DNA (cfDNA) coverage profiles of individual genes
-to accurately and directly predict underlying mRNA abundance providing a wholistic, liquid-biopsy-based analog to tradtional RNA-seq assays.
+to accurately and directly predict underlying mRNA abundance to provide a wholistic, liquid-biopsy-based analog to tradtional RNA-seq assays.
 
 _Proteus_, also known as the "old man of the sea," is named for a prophetic Greek god of the sea who would change forms to disquise himself before ultimately revealing the truth.  
 Like Proteus, this tool works in the deep and changes the form of data to reveal new information.

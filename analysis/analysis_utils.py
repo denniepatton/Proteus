@@ -9,149 +9,48 @@ This script contains helper functions for the analysis of the data.
 
 # Standard library imports
 from scipy.optimize import minimize
-from scipy.stats import spearmanr, pearsonr, mannwhitneyu
+from scipy.stats import spearmanr, pearsonr
 
 # Third party imports
 import matplotlib.colors as mcolors
 import matplotlib.gridspec as gridspec
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
-import scipy.stats as stats
 import numpy as np
 import pandas as pd
 import seaborn as sns
 from sklearn.metrics import mean_absolute_error, r2_score
 
 
-########################## HELPER FUNCTIONS ##########################################################################################
+def subtract_background(preds_df, tfx_dict, sub_sample, ref_file):
+    import scipy.stats as stats
+    # Load the reference file as a pandas DataFrame
+    ref_df = pd.read_csv(ref_file, sep='\t', index_col=0, header=0)
 
-def load_file_as_list(filename):
-    with open(filename, 'r') as f:
-        return [line.strip() for line in f]
-    
-def rename_tan(df):
-    df.columns = df.columns.str.replace(r'(\d{2}-\d{3})([A-Z]\d)', r'\1_\2-', regex=True)
-    return df
+    # Restrict the reference DataFrame to the specified sample
+    ref_df = ref_df[[sub_sample]]
 
-def create_palette(file_path):
-    df = pd.read_csv(file_path, sep='\t', header=None)
-    subtype_to_color = dict(zip(df[0], df[1]))
-    return subtype_to_color
-    
-def merge_validation(fold_dfs):
-    # Reset the index of each DataFrame and concatenate them
-    df_concat = pd.concat(df.reset_index() for df in fold_dfs)
-    # Pivot the DataFrame so that genes are the index, samples are the columns, and predictions are the values
-    df_merged = df_concat.pivot(index='index', columns='sample', values='prediction')
-    return df_merged
+    # Un-log2 scale and subtract 1 from all values in both DataFrames
+    preds_df = np.power(2, preds_df) - 1
+    ref_df = np.power(2, ref_df) - 1
 
-def get_average_tpm(df):
-    # Convert Log2(TPM+1) to TPM [also works for CPM]
-    df_tpm = 2**df - 1
-
-    # Extract the sample names from the column names
-    sample_names = df_tpm.columns.str.split('_').str[0]
-
-    # Average together columns which have the same sample name
-    # This creates a DataFrame with one column per sample, where each value is the average TPM for that sample
-    df_avg = df_tpm.groupby(sample_names, axis=1).mean()
-
-    # Rename the columns by adding '_avg' to the sample names
-    df_avg.columns = df_avg.columns + '_avg'
-
-    # Convert back to Log2(TPM+1)
-    # This transforms the TPM values back to the original scale
-    df_log2tpm_plus_1 = np.log2(df_avg + 1)
-
-    # Return the transformed DataFrame
-    return df_log2tpm_plus_1
+    # For each sample in preds_df, subtract the background linearly
+    for sample in preds_df.columns:
+        tfx = tfx_dict[sample]
+        preds_df[sample] = (preds_df[sample] - (1 - tfx) * ref_df[sub_sample]) / tfx
 
 
-def get_fit_tpm(df_mets, df_pred):
-    # Convert Log2(TPM+1) to TPM [also works for CPM - see block comment below]
-    df_mets_tpm = 2**df_mets - 1
-    df_pred_tpm = 2**df_pred - 1
+    # Floor all values at 0
+    preds_df = preds_df.clip(lower=0)
+    df_tmm = preds_df * 1e6
 
-    # Find the common genes
-    common_genes = df_mets_tpm.index.intersection(df_pred_tpm.index)
-
-    # Filter the dataframes to include only common genes
-    df_mets_tpm = df_mets_tpm.loc[common_genes]
-    df_pred_tpm = df_pred_tpm.loc[common_genes]
-
-    # Initialize the result DataFrame and dict
-    result_df = pd.DataFrame(index=df_mets_tpm.index, columns=df_pred_tpm.columns)
-    splits_dict = {}
-
-    # Iterate over each sample in df_pred
-    for sample in df_pred_tpm.columns:
-        # Get the sample name prefix
-        prefix = sample.split('_')[0]
-
-        # Get the columns in df_mets that match the prefix
-        matching_cols = [col for col in df_mets_tpm.columns if col.startswith(prefix)]
-        if len(matching_cols) < 2:
-            continue
-
-        # Define the objective function to minimize
-        def objective(x):
-            combined = np.dot(df_mets_tpm[matching_cols], x)
-            if np.isnan(combined).any():
-                return 1e6
-            # Create a mask for non-NaN rows in df_pred_tpm[sample]
-            mask = ~np.isnan(df_pred_tpm[sample])
-            # Apply the mask to both df_pred_tpm[sample] and combined
-            return mean_absolute_error(df_pred_tpm[sample][mask], combined[mask])
-
-        # Define the constraints
-        cons = ({'type': 'eq', 'fun': lambda x:  np.sum(x) - 1})
-        # Define the bounds
-        bnds = [(0, 1) for _ in matching_cols]
-        # Initialize the weights
-        x0 = [1/len(matching_cols)] * len(matching_cols)
-        # Perform the optimization
-        res = minimize(objective, x0, method='SLSQP', bounds=bnds, constraints=cons)
-
-        # Store the result in the DataFrame and dict
-        result_df[sample] = np.dot(df_mets_tpm[matching_cols], list(res.x))
-        modified_keys = ["_".join(col.split("_")[1:]) for col in matching_cols]
-        splits_dict[sample] = dict(zip(modified_keys, list(res.x)))
-
-    # Drop any columns in result_df that did not receive values
-    result_df = result_df.dropna(axis=1, how='all')
-    """ Un-block if using TPM:
-    # Re-scale the result_df to sum to 1,000,000
-    result_df = result_df.div(result_df.sum()) * 1e6
-    """
-    # Convert the result back to Log2(TPM+1)
-    result_df = result_df.applymap(lambda x: np.log2(x + 1))
-    return result_df, splits_dict
-
-
-def rescale_tmm(df, ref_sample='../../RNA-Seq/LuCaP_173-1_raw_counts.pkl'):
-    """
-    This function re-scales a set of samples based on TMM (see edgeR) normalization,
-    using the same (default) reference sample used to scale model inputs. Input is expcted
-    in Log2(CPM +1), which is 
-
-    Parameters:
-    df (pandas.DataFrame): DataFrame containing gene expression data.
-    ref_sample (pandas.DataFrame): DataFrame containing the raw counts of the reference sample.
-
-    Returns:
-    pandas.DataFrame: DataFrame with the gene expression data in re-scaled Log2(CPM + 1) format.
-    """
-    ref_sample = pd.read_pickle(ref_sample)
-
-    # Transform the data back to "raw counts" by reversing the log2 transformation and subtracting 1
-    df.loc[:, df.columns != 'mRNA_size'] = 2**df.loc[:, df.columns != 'mRNA_size']
-    df.loc[:, df.columns != 'mRNA_size'] -= 1
-    # Align df and ref_sample
-    df, ref_sample = df.align(ref_sample, join='inner', axis=0)
-
-    # Drop rows where all values are 0 in both df and ref_sample
-    mask = (df != 0).any(axis=1) | (ref_sample != 0).any()
-    df_tmm_nz = df[mask]
+    ### perform TMM normalization
+    ref_sample = pd.read_pickle('../../RNA-Seq/LuCaP_173-1_raw_counts.pkl')
+    # Ensure df_tmm and ref_sample have the same index
+    df_tmm, ref_sample = df_tmm.align(ref_sample, join='inner', axis=0)
+    # Drop rows where all values are 0 in both df_tmm and ref_sample
+    mask = (df_tmm != 0).any(axis=1) | (ref_sample != 0).any()
+    df_tmm_nz = df_tmm[mask]
     ref_sample = ref_sample[mask]
 
     # Calculate the library sizes
@@ -200,12 +99,65 @@ def rescale_tmm(df, ref_sample='../../RNA-Seq/LuCaP_173-1_raw_counts.pkl'):
     # Combine initial library sizes, scaling factors, and final library sizes into a single DataFrame
     combined_df = pd.concat([lib_sizes_tmm, scaling_factors.T, lib_sizes_scaled.T], axis=1)
     combined_df.columns = ['Initial Library Sizes', 'Scaling Factors', 'Final Library Sizes (TMM-scaled)']
-    print(combined_df)
-
-    df_log2cpm = np.log2(df.div(lib_sizes_scaled) * 1e6 + 1)  # return log2(CPM + 1)
+    df_log2cpm = np.log2(df_tmm.div(lib_sizes_scaled) * 1e6 + 1)  # return log2(CPM + 1)
 
     return df_log2cpm
 
+
+########################## HELPER FUNCTIONS ##########################################################################################
+
+def format_pval(pval):
+    if pval < 1e-10:
+        return "< E-10"
+    elif pval < 0.001:
+        return f'= {pval:.2E}'
+    else:
+        return f'= {pval:.3f}'
+
+def load_file_as_list(filename):
+    with open(filename, 'r') as f:
+        return [line.strip() for line in f]
+
+def create_palette(file_path):
+    df = pd.read_csv(file_path, sep='\t', header=None)
+    subtype_to_color = dict(zip(df[0], df[1]))
+    return subtype_to_color
+    
+def merge_validation(fold_dfs):
+    # Reset the index of each DataFrame and concatenate them
+    df_concat = pd.concat(df.reset_index() for df in fold_dfs)
+    # Pivot the DataFrame so that genes are the index, samples are the columns, and predictions are the values
+    df_merged = df_concat.pivot(index='index', columns='sample', values='prediction')
+    return df_merged
+
+def sample_level_correction(df_preds, df_ref, ref_sample='LuCaP_173-1'):
+    # Ensure the reference sample exists in the reference DataFrame
+    if ref_sample not in df_ref.columns:
+        raise ValueError(f"Reference sample '{ref_sample}' not found in df_ref columns")
+    
+    # Extract the reference sample, dropping NaNs
+    ref_values = df_ref[ref_sample].dropna()
+    
+    # Function to apply quantile normalization without changing ranks
+    def quantile_normalize(sample, ref_values):
+        # Match the index with the reference values and drop NaNs
+        matched_values = sample.dropna().reindex(ref_values.index).dropna()
+        valid_ref_values = ref_values.loc[matched_values.index]
+        
+        # Sort both sample and reference values
+        sorted_sample = matched_values.sort_values()
+        sorted_ref_values = valid_ref_values.sort_values()
+        
+        # Map the sorted sample values to the sorted reference values
+        result = pd.Series(np.nan, index=sample.index)
+        result.loc[sorted_sample.index] = sorted_ref_values.values
+        
+        return result
+    
+    # Apply the quantile normalization to each column in df_preds
+    df_normalized = df_preds.apply(lambda col: quantile_normalize(col, ref_values), axis=0)
+    
+    return df_normalized
 
 ########################## PLOTTING FUNCTIONS ########################################################################################
 
@@ -246,12 +198,12 @@ def plot_samples(df, filename):
     # Add a legend, title, and labels to the plots
     ax_kde.legend(loc="upper left", bbox_to_anchor=(1, 1), prop={'size': 6})
     ax_kde.set_title('Kernel Density Plots')
-    ax_kde.set_xlabel('Log2(CPM +1)')
+    ax_kde.set_xlabel('log\u2082(CPM+1)')
     ax_kde.set_ylabel('Density')
 
     ax_hist.legend(loc="upper left", bbox_to_anchor=(1, 1), prop={'size': 6})
     ax_hist.set_title('Histograms')
-    ax_hist.set_xlabel('Log2(CPM +1)')
+    ax_hist.set_xlabel('log\u2082(CPM+1)')
     ax_hist.set_ylabel('Density')
 
     # Save the plots as PDF files
@@ -264,9 +216,9 @@ def plot_samples(df, filename):
     plt.close()
 
 
-def plot_vs_meta(df_x, df_y, name_x, name_y, name, tfx_dict=None, subtypes=None):
-    if tfx_dict is not None:
-        tfx_dict = {key[:6]: value for key, value in tfx_dict.items()}
+def plot_vs_meta(df_x, df_y, name_x, name_y, name, x_unit='RNA-Seq log\u2082(CPM+1)', y_unit='Predicted log\u2082(CPM+1)', tfx_dict=None, subtypes=None):
+    # if tfx_dict is not None:
+    #     tfx_dict = {key[:6]: value for key, value in tfx_dict.items()}
 
     x_values = df_x.loc[name_x]
     y_values = df_y.loc[name_y]
@@ -290,121 +242,54 @@ def plot_vs_meta(df_x, df_y, name_x, name_y, name, tfx_dict=None, subtypes=None)
     spearman_coef, ps_val = spearmanr(data['x'], data['y'])
     pearson_coef, pr_val = pearsonr(data['x'], data['y'])
 
+    mae = mean_absolute_error(data['x'], data['y'])
+    slope = np.polyfit(pd.to_numeric(data['x'], errors='coerce'), pd.to_numeric(data['y'], errors='coerce'), 1)[0]
+
     plt.figure(figsize=(6, 6))
 
+    x_range = data['x'].max() - data['x'].min()
+    y_range = data['y'].max() - data['y'].min()
     if name_x == name_y:
-        # plt.xlim([min(data['x'].min() - 0.5, data['y'].min() - 0.5), max(data['x'].max() + 0.5, data['y'].max() + 0.5)])
-        # plt.ylim([min(data['x'].min() - 0.5, data['y'].min() - 0.5), max(data['x'].max() + 0.5, data['y'].max() + 0.5)])
-        plt.xlim([min(data['x'].min() - 0.1, data['y'].min() - 0.1), max(data['x'].max() + 0.1, data['y'].max() + 0.1)])
-        plt.ylim([min(data['x'].min() - 0.1, data['y'].min() - 0.1), max(data['x'].max() + 0.1, data['y'].max() + 0.1)])
+        combined_min = min(data['x'].min(), data['y'].min()) - 0.05 * max(x_range, y_range)
+        combined_max = max(data['x'].max(), data['y'].max()) + 0.05 * max(x_range, y_range)
+        plt.xlim([combined_min, combined_max])
+        plt.ylim([combined_min, combined_max])
     else:
-        plt.xlim([data['x'].min(), data['x'].max()])
-        plt.ylim([data['y'].min(), data['y'].max()])
+        plt.xlim([data['x'].min() - 0.05 * x_range, data['x'].max() + 0.05 * x_range])
+        plt.ylim([data['y'].min() - 0.05 * y_range, data['y'].max() + 0.05 * y_range])
 
     sizes = [tfx_dict.get(sample, 1) * 200 if tfx_dict is not None else 200 for sample in data.index]
     if subtypes is not None:
-        colors = [subtype_to_color.get(subtype, 'black') for subtype in subtypes[data.index]]
+        common_index = data.index.intersection(subtypes.index)
+        filtered_data = data.loc[common_index]
+        colors = [subtype_to_color.get(subtype, 'black') for subtype in subtypes[filtered_data.index]]
+        # colors = [subtype_to_color.get(subtype, 'black') for subtype in subtypes[data.index]]
         plt.scatter(data['x'], data['y'], s=sizes, c=colors, alpha=0.8)
         seen_subtypes = subtypes[data.index].unique()
         handles = [plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=subtype_to_color[subtype], markersize=10) for subtype in seen_subtypes]
-        plt.legend(handles, seen_subtypes, title='Subtype', bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.legend(handles, seen_subtypes, title='Subtype', bbox_to_anchor=(1.02, 1), loc='upper left')
     else:
         plt.scatter(data['x'], data['y'], s=sizes, alpha=0.8)
 
+    if tfx_dict is not None:
+        # Create a legend for the point sizes using list comprehension
+        markers = [plt.scatter([], [], s=size*200, alpha=1.0, color='gray', label=str(size)) for size in [0.1, 0.3, 0.5, 1.0]]
+        plt.legend(handles=markers, title='TFX', bbox_to_anchor=(1.02, 1), loc='upper left')
+
     plt.plot(data['x'], func(data['x'], *popt), '--', color='gray', alpha=0.5)
-    if name_x == name_y:
-        # plt.xlabel(name_x + ' Log2(CPM+1) [RNA-seq]')
-        plt.xlabel(name_x + ' Score [RNA-seq]')
-    else:
-        plt.xlabel(name_x)
-    # plt.ylabel(name_y + ' Log2(CPM+1) [predicted]')
-    plt.ylabel(name_y + ' Score [predicted]')
+    plt.xlabel(name_x + ' ' + x_unit)
+    plt.ylabel(name_y + ' ' + y_unit)
     plt.title(name_x)
-    plt.text(0.05, 0.95, f'R^2 = {r2:.3f}\nSpearman = {spearman_coef:.3f}\nS. p-val = {ps_val:.3f}\nPearson = {pearson_coef:.3f}\nP. p-val = {pr_val:.3f}', transform=plt.gca().transAxes, verticalalignment='top')
+    if name_x == name_y:  # testing for direct linear relationship - use PEARSON
+        plt.text(0.05, 0.95, f'R² = {r2:.3f}\nMAE: {mae:.2f}\nSlope: {slope:.2f}\nPearson r = {pearson_coef:.3f}\nr p-val {format_pval(pr_val)}', transform=plt.gca().transAxes, verticalalignment='top')
+    else:  # testing for monotonic relationship - use SPEARMAN
+        plt.text(0.05, 0.95, f'R² = {r2:.3f}\nMAE: {mae:.2f}\nSlope: {slope:.2f}\nSpearman ρ = {spearman_coef:.3f}\nρ p-val {format_pval(ps_val)}', transform=plt.gca().transAxes, verticalalignment='top')
 
     plt.savefig(name + '.pdf', bbox_inches='tight')
     plt.close()
-
-
-def plot_vs_tfx(preds_df, tfx_dict, ref, tissue, name):
-    # convert boths dfs to CPM
-    # preds_df = 2**preds_df - 1
-    ref_cpm = 2**ref - 1
-
-    # Create a mask for each condition
-    mask_ref = (ref_cpm['Whole_Blood'] < 0.5) & (ref_cpm[tissue] > 10)
-    mask_whole_blood = (ref_cpm['Whole_Blood'] > 10) & (ref_cpm[tissue] < 0.5)
-
-    # Apply the masks to the index of the dataframe to get the gene lists
-    genes_ref = ref.index[mask_ref].tolist()
-    genes_whole_blood = ref.index[mask_whole_blood].tolist()
-
-    # print the number of genes in each list
-    print(f'Number of genes in {tissue} list: {len(genes_ref)}')
-    print(f'Number of genes in Whole_Blood list: {len(genes_whole_blood)}')
     
-    def func(x, a, b, c, d, e):
-        return a + b * x + c * np.power(x, 2) + d * np.power(x, 3) + e * np.power((1 - x), 2)
 
-    def inverted_func(x, a, b, c, d, e):
-        return a + b * x + c * np.power(x, 2) + d * np.power(x, 3) + e * np.power((1 - x), 2)
-
-    # Define the error function to minimize
-    def error(params, x, y, func):
-        return np.sum((y - func(x, *params))**2)
-
-    # Create the plots
-    for gene_set, color, name_suffix in [(genes_ref, 'blue', tissue), (genes_whole_blood, 'red', 'Whole_Blood')]:
-        
-        plt.figure(figsize=(10, 6))
-        # Check if each gene in gene_set is in the index of preds_df
-        valid_genes = [gene for gene in gene_set if gene in preds_df.index]
-        # Restrict to genes in the list also in preds_df
-        restricted_df = preds_df.loc[valid_genes].copy()
-        # If name_suffix is 'WholeBlood', divide every value by the corresponding value in the "Whole_Blood" column of blood_ref
-        restricted_df = restricted_df.div(ref[name_suffix].loc[valid_genes], axis=0)
-        # Pivot df into long form
-        long_df = restricted_df.reset_index().melt(id_vars='index', var_name='Sample', value_name='GeneValues')
-        long_df.columns = ['Gene', 'Sample', 'GeneValues']
-        # Remove any rows with NaNs
-        long_df = long_df.dropna()
-        # Add a TFX column based on the Sample column
-        long_df['TFX'] = long_df['Sample'].map(tfx_dict)
-        # Proceed with the analysis/fit/plotting
-        # plt.scatter(long_df['TFX'], long_df['GeneValues'], alpha=0.2)
-        plt.hexbin(long_df['TFX'], long_df['GeneValues'], gridsize=300, cmap='hot_r', bins='log')
-        plt.colorbar(label='log10(N)')
-        plt.ylim(0.0, 2.0)
-        plt.xlim(0.0, 1.0)
-
-        # Choose the function to use based on name_suffix
-        if name_suffix == 'WholeBlood':
-            fit_func = func
-        else:
-            fit_func = inverted_func
-
-        # Fit an exponential decay curve to the data and add it to the plot
-        # p0 = [0.8, 2]  # Initial guess for the parameters
-        # bounds = [(0, None), (0, None)]  # Bounds for the parameters
-        # res = minimize(error, p0, args=(long_df['TFX'], long_df['GeneValues'], fit_func), method='L-BFGS-B', bounds=bounds, options={'maxiter': 1000})
-        x0 = [0.5, 0.5, 0.5, 0.5, 0.5]
-        res = minimize(error, x0, args=(long_df['TFX'], long_df['GeneValues'], fit_func), method='L-BFGS-B', options={'maxiter': 10000})
-        popt = res.x        
-        tfx_values_sorted = np.sort(long_df['TFX'])
-        plt.plot(tfx_values_sorted, fit_func(tfx_values_sorted, *popt), color=color)
-
-        # Print the coefficients on the plot
-        plt.text(0.05, 0.95, f'Coefficients for {color} genes: {popt}', transform=plt.gca().transAxes)
-
-        plt.xlabel('TFX')
-        plt.title(f'Gene values vs TFX for {name_suffix} genes')
-
-        # Save the plot to a file
-        plt.savefig(name + name_suffix + '.pdf')
-        plt.close()
-
-
-def scatter_plot(df_ref, df_pred, genes_subset=None, name='scatter', goi_dict=None):
+def scatter_plot(df_ref, df_pred, genes_subset=None, subset_names=None, name='scatter', goi_dict=None):
     """
     Function to create a scatter plot, with point densities or different colors for gene groups.
 
@@ -448,21 +333,15 @@ def scatter_plot(df_ref, df_pred, genes_subset=None, name='scatter', goi_dict=No
     # Calculate metrics
     mae = mean_absolute_error(y_true_group, y_pred_group)
     r2 = r2_score(y_true_group, y_pred_group)
-    rho, p_val = spearmanr(y_true_group, y_pred_group)
+    pearson_coef, pr_val = pearsonr(y_true_group, y_pred_group)
     # Calculate best fit line
     slope = np.polyfit(y_true_group, y_pred_group, 1)[0]
 
     # Create scatter plot
     plt.figure(figsize=(8, 8))
     if genes_subset is None:
-        # # Calculate the 2D histogram of the data
-        # H, xedges, yedges = np.histogram2d(y_true_group, y_pred_group, bins=500)
-
-        # # Plot the histogram as a heatmap
-        # plt.imshow(H, extent=[xedges[0], xedges[-1], yedges[0], yedges[-1]], origin='lower', aspect='auto', cmap='hot', norm=LogNorm())
-        # plt.colorbar(label='Density')
         plt.hexbin(y_true_group, y_pred_group, gridsize=100, cmap='viridis_r', bins='log')
-        plt.colorbar(label='log10(N)')
+        plt.colorbar(label='$\log_{10}(N+1)$', shrink=0.8)
     else:
         colors = ['b', 'r', 'g', 'c', 'm', 'y', 'k']
         for i, gene_group in enumerate(genes_subset):
@@ -477,8 +356,14 @@ def scatter_plot(df_ref, df_pred, genes_subset=None, name='scatter', goi_dict=No
             y_true_subset = y_true_subset[not_nan_mask]
             y_pred_subset = y_pred_subset[not_nan_mask]
 
-            plt.scatter(y_true_subset, y_pred_subset, alpha=0.5, color=colors[i % len(colors)], edgecolors='none', label=f'subset_{i+1}')
-        plt.legend(title='Gene Set', bbox_to_anchor=(1.05, 1), loc='upper left')
+            # Check if subset_names is not None and use it to label the groups
+            if subset_names is not None:
+                label = f"{subset_names[i]} ({len(gene_group):,})"
+            else:
+                label = f'subset_{i+1}'
+
+            plt.scatter(y_true_subset, y_pred_subset, alpha=0.5, color=colors[i % len(colors)], edgecolors='none', label=label)
+        plt.legend(title='Gene Set', bbox_to_anchor=(1.02, 1), loc='upper left')
 
     if goi_dict is not None:
         for subtype, genes in goi_dict.items():
@@ -512,9 +397,9 @@ def scatter_plot(df_ref, df_pred, genes_subset=None, name='scatter', goi_dict=No
     # plt.plot(x, slope * x, 'k--', alpha=0.5)
     plt.plot(x, x, 'k--', alpha=0.5)
 
-    plt.xlabel('True Values in Log2(CPM + 1)')
-    plt.ylabel('Predicted Values in Log2(CPM + 1)')
-    plt.title(f'Valid genes: {len(y_true)} / Total genes: {len(mask)} / Total comparisons: {len(common_samples)}')
+    plt.xlabel('RNA-Seq log\u2082(CPM+1)')
+    plt.ylabel('Predicted log\u2082(CPM+1)')
+    plt.title(f'Valid genes: {len(y_true):,} / Total genes: {len(mask):,} / Total samples: {len(common_samples):,}')
 
     # Make the plot square and set the axis limits
     plt.axis('square')
@@ -522,10 +407,9 @@ def scatter_plot(df_ref, df_pred, genes_subset=None, name='scatter', goi_dict=No
     plt.ylim(0, max(y_true_group.max(), y_pred_group.max()) + 1)
 
     # Print metrics on the plot
-    plt.text(0.05, 0.95, f'MAE: {mae:.2f}\nR-squared: {r2:.2f}\nSpearman rho: {rho:.2f}\np-value: {p_val:.2f}\nSlope: {slope:.2f}', 
-            transform=plt.gca().transAxes, verticalalignment='top')
+    plt.text(0.05, 0.95, f'R² = {r2:.3f}\nMAE: {mae:.2f}\nSlope: {slope:.2f}\nPearson r = {pearson_coef:.3f}\nr p-val {format_pval(pr_val)}', transform=plt.gca().transAxes, verticalalignment='top')
 
-    plt.savefig(f"{name}.pdf")
+    plt.savefig(f"{name}.pdf", bbox_inches='tight')
     plt.close()
 
     return r2, slope, mae
@@ -620,7 +504,7 @@ def plot_heatmap(genes, df, tfx_dict, name='heatmap', breaks=None, tfx_sort=Fals
 
     # Create the colorbar
     cbar = plt.colorbar(ax2.collections[0], ax=ax2, extend='min')
-    cbar.set_label("GSVA Score") if gsea else cbar.set_label("Predicted Log2(CPM +1)")
+    cbar.set_label("GSVA Score") if gsea else cbar.set_label("Predicted log\u2082(CPM+1)")
 
     # Create the bar plot
     ax1 = fig.add_axes([ax2.get_position().x0, ax2.get_position().y0 + ax2.get_position().height + 0.01, ax2.get_position().width, 1.0/fig_height])  # Set the height of the bar plot to 1"
@@ -669,12 +553,13 @@ def plot_heatmap(genes, df, tfx_dict, name='heatmap', breaks=None, tfx_sort=Fals
     ax1.set_xticks([])  # Remove x-axis labels for the bar plot
 
     # Save the figure to a PDF
-    print('SAVING FIGURE: ', name)
     plt.savefig(f'{name}.pdf', bbox_inches='tight')
     plt.close()  # Close the figure to free up memory
 
 
-def plot_double_heatmap(genes, df_true, df_pred, name='double_heatmap', breaks=None, subtypes=None):
+def plot_double_heatmap(genes, df_true, df_pred, name='double_heatmap', breaks=None, subtypes=None, gsea=False):
+    df_true = df_true.apply(pd.to_numeric, errors='coerce')
+    df_pred = df_pred.apply(pd.to_numeric, errors='coerce')
     # check if genes is a tuple, if so, unpack it into one list but record count divide as breaks
     if isinstance(genes, tuple):
         breaks, total = [], 0
@@ -697,17 +582,21 @@ def plot_double_heatmap(genes, df_true, df_pred, name='double_heatmap', breaks=N
     if subtypes is not None:
         sorted_samples = subtypes.loc[common_samples].sort_values().index
     else:
-        # Calculate the sum for each sample in df_true for the first gene list
-        sums = df_true.loc[genes[:breaks[0]], common_samples].sum()
-        # Sort the samples by the calculated sums
-        sorted_samples = sums.sort_values().index
+        if not gsea:
+            # Calculate the sum for each sample in df_true for the first gene list
+            sums = df_true.loc[genes[:breaks[0]], common_samples].sum()
+            # Sort the samples by the calculated sums
+            sorted_samples = sums.sort_values().index
+        else:
+            # Sort the columns of df_true by the values in the first row
+            sorted_samples = df_true.T.sort_values(by=df_true.index[0]).T.columns
 
     # Filter and sort the DataFrames to include only the common genes and samples
     filtered_df_true = df_true.loc[genes, sorted_samples]
     filtered_df_pred = df_pred.loc[genes, sorted_samples]
 
     # Define the colors
-    colors = ["darkblue", "royalblue", "skyblue", "yellow", "orange", "red", "darkred"]
+    colors = ["royalblue", "white", "darkred"] if gsea else ["darkblue", "royalblue", "skyblue", "yellow", "orange", "red", "darkred"]
     # Create the colormap
     cmap = mcolors.LinearSegmentedColormap.from_list("", colors)
     cmap.set_bad(color='lightgray')  # Set the color for any NaN values
@@ -719,15 +608,24 @@ def plot_double_heatmap(genes, df_true, df_pred, name='double_heatmap', breaks=N
     fig_height = max(10, num_genes * 0.4)  # 0.4 inch per gene (double the height for two heatmaps)
 
     # Calculate the global minimum and maximum values across both dataframes
-    vmin = min(filtered_df_true.min().min(), filtered_df_pred.min().min())
-    vmax = max(filtered_df_true.max().max(), filtered_df_pred.max().max())
+    if gsea:
+        vmin = -1.0
+        vmax = 1.0
+    else:
+        vmin = min(filtered_df_true.min().min(), filtered_df_pred.min().min())
+        vmax = max(filtered_df_true.max().max(), filtered_df_pred.max().max())
 
     # Create the figure
     _, (ax1, ax2) = plt.subplots(2, 1, figsize=(fig_width, fig_height), sharex=True, gridspec_kw={'height_ratios': [1, 1], 'hspace': 0.02})
 
     # Create the heatmaps
-    sns.heatmap(filtered_df_true, cmap=cmap, linewidths=0.1, linecolor='black', ax=ax1, vmin=vmin, vmax=vmax, cbar=True)
-    sns.heatmap(filtered_df_pred, cmap=cmap, linewidths=0.1, linecolor='black', ax=ax2, vmin=vmin, vmax=vmax, cbar=True)
+    ax1 = sns.heatmap(filtered_df_true, cmap=cmap, linewidths=0.1, linecolor='black', ax=ax1, vmin=vmin, vmax=vmax, cbar=True)
+    ax2 = sns.heatmap(filtered_df_pred, cmap=cmap, linewidths=0.1, linecolor='black', ax=ax2, vmin=vmin, vmax=vmax, cbar=True)
+    for cbar in [ax1.collections[0].colorbar, ax2.collections[0].colorbar]:
+        if gsea:
+            cbar.set_label("GSVA Score")
+        else:
+            cbar.set_label('log\u2082(CPM+1)')
 
     # Draw horizontal lines at the specified row numbers
     if breaks is not None:
@@ -740,15 +638,15 @@ def plot_double_heatmap(genes, df_true, df_pred, name='double_heatmap', breaks=N
     ax2.set_xticklabels(sorted_samples, ha='center')
 
     # Set the y-labels
-    ax1.set_ylabel('Gene (True)')
-    ax2.set_ylabel('Gene (Pred)')
+    ax1.set_ylabel('True')
+    ax2.set_ylabel('Predicted')
 
     # Save the figure to a PDF
     plt.savefig(f'{name}.pdf', bbox_inches='tight')
     plt.close()
 
 
-def r2_mae_plot(df_true, df_pred, df_meta, genes, name):
+def r2_mae_plot(df_true, df_pred, df_meta, genes, name, mode='depth'):
     common_genes = df_true.index.intersection(df_pred.index)
     # If a gene subset is provided, intersect it with the common genes
     if genes is not None:
@@ -760,7 +658,7 @@ def r2_mae_plot(df_true, df_pred, df_meta, genes, name):
     # Compute R^2 and MAE for each sample
     r2_scores = []
     maes = []
-    depths = []
+    var = []
 
     for sample in df_true.columns:
         if sample in df_pred.columns:
@@ -774,151 +672,64 @@ def r2_mae_plot(df_true, df_pred, df_meta, genes, name):
             y_pred = y_pred.loc[common_genes].values
             # Check if y_true and y_pred are not empty
             if y_true.size > 2 and y_pred.size > 2:
-                r2_scores.append(r2_score(y_true, y_pred))
+                # r2_scores.append(r2_score(y_true, y_pred))
+                r2_scores.append(pearsonr(y_true, y_pred)[0])
                 maes.append(mean_absolute_error(y_true, y_pred))
-                depths.append(df_meta.loc['depth', sample])
+                if mode == 'depth':
+                    var.append(df_meta.loc['depth', sample])
+                else:
+                    var.append(df_meta[sample])
 
     # Create a DataFrame from the scores and depths
     scores_df = pd.DataFrame({
-        'depth': depths,
+        'var': var,
         'r2_scores': r2_scores,
         'maes': maes
     })
 
     # Sort the DataFrame by depth
-    scores_df = scores_df.sort_values(by='depth')
+    scores_df = scores_df.sort_values(by='var')
 
     # Create the plot
     fig, ax1 = plt.subplots()
 
     color = 'tab:red'
-    ax1.set_xlabel('Depth')
-    ax1.set_ylabel('R^2', color=color)
-    ax1.plot(scores_df['depth'], scores_df['r2_scores'], color=color)
+    if mode == 'depth':
+        ax1.set_xlabel('Depth')
+    else:
+        ax1.set_xlabel('TFX')
+    ax1.set_ylabel('R²', color=color)
+    ax1.plot(scores_df['var'], scores_df['r2_scores'], color=color)
     ax1.tick_params(axis='y', labelcolor=color)
+    ax1.set_ylim([0, 1])
 
     ax2 = ax1.twinx()
     color = 'tab:blue'
     ax2.set_ylabel('MAE', color=color)
-    ax2.plot(scores_df['depth'], scores_df['maes'], color=color)
+    ax2.plot(scores_df['var'], scores_df['maes'], color=color)
     ax2.tick_params(axis='y', labelcolor=color)
+
+    # Fit a logarithmic trendline to the R^2
+    if (scores_df['r2_scores'] >= 0).all():  # Check if all R^2 values are non-negative
+        try:
+            r2_fit = np.polyfit(np.log(scores_df['var']), scores_df['r2_scores'], 1, w=np.sqrt(scores_df['r2_scores']))
+            r2_trendline = r2_fit[1] + r2_fit[0] * np.log(scores_df['var'])
+            ax1.plot(scores_df['var'], r2_trendline, color='tab:red', linestyle='dotted')
+        except np.linalg.LinAlgError:
+            print("Could not fit logarithmic trendline to the R^2")
+    # else:
+    #     print("Skipped fitting due to negative R^2 values")
+
+    # Fit an exponential decay trendline to the MAE
+    try:
+        mae_fit = np.polyfit(scores_df['var'], np.log(scores_df['maes']), 1, w=np.sqrt(scores_df['maes']))
+        mae_trendline = np.exp(mae_fit[1]) * np.exp(mae_fit[0] * scores_df['var'])
+        ax2.plot(scores_df['var'], mae_trendline, color='tab:blue', linestyle='dotted')
+    except np.linalg.LinAlgError:
+        print("Could not fit exponential decay trendline to the MAE")
+
 
     fig.tight_layout()
     plt.savefig(f'{name}.pdf')
     plt.close()
-
-
-########################## UN-USED FUNCTIONS #########################################################################################
-    
-# def renormalize_tpm(df):
-#     """Renormalize each sample to have total TPM of 1,000,000. Input DF has samples as columns and genes as rows,
-#     and expects values to be in Log2(TPM + 1), so it will convert to TPM, renormalize, and convert back to Log2(TPM + 1).
-#     """
-#     # Convert log2(TPM+1) back to TPM
-#     df = 2**df - 1
-#     # Renormalize each sample to have total TPM of 1,000,000
-#     df = df.div(df.sum()) * 1e6
-#     # Convert to log2(TPM + 1)
-#     df = np.log2(df + 1)
-#     return df
-
-
-# def impute_rescale_tpm(df):
-#     # Convert from log2(tpm+1) to tpm
-#     df_tpm = 2**df - 1
-#     # Create a mask of the NaN values
-#     mask = df_tpm.isna()
-#     # Fill NaN values with the row (gene) mean
-#     df_tpm.fillna(df_tpm.mean(axis=1), inplace=True)
-#     # Rescale each column (sample) to sum to 1e6
-#     df_tpm = df_tpm.div(df_tpm.sum(axis=0), axis=1) * 1e6
-#     # Convert back to log2(tpm +1)
-#     df_log2 = np.log2(df_tpm + 1)
-#     # Re-apply the NaN values from the mask
-#     df_log2[mask] = np.nan
-#     return df_log2
-
-
-# def perform_reference_deconvolution(all_predictions_df, tfx_dict, background_df, tissues=None):
-#     print('Performing reference deconvolution...')
-#     if tissues is not None:
-#         background_df = background_df[tissues]
-
-#     # Convert values from Log2(TPM +1) to raw TPM
-#     all_predictions_df = 2**all_predictions_df - 1
-
-#     # Find common genes between predictions and background
-#     common_genes = all_predictions_df.index.intersection(background_df.index)
-#     all_predictions_df = all_predictions_df.loc[common_genes]
-#     background_df = background_df.loc[common_genes]
-
-#     # Initialize output DataFrames
-#     dc_tumor = pd.DataFrame(index=all_predictions_df.index, columns=all_predictions_df.columns)
-#     dc_background = all_predictions_df.copy()
-#     deconvolution_weights = pd.DataFrame(index=all_predictions_df.columns, columns=background_df.columns)
-
-#     # Perform deconvolution for each sample
-#     for sample in all_predictions_df.columns:
-#         print(f'Processing sample {sample}...')
-#         tfx = tfx_dict[sample]
-#         # Filter out NaN values from pred_values
-#         pred_values = all_predictions_df[sample].dropna()
-#         # Use the same indices to subset background_df
-#         background_df_sample = background_df.reindex(pred_values.index)
-#         # Find the total TPM of the sample, excluding NaN values, save it, and re-scale to sum to 1,000,000
-#         total_tpm = pred_values.sum()
-#         pred_values = pred_values / total_tpm * 1e6
-#         # Now do the same for each tissue in the background_df_sample
-#         background_df_sample = background_df_sample.apply(lambda x: x / x.sum() * 1e6, axis=0)
-
-#         # Make a preliminary guess for the tumor profile: tfx * pred_values
-#         preliminary_tumor_profile = pred_values
-
-#         # Objective function for minimization
-#         def objective(weights):
-#             reconstruction = tfx * preliminary_tumor_profile + (1 - tfx) * np.dot(weights, background_df_sample.values.T)
-#             return np.sum((pred_values - reconstruction)**2)
-
-#         # Constraints: weights must sum to <= 1 and be non-negative
-#         constraints = ({'type': 'eq', 'fun': lambda x:  1 - np.sum(x)})
-#         bounds = [(0, (1 - tfx)) for _ in range(len(background_df_sample.columns))]
-
-#         # Perform minimization
-#         # x0 = np.ones(len(background_df_sample.columns)) / len(background_df_sample.columns)
-#         x0 = [0.01, 0.01, 0.01, 0.07, 0.9]
-#         result = minimize(objective, x0, bounds=bounds, constraints=constraints)
-
-#         # Store the weights
-#         deconvolution_weights.loc[sample] = result.x
-
-#         # Save the index before converting to numpy array
-#         pred_values_index = pred_values.index
-
-#         # Reconstruct the tumor and background profiles
-#         background_profile = (1 - tfx) * np.dot(result.x, background_df_sample.values.T)
-#         tumor_profile = pred_values - background_profile
-#         tumor_profile = np.clip(tumor_profile, 0, None)
-
-#         # Convert numpy arrays to pandas Series
-#         background_profile = pd.Series(background_profile, index=pred_values_index)
-#         tumor_profile = pd.Series(tumor_profile, index=pred_values_index)
-
-#         # Re-normalize the profiles to sum to 1,000,000
-#         tumor_profile = tumor_profile / tumor_profile.sum() * 1e6
-#         background_profile = background_profile / background_profile.sum() * 1e6
-
-#         # Store the profiles in the output DataFrames
-#         dc_tumor[sample] = tumor_profile.reindex(dc_tumor.index)
-#         dc_background[sample] = background_profile.reindex(dc_background.index)
-
-
-#     # Convert values from raw TPM to Log2(TPM +1)
-#     dc_tumor = np.log2(dc_tumor + 1)
-#     dc_background = np.log2(dc_background + 1)
-#     print('Done!')
-
-#     return dc_tumor, dc_background, deconvolution_weights
-
-
-
 

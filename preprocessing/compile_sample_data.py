@@ -9,21 +9,21 @@ This script contains functions for compiling sample data from raw Triton and ref
 
 # Standard library imports
 import os
+import glob
 
 # Third party imports
 import h5py
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
 
 
-def get_samples(modal):
+def get_samples(modal, dataset):
     """
     Retrieves sample names based on the modality of the data.
 
     Args:
         modal (tuple): A tuple where the first element is the modality of the data 
-                       ("image", "panel", "scalars", "label", "ref") and the second element 
+                       ("image", "panel", "scalars", "label", "ref", "tfx") and the second element 
                        is the path to the directory containing the files.
 
     Returns:
@@ -32,17 +32,23 @@ def get_samples(modal):
     """
     modality, path = modal[0], modal[-1]
 
-    if modality in ["image", "panel"]:
-        return _get_samples_from_files(path)
+    if modality == "image":
+        samples = _get_samples_from_files(path)
     elif modality == "scalars":
-        return _get_samples_from_scalars(path)
+        samples = _get_samples_from_scalars(path)
     elif modality == "label":
-        return _get_samples_from_label(path)
+        samples = _get_samples_from_label(path)
+    elif modality == "tfx":
+        samples = _get_samples_from_tfx(path)
     elif modality == "ref":
         return []
     else:
         print(f'Modality "{modality}" not recognized. Skipping.')
         return []
+    if 'TAN' in dataset:
+        if modality not in ['ref', 'tfx', 'label']:
+            samples = [f'{dataset}_{sample[:6]}' for sample in samples]
+    return samples
 
 
 def _get_samples_from_files(path):
@@ -64,7 +70,13 @@ def _get_samples_from_scalars(path):
 def _get_samples_from_label(path):
     """Helper function to get samples from a label file."""
     df = pd.read_csv(path, sep='\t', nrows=1)
-    return df.dropna(axis=1).columns.unique().tolist()
+    return df.columns.unique().tolist()
+
+
+def _get_samples_from_tfx(path):
+    """Helper function to get samples from a tfx file."""
+    df = pd.read_csv(path, sep='\t')
+    return df['sample'].unique().tolist()
 
 
 def process_sample(sample, regions_dict, ref_path, out_dir, overwrite):
@@ -86,11 +98,31 @@ def process_sample(sample, regions_dict, ref_path, out_dir, overwrite):
         return
 
     print(f'Processing sample {sample} . . .')
+    # Check if tfx is one of the modals; if so, record it, if not, assign all sites to 1.0 (assumed PDX)
+    if 'TFX_label' in regions_dict:
+        tfx_df = pd.read_csv(regions_dict['TFX_label'][1], sep='\t', index_col='sample')
+        tfx = tfx_df.at[sample, 'tfx']
+    else:
+        tfx = 1.0
+
     sample_dict = {}
     for label, modal in regions_dict.items():
         modality, path = modal[0], modal[1]
+        if modality == 'tfx':
+            continue
         if modality == 'image':
-            sample_dict[label] = _process_image(f'{path}{sample}_TritonProfiles.npz')
+            if 'TAN' in sample:
+                tan_part = sample.split('TAN_')[1]
+                matching_files = glob.glob(f'{path}*{tan_part}*_TritonProfiles.npz')
+                if len(matching_files) > 1:
+                    raise ValueError(f"More than one file found for sample {sample}")
+                elif not matching_files:
+                    raise ValueError(f"No file found for sample {sample}")
+                else:
+                    file_path = matching_files[0]
+            else:
+                file_path = f'{path}{sample}_TritonProfiles.npz'
+            sample_dict[label] = _process_image(file_path)
         elif modality == 'scalars':
             sample_dict[label] = _process_scalar(f'{path}TritonCompositeFM.tsv', sample)
         elif modality == 'label':
@@ -104,14 +136,16 @@ def process_sample(sample, regions_dict, ref_path, out_dir, overwrite):
     gene_dict = {}
 
     # Iterate over the original dictionary
-    print('Inverting sample dictionary . . . (to gene outer, modal inner))')
     for outer_key, inner_dict in sample_dict.items():
         for inner_key, value in inner_dict.items():
             if inner_key not in gene_dict:
                 gene_dict[inner_key] = {}
             gene_dict[inner_key][outer_key] = value
+            # Add the "TFX_label" key with the value of tfx for every gene
+            gene_dict[inner_key]["TFX_label"] = float(tfx)
 
     _save_dict_to_hdf5(gene_dict, out_dir + sample + '_CompiledProcessedData.h5')
+
 
 def _process_image(filepath):
     """
@@ -125,8 +159,6 @@ def _process_image(filepath):
     Returns:
         dict: A dictionary where each key is a 'site' and the value is a 2D numpy array of the signals.
     """
-    print(f'Processing image file {filepath} . . .')
-
     # Load the NPZ file
     input_object = np.load(filepath, allow_pickle=True)
 
@@ -146,7 +178,7 @@ def _process_image(filepath):
 
         out_dict[key] = signals
 
-    print(f'Found {counter} non-functional input matrices.')
+    print(f'Found {counter} non-functional input matrices when processing images for {filepath}.')
     return out_dict
 
 def _scale_signal(input_array):
@@ -189,10 +221,13 @@ def _process_scalar(filepath, sample, drop_list=None):
         drop_list = ["central-diversity", "central-depth", "central-loc", 
                      "plus-minus-ratio", "minus-one-pos", "plus-one-pos"]
 
-    print(f'Processing scalar file {filepath} . . .')
-
     df = pd.read_csv(filepath, sep='\t')
-    df = df[df['sample'] == sample].drop(columns=['sample'])
+    if 'TAN' in sample:
+        tan_part = sample.split('TAN_')[1]
+        df = df[~df['sample'].str.contains('ULP')]
+        df = df[df['sample'].str.contains(tan_part)].drop(columns=['sample'])
+    else:
+        df = df[df['sample'] == sample].drop(columns=['sample'])
 
     # Pivot the DataFrame
     df = df.pivot(index='site', columns='feature', values='value')
@@ -203,14 +238,23 @@ def _process_scalar(filepath, sample, drop_list=None):
     # Sort the remaining columns
     df = df.sort_index(axis=1)
 
-    # Apply StandardScaler to each feature across all sites
-    scaler = StandardScaler()
+    # Standard scale each feature across all sites
     columns_to_scale = df.columns.difference(['mean-depth'])
-    df[columns_to_scale] = scaler.fit_transform(df[columns_to_scale])
+    for col in columns_to_scale:
+        if df[col].isna().all():
+            # print(f"All values in {col} are NaN. Setting column to NaN.")
+            df[col] = np.nan
+        else:
+            col_std = np.nanstd(df[col])
+            if col_std != 0:
+                col_mean = np.nanmean(df[col])
+                df[col] = (df[col] - col_mean) / col_std
+            else:
+                print(f"Standard deviation of {col} is 0. Setting column to NaN.")
+                df[col] = np.nan
 
     # Convert the DataFrame to a dictionary where each key is a 'site' and the value is a 1D numpy array of the values
     site_dict = {site: np.array(df.loc[site].values) for site in df.index}
-
     return site_dict
 
 
@@ -225,8 +269,6 @@ def _process_label(filepath, sample):
     Returns:
         dict: A dictionary where each key is an index (row name) and the value comes from the sample column.
     """
-    print(f'Processing label file {filepath} . . .')
-
     df = pd.read_csv(filepath, sep='\t', index_col=0)
 
     # Restrict to the column that is sample
@@ -250,8 +292,6 @@ def _process_ref(filepath, cols=['NumExons', 'transcript_length', 'mRNA_size']):
     Returns:
         dict: A dictionary where each key is a 'name' and the value is a 1D numpy array of the values.
     """
-    print(f'Processing reference file {filepath} . . .')
-
     # Load the TSV file
     df = pd.read_csv(filepath, sep='\t')
 
@@ -259,13 +299,14 @@ def _process_ref(filepath, cols=['NumExons', 'transcript_length', 'mRNA_size']):
     df[cols] = df[cols].apply(lambda x: pd.to_numeric(x, errors='coerce'))
 
     # Drop rows with NaNs in cols
-    df = df.dropna(subset=cols)
+    # df = df.dropna(subset=cols)
 
-    # Apply StandardScaler to the columns indicated by cols
-    scaler = StandardScaler()
-    df[cols] = scaler.fit_transform(df[cols])
+    # Standard scale the columns indicated by cols
+    col_std = df[cols].std()
+    col_mean = df[cols].mean()
+    df[cols] = (df[cols] - col_mean) / col_std
 
-    # Write a dictionary where the keys come from the column 'symbol' and the values are 1D numpy arrays based on the values for that row/dymbol in cols
+    # Write a dictionary where the keys come from the column 'symbol' and the values are 1D numpy arrays based on the values for that row/symbol in cols
     ref_dict = {row['symbol']: np.array(row[cols].values, dtype=float) for _, row in df.iterrows()}
 
     return ref_dict
