@@ -59,10 +59,15 @@ Proteus was designed to run on a () GPU as a command line tool . . .
 ### Contained Scripts:
 
 **Proteus.py** | primary script which calls those in preprocessing/ and models/ to train and run Proteus
-**preprocessing/compile_sample_data.py** | ...
+
+**preprocessing/compile_sample_data.py** | ... \
 **preprocessing/generate_tf_splits.py** | ...
-**models/models.py** | ...
+
+**models/models.py** | ... \
 **models/model_utils.py** | ...
+
+**interpretation/interpretation.py** | wrapper script to perform kernel visualization, SHAP, and gradient ascent analyses \
+**interpretation/interpretation_utils.py** | utility script holding all the functions for interpretability analyses
 N.B. analysis/ will be re-structured, we may not include all scripts . . .
 
 #### compile_sample_data.py
@@ -72,6 +77,9 @@ Summary of this specific script, and so on.
 ### Methodology
 
 We'll want to fill this out, include a diagram of the model architecture, and highlight some model interp. (with images)
+![image](https://github.com/GavinHaLab/Proteus/assets/147434235/990c4489-9675-4f00-b36b-f8e0f54c25df)
+
+
 
 ### TO RUN
 
