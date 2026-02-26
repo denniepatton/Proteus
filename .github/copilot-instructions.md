@@ -27,7 +27,7 @@
   - Zarr compilation + validation: `proteus_utils/compile_sample_data.py` (`process_dataset()`, `create_fold_index()`, `verify_zarr_store()`)
   - Datasets/loaders: `proteus_utils/proteus_utils.py` (`ProteusGeneDataset`, `build_train_val_loaders()`, `create_inference_loader()`)
   - Model: `models/models.py` (`BioDVN`, `BioDVNConfig`)
-  - Training loop: `trainer.py` (`Trainer`, AMP, cosine decay, checkpointing)
+  - Training loop: `proteus_utils/trainer.py` (`Trainer`, AMP, cosine decay, checkpointing)
 
 ## HPC execution constraint
 - Assume the user is running on an HPC node.

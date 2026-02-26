@@ -57,7 +57,7 @@ torch.backends.cudnn.benchmark = True
 
 # Local imports
 from models import BioDVN, BioDVNConfig, get_model_instance
-from trainer import TrainingConfig, Trainer
+from proteus_utils.trainer import TrainingConfig, Trainer
 from proteus_utils import (
     get_samples, get_zarr_output_dir, process_dataset,
     process_sample_to_zarr,

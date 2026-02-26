@@ -45,6 +45,7 @@ from .proteus_utils import (
 )
 
 from .debug_utils import print_input_diagnostics
+from .trainer import TrainingConfig, Trainer
 
 __all__ = [
     # logging
@@ -66,4 +67,6 @@ __all__ = [
     'get_fold_indices', 'build_train_val_loaders', 'build_loaders_from_splits', 'extract_gene_depths',
     # debug
     'print_input_diagnostics',
+    # trainer
+    'TrainingConfig', 'Trainer',
 ]

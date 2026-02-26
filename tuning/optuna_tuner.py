@@ -41,7 +41,7 @@ from config.experiment_spec import (
     load_experiment_spec,
 )
 from models import BioDVNConfig
-from trainer import TrainingConfig
+from proteus_utils.trainer import TrainingConfig
 
 
 # =============================================================================
