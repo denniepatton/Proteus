@@ -1,0 +1,15 @@
+# CRPC-WCDT.yaml
+# Castration-Resistant Prostate Cancer - West Coast Dream Team Tumor patient dataset
+
+name: CRPC-WCDT
+
+# Data source paths (relative to paths.base.raw_data_dir)
+sources:
+  triton_tss: "WCDT_data/TritonV2_TSS/results/"
+  triton_gb: "WCDT_data/TritonV2_GB/results/"
+  tfx: "CRPC-WCDT_TFX_Subtype.tsv"
+
+# Label files (relative to paths.base.labels_dir)
+labels:
+  tumor_exp: "CRPC-WCDT_Log2CPMplus1.tsv"
+  background_exp: null

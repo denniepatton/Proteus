@@ -1,0 +1,15 @@
+# PHT.yaml
+# "PDX - HD - Training" dataset of PDX+HD mixtures for use in model training
+
+name: PHT
+
+# Data source paths (relative to paths.base.raw_data_dir)
+sources:
+  triton_tss: "Admix_data/PHT/TritonV2_TSS/results/"
+  triton_gb: "Admix_data/PHT/TritonV2_GB/results/"
+  tfx: "PHT_TFX_Subtype.tsv"
+
+# Label files (relative to paths.base.labels_dir)
+labels:
+  tumor_exp: "PHT-tumor_Log2CPMplus1.tsv"
+  background_exp: "PHT-background_Log2CPMplus1.tsv"

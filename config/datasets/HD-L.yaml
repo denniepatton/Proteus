@@ -1,0 +1,15 @@
+# HD-L.yaml
+# Healthy Donor (labeled with RNA-Seq) data
+
+name: HD-L
+
+# Data source paths (relative to paths.base.raw_data_dir)
+sources:
+  triton_tss: "HD_data/TritonV2_TSS/results/"
+  triton_gb: "HD_data/TritonV2_GB/results/"
+  tfx: "HD-L_TFX_Subtype.tsv"
+
+# Label files (relative to paths.base.labels_dir)
+labels:
+  tumor_exp: null
+  background_exp: "HD-L_Log2CPMplus1.tsv"

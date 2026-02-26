@@ -1,6 +1,6 @@
 """
 plot_utils.py
-v1.0.2, 1/9/2024
+v1.0.3, 9/04/2024
 Author: Robert D Patton, rpatton@fredhutch.org
 Ha Lab, Fred Hutchinson Cancer Research Center
 
@@ -15,7 +15,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from scipy.stats import pearsonr, gaussian_kde
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, roc_curve, auc
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from tensorflow.keras.utils import plot_model
 
 
@@ -53,9 +53,12 @@ def plot_model_loss(history, output_dir, filename="model"):
     # Create a new figure
     plt.figure()
 
-    # Plot the training and validation loss
-    plt.plot(history.history['loss'])
-    plt.plot(history.history['val_loss'])
+    # Plot the training loss
+    plt.plot(history.history['loss'], label='Train')
+
+    # Plot the validation loss if available
+    if 'val_loss' in history.history:
+        plt.plot(history.history['val_loss'], label='Validation')
 
     # Set the title and labels
     plt.title('Model Loss')
@@ -63,7 +66,7 @@ def plot_model_loss(history, output_dir, filename="model"):
     plt.xlabel('Epoch')
 
     # Add a legend
-    plt.legend(['Train', 'Validation'], loc='upper left')
+    plt.legend(loc='upper left')
 
     # Save the figure
     plt.savefig(os.path.join(output_dir, f"{filename}_loss.pdf"))
@@ -117,9 +120,13 @@ def scatter_plot(y_true, y_pred, output_dir, filename, title, annotations=None):
     Returns:
     None
     """
+    # Drop paired points where either value is NaN
+    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
+
     # Calculate metrics
     mse = mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)
     mae = mean_absolute_error(y_true, y_pred)
     r2 = r2_score(y_true, y_pred)
     pcc, _ = pearsonr(y_true, y_pred)
@@ -138,13 +145,13 @@ def scatter_plot(y_true, y_pred, output_dir, filename, title, annotations=None):
         for i, txt in enumerate(annotations):
             plt.annotate(txt, (y_true[i], y_pred[i]), fontsize='small')
 
-    plt.xlabel('True Values in Log2(CPM + 1)')
-    plt.ylabel('Predicted Values in Log2(CPM + 1)')
+    plt.xlabel('RNA-Seq log\u2082(CPM+1)')
+    plt.ylabel('Predicted log\u2082(CPM+1)')
     plt.title(title)
     plt.colorbar(label='Density')
 
     # Print metrics on the plot
-    plt.text(0.05, 0.95, f'MSE: {mse:.2f}\nRMSE: {rmse:.2f}\nMAE: {mae:.2f}\nR-squared: {r2:.2f}\nPCC: {pcc:.2f}', 
+    plt.text(0.05, 0.95, f'MSE = {mse:.2f}\nMAE = {mae:.2f}\nR² = {r2:.2f}\nPearson r = {pcc:.2f}', 
              transform=plt.gca().transAxes, verticalalignment='top')
 
     plt.savefig(os.path.join(output_dir, f"{filename}.pdf"))
@@ -168,19 +175,20 @@ def subset_scatter_plot(data, output_dir, filename, subsets):
     scatter_plot(data['true_label'], data['prediction'], output_dir, filename, "All genes")
 
     # Iterate over each subset
-    for subset_name, genes in subsets.items():
-        # Subset the data
-        subset_data = data.loc[data.index.intersection(genes)]
+    if subsets is not None:
+        for subset_name, genes in subsets.items():
+            # Subset the data
+            subset_data = data.loc[data.index.intersection(genes)]
 
-        # Separate true and predicted values
-        y_true = subset_data['true_label']
-        y_pred = subset_data['prediction']
+            # Separate true and predicted values
+            y_true = subset_data['true_label']
+            y_pred = subset_data['prediction']
 
-        # Calculate the number of present genes in the subset
-        count_name = f"{subset_name} ({len(subset_data)}/{len(genes)})"
+            # Calculate the number of present genes in the subset
+            count_name = f"{subset_name} ({len(subset_data)}/{len(genes)})"
 
-        # Create a scatter plot for the subset
-        scatter_plot(y_true, y_pred, output_dir, f"{filename}_{subset_name}", count_name, subset_data.index if len(subset_data) < 30 else None)
+            # Create a scatter plot for the subset
+            scatter_plot(y_true, y_pred, output_dir, f"{filename}_{subset_name}", count_name, subset_data.index if len(subset_data) < 30 else None)
 
 
 def residuals_plot(y_true, y_pred, output_dir, filename, title, annotations=None, var=None):
@@ -199,13 +207,17 @@ def residuals_plot(y_true, y_pred, output_dir, filename, title, annotations=None
     Returns:
     None
     """
+    # Drop paired points where either value is NaN
+    mask = ~np.isnan(y_true) & ~np.isnan(y_pred)
+    y_true = y_true[mask]
+    y_pred = y_pred[mask]
+    if var is not None:
+        var = var[mask]
+    if annotations is not None:
+        annotations = [annotations[i] for i in range(len(annotations)) if mask[i]]
+
     # Calculate residuals
     residuals = y_true - y_pred
-
-    # Calculate metrics
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)
-    r2 = r2_score(y_true, y_pred)
 
     # Create residuals plot
     plt.figure(figsize=(8, 6))
@@ -221,21 +233,15 @@ def residuals_plot(y_true, y_pred, output_dir, filename, title, annotations=None
         for i, txt in enumerate(annotations):
             plt.annotate(txt, (y_pred[i] if var is None else var[i], residuals[i]), fontsize='small')
 
-    plt.xlabel('Predicted Values in Log2(CPM + 1)' if var is None else 'Standard Scaled ' + var.name)
+    plt.xlabel('RNA-Seq log\u2082(CPM+1)' if var is None else 'Standard Scaled ' + var.name)
     plt.ylabel('Residuals')
     plt.title(title)
     plt.colorbar(label='Density')
-
-    # Print metrics on the plot
-    if var is None:
-        plt.text(0.05, 0.95, f'MSE: {mse:.2f}\nRMSE: {rmse:.2f}\nR-squared: {r2:.2f}', 
-                transform=plt.gca().transAxes, verticalalignment='top')
-
     plt.savefig(os.path.join(output_dir, f"{filename}.pdf"))
     plt.close()
 
 
-def subset_residuals_plot(data, output_dir, filename, subsets, var=None):
+def subset_residuals_plot(data, output_dir, filename, subsets=None, var=None):
     """
     Function to create residuals plots of true vs predicted values for multiple subsets of data.
 
@@ -252,17 +258,19 @@ def subset_residuals_plot(data, output_dir, filename, subsets, var=None):
     # Create a residuals plot for all genes
     residuals_plot(data['true_label'], data['prediction'], output_dir, filename, "All genes", var=data[var] if var else None)
 
+
     # Iterate over each subset
-    for subset_name, genes in subsets.items():
-        # Subset the data
-        subset_data = data.loc[data.index.intersection(genes)]
+    if subsets is not None:
+        for subset_name, genes in subsets.items():
+            # Subset the data
+            subset_data = data.loc[data.index.intersection(genes)]
 
-        # Separate true and predicted values
-        y_true = subset_data['true_label']
-        y_pred = subset_data['prediction']
+            # Separate true and predicted values
+            y_true = subset_data['true_label']
+            y_pred = subset_data['prediction']
 
-        # Calculate the number of present genes in the subset
-        count_name = f"{subset_name} ({len(subset_data)}/{len(genes)})"
+            # Calculate the number of present genes in the subset
+            count_name = f"{subset_name} ({len(subset_data)}/{len(genes)})"
 
-        # Create a residuals plot for the subset
-        residuals_plot(y_true, y_pred, output_dir, f"{filename}_{subset_name}", count_name, subset_data.index if len(subset_data) < 30 else None, var=subset_data[var] if var else None)
+            # Create a residuals plot for the subset
+            residuals_plot(y_true, y_pred, output_dir, f"{filename}_{subset_name}", count_name, subset_data.index if len(subset_data) < 30 else None, var=subset_data[var] if var else None)

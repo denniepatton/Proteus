@@ -1,0 +1,23 @@
+# Proteus — Python 3.10, PyTorch 2.5+ (CUDA 12.1)
+#
+# PyTorch + CUDA are installed via conda/micromamba (not pip):
+#   micromamba create -n proteus -c pytorch -c nvidia \
+#       python=3.10 pytorch torchvision torchaudio pytorch-cuda=12.1
+#
+# Then install remaining dependencies with pip:
+#   pip install -r requirements.txt
+#
+# Full environment snapshot: see proteus.env
+
+zarr>=2.18
+numcodecs>=0.12
+numpy>=2.0
+pandas>=2.0
+h5py>=3.10
+optuna>=3.6
+matplotlib>=3.8
+seaborn>=0.13
+scipy>=1.11
+scikit-learn>=1.3
+pyyaml>=6.0
+rich>=13.0

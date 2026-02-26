@@ -1,856 +1,1828 @@
-"""
-Proteus.py
-v1.6.1, 5/9/2024
-Author: Robert D Patton, rpatton@fredhutch.org
-with help from: Alex Netzley
-Ha Lab, Fred Hutchinson Cancer Research Center
+"""Proteus.py
+
+PyTorch implementation of the Proteus pipeline for predicting gene expression from cfDNA.
+
+Primary model inputs (per gene):
+    - TSS_signals: (n_genes, 2000, 8) float32
+    - TSS_nucleotides: (n_genes, 2000, 4) uint8/float32 one-hot nucleotides
+    - TSS_features: (n_genes, 17) float32
+    - GB_features: (n_genes, 11) float32
+    - ref_scalars: (n_genes, 3) float32
+
+Usage:
+    # Generate Zarr data from raw Triton files
+    python Proteus.py --process_data --use_set PC-PDX
+    
+    # Train with cross-validation (requires experiment YAML with training_set TSV)
+    python Proteus.py --run_mode train --experiment config/experiments/biodvn_train.yaml
+    
+    # Train specific fold (for HPC parallelization)
+    python Proteus.py --run_mode train --experiment config/experiments/biodvn_train.yaml --test_fold 1
+    
+    # Full training (all data, no CV holdout)
+    python Proteus.py --run_mode full-train --experiment config/experiments/biodvn_train.yaml
+    
+    # Optuna HP tuning
+    python Proteus.py --run_mode tune --experiment config/experiments/biodvn_tune.yaml --n_trials 50
+    
+    # Run inference on holdout samples
+    python Proteus.py --run_mode run --use_set Crompton
 """
 
 # Standard library imports
-import re
 import os
+import sys
 import csv
+import json
+import random
 import argparse
+from pathlib import Path
 from multiprocessing import Pool, cpu_count
+from dataclasses import asdict, replace
+from typing import Optional, Dict, List, Any, Callable
 
 # Third party imports
 import pandas as pd
-import tensorflow as tf
-from keras.callbacks import EarlyStopping
-from keras_tuner.tuners import RandomSearch, BayesianOptimization
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
 
-# Local application imports
-from analysis import plot_utils
-from models.models import *
-from models.model_utils import *
-from preprocessing.generate_tf_splits import *
-from preprocessing.compile_sample_data import *
+# cuDNN benchmark mode: let the auto-tuner profile convolution algorithms
+# for each tensor shape once, then reuse the fastest.  Combined with
+# _seed_everything() (which deterministically seeds weight init, dropout,
+# and data ordering), this gives practically reproducible training while
+# keeping full GPU throughput.
+torch.backends.cudnn.benchmark = True
+
+# Local imports
+from models import BioDVN, BioDVNConfig, get_model_instance
+from trainer import TrainingConfig, Trainer
+from proteus_utils import (
+    get_samples, get_zarr_output_dir, process_dataset,
+    process_sample_to_zarr,
+    create_data_loader, create_inference_loader,
+    get_fold_indices, build_train_val_loaders, build_loaders_from_splits,
+    DEFAULT_ZARR_BASE
+)
+from config.config_loader import ConfigLoader
+
+# Loader sizing invariants
+FIXED_GENES_PER_BATCH = 32
+FIXED_CHUNK_SIZE = 256  # Must match Zarr store chunking in compile_sample_data.py
+
+# Resolve project-relative paths robustly (do not depend on current working directory)
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-def generate_data(dataset, regions_dict, ref_path, overwrite=False):
+def _seed_everything(seed: int) -> None:
+    """Seed all RNGs for reproducible model init, dropout, and training.
+
+    Must be called before model construction so that
+    ``nn.init.xavier_uniform_`` (and any other weight-init that draws from
+    torch's global RNG) is deterministic.  Also seeds Python's ``random``
+    and NumPy for any stochastic data-loading helpers that run in the main
+    process.
     """
-    Generates data for each modality, for each sample. Each sample is saved as an h5 file, and nested to mimic a dictionary
-    structure where the outer keys are genes, and the inner key:value pairs are modalities:data.
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)          # seeds both CPU and CUDA RNGs
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    Args:
-        regions_dict (dict): A dictionary where each key is a label and the value is a list of modality and path.
-        ref_path (str): The path to the reference file.
-        overwrite (bool, optional): If True, overwrite existing processed data. Defaults to False.
 
-    Returns:
-        None
+def _loader_workers() -> int:
+    """Number of DataLoader workers, respecting Slurm/cgroup CPU limits."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        # macOS lacks sched_getaffinity
+        return max(1, os.cpu_count() or 1)
+
+
+def ensure_datasets_exist(
+    config_loader: 'ConfigLoader',
+    dataset_names: List[str],
+    zarr_base: str,
+    raw_data_base: str,
+    labels_dir: str,
+    ref_path: str,
+    n_workers: int = 0
+) -> Dict[str, bool]:
     """
-    # Create the output directory if it doesn't exist
-    out_dir = f'data/{dataset}/h5_files/'
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Find common samples across all modalities
-    common_samples = set()
-    for _, modal in regions_dict.items():
-        samples = get_samples(modal, dataset)
-        if samples:  # Ignore empty lists
-            if not common_samples:
-                common_samples = set(samples)
-            elif common_samples:
-                common_samples &= set(samples)
-
-
-    print(f'Found {len(common_samples)} common samples across all modalities.')
-    print(f'Samples: {common_samples}')
-
-    # Prepare arguments for multiprocessing
-    args = [(sample, regions_dict, ref_path, out_dir, overwrite) for sample in common_samples]
-
-    # Create a pool of workers and process each sample
-    with Pool(cpu_count()) as p:
-        print(f'Using {cpu_count()} cores to process samples . . .')
-        p.starmap(process_sample, args)
-
-
-def generate_sets(name, strat_method, data_files, use_modes, holdout_samples, folds=5, min_depth=0.0, min_label=1.0):
-    """
-    Generates sets of data for training. Will use all available samples in the sample_data_path passed, excluding those in the
-    holdout_samples list. Will split the data into folds according to the stratification method specified.
-
-    Args:
-        name (str): The name of the dataset.
-        strat_method (str): The strategy for splitting the data ('gene' or 'sample').
-        sample_paths (list): The paths to each h5 sample file
-        use_modes (list): The list of modalities to use.
-        holdout_samples (list): The list of samples to use for holdout.
-        folds (int, optional): The number of folds for cross-validation. Defaults to 5.
-        min_depth (float, optional): The minimum depth to use for training. Defaults to 0.0.
-        use_zeros (bool, optional): If True, will use samples with zero TPM true label. Defaults to True.
-
-    Returns:
-        None
-    """
-    # Define output directory and create it if it doesn't exist
-    out_dir = 'data/' + name + '/'
-    os.makedirs(out_dir, exist_ok=True)
-    samples = [os.path.basename(f).replace('_CompiledProcessedData.h5', '') for f in data_files]
-
-    # Write the arguments to a TSV file
-    with open(f'{out_dir}{name}.tsv', 'w', newline='') as f:
-        writer = csv.writer(f, delimiter='\t')
-        writer.writerow(['name', 'use_modes', 'holdout_samples', 'folds', 'min_depth', 'min_label'])
-        writer.writerow([name, use_modes, holdout_samples, folds, min_depth, min_label])
-        f.write("\n")
-        f.write("samples:\n")
-        for path in data_files:
-            f.write(f"{path}\n")
-
-    # Filter out holdout samples and their corresponding data files
-    samples, data_files = zip(*[(sample, data_file) for sample, data_file in zip(samples, data_files) if sample not in holdout_samples])
-
-    # Load existing gene-sample DataFrame or create a new one
-    if os.path.exists(out_dir + 'gene_sample_df.tsv'):
-        print('Loading existing gene availability . . .')
-        gene_sample_df = pd.read_csv(out_dir + 'gene_sample_df.tsv', sep='\t', index_col=0)
-    else:
-        # create a dataframe to hold what genes have no NaN / meet the depth and zeros requirement values for all modalities for each sample
-        # N.B. that ALL available modalities are saved so long as those specified with use_modes have no NaN values and threhsolds are met.
-        print('Checking samples for minimum depth, minimum labels, and NaN values in modalities specified . . .')
-        with Pool(cpu_count()) as p:
-            results = p.map(check_sample_genes, zip(samples, data_files, [use_modes]*len(samples), [min_depth]*len(samples), [min_label]*len(samples)))
-        # Create dataframes to hold the results
-        gene_sample_df = pd.DataFrame()
-        summary_df = pd.DataFrame(columns=['valid_genes', 'invalid_nans', 'invalid_depth', 'invalid_label'])
-        # Loop over the results
-        for sample, df in results:
-            # Create a new column 'valid' that is True if all modalities have no NaN values and meet the thresholds
-            df['valid'] = df['no_nans'] & df['min_depth'] & df['min_label']
-            # Add the 'valid' column to the gene_sample_df DataFrame
-            gene_sample_df[sample] = df['valid']
-
-            # Calculate the summary statistics
-            valid_genes = df['valid'].sum()
-            invalid_nans = (~df['no_nans']).sum()
-            invalid_depth = (~df['min_depth']).sum()
-            invalid_label = (~df['min_label']).sum()
-
-            # Add the summary statistics to the summary DataFrame
-            summary_df.loc[sample] = [valid_genes, invalid_nans, invalid_depth, invalid_label]
-
-        # Write the summary DataFrame to a CSV file
-        summary_df.sort_index(axis=0, inplace=True)
-        summary_df.to_csv(out_dir + 'valid_genes_summary.csv')
-        # Sort the gene_sample_df DataFrame by row and column indices
-        gene_sample_df.sort_index(axis=0, inplace=True)
-        gene_sample_df.sort_index(axis=1, inplace=True)
-        # Fill NaN values with False (NaNs occur for genes which exist in on cohort but not another)
-        gene_sample_df.fillna(False, inplace=True)
-        # Write the gene_sample_df DataFrame to a TSV file
-        gene_sample_df.to_csv(out_dir + 'gene_sample_df.tsv', sep='\t')
-
-    if os.path.exists(out_dir + 'folds_df.tsv'):
-        print('Loading existing fold splits . . .')
-        folds_df = pd.read_csv(out_dir + 'folds_df.tsv', sep='\t', index_col=0)
-    else:
-        if strat_method == 'gene':
-            # Split the DataFrame into folds
-            folds_df = split_df_gene(gene_sample_df, folds)
-        elif strat_method == 'var':
-            # Split the DataFrame into folds
-            folds_df = split_df_gene(gene_sample_df, folds, gene_set='reference/variable_training.txt')
-        elif strat_method == 'sample':
-            # Split the DataFrame into folds
-            folds_df = split_df_sample(gene_sample_df, folds)
-        folds_df = folds_df.sort_index(axis=1)
-        folds_df.to_csv(out_dir + 'folds_df.tsv', sep='\t')
-
-    # Flatten the DataFrame into a Series
-    flattened = pd.Series(folds_df.values.flatten())
-    # Get the count of each unique value
-    value_counts = flattened.value_counts()
-    # Print the counts
-    print('Fold counts:')
-    print(value_counts)
+    Check that all configured datasets have Zarr stores, regenerate if missing.
     
-    # Loop through folds_df by sample, open up the corresponding sample .h5 file from data/samples, 
-    # and write the data to the corresponding .tf record file based on the fold specified in folds_df
-    print('Starting new .tf splits . . .')
-    args_list = [(folds_df, sample_name, samples, data_files, out_dir) for sample_name in folds_df.columns]
-    with Pool(cpu_count()) as p:
-        # Use the pool to process each sample in parallel
-        p.starmap(process_sample_folds, args_list)
-
-    print('Merging .tf splits by fold . . .')
-    # Combine the tfrecords for each fold
-    for fold_number in range(1, folds + 1):
-        combine_tfrecords(fold_number, out_dir)
-    print('Finished generating sets.')
-
-
-def generate_holdout(use_modes, holdout_samples, out_dir, min_depth=0.0, filter_samples=True):
-    """
-    Generates sample-level holdout data (tfrecords).
-
-    Args:
-        use_modes (list): The list of modalities to use.
-        holdout_samples (list): The list of samples to use for holdout.
-        out_dir (str, optional): The path to the output directory. Defaults to None.
-        min_depth (float, optional): The minimum depth to use for training. Defaults to 0.0.
-        use_zeros (bool, optional): If True, will use samples with zero TPM true label. Defaults to True.
-        filter_samples (bool, optional): If True, will filter the samples to only those in the holdout_samples list. Defaults to True.
-
-    Returns:
-        None
-    """
-    # Create the output directory if it doesn't exist
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Get all files in the root data directory and filter the list of files
-    data_files = glob.glob('data/**/*_CompiledProcessedData.h5', recursive=True)
-    samples = [os.path.basename(f).replace('_CompiledProcessedData.h5', '') for f in data_files]
-
-    # Filter out holdout samples and their corresponding data files
-    if filter_samples:
-        # Check if there are any matching samples
-        matching_samples = [sample for sample in samples if sample in holdout_samples]
-        if not matching_samples:
-            print(f"No matching samples found. Skipping.")
-            return
-        samples, data_files = zip(*[(sample, data_file) for sample, data_file in zip(samples, data_files) if sample in holdout_samples])
-
-    print('Starting holdout .tfrecord generation . . .')
-
-    # Prepare arguments for multiprocessing
-    args_list = [(sample, sample_data, use_modes, out_dir, min_depth) for sample, sample_data in zip(samples, data_files)]
-
-    # Create a pool of workers and process each sample
-    with Pool(cpu_count()) as p:
-        p.starmap(process_holdout_sample, args_list)
-
-    print('Finished generating holdout data.')
-
-
-def train_model(model_name, use_set, folds, test_fold=None, tune_hyperparameters=True):
-    """
-    Trains a model using the specified dataset and folds.
-
-    Args:
-        model_name (str): The name of the model to train.
-        use_set (str): The name of the dataset to use.
-        folds (int): The number of folds for cross-validation.
-        test_fold (int, optional): If specified, will only conduct the CV with test_fold as test. Defaults to None.
-        tune_hyperparameters (bool, optional): If True, hyperparameters will be tuned. Defaults to True.
-
-    Returns:
-        None
-    """
-    print('Training model . . .')
-    out_dir = 'results_training/' + model_name + '_' + use_set + '/'
-    os.makedirs(out_dir, exist_ok=True)
-
-    # Instantiate the hypermodel
-    hypermodel = get_model_instance(model_name)
-    def extract_features_wrapper(batch):
-        return hypermodel.feature_extraction(batch)
+    This is useful because Zarr stores are kept in fast-access temporary storage
+    that may be cleared periodically (e.g., every 30 days).
     
-    # Print the model summary
-    print('Model summary (base model if tuning hyperparameters):')
-    model = hypermodel.build_default()
-    model.summary()
-    plot_utils.plot_model_architecture(model, out_dir)
+    Args:
+        config_loader: ConfigLoader instance for loading dataset configs
+        dataset_names: List of dataset names to check
+        zarr_base: Base directory for Zarr stores
+        raw_data_base: Base directory for raw Triton outputs
+        labels_dir: Directory containing label files
+        ref_path: Path to reference file
+        n_workers: Number of parallel workers (0=auto)
+        
+    Returns:
+        Dictionary mapping dataset names to whether they were regenerated
+    """
+    from functools import partial
 
-    # Loop over the folds
-    prediction_data = []
-    best_model = None
-    best_val_performance = float('inf')
+    regenerated: Dict[str, bool] = {}
 
-    for i in range(1, folds + 1):
-        # Re-instantiate the model for each fold to ensure a fresh model and no leakage
-        model = hypermodel.build_default()
+    def _is_present_zarr_store(path: str) -> bool:
+        if not os.path.isdir(path):
+            return False
+        try:
+            return any(os.scandir(path))
+        except FileNotFoundError:
+            return False
 
-        # If test_fold is specified and this is not the test_fold, skip this iteration
-        if test_fold is not None and i != test_fold:
+    for dataset_name in dataset_names:
+        # Load dataset config from YAML
+        try:
+            dataset_config = config_loader.load_dataset(dataset_name)
+        except FileNotFoundError:
+            print(f"[Auto-regenerate] Warning: No config for '{dataset_name}', skipping")
             continue
 
-        print(f'Starting fold {i}/{folds}')
+        # Auto-detect n_workers if 0
+        actual_workers = n_workers if n_workers > 0 else cpu_count()
 
-        # Create a new subdirectory for the current fold
-        fold_dir = os.path.join(out_dir, f'CV-fold_{i}')
-        os.makedirs(fold_dir, exist_ok=True)
+        zarr_dir = get_zarr_output_dir(dataset_name, zarr_base)
 
-        # Use the current fold for validation and all other folds for training
-        train_folds = [j for j in range(1, folds + 1) if j != i]
-        val_fold = [i]
+        # Build absolute paths from config
+        tss_dir = os.path.join(raw_data_base, dataset_config.triton_tss)
+        gb_dir = os.path.join(raw_data_base, dataset_config.triton_gb)
 
-        trainset = get_dataset(use_set=use_set, fold_numbers=train_folds, shuffle=True, batch_size=32).map(extract_features_wrapper)
-        valset = get_dataset(use_set=use_set, fold_numbers=val_fold, shuffle=False, batch_size=32).map(extract_features_wrapper)
-        valset_genes = get_dataset(use_set=use_set, fold_numbers=val_fold, shuffle=False, batch_size=32).map(extract_gene_names)
-        valset_samples = get_dataset(use_set=use_set, fold_numbers=val_fold, shuffle=False, batch_size=32).map(extract_sample_names)
-        # Flatten the gene_names_list and decode the byte strings to strings
-        gene_names_list = [item.numpy().decode('utf-8') for batch in valset_genes for item in batch]
-        sample_names_list = [item.numpy().decode('utf-8') for batch in valset_samples for item in batch]
-        print('Completed extracting data.')
+        # Directory missing or empty -> process whole dataset
+        zarr_files: List[str] = []
+        if os.path.exists(zarr_dir):
+            zarr_files = [f for f in os.listdir(zarr_dir) if f.endswith('.zarr')]
 
-        if tune_hyperparameters:
-            print('Tuning hyperparameters . . .')
-            total_batches = sum(1 for _ in trainset)
-            print(f'Total training batches (size 32): {total_batches}')
-
-            # # Define early stopping (fairly critical threshold here, as it is used for random_tuner only)
-            # early_stopping = EarlyStopping(monitor='val_loss', patience=5)
-
-            # # Start with random search
-            # random_tuner = RandomSearch(
-            #     lambda hp: hypermodel.build(hp, epoch_batches=total_batches),
-            #     objective='val_mse',
-            #     max_trials=10,  # Number of random search trials - should go quickly with strict early stopping
-            #     executions_per_trial=2,  # Number of models that should be built and fit for each trial
-            #     directory=fold_dir + '/random_search',
-            #     project_name=model_name + '_' + use_set + '_fold_' + str(i)
-            # )
-
-            # random_tuner.search(trainset, validation_data=valset, epochs=15, callbacks=[early_stopping])
-            # # Get the best hyperparameters from random search
-            # rt_hyperparameters = random_tuner.get_best_hyperparameters()[0]
-
-            bayesian_tuner = BayesianOptimization(
-                lambda hp: hypermodel.build(hp, epoch_batches=total_batches),
-                objective='val_mse',
-                max_trials=30,
-                executions_per_trial=1,
-                directory=fold_dir + '/bayesian_optimization',
-                project_name=model_name + '_' + use_set + '_fold_' + str(i)
-                # Use the best hyperparameters from random search as a starting point
-                # hyperparameters=rt_hyperparameters
+        if (not os.path.exists(zarr_dir)) or (not zarr_files):
+            reason = "directory missing" if not os.path.exists(zarr_dir) else "no zarr files"
+            print(f"\n[Auto-regenerate] Dataset '{dataset_name}' {reason}, processing...")
+            process_dataset(
+                dataset=dataset_name,
+                tss_dir=tss_dir,
+                gb_dir=gb_dir,
+                ref_path=ref_path,
+                labels_dir=labels_dir,
+                tfx_file=dataset_config.tfx_file,
+                zarr_base_dir=zarr_base,
+                tumor_exp_file=dataset_config.tumor_exp_file,
+                background_exp_file=dataset_config.background_exp_file,
+                overwrite=False,
+                n_workers=actual_workers
             )
+            regenerated[dataset_name] = True
+            continue
 
-            # Run the hyperparameter search - early stopping is NOT used as we want the best performance AT the final epoch
-            bayesian_tuner.search(trainset, validation_data=valset, epochs=15)
-            best_hyperparameters = bayesian_tuner.get_best_hyperparameters()[0]
-            best_model = bayesian_tuner.get_best_models(num_models=1)[0]
-            print('Best model summary:')
-            best_model.summary()
-            plot_utils.plot_model_architecture(best_model, fold_dir)
-            model = best_model
-            # Save the best hyperparameters to a file
-            best_hyperparameters_values = best_hyperparameters.values
-            with open(os.path.join(fold_dir, 'best_hyperparameters.txt'), 'w') as f:
-                for key, value in best_hyperparameters_values.items():
-                    f.write(f'{key}: {value}\n')
-            
-        # train the (best hps if tuned) model
-        history = model.fit(trainset, epochs=15, batch_size=32, verbose=1, shuffle=True, validation_data=valset)
-        model.save_weights(os.path.join(fold_dir, f"validation-fold_{val_fold[0]}_weights.hdf5"))
-        print('Finished training model.')
-        # Plot the training and validation loss
-        plot_utils.plot_model_loss(history, fold_dir, f"validation-fold_{val_fold[0]}")
+        # Discover expected samples from TSS folder structure
+        discovered_samples = get_samples(tss_dir, dataset_name)
 
-        # Generate predictions on the validation set
-        predictions = model.predict(valset).flatten()
-        # Extract the true labels from the validation set
-        true_labels = np.concatenate([y.numpy() for _, y in valset], axis=0)
-        prediction_data.append((true_labels, predictions))
-        df = pd.DataFrame({'true_label': true_labels, 'prediction': predictions, 'sample': sample_names_list}, index=gene_names_list)
-        df.to_csv(os.path.join(fold_dir, f'validation-fold_{val_fold[0]}_predictions.tsv'), sep='\t')
+        # Restrict to samples in the TFX file
+        tfx_file_path = os.path.join(labels_dir, dataset_config.tfx_file)
+        try:
+            tfx_df = pd.read_csv(tfx_file_path, sep='\t', index_col='sample')
+            tfx_index = [str(i) for i in tfx_df.index.tolist()]
 
-        # Plot the output predictions
-        plot_utils.scatter_plot(true_labels, predictions, fold_dir, f"validation-fold_{val_fold[0]}_predictions-scatter", val_fold[0])
-        plot_utils.residuals_plot(true_labels, predictions, fold_dir, f"validation-fold_{val_fold[0]}_residuals-scatter", val_fold[0])
+            def _matches_tfx(sample: str) -> bool:
+                if sample in tfx_df.index:
+                    return True
+                for idx in tfx_index:
+                    if sample in idx or idx in sample:
+                        return True
+                return False
 
-        # Check if this model has better validation performance than the current best model (always will if doing seperate folds)
-        val_performance = np.min(history.history['val_mse']) 
-        if val_performance < best_val_performance:
-            best_val_performance = val_performance
-            best_model = model
+            expected_samples = [s for s in discovered_samples if _matches_tfx(s)]
+        except (FileNotFoundError, ValueError, UnicodeDecodeError) as e:
+            raise ValueError(f"Failed to read TFX file for '{dataset_name}': {e}")
 
-        best_model.save(os.path.join(fold_dir, 'best_model.h5'))
-        with open(os.path.join(fold_dir, 'best_model_val_loss.txt'), 'w') as f:
-            f.write(str(best_val_performance))
-        print(f'Finished fold {i}/{folds}.')
+        # Existence-only check (fast): only regenerate missing/empty stores.
+        missing_samples: List[str] = []
+        for sample in expected_samples:
+            store_path = os.path.join(zarr_dir, f'{sample}.zarr')
+            if not _is_present_zarr_store(store_path):
+                missing_samples.append(sample)
 
-    print('Finished complete training across all folds.')
+        samples_to_regen = sorted(set(missing_samples))
+        if not samples_to_regen:
+            regenerated[dataset_name] = False
+            continue
 
-    return
+        print(
+            f"[Auto-regenerate] Regenerating {len(samples_to_regen)} sample(s) "
+            f"(missing={len(missing_samples)})"
+        )
+
+        # Build label paths for regeneration
+        tfx_path = os.path.join(labels_dir, dataset_config.tfx_file)
+        tumor_exp_path = os.path.join(labels_dir, dataset_config.tumor_exp_file) if dataset_config.tumor_exp_file else None
+        background_exp_path = os.path.join(labels_dir, dataset_config.background_exp_file) if dataset_config.background_exp_file else None
+
+        worker_fn = partial(
+            process_sample_to_zarr,
+            tss_dir=tss_dir,
+            gb_dir=gb_dir,
+            ref_path=ref_path,
+            tfx_path=tfx_path,
+            tumor_exp_path=tumor_exp_path,
+            background_exp_path=background_exp_path,
+            out_dir=zarr_dir,
+            overwrite=True,
+        )
+
+        if actual_workers <= 1:
+            for sample in samples_to_regen:
+                worker_fn(sample)
+        else:
+            with Pool(actual_workers) as pool:
+                pool.map(worker_fn, samples_to_regen)
+        regenerated[dataset_name] = True
+    
+    # Summary
+    regen_count = sum(regenerated.values())
+    if regen_count > 0:
+        print(f"\n[Auto-regenerate] Regenerated {regen_count} dataset(s)")
+    
+    return regenerated
 
 
-def test_model(model_name, use_set, holdout_samples, gene_sets, min_depth=0.0):
+def generate_data(
+    dataset: str,
+    tss_dir: str,
+    gb_dir: str,
+    labels_dir: str,
+    ref_path: str,
+    tfx_file: str,
+    zarr_base_dir: Optional[str] = None,
+    tumor_exp_file: Optional[str] = None,
+    background_exp_file: Optional[str] = None,
+    overwrite: bool = False,
+):
     """
-    Tests a model using the specified dataset and holdout samples.
+    Generate Zarr stores from Triton outputs using the sample-level folder structure.
+
+    Zarr stores are saved to:
+        {zarr_base_dir}/{dataset}/zarr_files/SAMPLE.zarr
+    
+    Args:
+        dataset: Dataset name (e.g., 'PC-PDX')
+        tss_dir: Absolute path to TSS results directory
+        gb_dir: Absolute path to GB results directory
+        labels_dir: Directory containing label files
+        ref_path: Path to reference file
+        tfx_file: Name of TFX file in labels_dir (required)
+        zarr_base_dir: Base directory for Zarr output (default: /hpc/temp/...)
+        tumor_exp_file: Name of tumor expression file
+        background_exp_file: Name of background expression file
+        overwrite: Whether to overwrite existing Zarr stores
+    """
+    print(f"Generating Zarr stores for dataset: {dataset}")
+    
+    # Auto-detect n_workers
+    n_workers = cpu_count()
+    print(f"  Workers: {n_workers}")
+    
+    created_paths = process_dataset(
+        dataset=dataset,
+        tss_dir=tss_dir,
+        gb_dir=gb_dir,
+        ref_path=ref_path,
+        labels_dir=labels_dir,
+        tfx_file=tfx_file,
+        zarr_base_dir=zarr_base_dir,
+        tumor_exp_file=tumor_exp_file,
+        background_exp_file=background_exp_file,
+        overwrite=overwrite,
+        n_workers=n_workers
+    )
+    
+    if created_paths:
+        print(f"\nSuccessfully created {len(created_paths)} Zarr stores.")
+    else:
+        print("\nNo Zarr stores created. Check input paths and data.")
+    
+    return created_paths
+
+
+def get_focus_set() -> set[str]:
+    """Load focus genes for subsetting data during training."""
+    print('Loading focus genes for subsetting...')
+    gene_files = [
+        'CCP31.txt',
+        'Targets_PC.txt',
+        'Targets_SCLC.txt',
+        'Targets_BC.txt',
+        'PC_PhenotypingGenes.txt',
+        'PAM50.txt',
+        'Fanconi-Anemia.txt',
+        'EMT.txt',
+        'Hypoxia.txt',
+    ]
+    gene_ids: set[str] = set()
+    for gene_file in gene_files:
+        with open(f'reference/{gene_file}', 'r') as file:
+            reader = csv.reader(file, delimiter='\t')
+            for row in reader:
+                gene_ids.add(row[0])
+    print(f'Loaded {len(gene_ids)} focus genes.')
+    return gene_ids
+
+
+def _collect_fold_zarr_paths(
+    training_set_tsv: str,
+    zarr_base: str,
+    exclude_fold: int,
+) -> List[str]:
+    """Collect Zarr paths for all samples NOT in the excluded fold.
+
+    This mirrors the path construction logic in build_loaders_from_splits
+    so that gene weights are computed from exactly the same samples used
+    for training.
+    """
+    paths: List[str] = []
+    with open(training_set_tsv, 'r', newline='') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            fold = int(row['Fold'])
+            if fold == exclude_fold:
+                continue
+            cohort = row['Cohort'].strip()
+            sample = row['Sample'].strip()
+            sample_name = sample
+            if sample.startswith(f"{cohort}_"):
+                sample_name = sample[len(cohort) + 1:]
+            zarr_path = os.path.join(zarr_base, cohort, 'zarr_files', f"{sample_name}.zarr")
+            if os.path.isdir(zarr_path):
+                paths.append(zarr_path)
+    return paths
+
+
+def _collect_only_fold_zarr_paths(
+    training_set_tsv: str,
+    zarr_base: str,
+    fold_num: int,
+) -> List[str]:
+    """Collect Zarr paths for all samples in a single fold.
+
+    This mirrors the path construction logic in build_loaders_from_splits so that
+    validation-fold-only gene weights are computed from exactly the same samples
+    used in the held-out validation loader.
+    """
+    paths: List[str] = []
+    with open(training_set_tsv, 'r', newline='') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            fold = int(row['Fold'])
+            if fold != int(fold_num):
+                continue
+            cohort = row['Cohort'].strip()
+            sample = row['Sample'].strip()
+            sample_name = sample
+            if sample.startswith(f"{cohort}_"):
+                sample_name = sample[len(cohort) + 1:]
+            zarr_path = os.path.join(zarr_base, cohort, 'zarr_files', f"{sample_name}.zarr")
+            if os.path.isdir(zarr_path):
+                paths.append(zarr_path)
+    return paths
+
+
+def _collect_all_zarr_paths(
+    training_set_tsv: str,
+    zarr_base: str,
+) -> List[str]:
+    """Collect Zarr paths for ALL samples in the training set TSV (no fold filter).
+
+    Used to compute full-dataset gene variance for GVW evaluation metrics
+    so that validation metrics reflect the true expression variability across
+    all samples rather than only the held-out fold.
+    """
+    paths: List[str] = []
+    with open(training_set_tsv, 'r', newline='') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            cohort = row['Cohort'].strip()
+            sample = row['Sample'].strip()
+            sample_name = sample
+            if sample.startswith(f"{cohort}_"):
+                sample_name = sample[len(cohort) + 1:]
+            zarr_path = os.path.join(zarr_base, cohort, 'zarr_files', f"{sample_name}.zarr")
+            if os.path.isdir(zarr_path):
+                paths.append(zarr_path)
+    return paths
+
+
+def train_model_cv(
+    model_name: str,
+    training_set_tsv: str,
+    zarr_base: str,
+    test_fold: Optional[int] = None,
+    out_dir: Optional[str] = None,
+    model_config: Optional[BioDVNConfig] = None,
+    training_config: Optional[TrainingConfig] = None,
+    genes_per_batch: int = 32,
+    chunk_size: int = 256,
+    shuffle_genes_in_batch: bool = True,
+    seed: int = 42,
+    subsample_frac: Optional[float] = None,
+    epoch_end_callback: Optional[Callable[..., None]] = None,
+    external_stop_check: Optional[Callable[..., bool]] = None,
+):
+    """Train a model using cross-validation with deterministic fold assignment.
 
     Args:
-        model_name (str): The name of the model to test.
-        use_set (str): The name of the dataset to use.
-        holdout_samples (list): The list of samples to use for holdout.
-        gene_sets (list): The list of gene sets to use.
+        model_name: Name of the model class.
+        training_set_tsv: Path to TSV file with Cohort/Sample/Fold columns.
+        zarr_base: Base directory for Zarr stores ({zarr_base}/{cohort}/{sample}.zarr).
+        test_fold: If set, only train this fold (for HPC parallelization).
+        out_dir: Output directory for checkpoints/predictions.
+        model_config: Fully-specified BioDVNConfig.
+        training_config: Fully-specified TrainingConfig.
+        genes_per_batch: Genes per batch (32 invariant).
+        chunk_size: Genes per chunk (256 invariant).
+        shuffle_genes_in_batch: Whether to shuffle genes within batch.
+        seed: Random seed for reproducibility.
+        subsample_frac: Optional fraction (0.0-1.0) of genes for fast sanity checks.
 
-    Returns:
-        None
+    Raises:
+        FileNotFoundError: If training_set_tsv or Zarr stores don't exist.
+        ValueError: If TSV format is invalid or no samples in folds.
     """
-    print('Starting testing model . . .')
-    out_dir = 'results_training/' + model_name + '_' + use_set + '/'
+    import csv
+
+    # Determine folds from TSV
+    if not os.path.exists(training_set_tsv):
+        raise FileNotFoundError(f"Training set TSV not found: {training_set_tsv}")
+
+    folds_in_tsv: set[int] = set()
+    with open(training_set_tsv, 'r', newline='') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            folds_in_tsv.add(int(row['Fold']))
+    n_folds = len(folds_in_tsv)
+    if n_folds == 0:
+        raise ValueError(f"No folds found in {training_set_tsv}")
+    fold_list = sorted(folds_in_tsv)
+
+    print(f'Training model with {n_folds} folds from {training_set_tsv}...')
+    if out_dir is None:
+        out_dir = f'results_training/{model_name}/'
     os.makedirs(out_dir, exist_ok=True)
 
-    hypermodel = get_model_instance(model_name)
-    def extract_features_wrapper(batch):
-        return hypermodel.feature_extraction(batch)
+    if model_config is None:
+        model_config = BioDVNConfig()
+    if training_config is None:
+        training_config = TrainingConfig(checkpoint_dir=out_dir)
 
-    # Loop through the holdout samples
-    prediction_data = []
-    for sample in holdout_samples:
-        print(f'Starting holdout testing for {sample}')
-        # Create a new subdirectory for the current sample
-        sample_dir = os.path.join(out_dir, sample)
-        os.makedirs(sample_dir, exist_ok=True)
+    # Device setup (GPU-only)
+    device = torch.device('cuda')
 
-        # Get the dataset for the current sample
-        valset = get_dataset(use_set=f'tfrecords_{min_depth}x', samples=[sample], shuffle=False, batch_size=32).map(extract_features_wrapper)
-        valset_genes = get_dataset(use_set=f'tfrecords_{min_depth}x', samples=[sample], shuffle=False, batch_size=32).map(extract_gene_names)
-        valset_depths = get_dataset(use_set=f'tfrecords_{min_depth}x', samples=[sample], shuffle=False, batch_size=32).map(extract_gene_depths)
+    # Compute full-dataset (all folds) gene variance once for GVW evaluation.
+    # This gives validation metrics a stable, unbiased variance estimate.
+    from proteus_utils.proteus_utils import compute_gene_weights_from_zarr, compute_gene_variances_unclipped
+    print('Computing full-dataset gene variance for GVW evaluation...')
+    all_zarr_paths = _collect_all_zarr_paths(training_set_tsv, zarr_base)
+    full_tumor_variance = compute_gene_variances_unclipped(
+        all_zarr_paths, label_key='flat/tumor_exp',
+    )
+    full_background_variance = compute_gene_variances_unclipped(
+        all_zarr_paths, label_key='flat/background_exp',
+    )
+    print(f'  Full-dataset tumor variance: {len(full_tumor_variance)} genes '
+          f'(range [{min(full_tumor_variance.values()):.3f}, {max(full_tumor_variance.values()):.3f}])')
+    print(f'  Full-dataset background variance: {len(full_background_variance)} genes '
+          f'(range [{min(full_background_variance.values()):.3f}, {max(full_background_variance.values()):.3f}])')
 
-        # Flatten the gene_names_list and decode the byte strings to strings, etc.
-        gene_names_list = [item.numpy().decode('utf-8') for batch in valset_genes for item in batch]
-        gene_depths_list = [item.numpy() for batch in valset_depths for item in batch]
+    for fold_num in fold_list:
+        if test_fold is not None and fold_num != test_fold:
+            continue
 
-        # Load the best model
-        best_model = tf.keras.models.load_model(os.path.join(out_dir, 'best_model.h5'), custom_objects={'CosineDecay': CosineDecay, 'WeightedMSELoss': WeightedMSELoss(), 'ClippedReLU': ClippedReLU()})
-        # Generate predictions on the holdout set
-        predictions = best_model.predict(valset).flatten()
+        # Deterministic seeding *before* model construction so that
+        # nn.init.xavier_uniform_ draws are reproducible.  Each fold
+        # gets a distinct but deterministic seed.
+        _seed_everything(seed + fold_num)
 
-        # Extract the true labels from the holdout set
-        true_labels = np.concatenate([y.numpy() for _, y in valset], axis=0)
-        prediction_data.append((true_labels, predictions))
+        print(f'\nStarting fold {fold_num}/{n_folds}')
+        fold_dir = os.path.join(out_dir, f'CV-fold_{fold_num}')
+        os.makedirs(fold_dir, exist_ok=True)
 
-        df = pd.DataFrame({'true_label': true_labels, 'prediction': predictions, 'tss_depth': gene_depths_list}, index=gene_names_list)
-        df.to_csv(os.path.join(sample_dir, f'holdout-{sample}_predictions.tsv'), sep='\t')
+        fold_training_config = replace(training_config, checkpoint_dir=fold_dir)
 
-        plot_utils.subset_scatter_plot(df, sample_dir, f"scatter_holdout_{sample}", gene_sets)
-        plot_utils.subset_residuals_plot(df, sample_dir, f"residual_holdout_{sample}", gene_sets)
-        plot_utils.subset_residuals_plot(df, sample_dir, f"residual-depth_holdout_{sample}", gene_sets, var="tss_depth")
-            
-        print(f'Finished testing model for {sample}.')
-    print('Finished testing model.')
+        # Compute per-gene variance weights from the K-1 training folds
+        # (excluding the held-out validation fold).  Clipped variance weights
+        # scale the CRPS loss so high-variance genes contribute more.
+        print(f'Computing gene variance weights from training folds (excluding fold {fold_num})...')
+        train_zarr_paths = _collect_fold_zarr_paths(
+            training_set_tsv, zarr_base, exclude_fold=fold_num,
+        )
+        _raw_var = compute_gene_variances_unclipped(train_zarr_paths, label_key='flat/tumor_exp')
+        gene_weights = compute_gene_weights_from_zarr(
+            train_zarr_paths,
+            label_key='flat/tumor_exp',
+        )
+        _raw_vals = list(_raw_var.values())
+        print(f'  {len(gene_weights)} genes — '
+              f'raw variance [{min(_raw_vals):.4f}, {max(_raw_vals):.4f}], '
+              f'clipped to [0.100, 10.000]')
+
+        # Build data loaders from TSV
+        print('Building data loaders...')
+        train_loader, val_loader, train_steps, val_steps = build_loaders_from_splits(
+            training_set_tsv=training_set_tsv,
+            zarr_base=zarr_base,
+            val_fold=fold_num,
+            num_workers=_loader_workers(),
+            loader_mode='chunk',
+            chunk_size=chunk_size,
+            genes_per_batch=genes_per_batch,
+            shuffle_genes_in_batch=shuffle_genes_in_batch,
+            seed=seed,
+            subsample_frac=subsample_frac,
+            gene_weights=gene_weights,
+        )
+        print(f'Training batches: {train_steps}, Validation batches: {val_steps}')
+        
+        # Create model
+        ModelClass = get_model_instance(model_name)
+        model = ModelClass(model_config)
+        
+        # Move model to device BEFORE passing to Trainer
+        model = model.to(device)
+
+        # Persist run configuration for reproducibility / analysis.
+        try:
+            with open(os.path.join(fold_dir, 'model_config.json'), 'w') as f:
+                json.dump(asdict(model_config), f, indent=2)
+            with open(os.path.join(fold_dir, 'training_config.json'), 'w') as f:
+                json.dump(asdict(fold_training_config), f, indent=2)
+        except TypeError as e:
+            raise TypeError(f'Failed to JSON-serialize configs for fold {fold_num}: {e}')
+        
+        # Train
+        trainer = Trainer(model, fold_training_config, model_config, device)
+        trainer.val_gene_weight_map = full_tumor_variance
+        trainer.val_background_gene_weight_map = full_background_variance
+        history = trainer.fit(
+            train_loader,
+            val_loader,
+            epochs=fold_training_config.epochs,
+            epoch_end_callback=epoch_end_callback,
+            external_stop_check=external_stop_check,
+        )
+
+        # Save training history for plotting / audit.
+        try:
+            with open(os.path.join(fold_dir, 'training_history.json'), 'w') as f:
+                json.dump(history, f, indent=2)
+        except TypeError as e:
+            raise TypeError(f'Failed to JSON-serialize training history for fold {fold_num}: {e}')
+
+        # Prefer the trainer's model reference (may be compiled).
+        model_for_eval = trainer.model
+        model_for_save = getattr(model_for_eval, '_orig_mod', model_for_eval)
+        
+        # Save final weights
+        torch.save(model_for_save.state_dict(), os.path.join(fold_dir, f'validation-fold_{fold_num}_weights.pt'))
+        
+        # Generate and save predictions
+        _save_fold_predictions(
+            model_for_eval,
+            val_loader,
+            fold_dir,
+            fold_num,
+            device,
+            full_tumor_variance=full_tumor_variance,
+            full_background_variance=full_background_variance,
+        )
+
+        # Per-fold plots
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            plot_dir = os.path.join(fold_dir, 'plots')
+            os.makedirs(plot_dir, exist_ok=True)
+
+            # Loss curves
+            fig = plt.figure(figsize=(7, 4))
+            epochs_axis = np.arange(1, len(history.get('train_loss', [])) + 1)
+            if len(epochs_axis) > 0:
+                plt.plot(epochs_axis, history.get('train_loss', []), label='train_loss')
+                if history.get('val_loss'):
+                    plt.plot(epochs_axis, history.get('val_loss', []), label='val_loss')
+                if history.get('val_tumor_gvw_crps'):
+                    plt.plot(epochs_axis, history.get('val_tumor_gvw_crps', []), label='val_tumor_gvw_crps')
+                plt.xlabel('epoch')
+                plt.ylabel('metric')
+                plt.title('Training / validation curves')
+                plt.legend(frameon=False)
+                plt.tight_layout()
+                fig.savefig(os.path.join(plot_dir, 'loss_curves.png'), dpi=150)
+            plt.close(fig)
+        except Exception as e:
+            print(f'  Warning: failed to generate fold plots for fold {fold_num}: {e}')
+        
+        print(f'Finished fold {fold_num}/{n_folds}.')
+    
+    if test_fold is None:
+        print('Finished complete training across all folds.')
+        _summarize_cv_results(out_dir)
 
 
-def run_model(model_path, samples_folder, out_dir):
-    print('Running model . . .')
+def _compute_regression_metrics(truth: np.ndarray, pred: np.ndarray) -> Dict[str, float]:
+    """Compute regression metrics with NaN-safe masking."""
+    truth = np.asarray(truth, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.float64)
+    mask = np.isfinite(truth) & np.isfinite(pred)
+    if mask.sum() == 0:
+        return {
+            'n': 0,
+            'mae': float('nan'),
+            'mse': float('nan'),
+            'rmse': float('nan'),
+            'r2': float('nan'),
+        }
+    y = truth[mask]
+    yhat = pred[mask]
+    err = yhat - y
+    mae = float(np.mean(np.abs(err)))
+    mse = float(np.mean(np.square(err)))
+    rmse = float(np.sqrt(mse))
+    denom = float(np.sum(np.square(y - float(np.mean(y)))))
+    r2 = float('nan') if denom <= 1e-12 else float(1.0 - (np.sum(np.square(err)) / denom))
+    return {
+        'n': int(mask.sum()),
+        'mae': mae,
+        'mse': mse,
+        'rmse': rmse,
+        'r2': r2,
+    }
+
+
+def _summarize_cv_results(out_dir: str) -> None:
+    """Aggregate per-fold prediction TSVs into a deterministic CV metrics summary."""
+    fold_metrics: List[Dict[str, float]] = []
+    for entry in sorted(os.listdir(out_dir)):
+        if not entry.startswith('CV-fold_'):
+            continue
+        fold_dir = os.path.join(out_dir, entry)
+        if not os.path.isdir(fold_dir):
+            continue
+        # fold number is suffix after underscore
+        try:
+            fold_num = int(entry.split('_')[-1])
+        except Exception:
+            fold_num = -1
+
+        metrics_path = os.path.join(fold_dir, f'validation-fold_{fold_num}_metrics.json')
+        fold_metrics_json: Optional[Dict[str, Any]] = None
+        if os.path.exists(metrics_path):
+            try:
+                with open(metrics_path, 'r') as f:
+                    fold_metrics_json = json.load(f)
+            except Exception:
+                fold_metrics_json = None
+
+        # Prefer metrics.json (includes GVW-CRPS + R² summaries). Fall back to TSV recomputation.
+        if fold_metrics_json is not None:
+            t_metrics = dict(fold_metrics_json.get('tumor', {}))
+            b_metrics = dict(fold_metrics_json.get('background', {}))
+        else:
+            tumor_path = os.path.join(fold_dir, f'validation-fold_{fold_num}_predictions_tumor.tsv')
+            bg_path = os.path.join(fold_dir, f'validation-fold_{fold_num}_predictions_background.tsv')
+            if not (os.path.exists(tumor_path) and os.path.exists(bg_path)):
+                continue
+            df_t = pd.read_csv(tumor_path, sep='\t', index_col=0)
+            df_b = pd.read_csv(bg_path, sep='\t', index_col=0)
+            t_metrics = _compute_regression_metrics(df_t['truth'].to_numpy(), df_t['prediction_mean'].to_numpy())
+            b_metrics = _compute_regression_metrics(df_b['truth'].to_numpy(), df_b['prediction_mean'].to_numpy())
+
+        row = {
+            'fold': int(fold_num),
+            # Primary selection metric
+            'score': float(t_metrics.get('gvw_crps', float('nan'))),
+            'tumor_gvw_crps': float(t_metrics.get('gvw_crps', float('nan'))),
+            'tumor_gvw_mean_r2': float(t_metrics.get('gvw_mean_r2', float('nan'))),
+
+            # Tumor regression summary
+            'tumor_n': int(t_metrics.get('n', 0)),
+            'tumor_mae': float(t_metrics.get('mae', float('nan'))),
+            'tumor_rmse': float(t_metrics.get('rmse', float('nan'))),
+            'tumor_r2': float(t_metrics.get('r2', float('nan'))),
+            'tumor_gene_r2_mean': float(t_metrics.get('gene_r2_mean', float('nan'))),
+            'tumor_gene_r2_median': float(t_metrics.get('gene_r2_median', float('nan'))),
+            'tumor_sample_r2_mean': float(t_metrics.get('sample_r2_mean', float('nan'))),
+            'tumor_sample_r2_median': float(t_metrics.get('sample_r2_median', float('nan'))),
+
+            # Background regression summary
+            'background_n': int(b_metrics.get('n', 0)),
+            'background_mae': float(b_metrics.get('mae', float('nan'))),
+            'background_rmse': float(b_metrics.get('rmse', float('nan'))),
+            'background_r2': float(b_metrics.get('r2', float('nan'))),
+            'background_gvw_crps': float(b_metrics.get('gvw_crps', float('nan'))),
+            'background_gvw_mean_r2': float(b_metrics.get('gvw_mean_r2', float('nan'))),
+        }
+        fold_metrics.append(row)
+
+    if not fold_metrics:
+        return
+
+    summary_df = pd.DataFrame(fold_metrics).sort_values('fold')
+    summary_df.to_csv(os.path.join(out_dir, 'cv_metrics_summary.tsv'), sep='\t', index=False)
+
+    # Also write a small JSON with mean/std across folds for quick comparison.
+    numeric_cols = [c for c in summary_df.columns if c not in ('fold',)]
+    agg: Dict[str, Any] = {
+        'primary_metric': {'name': 'tumor_gvw_crps', 'direction': 'minimize'},
+    }
+    for c in numeric_cols:
+        vals = pd.to_numeric(summary_df[c], errors='coerce').to_numpy(dtype=np.float64)
+        agg[c] = {
+            'mean': float(np.nanmean(vals)),
+            'std': float(np.nanstd(vals)),
+        }
+
+    # Best fold by primary metric
+    if 'tumor_gvw_crps' in summary_df.columns:
+        s = pd.to_numeric(summary_df['tumor_gvw_crps'], errors='coerce')
+        if np.isfinite(s.to_numpy(dtype=np.float64)).any():
+            best_idx = int(np.nanargmin(s.to_numpy(dtype=np.float64)))
+            best_row = summary_df.iloc[best_idx].to_dict()
+            agg['best'] = {
+                'fold': int(best_row.get('fold', -1)),
+                'tumor_gvw_crps': float(best_row.get('tumor_gvw_crps', float('nan'))),
+            }
+    with open(os.path.join(out_dir, 'cv_metrics_summary.json'), 'w') as f:
+        json.dump(agg, f, indent=2)
+
+
+def _save_fold_predictions(
+    model: nn.Module,
+    val_loader: DataLoader,
+    fold_dir: str,
+    fold_num: int,
+    device: torch.device,
+    full_tumor_variance: Optional[Dict[str, float]] = None,
+    full_background_variance: Optional[Dict[str, float]] = None,
+):
+    """Save MDN predictions, full distribution params, and quantile CIs for a validation fold.
+
+    For each observation the output TSV contains:
+        truth, prediction_mean, ci_q5, ci_q95,
+        pi_delta, pi_gamma, gamma_beta, pi_normal, normal_mean,
+        normal_stdev, sample.
+
+    ci_q5 / ci_q95 are CDF-based quantiles F^{-1}(0.05) / F^{-1}(0.95),
+    clamped to [0, Y_MAX].
+    """
+    from models.model_utils import (
+        mixture_quantile, mixture_crps, Y_MAX,
+    )
+
+    model.eval()
+
+    # ---- Accumulators (tumor) ----
+    all_t_pred_mean = []
+    all_t_q5 = []
+    all_t_q95 = []
+    all_t_true = []
+    all_t_pi_delta = []
+    all_t_pi_gamma = []
+    all_t_pi_normal = []
+    all_t_gamma_beta = []
+    all_t_normal_mu = []
+    all_t_normal_sigma = []
+
+    # ---- Accumulators (background) ----
+    all_b_pred_mean = []
+    all_b_q5 = []
+    all_b_q95 = []
+    all_b_true = []
+    all_b_pi_delta = []
+    all_b_pi_gamma = []
+    all_b_pi_normal = []
+    all_b_gamma_beta = []
+    all_b_normal_mu = []
+    all_b_normal_sigma = []
+
+    # Metadata
+    all_samples = []
+    all_genes = []
+
+    # CRPS accumulators
+    tumor_crps_sum = torch.tensor(0.0)
+    tumor_crps_denom = torch.tensor(0.0)
+    bg_crps_sum = torch.tensor(0.0)
+    bg_crps_denom = torch.tensor(0.0)
+
+    with torch.no_grad():
+        for features, labels in val_loader:
+            if 'sample_name' not in features or 'gene_name' not in features:
+                raise KeyError(
+                    "Validation batches are missing 'sample_name'/'gene_name'. "
+                    "This typically means the validation DataLoader was created without include_metadata=True."
+                )
+
+            features_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                               for k, v in features.items()}
+            labels_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v
+                             for k, v in labels.items()}
+
+            predictions, _ = model(features_device, return_internal_loss=False)
+
+            # ---- Tumor head ----
+            t_mdn = predictions['tumor_mdn']
+            t_q = mixture_quantile(t_mdn, quantiles=(0.05, 0.95))  # (batch, 2)
+            t_pi = t_mdn['log_pi'].exp().cpu().numpy()
+
+            all_t_pred_mean.extend(predictions['tumor_exp'].cpu().numpy().flatten())
+            all_t_q5.extend(t_q[:, 0].cpu().numpy().flatten())
+            all_t_q95.extend(t_q[:, 1].cpu().numpy().flatten())
+            all_t_true.extend(labels_device['tumor_exp'].cpu().numpy().flatten())
+            all_t_pi_delta.extend(t_pi[:, 0].flatten())
+            all_t_pi_gamma.extend(t_pi[:, 1].flatten())
+            all_t_pi_normal.extend(t_pi[:, 2].flatten())
+            all_t_gamma_beta.extend(t_mdn['gamma_beta'].cpu().numpy().flatten())
+            all_t_normal_mu.extend(t_mdn['normal_mu'].cpu().numpy().flatten())
+            all_t_normal_sigma.extend(t_mdn['normal_sigma'].cpu().numpy().flatten())
+
+            # ---- Background head ----
+            b_mdn = predictions['background_mdn']
+            b_q = mixture_quantile(b_mdn, quantiles=(0.05, 0.95))  # (batch, 2)
+            b_pi = b_mdn['log_pi'].exp().cpu().numpy()
+
+            all_b_pred_mean.extend(predictions['background_exp'].cpu().numpy().flatten())
+            all_b_q5.extend(b_q[:, 0].cpu().numpy().flatten())
+            all_b_q95.extend(b_q[:, 1].cpu().numpy().flatten())
+            all_b_true.extend(labels_device['background_exp'].cpu().numpy().flatten())
+            all_b_pi_delta.extend(b_pi[:, 0].flatten())
+            all_b_pi_gamma.extend(b_pi[:, 1].flatten())
+            all_b_pi_normal.extend(b_pi[:, 2].flatten())
+            all_b_gamma_beta.extend(b_mdn['gamma_beta'].cpu().numpy().flatten())
+            all_b_normal_mu.extend(b_mdn['normal_mu'].cpu().numpy().flatten())
+            all_b_normal_sigma.extend(b_mdn['normal_sigma'].cpu().numpy().flatten())
+
+            # ---- GVW-CRPS (tumor) ----
+            w_tumor = None
+            if full_tumor_variance is not None and 'gene_name' in features:
+                gnames = features['gene_name']
+                if isinstance(gnames, (list, tuple)):
+                    w_tumor = torch.tensor(
+                        [float(full_tumor_variance.get(str(g), 1.0)) for g in gnames],
+                        dtype=torch.float32, device=device,
+                    ).unsqueeze(-1)
+                else:
+                    w_tumor = torch.tensor(
+                        [[float(full_tumor_variance.get(str(gnames), 1.0))]],
+                        dtype=torch.float32, device=device,
+                    )
+            crps_s, crps_d = mixture_crps(t_mdn, labels_device['tumor_exp'], sample_weight=w_tumor)
+            tumor_crps_sum += crps_s.cpu()
+            tumor_crps_denom += crps_d.cpu()
+
+            # ---- GVW-CRPS (background) ----
+            w_bg = None
+            if full_background_variance is not None and 'gene_name' in features:
+                gnames = features['gene_name']
+                if isinstance(gnames, (list, tuple)):
+                    w_bg = torch.tensor(
+                        [float(full_background_variance.get(str(g), 1.0)) for g in gnames],
+                        dtype=torch.float32, device=device,
+                    ).unsqueeze(-1)
+                else:
+                    w_bg = torch.tensor(
+                        [[float(full_background_variance.get(str(gnames), 1.0))]],
+                        dtype=torch.float32, device=device,
+                    )
+            bg_crps_s, bg_crps_d = mixture_crps(b_mdn, labels_device['background_exp'], sample_weight=w_bg)
+            bg_crps_sum += bg_crps_s.cpu()
+            bg_crps_denom += bg_crps_d.cpu()
+
+            # Metadata
+            sample_names = features['sample_name']
+            gene_names = features['gene_name']
+            if isinstance(sample_names, (list, tuple)):
+                all_samples.extend([str(s) for s in sample_names])
+            else:
+                all_samples.append(str(sample_names))
+            if isinstance(gene_names, (list, tuple)):
+                all_genes.extend([str(g) for g in gene_names])
+            else:
+                all_genes.append(str(gene_names))
+
+    # ---- Convert to arrays ----
+    truth_t = np.asarray(all_t_true, dtype=np.float64)
+    pred_mean_t = np.asarray(all_t_pred_mean, dtype=np.float64)
+    q5_t = np.asarray(all_t_q5, dtype=np.float64)
+    q95_t = np.asarray(all_t_q95, dtype=np.float64)
+
+    truth_b = np.asarray(all_b_true, dtype=np.float64)
+    pred_mean_b = np.asarray(all_b_pred_mean, dtype=np.float64)
+    q5_b = np.asarray(all_b_q5, dtype=np.float64)
+    q95_b = np.asarray(all_b_q95, dtype=np.float64)
+
+    # ---- Build and save TSVs ----
+    df_tumor = pd.DataFrame({
+        'truth': truth_t,
+        'prediction_mean': pred_mean_t,
+        'ci_q5': q5_t,
+        'ci_q95': q95_t,
+        'pi_delta': all_t_pi_delta,
+        'pi_gamma': all_t_pi_gamma,
+        'gamma_beta': all_t_gamma_beta,
+        'pi_normal': all_t_pi_normal,
+        'normal_mean': all_t_normal_mu,
+        'normal_stdev': all_t_normal_sigma,
+        'sample': all_samples,
+    }, index=all_genes)
+
+    df_background = pd.DataFrame({
+        'truth': truth_b,
+        'prediction_mean': pred_mean_b,
+        'ci_q5': q5_b,
+        'ci_q95': q95_b,
+        'pi_delta': all_b_pi_delta,
+        'pi_gamma': all_b_pi_gamma,
+        'gamma_beta': all_b_gamma_beta,
+        'pi_normal': all_b_pi_normal,
+        'normal_mean': all_b_normal_mu,
+        'normal_stdev': all_b_normal_sigma,
+        'sample': all_samples,
+    }, index=all_genes)
+
+    df_tumor.to_csv(os.path.join(fold_dir, f'validation-fold_{fold_num}_predictions_tumor.tsv'), sep='\t')
+    df_background.to_csv(os.path.join(fold_dir, f'validation-fold_{fold_num}_predictions_background.tsv'), sep='\t')
+
+    # ---- Fold-level metrics ----
+    t_metrics = _compute_regression_metrics(truth_t, pred_mean_t)
+    b_metrics = _compute_regression_metrics(truth_b, pred_mean_b)
+
+    # GVW-CRPS
+    t_metrics['gvw_crps'] = float((tumor_crps_sum / tumor_crps_denom).item()) if float(tumor_crps_denom.item()) > 0 else float('nan')
+    b_metrics['gvw_crps'] = float((bg_crps_sum / bg_crps_denom).item()) if float(bg_crps_denom.item()) > 0 else float('nan')
+
+    # GVW-R² (mean-based) for both heads
+    def _weighted_r2(y: np.ndarray, yhat: np.ndarray, genes: list, weight_map: Optional[Dict[str, float]]) -> float:
+        mask = np.isfinite(y) & np.isfinite(yhat)
+        if mask.sum() < 2:
+            return float('nan')
+        y_m = y[mask]
+        yhat_m = yhat[mask]
+        if weight_map is not None:
+            genes_arr = np.asarray(genes)
+            w = np.array(
+                [float(weight_map.get(str(g), 1.0)) for g in genes_arr[mask]],
+                dtype=np.float64,
+            )
+        else:
+            w = np.ones(int(mask.sum()), dtype=np.float64)
+        ss_res = float(np.sum(w * (y_m - yhat_m) ** 2))
+        w_sum = float(np.sum(w))
+        w_mean_y = float(np.sum(w * y_m)) / w_sum
+        ss_tot = float(np.sum(w * (y_m - w_mean_y) ** 2))
+        if ss_tot < 1e-12:
+            return float('nan')
+        return 1.0 - ss_res / ss_tot
+
+    t_metrics['gvw_mean_r2'] = _weighted_r2(truth_t, pred_mean_t, all_genes, full_tumor_variance)
+    b_metrics['gvw_mean_r2'] = _weighted_r2(truth_b, pred_mean_b, all_genes, full_background_variance)
+
+    # Gene-level and sample-level correlation summaries
+    def _rankdata(x: np.ndarray) -> np.ndarray:
+        return pd.Series(x).rank(method='average').to_numpy(dtype=np.float64)
+
+    def _pearson_r(y: np.ndarray, yhat: np.ndarray) -> float:
+        y_c = y - float(np.mean(y))
+        yhat_c = yhat - float(np.mean(yhat))
+        denom = float(np.sqrt(np.sum(y_c * y_c) * np.sum(yhat_c * yhat_c)))
+        if denom <= 1e-12:
+            return float('nan')
+        return float(np.clip(np.sum(y_c * yhat_c) / denom, -1.0, 1.0))
+
+    def _spearman_r(y: np.ndarray, yhat: np.ndarray) -> float:
+        return _pearson_r(_rankdata(y), _rankdata(yhat))
+
+    def _spearman_r2(y: np.ndarray, yhat: np.ndarray) -> float:
+        r = _spearman_r(y, yhat)
+        return r * r if np.isfinite(r) else float('nan')
+
+    def _group_spearman_r2(df: pd.DataFrame, group_col: str, pred_col: str = 'prediction_mean') -> np.ndarray:
+        out = []
+        for _, sub in df.groupby(group_col):
+            y = sub['truth'].to_numpy(dtype=np.float64)
+            yhat = sub[pred_col].to_numpy(dtype=np.float64)
+            mask = np.isfinite(y) & np.isfinite(yhat)
+            if int(mask.sum()) < 3:
+                continue
+            out.append(_spearman_r2(y[mask], yhat[mask]))
+        arr = np.asarray(out, dtype=np.float64)
+        return arr[np.isfinite(arr)]
+
+    def _group_pearson_r_named(df: pd.DataFrame, group_col: str, pred_col: str):
+        """Per-gene Pearson r with associated gene names."""
+        names = []
+        vals = []
+        for gname, sub in df.groupby(group_col):
+            y = sub['truth'].to_numpy(dtype=np.float64)
+            yhat = sub[pred_col].to_numpy(dtype=np.float64)
+            mask = np.isfinite(y) & np.isfinite(yhat)
+            if int(mask.sum()) < 3:
+                continue
+            r = _pearson_r(y[mask], yhat[mask])
+            if np.isfinite(r):
+                names.append(str(gname))
+                vals.append(r)
+        return np.asarray(vals, dtype=np.float64), names
+
+    # Tumor gene/sample summaries
+    df_t_tmp = df_tumor.copy()
+    df_t_tmp['gene'] = df_t_tmp.index.astype(str)
+    gene_r2_t = _group_spearman_r2(df_t_tmp, group_col='gene', pred_col='prediction_mean')
+    sample_r2_t = _group_spearman_r2(df_tumor, group_col='sample', pred_col='prediction_mean')
+    t_metrics['gene_r2_mean'] = float(np.nanmean(gene_r2_t)) if gene_r2_t.size else float('nan')
+    t_metrics['gene_r2_median'] = float(np.nanmedian(gene_r2_t)) if gene_r2_t.size else float('nan')
+    t_metrics['gene_r2_n'] = int(gene_r2_t.size)
+    t_metrics['sample_r2_mean'] = float(np.nanmean(sample_r2_t)) if sample_r2_t.size else float('nan')
+    t_metrics['sample_r2_median'] = float(np.nanmedian(sample_r2_t)) if sample_r2_t.size else float('nan')
+    t_metrics['sample_r2_n'] = int(sample_r2_t.size)
+
+    # Quantile coverage (fraction of valid obs inside 90% CI)
+    def _coverage(truth, lo, hi):
+        mask = np.isfinite(truth)
+        if mask.sum() == 0:
+            return float('nan')
+        return float(np.mean((truth[mask] >= lo[mask]) & (truth[mask] <= hi[mask])))
+
+    t_metrics['quantile_coverage'] = _coverage(truth_t, q5_t, q95_t)
+    b_metrics['quantile_coverage'] = _coverage(truth_b, q5_b, q95_b)
+
+    metrics = {
+        'fold': int(fold_num),
+        'tumor': t_metrics,
+        'background': b_metrics,
+    }
+    with open(os.path.join(fold_dir, f'validation-fold_{fold_num}_metrics.json'), 'w') as f:
+        json.dump(metrics, f, indent=2)
+
+    print(
+        f'Fold {fold_num} tumor metrics: '
+        f'gvw_crps={t_metrics.get("gvw_crps", float("nan")):.4f} '
+        f'gvw_mean_r2={t_metrics.get("gvw_mean_r2", float("nan")):.4f} '
+        f'gene_r2(mean/med)={t_metrics.get("gene_r2_mean", float("nan")):.4f}/'
+        f'{t_metrics.get("gene_r2_median", float("nan")):.4f} '
+        f'sample_r2(mean/med)={t_metrics.get("sample_r2_mean", float("nan")):.4f}/'
+        f'{t_metrics.get("sample_r2_median", float("nan")):.4f}'
+    )
+
+    # ---- Plots (per fold) ----
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        plot_dir = os.path.join(fold_dir, 'plots')
+        os.makedirs(plot_dir, exist_ok=True)
+
+        # Helper: compute global regression stats for a scatter annotation.
+        def _scatter_stats(truth, pred):
+            mask = np.isfinite(truth) & np.isfinite(pred)
+            y, yhat = truth[mask], pred[mask]
+            if y.size < 3:
+                return {}
+            r = _pearson_r(y, yhat)
+            sp = _spearman_r(y, yhat)
+            err = yhat - y
+            mae = float(np.mean(np.abs(err)))
+            ss_res = float(np.sum(err ** 2))
+            ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else float('nan')
+            return {'R²': r2, 'Pearson r': r, 'Spearman r': sp, 'MAE': mae}
+
+        # Helper: true vs predicted scatter plot.
+        def _plot_true_vs_pred(truth, pred, head_label, est_label, fname):
+            mask = np.isfinite(truth) & np.isfinite(pred)
+            x, y_pts = truth[mask], pred[mask]
+            if x.size == 0:
+                return
+            stats = _scatter_stats(truth, pred)
+            rng = np.random.RandomState(0)
+            if x.size > 20000:
+                idx = rng.choice(x.size, size=20000, replace=False)
+                x, y_pts = x[idx], y_pts[idx]
+            fig = plt.figure(figsize=(5, 5))
+            plt.scatter(x, y_pts, s=3, alpha=0.25, linewidths=0)
+            plt.plot([0.0, Y_MAX], [0.0, Y_MAX], color='black', linewidth=1)
+            plt.xlim(0.0, Y_MAX)
+            plt.ylim(0.0, Y_MAX)
+            plt.xlabel('truth')
+            plt.ylabel(f'prediction ({est_label})')
+            plt.title(f'Fold {fold_num} {head_label}: true vs pred ({est_label})')
+            if stats:
+                ann = '\n'.join(f'{k} = {v:.4f}' for k, v in stats.items())
+                plt.text(
+                    0.03, 0.97, ann, transform=plt.gca().transAxes, fontsize=8,
+                    verticalalignment='top',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.85, edgecolor='#cccccc'),
+                    family='monospace',
+                )
+            plt.tight_layout()
+            fig.savefig(os.path.join(plot_dir, fname), dpi=150)
+            plt.close(fig)
+
+        # Helper: gene-level Pearson r density histogram by variance group.
+        def _plot_gene_r_hist(df, pred_col, var_map, head_label, est_label, fname):
+            df_tmp = df.copy()
+            df_tmp['gene'] = df_tmp.index.astype(str)
+            gene_r, gene_names_r = _group_pearson_r_named(df_tmp, 'gene', pred_col)
+            if gene_r.size == 0:
+                return
+            # Assign genes to biologically-meaningful variance groups.
+            gene_var = np.array(
+                [float(var_map.get(g, 0.0)) for g in gene_names_r], dtype=np.float64,
+            ) if var_map else np.zeros(len(gene_names_r), dtype=np.float64)
+            low_mask = gene_var < 1.0
+            mid_mask = (gene_var >= 1.0) & (gene_var < 3.0)
+            high_mask = gene_var >= 3.0
+            n_total = gene_r.size
+
+            groups = [
+                (low_mask, 'Low [0, 1)', '#3b82f6'),
+                (mid_mask, 'Med [1, 3)', '#f59e0b'),
+                (high_mask, 'High [3, \u221e)', '#ef4444'),
+            ]
+
+            fig, ax = plt.subplots(figsize=(5, 5))
+            bins = np.linspace(-1.0, 1.0, 61)
+            for gmask, glabel, gcolor in groups:
+                r_sub = gene_r[gmask]
+                if r_sub.size == 0:
+                    continue
+                pct = 100.0 * r_sub.size / n_total
+                ax.hist(
+                    r_sub, bins=bins, alpha=0.55, color=gcolor, density=True,
+                    label=f'{glabel} ({pct:.0f}%)', edgecolor='white', linewidth=0.3,
+                )
+            ax.axvline(0.0, color='black', linestyle='--', linewidth=0.8)
+            ax.set_xlim(-1.0, 1.0)
+            ax.set_xlabel('gene-level Pearson r')
+            ax.set_ylabel('density')
+            ax.set_title(f'Fold {fold_num} {head_label}: gene Pearson r ({est_label})')
+            ax.legend(loc='upper left', fontsize=8, frameon=True)
+            ax.set_box_aspect(1)
+            fig.tight_layout()
+            fig.savefig(os.path.join(plot_dir, fname), dpi=150)
+            plt.close(fig)
+
+        # Generate all plots for both heads.
+        for head, df, truth, pmean, var_map in [
+            ('tumor', df_tumor, truth_t, pred_mean_t, full_tumor_variance),
+            ('background', df_background, truth_b, pred_mean_b, full_background_variance),
+        ]:
+            _plot_true_vs_pred(truth, pmean, head, 'mean',
+                               f'{head}_true_vs_pred-mean.png')
+            _plot_gene_r_hist(df, 'prediction_mean', var_map, head, 'mean',
+                              f'{head}-mean_gene_r_hist.png')
+
+    except Exception as e:
+        print(f'  Warning: failed to generate evaluation plots for fold {fold_num}: {e}')
+
+
+def full_train_from_splits(
+    training_set_tsv: str,
+    zarr_base: str,
+    out_dir: str = 'final_models/',
+    model_config: Optional[BioDVNConfig] = None,
+    training_config: Optional[TrainingConfig] = None,
+    genes_per_batch: int = 32,
+    chunk_size: int = 256,
+    shuffle_genes_in_batch: bool = True,
+    seed: int = 42,
+    subsample_frac: Optional[float] = None,
+):
+    """Train a single model on ALL samples in the training_set TSV (no fold holdout).
+
+    This is for producing a final production model after CV tuning has selected
+    hyperparameters. All samples are used for training, with a 90/10 random split
+    for early stopping validation.
+
+    Args:
+        training_set_tsv: Path to TSV file with Cohort/Sample/Fold columns.
+        zarr_base: Base directory for Zarr stores.
+        out_dir: Output directory for final model.
+        model_config: Fully-specified BioDVNConfig.
+        training_config: Fully-specified TrainingConfig.
+        genes_per_batch: Genes per batch (32 invariant).
+        chunk_size: Genes per chunk (256 invariant).
+        shuffle_genes_in_batch: Whether to shuffle genes within batch.
+        seed: Random seed for reproducibility.
+        subsample_frac: Optional fraction (0.0-1.0) of genes for fast sanity checks.
+    """
+    import csv
+    import tempfile
+
+    print('Full training mode (all samples)...')
     os.makedirs(out_dir, exist_ok=True)
-    # hypermodel = get_model_instance('BioCNN')
-    hypermodel = get_model_instance('BioCNN')
-    def extract_features_wrapper(batch):
-        return hypermodel.patient_feature_extraction(batch)
-    model = tf.keras.models.load_model(model_path, custom_objects={'CosineDecay': CosineDecay, 'WeightedMSELoss': WeightedMSELoss(), 'ClippedReLU': ClippedReLU()})
 
-    # Get list of .tfrecord files in samples_folder
-    samples_files = [f for f in os.listdir(samples_folder) if f.endswith('.tfrecord')]
-    sample_home = "/".join(samples_folder.split("/")[1:]).rstrip('/')
+    if model_config is None:
+        model_config = BioDVNConfig()
+    if training_config is None:
+        training_config = TrainingConfig(checkpoint_dir=out_dir)
+    training_config = replace(training_config, checkpoint_dir=out_dir)
 
-    # Initialize an empty DataFrame to store all predictions
-    all_predictions = pd.DataFrame()
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA is required (GPU-only). No CPU fallback is supported.')
+    device = torch.device('cuda')
 
-    for sample_file in samples_files:
-        # Remove the file extension to get the sample name
-        sample = sample_file.replace('.tfrecord', '')
-        print(f'Starting run for {sample}')
+    # Read all samples from TSV (ignore fold assignments)
+    if not os.path.exists(training_set_tsv):
+        raise FileNotFoundError(f"Training set TSV not found: {training_set_tsv}")
 
-        # Get the dataset for the current sample
-        valset = get_dataset(use_set=sample_home, samples=[sample], shuffle=False, batch_size=32, labeled=False).map(extract_features_wrapper)
-        valset_genes = get_dataset(use_set=sample_home, samples=[sample], shuffle=False, batch_size=32, labeled=False).map(extract_gene_names)
+    all_paths: List[str] = []
+    with open(training_set_tsv, 'r', newline='') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            cohort = row['Cohort'].strip()
+            sample = row['Sample'].strip()
+            zarr_path = os.path.join(zarr_base, cohort, f"{sample}.zarr")
+            if not os.path.isdir(zarr_path):
+                raise FileNotFoundError(f"Zarr store not found: {zarr_path}")
+            all_paths.append(zarr_path)
 
-        # Flatten the gene_names_list and decode the byte strings to strings, etc.
-        gene_names_list = [item.numpy().decode('utf-8') for batch in valset_genes for item in batch]
+    # Shuffle and split 90/10 for train/val
+    rng = np.random.RandomState(seed)
+    rng.shuffle(all_paths)
+    split_idx = int(len(all_paths) * 0.9)
+    train_paths = all_paths[:split_idx]
+    val_paths = all_paths[split_idx:]
 
-        # Generate predictions
-        predictions = model.predict(valset).flatten()
+    print(f'Total samples: {len(all_paths)}, Train: {len(train_paths)}, Val: {len(val_paths)}')
 
-        # Create a DataFrame for the current sample's predictions
-        df = pd.DataFrame({sample: predictions}, index=gene_names_list)
+    # Write temp index files
+    temp_dir = tempfile.mkdtemp(prefix='proteus_full_train_')
+    train_index = os.path.join(temp_dir, 'full_train.json')
+    val_index = os.path.join(temp_dir, 'full_val.json')
+    with open(train_index, 'w') as f:
+        json.dump(train_paths, f)
+    with open(val_index, 'w') as f:
+        json.dump(val_paths, f)
 
-        # Concatenate the current sample's DataFrame to the all_predictions DataFrame
-        all_predictions = pd.concat([all_predictions, df], axis=1)
+    # Log subsampling info if active
+    if subsample_frac is not None and subsample_frac < 1.0:
+        print(f"  [Subsample] Using ~{subsample_frac*100:.0f}% of genes for fast sanity check")
 
-        print(f'Finished running model on {sample}.')
+    # Compute per-gene variance weights from all training samples.
+    # Clipped variance weights for the loss function.
+    print('Computing gene variance weights from all training samples...')
+    from proteus_utils.proteus_utils import compute_gene_weights_from_zarr, compute_gene_variances_unclipped
+    _raw_var = compute_gene_variances_unclipped(train_paths, label_key='flat/tumor_exp')
+    gene_weights = compute_gene_weights_from_zarr(
+        train_paths,
+        label_key='flat/tumor_exp',
+    )
+    _raw_vals = list(_raw_var.values())
+    print(f'  {len(gene_weights)} genes — '
+          f'raw variance [{min(_raw_vals):.4f}, {max(_raw_vals):.4f}], '
+          f'clipped to [0.100, 10.000]')
 
-    # Save the all_predictions DataFrame to a .tsv file
-    all_predictions.to_csv(os.path.join(out_dir, 'predictions.tsv'), sep='\t')
+    # Create loaders
+    train_loader, train_steps = create_data_loader(
+        index_file=train_index,
+        num_workers=_loader_workers(),
+        shuffle=False,
+        labeled=True,
+        loader_mode='chunk',
+        chunk_size=chunk_size,
+        genes_per_batch=genes_per_batch,
+        shuffle_genes_in_batch=shuffle_genes_in_batch,
+        seed=seed,
+        drop_last=False,
+        subsample_frac=subsample_frac,
+        gene_weights=gene_weights,
+    )
+
+    val_loader, val_steps = create_data_loader(
+        index_file=val_index,
+        num_workers=_loader_workers(),
+        shuffle=False,
+        labeled=True,
+        loader_mode='chunk',
+        chunk_size=chunk_size,
+        genes_per_batch=genes_per_batch,
+        shuffle_genes_in_batch=False,
+        seed=seed,
+        include_metadata=False,
+        drop_last=False,
+        subsample_frac=subsample_frac,
+        gene_weights=gene_weights,
+    )
+
+    print(f'Training batches: {train_steps}, Validation batches: {val_steps}')
+
+    # Seed before model construction for reproducible weight init.
+    _seed_everything(seed)
+
+    # Create model
+    model = BioDVN(model_config)
+
+    # Save config
+    with open(os.path.join(out_dir, 'model_config.json'), 'w') as f:
+        json.dump(asdict(model_config), f, indent=2)
+    with open(os.path.join(out_dir, 'training_config.json'), 'w') as f:
+        json.dump(asdict(training_config), f, indent=2)
+
+    # Train
+    trainer = Trainer(model, training_config, model_config, device)
+    history = trainer.fit(train_loader, val_loader, epochs=training_config.epochs)
+
+    # Save final model
+    model_for_save = getattr(trainer.model, '_orig_mod', trainer.model)
+    final_path = os.path.join(out_dir, 'final_model.pt')
+    torch.save(model_for_save.state_dict(), final_path)
+    print(f'Saved final model to: {final_path}')
+
+
+def run_model(model_path: str, sample_files: List[str], out_dir: str):
+    """Run the model on samples for inference.
+
+    Outputs long-format TSVs (one row per gene × sample) with full MDN
+    distribution parameters and quantile CIs — matching the
+    validation-fold prediction schema (minus the ``truth`` column).
+
+    Args:
+        model_path: Path to saved model weights.
+        sample_files: List of paths to sample Zarr stores.
+        out_dir: Output directory.
+    """
+    from models.model_utils import mixture_quantile
+
+    print('Running model for inference...')
+    os.makedirs(out_dir, exist_ok=True)
+
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA is required (GPU-only). No CPU fallback is supported.')
+    device = torch.device('cuda')
+
+    # Load model config if present (for reproducible inference)
+    model_dir = str(Path(model_path).parent)
+    cfg_path = os.path.join(model_dir, 'model_config.json')
+    if os.path.exists(cfg_path):
+        with open(cfg_path, 'r') as f:
+            cfg_raw = json.load(f)
+        allowed = set(BioDVNConfig.__dataclass_fields__.keys())
+        cfg = {k: v for k, v in cfg_raw.items() if k in allowed}
+        model_config = BioDVNConfig(**cfg)
+        print(f'Loaded model config from: {cfg_path}')
+    else:
+        model_config = BioDVNConfig()
+        print('WARNING: No model_config.json found; using BioDVNConfig defaults for inference.')
+
+    model = BioDVN(model_config).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+
+    # Long-format accumulators (shared across all samples).
+    _pred_cols = [
+        'prediction_mean',
+        'ci_q5', 'ci_q95',
+        'pi_delta', 'pi_gamma', 'gamma_beta',
+        'pi_normal', 'normal_mean', 'normal_stdev',
+    ]
+    tumor_rows: Dict[str, list] = {k: [] for k in _pred_cols}
+    bg_rows: Dict[str, list] = {k: [] for k in _pred_cols}
+    all_genes: List[str] = []
+    all_tumor_samples: List[str] = []
+    all_bg_samples: List[str] = []
+
+    for sample_file in sample_files:
+        sample = Path(sample_file).stem.replace('.zarr', '')
+        print(f'Processing {sample}...')
+
+        loader, gene_names = create_inference_loader(sample_file)
+
+        with torch.no_grad():
+            for batch in loader:
+                batch_device = {k: v.to(device) for k, v in batch.items()}
+                predictions, _ = model(batch_device, return_internal_loss=False)
+
+                for rows, head in [(tumor_rows, 'tumor'), (bg_rows, 'background')]:
+                    mdn = predictions[f'{head}_mdn']
+                    q_vals = mixture_quantile(mdn, quantiles=(0.05, 0.95))  # (batch, 2)
+                    pi = mdn['log_pi'].exp().cpu().numpy()
+
+                    rows['prediction_mean'].extend(
+                        predictions[f'{head}_exp'].cpu().numpy().flatten())
+                    rows['ci_q5'].extend(q_vals[:, 0].cpu().numpy().flatten())
+                    rows['ci_q95'].extend(q_vals[:, 1].cpu().numpy().flatten())
+                    rows['pi_delta'].extend(pi[:, 0].flatten())
+                    rows['pi_gamma'].extend(pi[:, 1].flatten())
+                    rows['gamma_beta'].extend(
+                        mdn['gamma_beta'].cpu().numpy().flatten())
+                    rows['pi_normal'].extend(pi[:, 2].flatten())
+                    rows['normal_mean'].extend(
+                        mdn['normal_mu'].cpu().numpy().flatten())
+                    rows['normal_stdev'].extend(
+                        mdn['normal_sigma'].cpu().numpy().flatten())
+
+        n_genes = len(gene_names)
+        all_genes.extend([str(g) for g in gene_names])
+        all_tumor_samples.extend([sample] * n_genes)
+        all_bg_samples.extend([sample] * n_genes)
+
+        print(f'Finished {sample}.')
+
+    # Build and save long-format TSVs (one row per gene × sample).
+    tumor_rows['sample'] = all_tumor_samples
+    bg_rows['sample'] = all_bg_samples
+
+    df_tumor = pd.DataFrame(tumor_rows, index=all_genes)
+    df_bg = pd.DataFrame(bg_rows, index=all_genes)
+
+    df_tumor.to_csv(os.path.join(out_dir, 'predictions_tumor.tsv'), sep='\t')
+    df_bg.to_csv(os.path.join(out_dir, 'predictions_background.tsv'), sep='\t')
 
     print('Finished running model on all samples.')
-    return all_predictions
 
 
 def main():
-    print(tf.__version__)
-    """
-    The main function to run the Proteus pipeline.
-
-    This function sets up the necessary parameters for the Proteus pipeline, including paths to various data and model files, 
-    and the modalities to be used in the model. If the `process_data` flag is set, it will process the data according to the
-    defined modalities and save the processed data in a hierarchical format (gene -> feature-key -> data).
-
-    Finally, it defines the parameters for the dataset to be used in the model training/testing.
-
-    Command line arguments:
-    --scalars_reference_path: Path to the scalars reference file.
-    --model_name: Name of the model to use.
-    --use_set: The dataset to use.
-    --process_data: If True, will check but not overwrite existing sample-level h5 data.
-    --test_fold: Specify the test fold for parallel training on different GPU nodes.
-    --set_parameters: Path to the set_parameters.tsv file.
-    --run_mode: Specify whether to 'train' or 'run' the model.
-    --tune_hps: Specify whether to tune hyperparameters.
-
-    NOTE: this function has been optimized to run on as many GPUs as are available on the machine. At Fred Hutch some
-    dunce decided to put every GPU core on its own node, so the native methods for multi-GPU training don't work (for now).
-    Instead, training folds can be run in parallel on different GPU (nodes) by specifying a test fold on the command line.
-
-    Notes:
-    The `use_set` parameter is a key in the `set_parameters` dictionary defined in the function. This dictionary defines
-    the parameters for the dataset to be used in the model training/testing. Here are the current options:
-
-        use_set:
-    GeneStrat_0x_0CPM
-    SampleStrat_0x_0CPM
-    PC-HO_0x_0CPM
-    SCLC-HO_0x_0CPM
-    """
-    # Create the parser and add the arguments
-    parser = argparse.ArgumentParser(description="Run Proteus")
-    parser.add_argument("--scalars_reference_path", type=str, default="/fh/fast/ha_g/user/rpatton/TritonCNN/Proteus/reference/MANE.GRCh38.v1.3.UniversalReference.tsv", help="Path to the scalars reference file")
-    parser.add_argument("--model_name", type=str, default="BioCNN", help="Name of the model to use (in models/models.py))")
-    parser.add_argument("--use_set", type=str, default='GeneStrat_0x_0CPM', help="The set_parameters dataset to use (see Proteus.py main() for options)")
-    parser.add_argument("--process_data", type=bool, default=False, help="If True, will check but not overwrite existing sample-level h5 data")
-    parser.add_argument("--test_fold", type=int, default=None, help="Specify the test fold for parallel training on different GPU nodes")
-    parser.add_argument("--set_parameters", type=str, default='data/set_parameters.tsv', help="Path to the set_parameters.tsv file")
-    parser.add_argument("--run_mode", type=str, default='train', help="Specify whether to 'train' (+test using CV), 'test', 'full-train', 'transfer-train',  or 'run' the model")
-    parser.add_argument("--tune_hps", type=bool, default=False, help="Specify whether to tune hyperparameters")
-
-    # Parse the arguments
-    args = parser.parse_args()
-
-    # Define the set parameters / use_sets
-    """ KEYS: these are pre-defined, hard-coded fold splits with different holdout strategies and stratification methods.
-    min_depth is used to enforce a depth cutoff for heldout ('run') data as well if specfied. use_zeros applies only to training."""
-    set_parameters = {}
-    with open(args.set_parameters, 'r') as f:
-        reader = csv.reader(f, delimiter='\t')
-        next(reader)  # Skip the header row
-        for row in reader:
-            set_parameters[row[0]] = {'strat_method': row[1],
-                                      'min_depth': float(row[2]),
-                                      'min_label': float(row[3]),
-                                      'holdout_samples': row[4].split(',')}
-
-    # Define dataset paths and label files (name: [Triton top directory, RNA-Seq/truth path, TFX labels path])
-    datasets = {'LuCaP-PDX':['/fh/fast/ha_g/user/rpatton/LuCaP_data/', 'labels/LuCaP-PDX_Log2CPMplus1.tsv', None],
-                'SCLC-PDX':['/fh/fast/ha_g/user/rpatton/SCLC_data/', 'labels/SCLC-PDX_Log2CPMplus1.tsv', None],
-                'BC-TAN':['/fh/fast/ha_g/user/rpatton/BC-TAN_data/', 'labels/BC-TAN_Log2CPMplus1.tsv', 'labels/BC-TAN_TFX_Subtype.tsv'],
-                'PC-TAN':['/fh/fast/ha_g/user/rpatton/PC-TAN_data/', 'labels/PC-TAN_Log2CPMplus1.tsv', 'labels/PC-TAN_TFX_Subtype.tsv'],
-                'SCLC':[None, 'labels/SCLC_Log2CPMplus1.tsv', 'labels/SCLC_TFX_Subtype.tsv'],
-                'PSMA':['/fh/fast/ha_g/user/rpatton/PSMA_data/', None, 'labels/PSMA_TFX_Subtype.tsv'],
-                'WCDT':[None, 'labels/WCDT_Log2CPMplus1.tsv', None]}
+    """Main entry point for Proteus PyTorch pipeline."""
+    parser = argparse.ArgumentParser(description="Run Proteus (PyTorch) - Gene expression prediction from cfDNA", formatter_class=argparse.RawDescriptionHelpFormatter,
+                                     epilog="""
+    Examples:
+    # Process raw data to Zarr stores
+    python Proteus.py --process_data --use_set PC-PDX
     
-    # Process all data into sample-level h5 files (or check if it needs to be processed)
+    # Train with cross-validation (requires experiment YAML)
+    python Proteus.py --run_mode train --experiment config/experiments/biodvn_train.yaml
+    
+    # Train specific fold (for HPC parallelization)
+    python Proteus.py --run_mode train --experiment config/experiments/biodvn_train.yaml --test_fold 1
+
+    # Full training (all data, no CV holdout)
+    python Proteus.py --run_mode full-train --experiment config/experiments/biodvn_train.yaml
+
+    # Optuna CV tuning
+    python Proteus.py --run_mode tune --experiment config/experiments/biodvn_tune.yaml --n_trials 50
+    
+    # Run inference on holdout samples
+    python Proteus.py --run_mode run --use_set Crompton
+    """
+    )
+    
+    # Data processing arguments
+    parser.add_argument("--process_data", action='store_true', help="Process raw Triton data into Zarr stores")
+    parser.add_argument("--verify_data", action='store_true', help="Fast presence check for Zarr stores (existence-only)")
+    
+    # Dataset configuration
+    parser.add_argument("--use_set", type=str, default='PC-PDX', help="Dataset name (e.g., PC-PDX, UW, SCLC). Use 'all' to process every configured dataset.")
+    parser.add_argument("--raw_data_dir", type=str, default=None, help="Base directory for raw Triton outputs (default: /fh/fast/ha_g/user/rpatton)")
+    parser.add_argument("--zarr_output_dir", type=str, default=None, help="Zarr output directory (default: /hpc/temp/ha_g/user/rpatton/ProteusZarrs)")
+    parser.add_argument("--scalars_reference_path", type=str, default="reference/MANE.GRCh38.v1.3.UniversalReference.tsv", help="Path to reference TSV file")
+    
+    # Training arguments
+    parser.add_argument("--model_name", type=str, default="BioDVN", help="Model architecture name")
+    parser.add_argument("--run_mode", type=str, default='train', choices=['train', 'full-train', 'tune', 'run'], help="train=CV training, full-train=final model, tune=Optuna CV tuning, run=inference")
+    parser.add_argument("--test_fold", type=int, default=None, help="Specific fold to train (for HPC parallelization)")
+    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
+
+    # Experiment / tuning
+    parser.add_argument("--experiment", type=str, default=None, help="Path to experiment YAML (required for train/full-train/tune modes)")
+    parser.add_argument("--n_trials", type=int, default=50, help="Number of Optuna trials for --run_mode tune")
+    parser.add_argument("--optuna_storage", type=str, default="sqlite:///results_training/optuna.db", help="Optuna storage URL (default: sqlite:///results_training/optuna.db)")
+    parser.add_argument("--study_name", type=str, default=None, help="Optuna study name override (default: experiment.name)")
+    parser.add_argument("--sampler_seed", type=int, default=42, help="Optuna sampler seed")
+
+    # Manual warm-start only (transfer learning is HP-controlled in experiment YAML)
+    parser.add_argument("--base_weights", type=str, default=None, help="Optional: path to a .pt state_dict to load before training (manual warm-start).")
+    parser.add_argument("--runtime_device_banner", action='store_true', help="Print device and memory info at runtime")
+    
+    # Sanity check / fast iteration
+    parser.add_argument("--subsample", type=float, default=None, 
+                        help="Subsample fraction (0.0-1.0) of genes for fast sanity checks. "
+                             "E.g., --subsample 0.1 uses ~10%% of genes per epoch.")
+    parser.add_argument("--debug_inputs", action='store_true',
+                        help="Print detailed diagnostics for the first batch of input tensors "
+                             "(shapes, dtypes, value ranges, sanity checks) then exit. "
+                             "Use this to verify data loading is correct before training.")
+    
+    # General options
+    parser.add_argument("--overwrite", action='store_true', help="Overwrite existing data files")
+    args = parser.parse_args()
+    
+    # If an experiment is provided, it becomes the source of truth for training.
+    experiment_spec = None
+    if args.experiment is not None:
+        from config.experiment_spec import load_experiment_spec
+        experiment_spec = load_experiment_spec(args.experiment)
+
+    # For data processing and inference, use_set is still used
+    active_use_set = args.use_set
+    
+    # Initialize ConfigLoader for YAML-based dataset configurations
+    config_loader = ConfigLoader()
+    
+    # Helper function to load dataset config.
+    def get_dataset_config(dataset_name: str):
+        """Load dataset config from YAML or return None if not found."""
+        try:
+            return config_loader.load_dataset(dataset_name)
+        except FileNotFoundError:
+            return None
+    
+    # Determine Zarr output directory
+    zarr_base = args.zarr_output_dir or DEFAULT_ZARR_BASE
+
+    # Resolve project-relative inputs regardless of CWD
+    labels_dir = str(PROJECT_ROOT / 'labels')
+    default_ref_path = str(PROJECT_ROOT / 'reference' / 'MANE.GRCh38.v1.3.UniversalReference.tsv')
+    
+    # Verify data mode
+    if args.verify_data:
+        zarr_dir = get_zarr_output_dir(args.use_set, zarr_base)
+        if not (os.path.exists(zarr_dir) and any(str(f).endswith('.zarr') for f in os.listdir(zarr_dir))):
+            print(f"No Zarr stores found in {zarr_dir}")
+            return
+
+        stores = [f for f in os.listdir(zarr_dir) if f.endswith('.zarr')]
+        print(f"Found {len(stores)} Zarr stores in {zarr_dir}")
+        preview = sorted(stores)[:20]
+        if preview:
+            print("First stores:")
+            for s in preview:
+                print(f"  {s}")
+        return
+    
+    # Process data into Zarr stores
     if args.process_data:
-        for dataset, set_paths in datasets.items():
-            if set_paths[0] is None:
-                continue
-            # Define the modality dictionary
-            """ MODALITY DICT: this is the dictionary that defines the global modalities to be used in the model, and where to find them.
-            These are also hard-coded into the preprocessing scripts, so if you change them here, you must change them there as well."""
-            modality_dict = {'TSS_images': ['image', set_paths[0] + 'Triton_TSS/results/'],
-                            'TSS_scalars': ['scalars', set_paths[0] + 'Triton_TSS/results/'],
-                            'GB_scalars': ['scalars', set_paths[0] + 'Triton_GB/results/'],
-                            'ref_scalars': ['ref', ['NumExons', 'transcript_length', 'mRNA_size'], args.scalars_reference_path]}
-            if set_paths[1] is not None:
-                modality_dict['truth_labels'] = ['label', set_paths[1]]
-            if set_paths[2] is not None:
-                modality_dict['TFX_label'] = ['tfx', set_paths[2]]
-            # Process the data
-            """ PROCESS DATA: if True, will check but not overwrite existing SAMPLE-LEVEL h5 data
-            -> the outer structure of the saved, sample-level data will be a dictionary with gene names as keys
-            -> the inner structure of the saved, sample-level data will be a dictionary with feature-keys defined by the modality_dict"""
-            print('Starting data processing for ' + dataset + ' . . .')
-            generate_data(dataset, modality_dict, args.scalars_reference_path, overwrite=False)
+        # Resolve dataset list: 'all' expands to every configured YAML.
+        if args.use_set.lower() == 'all':
+            datasets_to_process = sorted(f.stem for f in config_loader.datasets_dir.glob('*.yaml'))
+            if not datasets_to_process:
+                print("No dataset configs found in config/datasets/")
+                sys.exit(1)
+            print(f"Processing all configured datasets: {datasets_to_process}")
+        else:
+            datasets_to_process = [args.use_set]
+
+        raw_data_dir = args.raw_data_dir or "/fh/fast/ha_g/user/rpatton"
+
+        for dataset_name in datasets_to_process:
+            dataset_config = get_dataset_config(dataset_name)
+            if dataset_config is None:
+                available = [f.stem for f in config_loader.datasets_dir.glob('*.yaml')]
+                print(f"Dataset '{dataset_name}' is not configured.")
+                print(f"Available datasets: {available}")
+                print(f"Add a YAML config file at: config/datasets/{dataset_name}.yaml")
+                sys.exit(1)
+
+            # Build absolute paths from config-specified relative paths
+            tss_dir = os.path.join(raw_data_dir, dataset_config.triton_tss)
+            gb_dir = os.path.join(raw_data_dir, dataset_config.triton_gb)
+
+            print(f'Processing {dataset_name}...')
+            print(f'  Config loaded from: config/datasets/{dataset_name}.yaml')
+            generate_data(
+                dataset=dataset_name,
+                tss_dir=tss_dir,
+                gb_dir=gb_dir,
+                labels_dir=labels_dir,
+                ref_path=args.scalars_reference_path or default_ref_path,
+                tfx_file=dataset_config.tfx_file,
+                zarr_base_dir=zarr_base,
+                tumor_exp_file=dataset_config.tumor_exp_file,
+                background_exp_file=dataset_config.background_exp_file,
+                overwrite=args.overwrite,
+            )
+
         print('Finished processing data.')
+        return
+    
+    # ==========================================================================
+    # AUTO-CHECK: Ensure required datasets exist before training/inference
+    # This handles the case where scratch storage has been cleared.
+    # Only check datasets actively being used.
+    # ==========================================================================
+    raw_data_dir = args.raw_data_dir or "/fh/fast/ha_g/user/rpatton"
 
-    # Run Proteus.py in training mode if specified
-    if args.run_mode == 'train' or args.run_mode == 'test':
-        # Check if use_set key is in the dictionary
-        if args.use_set in set_parameters:
-            print(set_parameters[args.use_set])
-            # Get the parameters for this use_set
-            strat_method = set_parameters[args.use_set]['strat_method']
-            min_depth = set_parameters[args.use_set]['min_depth']
-            min_label = set_parameters[args.use_set]['min_label']
-            holdout_samples = set_parameters[args.use_set]['holdout_samples']
-            # Define common parameters
-            folds = 5
-            use_modes = ['TSS_images', 'TSS_scalars', 'GB_scalars', 'ref_scalars', 'TFX_label', 'truth_labels']
-            # Check if the output files already exist
-            output_files_exist = all(os.path.exists(f'data/{args.use_set}/combined_fold-{i}.tfrecord') for i in range(1, folds + 1))
-            # Get all files in the training directories (default to PDX training)
-            all_files = ['data/LuCaP-PDX/h5_files/' + f for f in os.listdir('data/LuCaP-PDX/h5_files/')] + ['data/SCLC-PDX/h5_files/' + f for f in os.listdir('data/SCLC-PDX/h5_files/')]
-            data_files = [f for f in all_files if f.endswith('_CompiledProcessedData.h5')]
-            # Check if holdout samples are named or bulk:
-            if len(holdout_samples) == 1:
-                single_sample = holdout_samples[0]
-                samples = [f.replace('_CompiledProcessedData.h5', '') for f in data_files]
-                if single_sample.startswith("PLUS_"):
-                    group_id = single_sample.replace("PLUS_", "")
-                    holdout_samples = [sample for sample in samples if group_id in sample]
-                elif single_sample.startswith("MINUS_"):
-                    group_id = single_sample.replace("MINUS_", "")
-                    holdout_samples = [sample for sample in samples if group_id not in sample]
-            # Only run generate_sets if the output files do not exist
-            if not output_files_exist:
-                generate_sets(args.use_set, strat_method, data_files, use_modes, holdout_samples, folds=folds, min_depth=min_depth, min_label=min_label)
-                print('Finished generating sets.')
-            else:
-                print('Training data already exists. Continuing.')
-        else:
-            print('No training use_set specified which matches the keys in ' + args.set_parameters + '. Exiting.')
-            quit()
+    datasets_to_check: List[str] = []
+    if get_dataset_config(active_use_set) is not None:
+        datasets_to_check.append(active_use_set)
 
-        # Define the holdout data path based on min_depth
-        holdout_data_path = f'data/tfrecords_{min_depth}x/'
-        # Check if the output files (holdout) already exist
-        output_ho_exist = all(os.path.exists(f'{holdout_data_path}{i}.tfrecord') for i in holdout_samples)
+    if datasets_to_check:
+        ensure_datasets_exist(
+            config_loader=config_loader,
+            dataset_names=datasets_to_check,
+            zarr_base=zarr_base,
+            raw_data_base=raw_data_dir,
+            labels_dir=labels_dir,
+            ref_path=args.scalars_reference_path or default_ref_path,
+            n_workers=0  # 0 = auto-detect (use all available CPUs)
+        )
 
-        # Only run generate_sets if the output files do not exist
-        if not output_ho_exist:
-            generate_holdout(use_modes, holdout_samples, holdout_data_path, min_depth=min_depth)
-            print('Finished generating sets.')
-        else:
-            print('Holdout data already exists. Continuing.')
+    # NOTE: transfer learning (including freeze_level) is HP-controlled in experiment YAML.
+    # CLI --base_weights is a manual warm-start convenience only.
+    
+    # Training modes
+    if args.run_mode == 'train':
+        if experiment_spec is None:
+            raise ValueError(
+                "--run_mode train requires --experiment <path/to/experiment.yaml>\n"
+                "Training now requires an experiment YAML that defines the training_set TSV."
+            )
 
-        # Check for GPU availability
-        n_gpus = len(tf.config.list_physical_devices('GPU'))
-        if n_gpus == 0:
-            print('No GPUs available - please check your environemnt/drivers/machine. Exiting.')
-            quit()
-        elif n_gpus == 1:
-            print('1 GPU available: running in single GPU mode.')
-        else:
-            print(f'{n_gpus} GPUs available: running in multi GPU mode.')
-
-        # Train and test as separated folds for parallelization
-        """ If this is ever run on a proper system with multiple GPUs per node, this can be changed to run all folds in parallel,
-        e.g. only the else needs to be evaluated. The if will catch a larger batch submission where each job is a single fold."""
-        if args.run_mode == 'train':
-            if args.test_fold is not None and args.test_fold > 0:
-                # train only on the specified fold, then exit
-                print(f'Running fold {args.test_fold} in parallel . . .')
-                train_model(args.model_name, args.use_set, folds, test_fold=args.test_fold, tune_hyperparameters=args.tune_hps)
-            else:
-                # train on all folds
-                train_model(args.model_name, args.use_set, folds, tune_hyperparameters=args.tune_hps)
-            print('Finished training on all CV folds.')
-
-        # After ALL folds have been run load the default (presumed best - update default based on HPs) model and test on hold out data:
-        if args.test_fold is None or args.test_fold == 0:
-            print('Training model using all CV folds for holdout evaluation . . .')
-            out_dir = 'results_training/' + args.model_name + '_' + args.use_set + '/'
-            hypermodel = get_model_instance(args.model_name)
-
-            def extract_features_wrapper(batch):
-                return hypermodel.feature_extraction(batch)
-
-            trainset = get_dataset(use_set=args.use_set, fold_numbers=range(1, folds + 1), shuffle=True, batch_size=32).map(extract_features_wrapper)
-            print('Finished combining training data.')
-            print('Training model . . .')
-            total_batches = sum(1 for _ in trainset)
-            print(f'Total training batches (size 32): {total_batches}')  # used for setting the Cosine Decay schedule to ensure it decays in N epochs
-            model = hypermodel.build_default(epoch_batches=total_batches)
-
-            # train the model
-            model.fit(trainset, epochs=15, batch_size=32, verbose=1, shuffle=True)
-            model.save_weights(os.path.join(out_dir, 'All-CV_weights.hdf5'))
-            model.save(os.path.join(out_dir, 'All-CV_model.h5'))
-            print('Finished training.')
-            print('Testing model on holdout samples . . .')
-            test_model(args.model_name, args.use_set, holdout_samples, min_depth=min_depth)
-            print('Finished!')
-
-    # Transfer learning mode
-    elif args.run_mode == 'transfer-train':
-
-        training_home = 'data/samples_training/'
-        training_samples = ['18-101',
-                            '19-001',
-                            '19-048']
-        # Define output directory and create it if it doesn't exist
-        out_dir = 'data/composite_training/'
-        os.makedirs(out_dir, exist_ok=True)
-        # Define the training data path based on min_depth
-        training_data_path = f'data/tfrecords_0.0x/'
-        # Check if the output files (holdout) already exist
-        output_training_exist = all(os.path.exists(f'{training_data_path}{i}.tfrecord') for i in training_samples)
-        # Only run generate_sets if the output files do not exist
-        use_modes = ['TSS_images', 'TSS_scalars', 'GB_scalars', 'ref_scalars', 'TFX_label', 'truth_labels']
-        if not output_training_exist:
-            generate_holdout('data/samples_training/', use_modes, training_samples, training_data_path, min_depth=0.0)
-            print('Finished generating sets.')
-        else:
-            print('Training data already exists. Continuing.')
-
-        # Create a new .tfrecord file to write the combined data
-        with tf.io.TFRecordWriter(f'{out_dir}TransferSamples_0x_0CPM.tfrecord') as writer:
-            for tfrecord_file in [f'{training_data_path}{sample}.tfrecord' for sample in training_samples]:
-                # Read the .tfrecord file
-                for record in tf.data.TFRecordDataset(tfrecord_file):
-                    # Write the record to the new file
-                    writer.write(record.numpy())
-        print('Finished combining training data.')
-
-        print('Training model . . .')
-        out_dir = 'final_models/'
-        os.makedirs(out_dir, exist_ok=True)
-
-        # Instantiate the hypermodel
-        hypermodel = get_model_instance('BioCNN')
-        model = hypermodel.build_default(epoch_batches=10000)
-
-        def extract_features_wrapper(batch):
-            return hypermodel.feature_extraction(batch)
-
-        # Load transfer training data
-        ds = tf.data.TFRecordDataset('data/composite_training/TransferSamples_0x_0CPM.tfrecord')
-        ds = ds.cache()
-        ds = ds.shuffle(1024*8)
-        opt = tf.data.Options()
-        opt.experimental_deterministic = False
-        ds = ds.with_options(opt)
-        # Parse the data
-        ds = ds.map(lambda x: parse_serialized_example(x, labeled=True))
-        # Batch the data
-        ds = ds.batch(32)
-        trainset = ds.map(extract_features_wrapper)
-
-        total_batches = sum(1 for _ in trainset)
-        print(f'Total training batches (size 32): {total_batches}')  # used for setting the Cosine Decay schedule to ensure it decays in N epochs
-        model = hypermodel.build_default(epoch_batches=total_batches,
-                                         initial_learning_rate=0.00001,  # 10% of initial learning rate
-                                         decay_epochs=10)  # decay to 0 over 10 instead of 15 epochs
-        model.load_weights('final_models/NUM_weights.hdf5')
-        print('Completed extracting data and loading base model.')
-
-        # train the model
-        model.fit(trainset, epochs=10, batch_size=32, verbose=1, shuffle=True)
-        model.save_weights(os.path.join(out_dir, f"NUM-TT_weights.hdf5"))
-        model.save(os.path.join(out_dir, 'NUM-TT_model.h5'))
-        print('Finished transfer training.')
-
-
-    # Run Proteus.py in run mode if specified
-    elif args.run_mode == 'run':
-        ### Patient data ###
-        min_val_depth = 0.0
-        use_modes = ['TSS_images', 'TSS_scalars', 'GB_scalars', 'TFX_label', 'ref_scalars']
-        patient_homes = ['/fh/fast/ha_g/user/rpatton/BC-TAN_data/',
-                         '/fh/fast/ha_g/user/rpatton/PSMA_data/',
-                         '/fh/fast/ha_g/user/rpatton/PC-TAN_data/']
-        for patient_home in patient_homes:
-            modality_dict = {'TSS_images': ['image', patient_home + 'Triton_TSS/results/'],
-                            'TSS_scalars': ['scalars', patient_home + 'Triton_TSS/results/'],
-                            'GB_scalars': ['scalars', patient_home + 'Triton_GB/results/'],
-                            'TFX_label': ['tfx', patient_home + 'labels/'],
-                            'ref_scalars': ['ref', ['NumExons', 'transcript_length', 'mRNA_size'], args.scalars_reference_path]}
-            sample_group = patient_home.split('/')[-2]
-            group_dir = 'data/' + sample_group + '/'
-            os.makedirs(group_dir, exist_ok=True)
-            h5_dir = group_dir + 'h5_files/'
-            os.makedirs(h5_dir, exist_ok=True)
-            print('Starting data processing for ' + sample_group + ' . . .')
-            generate_data(modality_dict, args.scalars_reference_path, h5_dir, overwrite=False)
-            print('Finished processing data.')
-            # Get list of files in each directory
-            samples_files = [f for f in os.listdir(h5_dir) if f.endswith('_CompiledProcessedData.h5')]
-            tf_dir = f'{group_dir}tfrecords_{min_val_depth}x/'
-            os.makedirs(tf_dir, exist_ok=True)
-            tf_files = os.listdir(tf_dir)
-            # Remove file extensions and keep only unique names
-            samples_names = set([f.replace('_CompiledProcessedData.h5', '') for f in samples_files])
-            tf_names = set([f.replace('.tfrecord', '') for f in tf_files])
-            # Find names that are in samples_names but not in tf_names
-            missing_names = samples_names - tf_names
-            # Call generate_holdout with missing_names
-            generate_holdout(h5_dir, use_modes, list(missing_names), tf_dir, min_depth=min_val_depth, filter_samples=True)
-            output_base = 'results_holdout/' + sample_group + '/'
-            os.makedirs(output_base, exist_ok=True)
-            model = 'final_models/NUM-TT_model.h5'
-            run_model(model, tf_dir, output_base)
-
-    # train a complete model on all training data
-    elif args.run_mode == 'full-train':
-        min_depth = 0.0
-        use_modes = ['TSS_images', 'TSS_scalars', 'GB_scalars', 'ref_scalars', 'TFX_label', 'truth_labels']
-        # convert the training data to a single tfrecord
-        training_home = 'data/samples_training/'
-        training_samples = [f.replace('_CompiledProcessedData.h5', '') for f in os.listdir(training_home)]
-        # Define output directory and create it if it doesn't exist
-        out_dir = 'data/composite_training/'
-        os.makedirs(out_dir, exist_ok=True)
-
-        # Define the training data path based on min_depth
-        training_data_path = f'data/tfrecords_{min_depth}x/'
-        # Check if the output files (holdout) already exist
-        output_training_exist = all(os.path.exists(f'{training_data_path}{i}.tfrecord') for i in training_samples)
-
-        # Only run generate_holdout if the output files do not exist
-        if not output_training_exist:
-            generate_holdout('data/samples_training/', use_modes, training_samples, training_data_path, min_depth=min_depth)
-            print('Finished generating sets.')
-        else:
-            print('Training data already exists. Continuing.')
-
-        # Create a new .tfrecord file to write the combined data
-        with tf.io.TFRecordWriter(f'{out_dir}AllSamples_0x_0CPM.tfrecord') as writer:
-            for tfrecord_file in glob.glob(f'{training_data_path}*.tfrecord'):
-                # Read the .tfrecord file
-                for record in tf.data.TFRecordDataset(tfrecord_file):
-                    # Write the record to the new file
-                    writer.write(record.numpy())
-        print('Finished combining training data.')
-
-        print('Training model . . .')
-        out_dir = 'final_models/'
-        os.makedirs(out_dir, exist_ok=True)
-
-        # Instantiate the hypermodel
-        hypermodel = get_model_instance('BioCNN')
-        model = hypermodel.build_default(epoch_batches=10000)
-
-        def extract_features_wrapper(batch):
-            return hypermodel.feature_extraction(batch)
+        # Resolve fixed parameters from experiment spec
+        model_cfg = BioDVNConfig(
+            encoder_start=int(experiment_spec.scale.encoder_start.fixed),
+            latent_size=int(experiment_spec.scale.latent_size.fixed),
+            decoder_start=int(experiment_spec.scale.decoder_start.fixed),
+            mdn_hidden=int(experiment_spec.scale.mdn_hidden.fixed),
+            mdn_final=int(experiment_spec.scale.mdn_final.fixed),
+            signal_filters=int(experiment_spec.scale.signal_filters.fixed),
+            signal_ksize=int(experiment_spec.scale.signal_ksize.fixed),
+            interaction_ksize=int(experiment_spec.scale.interaction_ksize.fixed),
+            initial_reduction_channels=int(experiment_spec.scale.initial_reduction_channels.fixed),
+            n_reductions=int(experiment_spec.scale.n_reductions.fixed),
+            reduction_dilation_small=int(experiment_spec.scale.reduction_dilation_small.fixed),
+            reduction_dilation_large=int(experiment_spec.scale.reduction_dilation_large.fixed),
+            beta_background=float(experiment_spec.structural.beta_background.fixed),
+            beta_tcvae=float(experiment_spec.structural.beta_tcvae.fixed),
+            beta_contrastive=float(experiment_spec.structural.beta_contrastive.fixed),
+            beta_reconstruction=float(experiment_spec.structural.beta_reconstruction.fixed),
+            beta_grl=float(experiment_spec.structural.beta_grl.fixed),
+            beta_point_mse=float(experiment_spec.structural.beta_point_mse.fixed),
+            cl_margin=float(experiment_spec.structural.cl_margin.fixed),
+            internal_weight=float(experiment_spec.structural.internal_weight.fixed),
+            dropout_rate=float(experiment_spec.training.dropout_rate.fixed),
+            weight_decay=float(experiment_spec.training.weight_decay.fixed),
+            max_lr=float(experiment_spec.training.max_lr.fixed),
+            max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
+        )
         
-        # Print the model summary
-        print('Model summary (base model if tuning hyperparameters):')
-        model.summary()
-        plot_utils.plot_model_architecture(model, out_dir)
+        train_cfg = TrainingConfig(
+            checkpoint_dir='',
+            max_lr=float(experiment_spec.training.max_lr.fixed),
+            min_lr_ratio=float(experiment_spec.training.min_lr_ratio.fixed),
+            warmup_start_lr=float(experiment_spec.training.warmup_start_lr.fixed),
+            weight_decay=float(experiment_spec.training.weight_decay.fixed),
+            max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
+            warmup_frac=float(experiment_spec.training.warmup_frac.fixed),
+            schedule_frac=float(experiment_spec.training.schedule_frac.fixed),
+            epochs=int(experiment_spec.training.epochs.fixed),
+            patience=int(experiment_spec.training.patience.fixed),
+            use_amp=bool(experiment_spec.training.use_amp.fixed),
+            runtime_device_banner=bool(args.runtime_device_banner),
+            base_weights=experiment_spec.transfer.base_weights,
+            freeze_level=experiment_spec.transfer.freeze_level,
+        )
 
-        # Load all combined training data
-        ds = tf.data.TFRecordDataset('data/composite_training/AllSamples_0x_0CPM.tfrecord')
-        ds = ds.cache()
-        ds = ds.shuffle(1024*8)
-        opt = tf.data.Options()
-        opt.experimental_deterministic = False
-        ds = ds.with_options(opt)
-        # Parse the data
-        ds = ds.map(lambda x: parse_serialized_example(x, labeled=True))
-        # Batch the data
-        ds = ds.batch(32)
-        trainset = ds.map(extract_features_wrapper)
+        out_dir = experiment_spec.output_dir
+        test_fold = args.test_fold  # CLI override for HPC parallelization
 
-        total_batches = sum(1 for _ in trainset)
-        print(f'Total training batches (size 32): {total_batches}')  # used for setting the Cosine Decay schedule to ensure it decays in N epochs
-        model=hypermodel.build_default(epoch_batches=total_batches)
-        print('Completed extracting data.')
+        if test_fold is not None:
+            print(f'Running fold {test_fold}...')
+        else:
+            print('Running all folds from training_set TSV...')
 
-        # train the model
-        model.fit(trainset, epochs=15, batch_size=32, verbose=1, shuffle=True)
-        model.save_weights(os.path.join(out_dir, f"NUM_weights.hdf5"))
-        model.save(os.path.join(out_dir, 'NUM_model.h5'))
-        print('Finished complete training on all data.')
+        train_model_cv(
+            model_name='BioDVN',
+            training_set_tsv=experiment_spec.data.training_set,
+            zarr_base=experiment_spec.data.zarr_base,
+            test_fold=test_fold,
+            out_dir=out_dir,
+            model_config=model_cfg,
+            training_config=train_cfg,
+            genes_per_batch=FIXED_GENES_PER_BATCH,
+            chunk_size=FIXED_CHUNK_SIZE,
+            shuffle_genes_in_batch=True,
+            seed=experiment_spec.data.seed,
+            subsample_frac=args.subsample,
+        )
+    
+    elif args.run_mode == 'full-train':
+        if experiment_spec is None:
+            raise ValueError(
+                "--run_mode full-train requires --experiment <path/to/experiment.yaml>\n"
+                "Full training now requires an experiment YAML that defines the training_set TSV."
+            )
 
-                
+        # For full-train, we train on ALL samples in the TSV (no fold held out)
+        # This produces a single model using all available data.
+        model_cfg = BioDVNConfig(
+            encoder_start=int(experiment_spec.scale.encoder_start.fixed),
+            latent_size=int(experiment_spec.scale.latent_size.fixed),
+            decoder_start=int(experiment_spec.scale.decoder_start.fixed),
+            mdn_hidden=int(experiment_spec.scale.mdn_hidden.fixed),
+            mdn_final=int(experiment_spec.scale.mdn_final.fixed),
+            signal_filters=int(experiment_spec.scale.signal_filters.fixed),
+            signal_ksize=int(experiment_spec.scale.signal_ksize.fixed),
+            interaction_ksize=int(experiment_spec.scale.interaction_ksize.fixed),
+            initial_reduction_channels=int(experiment_spec.scale.initial_reduction_channels.fixed),
+            n_reductions=int(experiment_spec.scale.n_reductions.fixed),
+            reduction_dilation_small=int(experiment_spec.scale.reduction_dilation_small.fixed),
+            reduction_dilation_large=int(experiment_spec.scale.reduction_dilation_large.fixed),
+            beta_background=float(experiment_spec.structural.beta_background.fixed),
+            beta_tcvae=float(experiment_spec.structural.beta_tcvae.fixed),
+            beta_contrastive=float(experiment_spec.structural.beta_contrastive.fixed),
+            beta_reconstruction=float(experiment_spec.structural.beta_reconstruction.fixed),
+            beta_grl=float(experiment_spec.structural.beta_grl.fixed),
+            beta_point_mse=float(experiment_spec.structural.beta_point_mse.fixed),
+            cl_margin=float(experiment_spec.structural.cl_margin.fixed),
+            internal_weight=float(experiment_spec.structural.internal_weight.fixed),
+            dropout_rate=float(experiment_spec.training.dropout_rate.fixed),
+            weight_decay=float(experiment_spec.training.weight_decay.fixed),
+            max_lr=float(experiment_spec.training.max_lr.fixed),
+            max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
+        )
+        
+        train_cfg = TrainingConfig(
+            checkpoint_dir='',
+            max_lr=float(experiment_spec.training.max_lr.fixed),
+            min_lr_ratio=float(experiment_spec.training.min_lr_ratio.fixed),
+            warmup_start_lr=float(experiment_spec.training.warmup_start_lr.fixed),
+            weight_decay=float(experiment_spec.training.weight_decay.fixed),
+            max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
+            warmup_frac=float(experiment_spec.training.warmup_frac.fixed),
+            schedule_frac=float(experiment_spec.training.schedule_frac.fixed),
+            epochs=int(experiment_spec.training.epochs.fixed),
+            patience=int(experiment_spec.training.patience.fixed),
+            use_amp=bool(experiment_spec.training.use_amp.fixed),
+            runtime_device_banner=bool(args.runtime_device_banner),
+            base_weights=experiment_spec.transfer.base_weights,
+            freeze_level=experiment_spec.transfer.freeze_level,
+        )
+
+        out_dir = os.path.join(experiment_spec.output_dir, 'full_train')
+
+        full_train_from_splits(
+            training_set_tsv=experiment_spec.data.training_set,
+            zarr_base=experiment_spec.data.zarr_base,
+            out_dir=out_dir,
+            model_config=model_cfg,
+            training_config=train_cfg,
+            genes_per_batch=FIXED_GENES_PER_BATCH,
+            chunk_size=FIXED_CHUNK_SIZE,
+            shuffle_genes_in_batch=True,
+            seed=experiment_spec.data.seed,
+            subsample_frac=args.subsample,
+        )
+
+    elif args.run_mode == 'tune':
+        if args.experiment is None:
+            raise ValueError("--run_mode tune requires --experiment <path/to/experiment.yaml>")
+
+        from tuning.optuna_tuner import run_optuna_cv_tuning, run_optuna_fold_tuning
+
+        # If --test_fold is provided, run fold-parallel tuning:
+        # launch 5 jobs (one per fold) pointing at the same study/storage.
+        # Each fold independently calls study.optimize() — 5 folds = 5 different trials.
+        if args.test_fold is not None:
+            run_optuna_fold_tuning(
+                experiment_path=str(args.experiment),
+                fold_num=int(args.test_fold),
+                storage=str(args.optuna_storage),
+                n_trials=(int(args.n_trials) if args.n_trials else None),
+                study_name=(None if args.study_name is None else str(args.study_name)),
+                sampler_seed=int(args.sampler_seed),
+            )
+        else:
+            run_optuna_cv_tuning(
+                experiment_path=str(args.experiment),
+                n_trials=int(args.n_trials),
+                storage=str(args.optuna_storage),
+                study_name=(None if args.study_name is None else str(args.study_name)),
+                sampler_seed=int(args.sampler_seed),
+            )
+    
+    elif args.run_mode == 'run':
+        for model_version in ['TL-NoBC-v3_BioDVN']:
+            model_path = f'final_models/{model_version}_model.pt'
+
+            # Inference runs on the dataset specified by --use_set
+            patient_set = args.use_set
+            zarr_dir = get_zarr_output_dir(patient_set, zarr_base)
+
+            # Legacy fallback (older runs stored under project/data)
+            legacy_dir = str(PROJECT_ROOT / 'data' / patient_set / 'zarr_files')
+            if not (os.path.exists(zarr_dir) and any(f.endswith('.zarr') for f in os.listdir(zarr_dir))):
+                if os.path.exists(legacy_dir) and any(f.endswith('.zarr') for f in os.listdir(legacy_dir)):
+                    zarr_dir = legacy_dir
+                else:
+                    raise FileNotFoundError(
+                        f"No Zarr stores found for '{patient_set}' in:\n  - {zarr_dir}\n  - {legacy_dir}\n"
+                        "Run --process_data for that dataset (or point --zarr_output_dir to the correct base)."
+                    )
+
+            sample_files = [os.path.join(zarr_dir, f) for f in os.listdir(zarr_dir) if f.endswith('.zarr')]
+            output_base = f'results_holdout/{model_version}/{patient_set}/'
+            run_model(model_path, sample_files, output_base)
+    
     else:
-        print('Invalid run mode specified. Exiting.')
-        quit()
-
+        print('Invalid run mode. Exiting.')
+        sys.exit(1)
 
 
 if __name__ == "__main__":
