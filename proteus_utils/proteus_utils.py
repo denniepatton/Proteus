@@ -7,8 +7,8 @@ for efficient training with Zarr-based storage.
 Updated for current Triton outputs:
 - TSS_signals: 8 signal channels (float32)
 - TSS_nucleotides: 4 NT one-hot channels (uint8)
-- TSS_features: 17 numeric features
-- GB_features: 11 numeric features (no central-*/window-*)
+- TSS_features: 11 numeric features (shared Triton features)
+- GB_features: 11 numeric features (identical feature set)
 
 Key features:
 - Memory-mapped Zarr access for zero-copy reads
@@ -55,21 +55,6 @@ def _normalize_fold_index_to_sample_paths(loaded: Any) -> List[str]:
             seen.add(p)
             uniq.append(p)
     return uniq
-
-
-def soft_class_label(exp: torch.Tensor, center: float = 2.0, scale: float = 0.5) -> torch.Tensor:
-    """
-    Sigmoid function to create soft class labels.
-    
-    Args:
-        exp: Expression values (Log2CPM+1)
-        center: Inflection point (2.0 = ~3 CPM, empirical bimodal inflection)
-        scale: Scale factor controlling sigmoid slope
-        
-    Returns:
-        Soft class labels in [0, 1]
-    """
-    return torch.sigmoid((exp - center) / scale)
 
 
 class ProteusSampleDataset(Dataset):
@@ -144,8 +129,6 @@ class ProteusSampleDataset(Dataset):
             labels = {
                 'tumor_exp': tumor_exp,
                 'background_exp': background_exp,
-                'tumor_class': soft_class_label(tumor_exp),
-                'background_class': soft_class_label(background_exp),
                 'sample_weight': gene_weight,
                 'TFX_label': tfx,
             }
@@ -312,8 +295,6 @@ class ProteusGeneDataset(Dataset):
             labels: Dict[str, torch.Tensor] = {
                 'tumor_exp': tumor_exp,
                 'background_exp': background_exp,
-                'tumor_class': soft_class_label(tumor_exp),
-                'background_class': soft_class_label(background_exp),
                 'sample_weight': gene_weight,
                 'TFX_label': tfx,
             }
@@ -441,8 +422,6 @@ class ProteusGeneChunkDataset(Dataset):
             labels: Dict[str, torch.Tensor] = {
                 'tumor_exp': tumor_exp,
                 'background_exp': background_exp,
-                'tumor_class': soft_class_label(tumor_exp),
-                'background_class': soft_class_label(background_exp),
                 'sample_weight': gene_weight,
                 'TFX_label': tfx,
             }
@@ -643,8 +622,6 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
                     labels: Dict[str, torch.Tensor] = {
                         'tumor_exp': tumor_exp[sl].unsqueeze(-1),
                         'background_exp': background_exp[sl].unsqueeze(-1),
-                        'tumor_class': soft_class_label(tumor_exp[sl]).unsqueeze(-1),
-                        'background_class': soft_class_label(background_exp[sl]).unsqueeze(-1),
                         'sample_weight': gene_weight[sl].unsqueeze(-1),
                         'TFX_label': tfx[sl].unsqueeze(-1),
                     }
@@ -731,8 +708,6 @@ def collate_proteus_samples(
         batched_labels = {
             'tumor_exp': torch.cat([l['tumor_exp'] for l in labels_list], dim=0).unsqueeze(-1),
             'background_exp': torch.cat([l['background_exp'] for l in labels_list], dim=0).unsqueeze(-1),
-            'tumor_class': torch.cat([l['tumor_class'] for l in labels_list], dim=0).unsqueeze(-1),
-            'background_class': torch.cat([l['background_class'] for l in labels_list], dim=0).unsqueeze(-1),
             'sample_weight': torch.cat([l.get('sample_weight', torch.ones_like(l['tumor_exp'])) for l in labels_list], dim=0).unsqueeze(-1),
             'TFX_label': torch.cat([l['TFX_label'] for l in labels_list], dim=0).unsqueeze(-1),
         }
@@ -817,8 +792,6 @@ def collate_proteus_genes(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, tor
         batched_labels = {
             'tumor_exp': torch.stack([l['tumor_exp'] for l in labels_list]).unsqueeze(-1),
             'background_exp': torch.stack([l['background_exp'] for l in labels_list]).unsqueeze(-1),
-            'tumor_class': torch.stack([l['tumor_class'] for l in labels_list]).unsqueeze(-1),
-            'background_class': torch.stack([l['background_class'] for l in labels_list]).unsqueeze(-1),
             'sample_weight': torch.stack([l.get('sample_weight', torch.tensor(1.0)) for l in labels_list]).unsqueeze(-1),
             'TFX_label': torch.stack([l['TFX_label'] for l in labels_list]).unsqueeze(-1),
         }
@@ -1258,13 +1231,11 @@ def extract_gene_depths(features: Dict[str, torch.Tensor]) -> torch.Tensor:
     Note: mean-region-depth is log1p-transformed only (NOT z-scored) during
     Zarr preprocessing to preserve absolute depth information for scaling.
     
-    Feature order (17 features):
+    Feature order (11 features):
     0: fl-mean, 1: fl-stdev, 2: fl-skew, 3: fl-kurtosis, 
     4: fl-subnucleosomal-ratio, 5: fl-entropy, 6: fl-gini-simpson,
     7: pn-compaction-score, 8: pn-mean-spacing, 9: pn-mean-amplitude,
-    10: mean-region-depth (log1p only), 11: central-depth (log+zscore), 
-    12: central-entropy, 13: central-gini-simpson, 14: window-depth, 
-    15: window-entropy, 16: window-gini-simpson
+    10: mean-region-depth (log1p only)
     """
     return features['TSS_features'][:, 10]
 

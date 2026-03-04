@@ -4,8 +4,8 @@ set -euo pipefail
 # =====================================================================
 # Experiment name — single source of truth
 # =====================================================================
-EXPERIMENT="biodvn_tune_phase2-3"
-TAG="BTP_2-3"  # short tag for job names / logs
+EXPERIMENT="biodvn_tune_phase2-6"
+TAG="BTP_2-6"  # short tag for job names / logs
 
 YAML="${EXPERIMENT}.yaml"
 ENV_NAME="proteus"               # micromamba environment (pytorch-cuda=12.1)

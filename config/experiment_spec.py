@@ -245,6 +245,7 @@ class ScaleSpec:
     mdn_hidden: ParamSpec
     mdn_final: ParamSpec
     signal_filters: ParamSpec
+    signal_encoder_width: ParamSpec
     signal_ksize: ParamSpec
     interaction_ksize: ParamSpec
     initial_reduction_channels: ParamSpec
@@ -259,7 +260,8 @@ class ScaleSpec:
         allowed = [
             "encoder_start", "latent_size", "decoder_start",
             "mdn_hidden", "mdn_final",
-            "signal_filters", "signal_ksize", "interaction_ksize",
+            "signal_filters", "signal_encoder_width",
+            "signal_ksize", "interaction_ksize",
             "initial_reduction_channels", "n_reductions",
             "reduction_dilation_small", "reduction_dilation_large",
             "dropout_rate",
@@ -276,6 +278,7 @@ class ScaleSpec:
             mdn_hidden=p("mdn_hidden", 64),
             mdn_final=p("mdn_final", 16),
             signal_filters=p("signal_filters", 16),
+            signal_encoder_width=p("signal_encoder_width", 1024),
             signal_ksize=p("signal_ksize", 6),
             interaction_ksize=p("interaction_ksize", 3),
             initial_reduction_channels=p("initial_reduction_channels", 64),
@@ -516,6 +519,7 @@ class ExperimentSpec:
                 "mdn_hidden": m.get("mdn_hidden", 64),
                 "mdn_final": m.get("mdn_final", 16),
                 "signal_filters": m.get("signal_filters", 16),
+                "signal_encoder_width": m.get("signal_encoder_width", 1024),
                 "signal_ksize": m.get("signal_ksize", 6),
                 "interaction_ksize": m.get("interaction_ksize", 3),
                 "initial_reduction_channels": m.get(

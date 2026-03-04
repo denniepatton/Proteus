@@ -5,13 +5,12 @@ PyTorch models for predicting gene expression from cfDNA.
 Model inputs (per-gene):
     - TSS signals (biological channels)
     - TSS nucleotides (one-hot)
-    - Scalar feature blocks (TSS features, optional GB features)
+    - Scalar feature blocks (11 shared Triton features per region)
     - Reference scalars
-    - Tumor fraction (TFX)
+    - Tumor fraction (TFX) — training label only
 
 Labels:
     - tumor/background expression (regression)
-    - tumor/background class logits
 """
 
 from typing import Dict, Optional, Tuple, List
@@ -99,6 +98,7 @@ class BioDVNConfig:
     n_reductions: int = 3
     reduction_dilation_small: int = 1
     reduction_dilation_large: int = 11
+    signal_encoder_width: int = 1024  # First hidden dim of signal encoder funnel
     encoder_start: int = 128
     latent_size: int = 32
     decoder_start: int = 16
@@ -201,6 +201,16 @@ class ReductionBlock(nn.Module):
     
     Applies 2D convolutions to capture cross-channel relationships,
     interleaved with 1D average pooling for spatial reduction.
+    Each iteration has a residual connection following standard ResNet
+    design: both branches are normalized before summation, and a shared
+    activation follows the addition.
+
+    Residual path (standard post-activation residual):
+        main:  Conv2D → GroupNorm          (no activation)
+        skip:  Linear → LayerNorm          (no activation)
+        merge: main + skip → LayerNorm → ReLU → AvgPool
+
+    Channel schedule: initial_reduction_channels // (2 ** i) per iteration.
     """
     
     def __init__(
@@ -213,20 +223,36 @@ class ReductionBlock(nn.Module):
     ):
         super().__init__()
         
-        self.layers = nn.ModuleList()
+        self.convs = nn.ModuleList()
+        self.conv_norms = nn.ModuleList()
+        self.skip_projections = nn.ModuleList()
+        self.skip_norms = nn.ModuleList()
+        self.post_add_norms = nn.ModuleList()
         self.pools = nn.ModuleList()
+        self._skip_offsets: List[int] = []  # center-crop offsets for residual alignment
         
         current_channels = in_channels
         for i in range(n_reductions):
-            out_channels = max(initial_reduction_channels // (4 ** i), 1)
+            out_channels = max(initial_reduction_channels // (2 ** i), 1)
             
-            # Conv2D layer: treats channel dim as height, adds dummy width dim
-            self.layers.append(nn.Sequential(
+            # Main path: Conv2D (no activation — deferred to post-add)
+            self.convs.append(
                 nn.Conv2d(1, out_channels, kernel_size=(interaction_ksize, current_channels),
-                         dilation=(dilation, 1), padding=0),
-                get_norm_layer_2d(out_channels),
-                nn.ReLU()
-            ))
+                         dilation=(dilation, 1), padding=0)
+            )
+            self.conv_norms.append(get_norm_layer_2d(out_channels))
+            
+            # Skip path: Linear projection + LayerNorm
+            self.skip_projections.append(nn.Linear(current_channels, out_channels))
+            self.skip_norms.append(get_norm_layer(out_channels))
+            
+            # Post-addition LayerNorm (normalizes the sum, prevents magnitude
+            # drift under AMP float16 and across iterations).
+            self.post_add_norms.append(get_norm_layer(out_channels))
+            
+            # Center-crop offset so the residual aligns with the conv output
+            field_reduction = dilation * (interaction_ksize - 1)
+            self._skip_offsets.append(field_reduction // 2)
             
             self.pools.append(nn.AvgPool1d(kernel_size=2))
             current_channels = out_channels
@@ -241,14 +267,27 @@ class ReductionBlock(nn.Module):
         Returns:
             Reduced tensor of shape (batch, reduced_length, out_channels)
         """
-        for conv, pool in zip(self.layers, self.pools):
-            # Add dummy dim for Conv2D: (batch, 1, length, channels)
-            x = x.unsqueeze(1)
-            # Conv2D: (batch, out_channels, length', 1)
-            x = conv(x)
-            # Squeeze and permute: (batch, out_channels, length') -> (batch, length', out_channels)
-            x = x.squeeze(-1).permute(0, 2, 1)
-            # Pool: permute to (batch, out_channels, length'), pool, permute back
+        for conv, conv_norm, pool, skip_proj, skip_norm, post_norm, offset in zip(
+            self.convs, self.conv_norms, self.pools,
+            self.skip_projections, self.skip_norms,
+            self.post_add_norms, self._skip_offsets,
+        ):
+            # Skip path: project channels + normalize
+            residual = skip_norm(skip_proj(x))  # (batch, length, out_channels)
+            
+            # Main path: Conv2D + normalize (no activation yet)
+            x = x.unsqueeze(1)                  # (batch, 1, length, channels)
+            x = conv_norm(conv(x))              # (batch, out_channels, length', 1)
+            x = x.squeeze(-1).permute(0, 2, 1)  # (batch, length', out_channels)
+            
+            # Center-crop residual to match conv output length
+            L_out = x.shape[1]
+            residual = residual[:, offset : offset + L_out, :]
+            
+            # Residual addition → LayerNorm → ReLU
+            x = F.relu(post_norm(x + residual))
+            
+            # Pool: (batch, length', out_channels) → (batch, length'//2, out_channels)
             x = x.permute(0, 2, 1)
             x = pool(x)
             x = x.permute(0, 2, 1)
@@ -305,8 +344,8 @@ class Encoder(nn.Module):
         # Force float32 before the mean/logvar projections.  Under AMP the
         # upstream MLP runs in float16; if activations drift large, the
         # Linear output can overflow float16 (max ~65504).  z_mean is
-        # unbounded and feeds Sampling, contrastive_loss, KL, confidence
-        # gating, and the MDN heads — all of which assume finite input.
+        # unbounded and feeds Sampling, contrastive_loss, KL, and the MDN
+        # heads — all of which assume finite input.
         #
         # IMPORTANT: h.float() alone is NOT sufficient — under an enclosing
         # torch.amp.autocast context, nn.Linear is on the "allow" list and
@@ -395,11 +434,11 @@ class BioDVN(nn.Module):
     Architecture:
     1. Signal Processing Block: Conv1D per fragmentomic channel + Conv2D for nucleotides
     2. Dual Reduction Blocks: Small (local) and large (global) receptive fields
-    4. Signal Encoding: Dense layers to compress signal representation
-    5. Dual Encoder Block: Parallel VAE encoders for tumor and background
-    6. Latent Merging: TFX-conditional combination of latent spaces
-    7. Reconstruction: Decoder for scalar reconstruction (internal loss)
-    8. Prediction Block: MDN mixture-density regression heads
+    3. Signal Encoding: Dense layers to compress signal representation
+    4. Dual Encoder Block: Parallel VAE encoders for tumor and background
+    5. Latent Merging: TFX-conditional combination of latent spaces
+    6. Reconstruction: Decoder for scalar reconstruction (internal loss)
+    7. Prediction Block: MDN mixture-density regression heads
     
     Args:
         config: BioDVNConfig with architecture and training hyperparameters
@@ -443,14 +482,12 @@ class BioDVN(nn.Module):
         # Signal encoding (must be built eagerly so all parameters exist before
         # optimizer construction and torch.compile).
         self._tss_input_length = 2000
+        self.signal_encoded_dim = 64  # From signal encoder output
         self.signal_encoder_input_dim = self._compute_signal_encoder_input_dim()
         self.signal_encoder = self._build_signal_encoder(self.signal_encoder_input_dim)
-
-        # Encoder/decoder input dims depend on the input blocks included.
-        self.signal_encoded_dim = 64  # From signal encoder output
         self.scalar_input_dim = 0
-        # TSS scalar features are always included.
-        self.scalar_input_dim += 17
+        # TSS scalar features (11 shared Triton features, matching GB).
+        self.scalar_input_dim += 11
 
         # GB features (11 scalars).
         self.scalar_input_dim += 11
@@ -506,24 +543,17 @@ class BioDVN(nn.Module):
             dropout_rate=0.0,
         )
         
-        # Confidence gating for predictions
-        self.tumor_gating = nn.Sequential(
-            nn.Linear(config.latent_size, config.latent_size),
-            nn.Sigmoid()
-        )
-        self.background_gating = nn.Sequential(
-            nn.Linear(config.latent_size, config.latent_size),
-            nn.Sigmoid()
-        )
-        
-        # Mixture Density Network output heads
+        # Mixture Density Network output heads.
+        # Input is cat(z_mean, z_log_var) so the MDN has access to both the
+        # encoder's point estimate and its per-dimension uncertainty.
+        mdn_input_dim = 2 * config.latent_size
         self.tumor_mdn_head = MixtureDensityHead(
-            input_dim=config.latent_size,
+            input_dim=mdn_input_dim,
             hidden_dim=config.mdn_hidden,
             final_dim=config.mdn_final,
         )
         self.background_mdn_head = MixtureDensityHead(
-            input_dim=config.latent_size,
+            input_dim=mdn_input_dim,
             hidden_dim=config.mdn_hidden,
             final_dim=config.mdn_final,
         )
@@ -589,9 +619,9 @@ class BioDVN(nn.Module):
                 f'Invalid signal_ksize={self.config.signal_ksize} for TSS length {self._tss_input_length}'
             )
 
-        # ReductionBlock output channels are determined solely by initial_reduction_channels and n_reductions.
+        # ReductionBlock output channels: initial_reduction_channels // (2 ** i) per iteration.
         out_channels = max(
-            int(self.config.initial_reduction_channels) // (4 ** max(int(self.config.n_reductions) - 1, 0)),
+            int(self.config.initial_reduction_channels) // (2 ** max(int(self.config.n_reductions) - 1, 0)),
             1,
         )
 
@@ -622,19 +652,37 @@ class BioDVN(nn.Module):
         return int(small_flat_dim + large_flat_dim)
 
     def _build_signal_encoder(self, input_dim: int) -> nn.Module:
-        return nn.Sequential(
-            nn.Linear(int(input_dim), 1024),
-            get_norm_layer(1024),
+        """Build a halving-funnel MLP: input_dim → width → width//2 → … → signal_encoded_dim."""
+        width = int(self.config.signal_encoder_width)
+        target_dim = self.signal_encoded_dim
+
+        layers: list[nn.Module] = [
+            nn.Linear(int(input_dim), width),
+            get_norm_layer(width),
             nn.ReLU(),
             nn.Dropout(self.config.dropout_rate),
-            nn.Linear(1024, 256),
-            get_norm_layer(256),
-            nn.ReLU(),
-            nn.Dropout(self.config.dropout_rate),
-            nn.Linear(256, 64),
-            get_norm_layer(64),
-            nn.ReLU(),
-        )
+        ]
+        current = width
+        while current // 2 >= target_dim:
+            next_dim = current // 2
+            layers.extend([
+                nn.Linear(current, next_dim),
+                get_norm_layer(next_dim),
+                nn.ReLU(),
+                nn.Dropout(self.config.dropout_rate) if next_dim > target_dim else nn.Identity(),
+            ])
+            current = next_dim
+
+        # If the halving loop ended above target_dim, add a final
+        # projection.  (Only fires if width is not a power-of-2 multiple of 64.)
+        if current != target_dim:
+            layers.extend([
+                nn.Linear(current, target_dim),
+                get_norm_layer(target_dim),
+                nn.ReLU(),
+            ])
+
+        return nn.Sequential(*layers)
     
     def forward(
         self,
@@ -649,7 +697,7 @@ class BioDVN(nn.Module):
             features: Dictionary with keys:
                 - TSS_signals: (batch, 2000, 8) biological signals
                 - TSS_nucleotides: (batch, 2000, 4) one-hot nucleotides
-                - TSS_features: (batch, 17) TSS region features
+                - TSS_features: (batch, 11+) TSS region features (first 11 used)
                 - GB_features: (batch, 11) gene body features
                 - ref_scalars: (batch, 3) reference gene info
             return_internal_loss: Whether to compute and return internal loss
@@ -668,7 +716,9 @@ class BioDVN(nn.Module):
         # Extract features
         x_signals = features['TSS_signals']
         x_nucleotides = features['TSS_nucleotides']
-        tss_features = features['TSS_features']
+        # Backward-compatible: old Zarr stores have 17 TSS features;
+        # we only use the first 11 (shared Triton features, no central-*/window-*).
+        tss_features = features['TSS_features'][:, :11]
         gb_features = features['GB_features']
         ref_scalars = features['ref_scalars']
 
@@ -752,21 +802,11 @@ class BioDVN(nn.Module):
         
         # Reconstruction
         y_reconstructed = self.decoder(z_merged)
-        z_tumor_input = z_tumor_mean
-        z_background_input = z_background_mean
         
-        # Confidence gating
-        tumor_confidence = -z_tumor_log_var
-        tumor_gating = self.tumor_gating(tumor_confidence)
-        weighted_tumor = z_tumor_input * tumor_gating
-        
-        background_confidence = -z_background_log_var
-        background_gating = self.background_gating(background_confidence)
-        weighted_background = z_background_input * background_gating
-        
-        # MDN output heads
-        tumor_mdn = self.tumor_mdn_head(weighted_tumor)
-        background_mdn = self.background_mdn_head(weighted_background)
+        # MDN output heads: feed both mean and log-variance so the MDN
+        # can use encoder uncertainty for calibrated mixture outputs.
+        tumor_mdn = self.tumor_mdn_head(torch.cat([z_tumor_mean, z_tumor_log_var], dim=1))
+        background_mdn = self.background_mdn_head(torch.cat([z_background_mean, z_background_log_var], dim=1))
         
         # Point estimates (mixture mean) for backward-compatible metrics / analysis
         tumor_exp = mixture_mean(tumor_mdn)

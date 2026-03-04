@@ -5,7 +5,7 @@ PyTorch implementation of the Proteus pipeline for predicting gene expression fr
 Primary model inputs (per gene):
     - TSS_signals: (n_genes, 2000, 8) float32
     - TSS_nucleotides: (n_genes, 2000, 4) uint8/float32 one-hot nucleotides
-    - TSS_features: (n_genes, 17) float32
+    - TSS_features: (n_genes, 11) float32
     - GB_features: (n_genes, 11) float32
     - ref_scalars: (n_genes, 3) float32
 
@@ -1642,6 +1642,7 @@ def main():
             mdn_hidden=int(experiment_spec.scale.mdn_hidden.fixed),
             mdn_final=int(experiment_spec.scale.mdn_final.fixed),
             signal_filters=int(experiment_spec.scale.signal_filters.fixed),
+            signal_encoder_width=int(experiment_spec.scale.signal_encoder_width.fixed),
             signal_ksize=int(experiment_spec.scale.signal_ksize.fixed),
             interaction_ksize=int(experiment_spec.scale.interaction_ksize.fixed),
             initial_reduction_channels=int(experiment_spec.scale.initial_reduction_channels.fixed),
@@ -1718,6 +1719,7 @@ def main():
             mdn_hidden=int(experiment_spec.scale.mdn_hidden.fixed),
             mdn_final=int(experiment_spec.scale.mdn_final.fixed),
             signal_filters=int(experiment_spec.scale.signal_filters.fixed),
+            signal_encoder_width=int(experiment_spec.scale.signal_encoder_width.fixed),
             signal_ksize=int(experiment_spec.scale.signal_ksize.fixed),
             interaction_ksize=int(experiment_spec.scale.interaction_ksize.fixed),
             initial_reduction_channels=int(experiment_spec.scale.initial_reduction_channels.fixed),

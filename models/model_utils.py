@@ -1,14 +1,14 @@
 """
-model_utils.py (PyTorch version)
-v3.0.0, 12/5/2025
+model_utils.py (PyTorch)
 Author: Robert D Patton, rpatton@fredhutch.org
 
-This file contains custom layers, loss functions, and metrics for PyTorch models.
-Ported from TensorFlow/Keras implementation.
+Custom layers, loss functions, and metrics for BioDVN.
+Includes MDN heads, analytical CRPS loss, β-TCVAE decomposition,
+TFX gradient reversal, and masked regression losses.
 """
 
 import math
-from typing import Dict, Optional, Tuple, Literal
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -185,19 +185,6 @@ class TrainingChoice(nn.Module):
         if self.training:
             return latent_sampling
         return latent_means
-
-
-class ClippedReLU(nn.Module):
-    """
-    ReLU activation with a maximum value (for bounding predictions).
-    Default max of 19.93 corresponds to log2(10^6 + 1), the upper bound for CPM/TPM.
-    """
-    def __init__(self, max_value: float = 19.93):
-        super().__init__()
-        self.max_value = max_value
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.clamp(F.relu(x), max=self.max_value)
 
 
 # ==============================================================================
@@ -377,8 +364,6 @@ def total_correlation(z: torch.Tensor, z_mean: torch.Tensor, z_log_var: torch.Te
 class InternalLossComputer:
     """
     Computes internal losses (KL, contrastive, reconstruction) for the VAE.
-    Unlike TF version which uses add_loss(), this returns losses explicitly for the training loop.
-    
     Uses β-TCVAE objective: decomposes KL and upweights total correlation.
     """
     def __init__(
@@ -496,242 +481,6 @@ class InternalLossComputer:
 
 
 # ==============================================================================
-# External Loss Functions (with NaN masking)
-# ==============================================================================
-
-class MaskedMSELoss(nn.Module):
-    """
-    MSE loss that ignores NaN values in targets.
-    """
-    def __init__(self):
-        super().__init__()
-    
-    def forward(
-        self,
-        y_pred: torch.Tensor,
-        y_true: torch.Tensor,
-        sample_weight: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        # Create mask for valid (non-NaN) entries
-        mask = ~torch.isnan(y_true)
-        
-        if not mask.any():
-            return torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
-        
-        # Replace NaN with 0 for computation
-        y_true_masked = torch.where(mask, y_true, torch.zeros_like(y_true))
-        y_pred_masked = torch.where(mask, y_pred, torch.zeros_like(y_pred))
-        
-        # Compute squared error
-        squared_error = torch.square(y_true_masked - y_pred_masked)
-        masked_squared_error = torch.where(mask, squared_error, torch.zeros_like(squared_error))
-        
-        if sample_weight is not None:
-            weighted_error = masked_squared_error * sample_weight
-            denominator = torch.sum(mask.float() * sample_weight) + 1e-8
-            return torch.sum(weighted_error) / denominator
-        else:
-            return torch.sum(masked_squared_error) / (torch.sum(mask.float()) + 1e-8)
-
-
-class MaskedFocalMSELoss(nn.Module):
-    """
-    Focal MSE loss that ignores NaN values in targets.
-    Applies focal weighting to emphasize large errors.
-    """
-    def __init__(self, gamma: float = 0.0):
-        super().__init__()
-        self.gamma = gamma
-    
-    def forward(
-        self,
-        y_pred: torch.Tensor,
-        y_true: torch.Tensor,
-        sample_weight: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        mask = ~torch.isnan(y_true)
-        
-        if not mask.any():
-            return torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
-        
-        y_true_masked = torch.where(mask, y_true, torch.zeros_like(y_true))
-        y_pred_masked = torch.where(mask, y_pred, torch.zeros_like(y_pred))
-        
-        # Focal factor: emphasize large residuals
-        if self.gamma > 0:
-            reg_error = torch.abs(y_true_masked - y_pred_masked) + 1e-8
-            focal_factor = torch.pow(reg_error, self.gamma)
-        else:
-            focal_factor = 1.0
-        
-        squared_error = torch.square(y_true_masked - y_pred_masked)
-        focal_mse = focal_factor * squared_error
-        masked_focal_mse = torch.where(mask, focal_mse, torch.zeros_like(focal_mse))
-        
-        if sample_weight is not None:
-            weighted_error = masked_focal_mse * sample_weight
-            denominator = torch.sum(mask.float() * sample_weight) + 1e-8
-            return torch.sum(weighted_error) / denominator
-        else:
-            return torch.sum(masked_focal_mse) / (torch.sum(mask.float()) + 1e-8)
-
-
-class MaskedHuberLoss(nn.Module):
-    """
-    Huber loss that ignores NaN values in targets.
-    """
-    def __init__(self, delta: float = 1.0):
-        super().__init__()
-        self.delta = delta
-    
-    def forward(
-        self,
-        y_pred: torch.Tensor,
-        y_true: torch.Tensor,
-        sample_weight: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        mask = ~torch.isnan(y_true)
-        
-        if not mask.any():
-            return torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
-        
-        y_true_masked = torch.where(mask, y_true, torch.zeros_like(y_true))
-        y_pred_masked = torch.where(mask, y_pred, torch.zeros_like(y_pred))
-        
-        # Compute Huber loss element-wise
-        abs_error = torch.abs(y_true_masked - y_pred_masked)
-        quadratic = torch.clamp(abs_error, max=self.delta)
-        linear = abs_error - quadratic
-        huber = 0.5 * torch.square(quadratic) + self.delta * linear
-        
-        masked_huber = torch.where(mask, huber, torch.zeros_like(huber))
-        
-        if sample_weight is not None:
-            weighted_error = masked_huber * sample_weight
-            denominator = torch.sum(mask.float() * sample_weight) + 1e-8
-            return torch.sum(weighted_error) / denominator
-        else:
-            return torch.sum(masked_huber) / (torch.sum(mask.float()) + 1e-8)
-
-
-class MaskedFocalLoss(nn.Module):
-    """
-    Focal loss for binary classification that ignores NaN values in targets.
-    """
-    def __init__(
-        self,
-        gamma: float = 2.0,
-        alpha: float = 0.25,
-        from_logits: bool = False,
-        label_smoothing: float = 0.0
-    ):
-        super().__init__()
-        self.gamma = gamma
-        self.alpha = alpha
-        self.from_logits = from_logits
-        self.label_smoothing = label_smoothing
-    
-    def forward(
-        self,
-        y_pred: torch.Tensor,
-        y_true: torch.Tensor,
-        sample_weight: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        mask = ~torch.isnan(y_true)
-        
-        if not mask.any():
-            return torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
-        
-        # Apply label smoothing
-        if self.label_smoothing > 0:
-            y_true_smoothed = y_true * (1 - self.label_smoothing) + 0.5 * self.label_smoothing
-        else:
-            y_true_smoothed = y_true
-        
-        y_true_masked = torch.where(mask, y_true_smoothed, torch.zeros_like(y_true_smoothed))
-        
-        # Get probabilities
-        if self.from_logits:
-            p = torch.sigmoid(y_pred)
-            # BCE from logits is more numerically stable
-            bce = F.binary_cross_entropy_with_logits(y_pred, y_true_masked, reduction='none')
-        else:
-            p = y_pred
-            p_clipped = torch.clamp(p, 1e-7, 1 - 1e-7)
-            bce = -y_true_masked * torch.log(p_clipped) - (1 - y_true_masked) * torch.log(1 - p_clipped)
-        
-        # Compute pt (probability of correct class)
-        pt = y_true_masked * p + (1 - y_true_masked) * (1 - p)
-        focal_factor = torch.pow(1.0 - pt, self.gamma)
-        
-        # Alpha weighting
-        w = self.alpha * y_true_masked + (1.0 - self.alpha) * (1.0 - y_true_masked)
-        
-        focal_loss = w * focal_factor * bce
-        masked_focal_loss = torch.where(mask, focal_loss, torch.zeros_like(focal_loss))
-        
-        if sample_weight is not None:
-            weighted_loss = masked_focal_loss * sample_weight
-            denominator = torch.sum(mask.float() * sample_weight) + 1e-8
-            return torch.sum(weighted_loss) / denominator
-        else:
-            return torch.sum(masked_focal_loss) / (torch.sum(mask.float()) + 1e-8)
-
-
-class MaskedIdentitySlopeLoss(nn.Module):
-    """
-    Loss based on deviation from identity line (slope=1, intercept=0).
-    Useful for regression calibration.
-    """
-    def __init__(self):
-        super().__init__()
-    
-    def forward(
-        self,
-        y_pred: torch.Tensor,
-        y_true: torch.Tensor,
-        sample_weight: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        # Flatten inputs
-        y_true_flat = y_true.flatten()
-        y_pred_flat = y_pred.flatten()
-        
-        # Create mask for valid values
-        mask = torch.isfinite(y_true_flat)
-        
-        if mask.sum() < 2:
-            return torch.tensor(0.0, device=y_pred.device, dtype=y_pred.dtype)
-        
-        y_true_valid = y_true_flat[mask]
-        y_pred_valid = y_pred_flat[mask]
-        
-        if sample_weight is not None:
-            weights_flat = sample_weight.flatten()
-            weights_valid = weights_flat[mask]
-            sum_weights = weights_valid.sum() + 1e-8
-            
-            mean_true = (weights_valid * y_true_valid).sum() / sum_weights
-            mean_pred = (weights_valid * y_pred_valid).sum() / sum_weights
-            var_true = (weights_valid * torch.square(y_true_valid - mean_true)).sum() / sum_weights + 1e-8
-            cov_true_pred = (weights_valid * (y_true_valid - mean_true) * (y_pred_valid - mean_pred)).sum() / sum_weights
-        else:
-            mean_true = y_true_valid.mean()
-            mean_pred = y_pred_valid.mean()
-            var_true = torch.mean(torch.square(y_true_valid - mean_true)) + 1e-8
-            cov_true_pred = torch.mean((y_true_valid - mean_true) * (y_pred_valid - mean_pred))
-        
-        # Calculate slope and intercept
-        slope = cov_true_pred / var_true
-        intercept = mean_pred - slope * mean_true
-        
-        # Loss components
-        slope_loss = torch.square(slope - 1.0)
-        intercept_loss = torch.square(intercept)
-        
-        return slope_loss + intercept_loss
-
-
-# ==============================================================================
 # Metrics
 # ==============================================================================
 
@@ -801,70 +550,6 @@ class MetricsTracker:
             name: self.metrics[name] / max(self.counts[name], 1)
             for name in self.metrics
         }
-
-
-# ==============================================================================
-# Combined Loss Function for BioDVN
-# ==============================================================================
-
-class BioDVNLoss:
-    """
-    Combined loss function for BioDVN model.
-    Handles all output heads with appropriate loss functions and weights.
-    """
-    def __init__(
-        self,
-        beta_classification: float = 1.0,
-        beta_background: float = 1.0,
-        fl_gamma: float = 5.0,
-        fl_alpha: float = 0.0,
-        rf_gamma: float = 0.5
-    ):
-        self.tumor_exp_loss = MaskedFocalMSELoss(gamma=rf_gamma)
-        self.background_exp_loss = MaskedFocalMSELoss(gamma=rf_gamma)
-        self.tumor_class_loss = MaskedFocalLoss(gamma=fl_gamma, alpha=fl_alpha)
-        self.background_class_loss = MaskedFocalLoss(gamma=fl_gamma, alpha=fl_alpha)
-        
-        self.beta_classification = beta_classification
-        self.beta_background = beta_background
-    
-    def __call__(
-        self,
-        predictions: dict,
-        targets: dict,
-        sample_weight: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, dict]:
-        """
-        Args:
-            predictions: dict with keys 'tumor_exp', 'background_exp', 'tumor_class', 'background_class'
-            targets: dict with same keys containing ground truth
-            sample_weight: optional sample weights
-            
-        Returns:
-            total_loss: Combined weighted loss
-            loss_dict: Dictionary of individual losses for logging
-        """
-        l_tumor_exp = self.tumor_exp_loss(predictions['tumor_exp'], targets['tumor_exp'], sample_weight)
-        l_background_exp = self.background_exp_loss(predictions['background_exp'], targets['background_exp'], sample_weight)
-        l_tumor_class = self.tumor_class_loss(predictions['tumor_class'], targets['tumor_class'], sample_weight)
-        l_background_class = self.background_class_loss(predictions['background_class'], targets['background_class'], sample_weight)
-        
-        total_loss = (
-            l_tumor_exp +
-            self.beta_background * l_background_exp +
-            self.beta_classification * l_tumor_class +
-            self.beta_classification * l_background_class
-        )
-        
-        loss_dict = {
-            'tumor_exp_loss': l_tumor_exp.item(),
-            'background_exp_loss': l_background_exp.item(),
-            'tumor_class_loss': l_tumor_class.item(),
-            'background_class_loss': l_background_class.item(),
-            'total_external_loss': total_loss.item(),
-        }
-        
-        return total_loss, loss_dict
 
 
 # ==============================================================================
@@ -991,57 +676,6 @@ def mixture_mean(
     return mean.clamp(0.0, Y_MAX)  # (batch, 1)
 
 
-def mixture_cdf(
-    y_grid: torch.Tensor,
-    mdn_params: dict,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """Evaluate the mixture CDF on a grid of y values.
-
-    CDF(y) = pi_zero * 1{y >= 0}
-           + pi_gamma * gammainc(K_GAMMA, beta * y)
-           + pi_normal * Phi((y - mu) / sigma)
-
-    All components are differentiable w.r.t. their parameters.
-
-    Args:
-        y_grid: (G,) 1-D grid of y values at which to evaluate the CDF.
-        mdn_params: dict from MixtureDensityHead.forward(). Tensors are (batch, *).
-        eps: small constant for numerical stability.
-
-    Returns:
-        cdf: (batch, G) CDF values.
-    """
-    pi = mdn_params['log_pi'].float().exp()  # (batch, 3)
-    pi_zero = pi[:, 0:1]    # (batch, 1)
-    pi_gamma = pi[:, 1:2]
-    pi_normal = pi[:, 2:3]
-
-    # Expand y_grid to (1, G) for broadcasting with (batch, 1)
-    y = y_grid.float().unsqueeze(0)  # (1, G)
-
-    # --- Zero component CDF: step function at 0 ---
-    cdf_zero = (y >= 0.0).to(dtype=y.dtype)  # (1, G)
-
-    # --- Gamma(K_GAMMA, beta) CDF via regularized lower incomplete gamma ---
-    beta = mdn_params['gamma_beta'].float().clamp(min=eps)  # (batch, 1)
-    y_pos = y.clamp(min=0.0)
-    # torch.special.gammainc(a, x) = P(a, x) = regularized lower incomplete gamma
-    # For Gamma(shape=k, rate=beta), CDF(y) = P(k, beta * y)
-    cdf_gamma = torch.special.gammainc(
-        torch.tensor(K_GAMMA, device=y.device, dtype=y.dtype),
-        beta * y_pos,
-    )  # (batch, G)
-
-    # --- Normal(mu, sigma) CDF ---
-    mu = mdn_params['normal_mu'].float()        # (batch, 1)
-    sigma = mdn_params['normal_sigma'].float().clamp(min=eps)  # (batch, 1)
-    cdf_normal = 0.5 * (1.0 + torch.erf((y - mu) / (sigma * math.sqrt(2))))  # (batch, G)
-
-    # Mixture CDF
-    return pi_zero * cdf_zero + pi_gamma * cdf_gamma + pi_normal * cdf_normal
-
-
 def _mixture_cdf_at_points(
     y: torch.Tensor,
     mdn_params: dict,
@@ -1049,7 +683,7 @@ def _mixture_cdf_at_points(
 ) -> torch.Tensor:
     """Evaluate the mixture CDF at per-sample query points.
 
-    Unlike :func:`mixture_cdf` which broadcasts a shared 1-D grid across the
+    Unlike a grid-based CDF that broadcasts a shared 1-D grid across the
     batch, this evaluates the CDF at a *different* y value for each sample —
     exactly what vectorized bisection needs.
 

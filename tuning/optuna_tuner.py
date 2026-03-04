@@ -192,6 +192,7 @@ def _resolve_trial_configs(
     mdn_hidden = sc("mdn_hidden", exp.scale.mdn_hidden)
     mdn_final = sc("mdn_final", exp.scale.mdn_final)
     signal_filters = sc("signal_filters", exp.scale.signal_filters)
+    signal_encoder_width = sc("signal_encoder_width", exp.scale.signal_encoder_width)
     signal_ksize = sc("signal_ksize", exp.scale.signal_ksize)
     interaction_ksize = sc("interaction_ksize", exp.scale.interaction_ksize)
     initial_reduction_channels = sc("initial_reduction_channels", exp.scale.initial_reduction_channels)
@@ -234,6 +235,7 @@ def _resolve_trial_configs(
         mdn_hidden=int(mdn_hidden),
         mdn_final=int(mdn_final),
         signal_filters=int(signal_filters),
+        signal_encoder_width=int(signal_encoder_width),
         signal_ksize=int(signal_ksize),
         interaction_ksize=int(interaction_ksize),
         initial_reduction_channels=int(initial_reduction_channels),
@@ -305,6 +307,7 @@ def _resolve_trial_configs(
             "mdn_hidden": int(mdn_hidden),
             "mdn_final": int(mdn_final),
             "signal_filters": int(signal_filters),
+            "signal_encoder_width": int(signal_encoder_width),
             "signal_ksize": int(signal_ksize),
             "interaction_ksize": int(interaction_ksize),
             "initial_reduction_channels": int(initial_reduction_channels),

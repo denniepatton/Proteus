@@ -429,7 +429,6 @@ class Trainer:
         if self.optimizer is None:
             raise RuntimeError('Trainer is not prepared: optimizer is None. Call fit() to initialize training state.')
         metrics_tracker = MetricsTracker()
-        self._warned_nan_this_epoch = False  # Reset NaN warning flag for this epoch
         
         start_time = time.time()
         n_batches = len(train_loader)
@@ -594,9 +593,6 @@ class Trainer:
                 # Gradient clipping to prevent explosion
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
-            
-            # Previous versions warned and continued on NaNs.
-            # We now fail-fast above to keep runs deterministic and avoid wasting compute.
             
             # Update LR scheduler
             if self.scheduler is not None:

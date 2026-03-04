@@ -9,23 +9,24 @@ Raw Triton output structure (per sample folder):
     SAMPLE_TritonSignalProfiles.npz - 12 signal channels x 2000 bp (TSS only)
     SAMPLE_TritonFeatures.tsv - 19 columns of region-level features
 
-Zarr layout (gene-level hierarchy for fast random access):
+Zarr layout (flat arrays for batch loading):
     sample.zarr/
       ├── gene_names: array of gene IDs for indexing
-      ├── genes/
-      │   └── GENE_NAME/
-      │       ├── TSS_signals (2000, 8) float32 - biological signals
-      │       ├── TSS_nucleotides (2000, 4) uint8 - one-hot nucleotides
-      │       ├── TSS_features (17,) float32 - transformed features
-      │       ├── GB_features (11,) float32 - gene body features
-      │       ├── ref_scalars (3,) float32 - reference gene info
-      │       └── .zattrs: tfx, tumor_exp, background_exp
-      └── flat/  (alternative flat array access for batch loading)
-          └── TSS_signals (n_genes, 2000, 8), etc.
+      ├── attrs: {sample_name, n_genes, tfx}
+      └── flat/
+          ├── TSS_signals      (n_genes, 2000, 8)   float32
+          ├── TSS_nucleotides  (n_genes, 2000, 4)   uint8
+          ├── TSS_features     (n_genes, 11)        float32
+          ├── GB_features      (n_genes, 11)        float32
+          ├── ref_scalars      (n_genes, 3)         float32
+          ├── TFX_label        (n_genes,)           float32
+          ├── tumor_exp        (n_genes,)           float32
+          ├── background_exp   (n_genes,)           float32
+          └── gene_weight      (n_genes,)           float32
 
 Feature transforms (applied at Zarr conversion time):
     - mean-region-depth: log1p only (preserves absolute depth info)
-    - fl-kurtosis, pn-mean-spacing, pn-mean-amplitude, central-depth: log + z-score
+    - fl-kurtosis, pn-mean-spacing, pn-mean-amplitude: log + z-score
     - All others: z-score only
     
 NaN handling:
@@ -127,7 +128,9 @@ SIGNAL_CHANNELS = [
 # Nucleotide one-hot channels (stored separately as uint8)
 NUCLEOTIDE_CHANNELS = ['A', 'C', 'G', 'T']
 
-# TSS feature columns (17 features)
+# TSS feature columns (11 shared Triton features — matches GB)
+# NOTE: central-*/window-* (6 TSS-window-specific features) have been dropped.
+# They are always NaN in GB mode, and unused by the model.
 TSS_FEATURES = [
     'fl-mean',
     'fl-stdev',
@@ -140,15 +143,9 @@ TSS_FEATURES = [
     'pn-mean-spacing',
     'pn-mean-amplitude',
     'mean-region-depth',
-    'central-depth',
-    'central-entropy',
-    'central-gini-simpson',
-    'window-depth',
-    'window-entropy',
-    'window-gini-simpson',
 ]
 
-# GB features (11 features - no central-*/window-* which are TSS-window specific)
+# GB features (11 features — identical feature set to TSS)
 GB_FEATURES = [
     'fl-mean',
     'fl-stdev',
@@ -165,7 +162,7 @@ GB_FEATURES = [
 
 # Feature transform categories
 LOG_ONLY_FEATURES = ['mean-region-depth']  # log1p only, NO z-score
-LOG_TRANSFORM_FEATURES = ['fl-kurtosis', 'pn-mean-spacing', 'pn-mean-amplitude', 'central-depth']
+LOG_TRANSFORM_FEATURES = ['fl-kurtosis', 'pn-mean-spacing', 'pn-mean-amplitude']
 
 # NaN thresholds for gene exclusion
 MAX_SIGNAL_NAN_FRACTION = 0.5
@@ -191,7 +188,7 @@ def normalize_cohort_name(name: str) -> str:
 SHAPES = {
     'TSS_signals': (2000, 8),
     'TSS_nucleotides': (2000, 4),
-    'TSS_features': (17,),
+    'TSS_features': (len(TSS_FEATURES),),
     'GB_features': (11,),
     'ref_scalars': (3,),
     'TFX_label': (),
@@ -588,7 +585,7 @@ def process_sample_to_zarr(
             └── flat/
                     ├── TSS_signals (n_genes, 2000, 8) float32
                     ├── TSS_nucleotides (n_genes, 2000, 4) uint8
-                    ├── TSS_features (n_genes, 17) float32
+                    ├── TSS_features (n_genes, 11) float32
                     ├── GB_features (n_genes, 11) float32
                     ├── ref_scalars (n_genes, 3) float32
                     ├── TFX_label (n_genes,) float32
@@ -729,7 +726,7 @@ def process_sample_to_zarr(
     # Pre-allocate numpy arrays
     all_tss_signals = np.zeros((n_genes, 2000, 8), dtype=np.float32)
     all_tss_nucleotides = np.zeros((n_genes, 2000, 4), dtype=np.uint8)
-    all_tss_features = np.zeros((n_genes, 17), dtype=np.float32)
+    all_tss_features = np.zeros((n_genes, len(TSS_FEATURES)), dtype=np.float32)
     all_gb_features = np.zeros((n_genes, 11), dtype=np.float32)
     all_ref_scalars = np.zeros((n_genes, 3), dtype=np.float32)
     all_tfx = np.full((n_genes,), tfx, dtype=np.float32)
@@ -817,7 +814,7 @@ def process_sample_to_zarr(
     flat.create_dataset(
         'TSS_features',
         data=all_tss_features,
-        chunks=(chunk_genes_small, 17),
+        chunks=(chunk_genes_small, len(TSS_FEATURES)),
         compressor=COMPRESSOR,
     )
     flat.create_dataset(

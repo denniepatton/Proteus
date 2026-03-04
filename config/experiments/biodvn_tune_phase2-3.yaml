@@ -61,7 +61,7 @@ structural:
 # =========================================================================
 # GROUP 2: Training HPs  (7 - optimizer, schedule, regularisation)
 # =========================================================================
-# N.B. 1 epoch on 30% of data (4 folds, ~80% of total) is ~20250 steps
+# N.B. 1 epoch on all data (4 folds, ~80% of total) is ~20250 steps
 training:
   # Bounds:
   epochs: 15
@@ -92,7 +92,7 @@ training:
 
 
 # =========================================================================
-# GROUP 3: Scale HPs  (13 - width, depth, capacity)
+# GROUP 3: Scale HPs  (14 - width, depth, capacity)
 # =========================================================================
 scale:
   # signal_ksize: 3
@@ -107,6 +107,7 @@ scale:
   # mdn_final: 32
   # signal_filters: 16
   # initial_reduction_channels: 64
+  # signal_encoder_width: 512
   # dropout_rate: 0.10
   signal_ksize:
     suggest: {type: categorical, choices: [3, 6, 9]}
@@ -129,8 +130,10 @@ scale:
   mdn_final:
     suggest: {type: categorical, choices: [8, 16, 32]}
   signal_filters:
-    suggest: {type: categorical, choices: [8, 16, 32]}
+    suggest: {type: categorical, choices: [4, 8, 16]}
   initial_reduction_channels:
     suggest: {type: categorical, choices: [32, 64, 128]}
+  signal_encoder_width:
+    suggest: {type: categorical, choices: [256, 512, 1024]}
   dropout_rate:
     suggest: {type: float, low: 0.05, high: 0.20}

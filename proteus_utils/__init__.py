@@ -29,7 +29,6 @@ from .compile_sample_data import (
 )
 
 from .proteus_utils import (
-    soft_class_label,
     ProteusSampleDataset,
     ProteusDataset,
     ProteusInferenceDataset,
@@ -61,7 +60,7 @@ __all__ = [
     'LOG_TRANSFORM_FEATURES', 'LOG_ONLY_FEATURES',
     'MAX_SIGNAL_NAN_FRACTION', 'MAX_FEATURE_NAN_FRACTION',
     # proteus_utils
-    'soft_class_label', 'ProteusSampleDataset', 'ProteusDataset', 'ProteusInferenceDataset',
+    'ProteusSampleDataset', 'ProteusDataset', 'ProteusInferenceDataset',
     'collate_proteus_samples', 'collate_proteus', 'collate_inference',
     'create_data_loader', 'create_inference_loader',
     'get_fold_indices', 'build_train_val_loaders', 'build_loaders_from_splits', 'extract_gene_depths',

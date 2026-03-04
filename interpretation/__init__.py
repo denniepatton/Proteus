@@ -1,21 +1,25 @@
-# Interpretation module
-# 
-# WARNING: This module contains legacy TensorFlow code and needs to be 
-# rewritten for PyTorch. The following functions still use TensorFlow:
-# - load_best_model() - uses tf.keras.models.load_model
-# - get_data() - uses TFRecord parsing
-# - shap_analysis() - uses TensorFlow-based SHAP
-#
-# TODO: Port to PyTorch using Captum for interpretability
-#
-# For now, importing will fail unless TensorFlow is installed.
+# interpretation/ — PyTorch + Captum interpretation module for BioDVN models.
 
-try:
-    from .interpretation_utils import *
-except ImportError as e:
-    import warnings
-    warnings.warn(
-        f"Interpretation module not available: {e}. "
-        "This module requires TensorFlow which is not installed. "
-        "A PyTorch-native version using Captum is planned."
-    )
+from .interpretation_utils import (
+    attribution_analysis,
+    compute_PWM,
+    export_PWM_to_MEME,
+    get_data,
+    kernel_visualization,
+    load_interpretation_data,
+    load_model,
+    load_npz,
+    plot_motifs,
+    plot_nucleotide_conv2d_filters,
+    plot_nucleotide_motifs,
+    plot_reduction_filters,
+    plot_scalar_bars,
+    plot_scalar_summary,
+    plot_signal_attributions,
+    plot_signal_conv1d_filters,
+    plot_signal_polarity,
+    save_npz,
+    subsample,
+)
+
+from .interpretation import interpretation_analysis

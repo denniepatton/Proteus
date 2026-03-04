@@ -72,7 +72,7 @@ def print_input_diagnostics(
             if verbose:
                 _print_tensor_diag(name, diag)
                 
-                if name in ["tumor_exp", "background_exp", "tumor_class", "background_class"]:
+                if name in ["tumor_exp", "background_exp"]:
                     _print_sample_values(tensor, name, sample_idx, gene_idx)
     
     # Sanity checks
