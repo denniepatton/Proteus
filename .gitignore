@@ -7,6 +7,8 @@ config/paths.yaml
 results_training/
 results_holdout/
 logs/**
+# FOR NOW - need to exclude big outputs but keep all scripts, including XGBoost
+analysis/**
 
 # Fold index JSON files + split TSVs generated per-dataset
 data/*/

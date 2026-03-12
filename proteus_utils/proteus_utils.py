@@ -5,7 +5,7 @@ This file contains the PyTorch Dataset class and data loading utilities
 for efficient training with Zarr-based storage.
 
 Updated for current Triton outputs:
-- TSS_signals: 8 signal channels (float32)
+- TSS_signals: 9 signal channels (float32)
 - TSS_nucleotides: 4 NT one-hot channels (uint8)
 - TSS_features: 11 numeric features (shared Triton features)
 - GB_features: 11 numeric features (identical feature set)
@@ -55,87 +55,6 @@ def _normalize_fold_index_to_sample_paths(loaded: Any) -> List[str]:
             seen.add(p)
             uniq.append(p)
     return uniq
-
-
-class ProteusSampleDataset(Dataset):
-    """Sample-level Dataset for Proteus.
-
-    Each item is one complete sample (all genes kept together). During training,
-    a collate function concatenates genes across a batch of samples and shuffles
-    genes in-memory.
-
-        Expected Zarr layout:
-      sample.zarr/
-        ├── gene_names
-        └── flat/ (arrays with leading dim = n_genes)
-    """
-
-    def __init__(
-        self,
-        index_file: Optional[str] = None,
-        zarr_paths: Optional[List[str]] = None,
-        labeled: bool = True,
-        cache_stores: bool = True,
-    ):
-        self.labeled = labeled
-        self.cache_stores = cache_stores
-        self._store_cache: Dict[str, zarr.Group] = {}
-
-        if index_file is not None:
-            with open(index_file, 'r') as f:
-                self.zarr_paths = json.load(f)
-        elif zarr_paths is not None:
-            self.zarr_paths = list(zarr_paths)
-        else:
-            raise ValueError("Either index_file or zarr_paths must be provided")
-
-        if cache_stores:
-            for path in set(self.zarr_paths):
-                self._store_cache[path] = zarr.open(path, mode='r')
-
-    def __len__(self) -> int:
-        return len(self.zarr_paths)
-
-    def _get_store(self, zarr_path: str) -> zarr.Group:
-        if self.cache_stores and zarr_path in self._store_cache:
-            return self._store_cache[zarr_path]
-        return zarr.open(zarr_path, mode='r')
-
-    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        zarr_path = self.zarr_paths[idx]
-        store = self._get_store(zarr_path)
-        data_grp = store['flat'] if 'flat' in store else store
-
-        # Features (all genes together)
-        features = {
-            'TSS_signals': torch.from_numpy(data_grp['TSS_signals'][:]),
-            'TSS_nucleotides': torch.from_numpy(data_grp['TSS_nucleotides'][:].astype(np.float32)),
-            'TSS_features': torch.from_numpy(data_grp['TSS_features'][:]),
-            'GB_features': torch.from_numpy(data_grp['GB_features'][:]),
-            'ref_scalars': torch.from_numpy(data_grp['ref_scalars'][:]),
-        }
-
-        tfx = torch.from_numpy(data_grp['TFX_label'][:])
-
-        if 'gene_weight' in data_grp:
-            gene_weight = torch.from_numpy(data_grp['gene_weight'][:])
-        else:
-            gene_weight = torch.ones(tfx.shape[0], dtype=torch.float32)
-
-        labels: Dict[str, torch.Tensor]
-        if self.labeled:
-            tumor_exp = torch.from_numpy(data_grp['tumor_exp'][:])
-            background_exp = torch.from_numpy(data_grp['background_exp'][:])
-            labels = {
-                'tumor_exp': tumor_exp,
-                'background_exp': background_exp,
-                'sample_weight': gene_weight,
-                'TFX_label': tfx,
-            }
-        else:
-            labels = {'sample_weight': gene_weight, 'TFX_label': tfx}
-
-        return features, labels
 
 
 class ProteusGeneDataset(Dataset):
@@ -199,7 +118,7 @@ class ProteusGeneDataset(Dataset):
             n_genes_per_sample: List[int] = []
             for path in self._sample_paths:
                 store = self._get_store(path)
-                data_grp = store['flat'] if 'flat' in store else store
+                data_grp = store['flat']
                 n_genes_per_sample.append(int(data_grp['TSS_signals'].shape[0]))
             self._n_genes_per_sample = n_genes_per_sample
 
@@ -255,7 +174,7 @@ class ProteusGeneDataset(Dataset):
         if self._explicit_pairs is not None:
             zarr_path, gene_id = self._explicit_pairs[idx]
             store = self._get_store(zarr_path)
-            data_grp = store['flat'] if 'flat' in store else store
+            data_grp = store['flat']
             gene_idx = self._resolve_gene_index(store, zarr_path, gene_id)
         else:
             assert self._sample_paths is not None
@@ -265,7 +184,7 @@ class ProteusGeneDataset(Dataset):
             zarr_path = self._sample_paths[sample_i]
             gene_idx = idx - self._cum_gene_offsets[sample_i]
             store = self._get_store(zarr_path)
-            data_grp = store['flat'] if 'flat' in store else store
+            data_grp = store['flat']
 
         features = {
             'TSS_signals': torch.from_numpy(data_grp['TSS_signals'][gene_idx]),
@@ -292,133 +211,6 @@ class ProteusGeneDataset(Dataset):
         if self.labeled:
             tumor_exp = torch.tensor(float(data_grp['tumor_exp'][gene_idx]), dtype=torch.float32)
             background_exp = torch.tensor(float(data_grp['background_exp'][gene_idx]), dtype=torch.float32)
-            labels: Dict[str, torch.Tensor] = {
-                'tumor_exp': tumor_exp,
-                'background_exp': background_exp,
-                'sample_weight': gene_weight,
-                'TFX_label': tfx,
-            }
-        else:
-            labels = {'sample_weight': gene_weight, 'TFX_label': tfx}
-
-        return features, labels
-
-
-class ProteusGeneChunkDataset(Dataset):
-    """Chunked gene Dataset backed by flat per-sample Zarr arrays.
-
-    Each item is a *contiguous slice* of genes from one sample, e.g. [start:end).
-    This is much friendlier to Zarr chunking/compression than single-gene random reads.
-
-    Intended usage:
-      - DataLoader shuffle=False
-      - A deterministic, pre-shuffled chunk index is generated once and saved next to
-        the fold index file (so training order is reproducible across runs).
-      - Collate concatenates chunks and (optionally) shuffles genes in-memory.
-
-    Notes:
-      - Supports v5 fold indices (sample-path list). Legacy explicit (path,gene)
-        indices are not supported in chunk mode.
-    """
-
-    def __init__(
-        self,
-        index_file: str,
-        chunk_size: int = 256,
-        seed: int = 42,
-        labeled: bool = True,
-        cache_stores: bool = True,
-        include_metadata: bool = False,
-    ):
-        self.index_file = index_file
-        self.chunk_size = int(chunk_size)
-        self.seed = int(seed)
-        self.labeled = labeled
-        self.cache_stores = cache_stores
-        self.include_metadata = bool(include_metadata)
-        self._store_cache: Dict[str, zarr.Group] = {}
-        self._gene_names_cache: Dict[str, List[str]] = {}
-        self._sample_name_cache: Dict[str, str] = {}
-
-        with open(index_file, 'r') as f:
-            loaded = json.load(f)
-
-        # Accept both v5 sample-path lists and legacy explicit (path,gene) lists.
-        self.sample_paths = _normalize_fold_index_to_sample_paths(loaded)
-
-        if cache_stores:
-            for path in set(self.sample_paths):
-                self._store_cache[path] = zarr.open(path, mode='r')
-
-        # Build or load a deterministic chunk index.
-        cache_path = f"{index_file}.chunks_{self.chunk_size}_seed{self.seed}.json"
-        if os.path.exists(cache_path):
-            with open(cache_path, 'r') as f:
-                self._chunks: List[Tuple[str, int, int]] = [
-                    (str(p), int(s), int(e)) for (p, s, e) in json.load(f)
-                ]
-        else:
-            chunks: List[Tuple[str, int, int]] = []
-            for path in self.sample_paths:
-                store = self._get_store(path)
-                data_grp = store['flat'] if 'flat' in store else store
-                n_genes = int(data_grp['TSS_signals'].shape[0])
-                for start in range(0, n_genes, self.chunk_size):
-                    end = min(start + self.chunk_size, n_genes)
-                    chunks.append((path, start, end))
-
-            rng = random.Random(self.seed)
-            rng.shuffle(chunks)
-            self._chunks = chunks
-
-            # Persist for reproducibility + faster startup next time.
-            with open(cache_path, 'w') as f:
-                json.dump(self._chunks, f)
-
-    def __len__(self) -> int:
-        return len(self._chunks)
-
-    def _get_store(self, zarr_path: str) -> zarr.Group:
-        if self.cache_stores and zarr_path in self._store_cache:
-            return self._store_cache[zarr_path]
-        return zarr.open(zarr_path, mode='r')
-
-    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        zarr_path, start, end = self._chunks[idx]
-        store = self._get_store(zarr_path)
-        data_grp = store['flat'] if 'flat' in store else store
-
-        # Slice contiguous genes [start:end)
-        features = {
-            'TSS_signals': torch.from_numpy(data_grp['TSS_signals'][start:end]),
-            'TSS_nucleotides': torch.from_numpy(data_grp['TSS_nucleotides'][start:end].astype(np.float32)),
-            'TSS_features': torch.from_numpy(data_grp['TSS_features'][start:end]),
-            'GB_features': torch.from_numpy(data_grp['GB_features'][start:end]),
-            'ref_scalars': torch.from_numpy(data_grp['ref_scalars'][start:end]),
-        }
-
-        tfx = torch.from_numpy(data_grp['TFX_label'][start:end]).to(torch.float32)
-
-        if self.include_metadata:
-            sample_name = store.attrs.get('sample_name')
-            if sample_name is None:
-                sample_name = Path(zarr_path).stem.replace('.zarr', '')
-            sample_name = str(sample_name)
-            gene_names = self._gene_names_cache.get(zarr_path)
-            if gene_names is None:
-                gene_names = [str(g) for g in list(store['gene_names'][:])]
-                self._gene_names_cache[zarr_path] = gene_names
-            features['sample_name'] = [sample_name] * int(end - start)
-            features['gene_name'] = [str(g) for g in gene_names[int(start):int(end)]]
-
-        if 'gene_weight' in data_grp:
-            gene_weight = torch.from_numpy(data_grp['gene_weight'][start:end]).to(torch.float32)
-        else:
-            gene_weight = torch.ones(end - start, dtype=torch.float32)
-
-        if self.labeled:
-            tumor_exp = torch.from_numpy(data_grp['tumor_exp'][start:end]).to(torch.float32)
-            background_exp = torch.from_numpy(data_grp['background_exp'][start:end]).to(torch.float32)
             labels: Dict[str, torch.Tensor] = {
                 'tumor_exp': tumor_exp,
                 'background_exp': background_exp,
@@ -463,6 +255,8 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         include_metadata: bool = False,
         subsample_frac: Optional[float] = None,
         gene_weights: Optional[Dict[str, float]] = None,
+        val_frac: Optional[float] = None,
+        val_split: bool = False,
     ):
         super().__init__()
         self.index_file = str(index_file)
@@ -474,6 +268,8 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         self.include_metadata = bool(include_metadata)
         self.subsample_frac = subsample_frac
         self.gene_weights = gene_weights
+        self.val_frac = val_frac
+        self.val_split = val_split
 
         if self.genes_per_batch <= 0:
             raise ValueError('genes_per_batch must be > 0')
@@ -502,8 +298,7 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
             chunks: List[Tuple[str, int, int]] = []
             for path in self.sample_paths:
                 store = zarr.open(path, mode='r')
-                data_grp = store['flat'] if 'flat' in store else store
-                n_genes = int(data_grp['TSS_signals'].shape[0])
+                n_genes = int(store['flat']['TSS_signals'].shape[0])
                 for start in range(0, n_genes, self.chunk_size):
                     end = min(start + self.chunk_size, n_genes)
                     chunks.append((str(path), int(start), int(end)))
@@ -523,6 +318,18 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
             subsample_indices = sorted(rng.sample(range(n_chunks), n_keep))
             self._chunks = [self._chunks[i] for i in subsample_indices]
 
+        # Gene-level train/val split at chunk granularity.
+        # Deterministic: same seed + val_frac → same partition.
+        if self.val_frac is not None and self.val_frac > 0:
+            n_chunks = len(self._chunks)
+            n_val = max(1, int(n_chunks * self.val_frac))
+            rng_split = random.Random(self.seed + 777)
+            val_indices = set(rng_split.sample(range(n_chunks), n_val))
+            if self.val_split:
+                self._chunks = [self._chunks[i] for i in sorted(val_indices)]
+            else:
+                self._chunks = [c for i, c in enumerate(self._chunks) if i not in val_indices]
+
         # Compute how many fixed-size microbatches we will yield.
         self._n_batches = 0
         for _path, start, end in self._chunks:
@@ -530,6 +337,7 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
 
         # These caches live per-process (per DataLoader worker).
         self._store_cache: Dict[str, zarr.Group] = {}
+        self._flat_grp_cache: Dict[str, zarr.Group] = {}
         self._gene_names_cache: Dict[str, List[str]] = {}
 
     def __len__(self) -> int:
@@ -543,6 +351,24 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
                 self._store_cache[zarr_path] = store
             return store
         return zarr.open(zarr_path, mode='r')
+
+    def _get_flat_grp(self, zarr_path: str) -> zarr.Group:
+        """Return the 'flat' data group, caching the reference.
+
+        The flat group is resolved once per worker per store and then
+        reused for all subsequent epochs.  This avoids repeated
+        filesystem metadata probes (os.path.isfile on the scratch FS)
+        that can transiently fail under heavy concurrent I/O.
+        """
+        if self.cache_stores:
+            grp = self._flat_grp_cache.get(zarr_path)
+            if grp is not None:
+                return grp
+        store = self._get_store(zarr_path)
+        grp = store['flat']
+        if self.cache_stores:
+            self._flat_grp_cache[zarr_path] = grp
+        return grp
 
     def _get_gene_names(self, store: zarr.Group, zarr_path: str) -> List[str]:
         cached = self._gene_names_cache.get(zarr_path)
@@ -565,7 +391,7 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         for chunk_idx in range(worker_id, len(self._chunks), num_workers):
             zarr_path, start, end = self._chunks[chunk_idx]
             store = self._get_store(zarr_path)
-            data_grp = store['flat'] if 'flat' in store else store
+            data_grp = self._get_flat_grp(zarr_path)
 
             # Load one contiguous chunk into memory.
             tss_signals = torch.from_numpy(data_grp['TSS_signals'][start:end])
@@ -676,101 +502,6 @@ class ProteusInferenceDataset(Dataset):
         }
 
 
-def collate_proteus_samples(
-    batch: List[Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]],
-    shuffle_genes: bool = True,
-    generator: Optional[torch.Generator] = None,
-) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """Collate a batch of complete samples into a gene-level batch.
-
-    - Concatenates genes across samples (dim=0).
-    - Optionally shuffles genes across the combined batch.
-    """
-    features_list, labels_list = zip(*batch)
-
-    # Concatenate along gene axis
-    batched_features = {
-        'TSS_signals': torch.cat([f['TSS_signals'] for f in features_list], dim=0),
-        'TSS_nucleotides': torch.cat([f['TSS_nucleotides'] for f in features_list], dim=0),
-        'TSS_features': torch.cat([f['TSS_features'] for f in features_list], dim=0),
-        'GB_features': torch.cat([f['GB_features'] for f in features_list], dim=0),
-        'ref_scalars': torch.cat([f['ref_scalars'] for f in features_list], dim=0),
-    }
-
-    # Optional metadata passthrough (lists of strings)
-    if features_list and 'sample_name' in features_list[0]:
-        batched_features['sample_name'] = sum([list(f['sample_name']) if isinstance(f['sample_name'], (list, tuple)) else [f['sample_name']] for f in features_list], [])
-    if features_list and 'gene_name' in features_list[0]:
-        batched_features['gene_name'] = sum([list(f['gene_name']) if isinstance(f['gene_name'], (list, tuple)) else [f['gene_name']] for f in features_list], [])
-
-    # Labels
-    if labels_list and 'tumor_exp' in labels_list[0]:
-        batched_labels = {
-            'tumor_exp': torch.cat([l['tumor_exp'] for l in labels_list], dim=0).unsqueeze(-1),
-            'background_exp': torch.cat([l['background_exp'] for l in labels_list], dim=0).unsqueeze(-1),
-            'sample_weight': torch.cat([l.get('sample_weight', torch.ones_like(l['tumor_exp'])) for l in labels_list], dim=0).unsqueeze(-1),
-            'TFX_label': torch.cat([l['TFX_label'] for l in labels_list], dim=0).unsqueeze(-1),
-        }
-    else:
-        # Unlabeled path (inference-style training not typical, but keep consistent)
-        batched_labels = {
-            'sample_weight': torch.cat([l.get('sample_weight', torch.ones(l['TFX_label'].shape[0], dtype=torch.float32)) for l in labels_list], dim=0).unsqueeze(-1),
-            'TFX_label': torch.cat([l['TFX_label'] for l in labels_list], dim=0).unsqueeze(-1),
-        }
-
-    if shuffle_genes:
-        n = batched_features['TSS_signals'].shape[0]
-        perm = torch.randperm(n, generator=generator)
-        for k, v in batched_features.items():
-            if isinstance(v, torch.Tensor):
-                batched_features[k] = v[perm]
-            elif isinstance(v, list):
-                order = perm.tolist()
-                batched_features[k] = [v[i] for i in order]
-        for k, v in batched_labels.items():
-            batched_labels[k] = v[perm]
-
-    return batched_features, batched_labels
-
-
-class CollateProteusChunks:
-    """Pickle-friendly collate for chunked gene loading.
-
-    Concatenates chunk items along the gene axis, optionally shuffles genes
-    in-memory, then (optionally) truncates to a fixed genes-per-step size.
-    """
-
-    def __init__(
-        self,
-        shuffle_genes: bool = True,
-        seed: Optional[int] = None,
-    ):
-        self.shuffle_genes = bool(shuffle_genes)
-        self.seed = int(seed) if seed is not None else None
-        self._rng: Optional[torch.Generator] = None
-
-    def __call__(
-        self,
-        batch: List[Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]],
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        if self._rng is None:
-            # In worker processes, torch.initial_seed() is deterministically derived
-            # from the DataLoader's base generator seed.
-            worker_info = torch.utils.data.get_worker_info()
-            self._rng = torch.Generator()
-            if worker_info is None and self.seed is not None:
-                self._rng.manual_seed(self.seed)
-            else:
-                self._rng.manual_seed(torch.initial_seed())
-
-        features, labels = collate_proteus_samples(
-            batch,
-            shuffle_genes=self.shuffle_genes,
-            generator=self._rng,
-        )
-        return features, labels
-
-
 def collate_proteus_genes(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Collate gene-level items (each item is one gene)."""
     features_list, labels_list = zip(*batch)
@@ -804,11 +535,6 @@ def collate_proteus_genes(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, tor
     return batched_features, batched_labels
 
 
-# Backwards-compatible defaults (model trains per-gene)
-ProteusDataset = ProteusGeneDataset
-collate_proteus = collate_proteus_genes
-
-
 def collate_inference(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """Collate function for inference (no labels)."""
     return {
@@ -837,6 +563,8 @@ def create_data_loader(
     drop_last: bool = False,
     subsample_frac: Optional[float] = None,
     gene_weights: Optional[Dict[str, float]] = None,
+    val_frac: Optional[float] = None,
+    val_split: bool = False,
 ) -> Tuple[DataLoader, int]:
     """
     Create a DataLoader for Proteus training/validation.
@@ -886,6 +614,8 @@ def create_data_loader(
             include_metadata=include_metadata,
             subsample_frac=subsample_frac,
             gene_weights=gene_weights,
+            val_frac=val_frac,
+            val_split=val_split,
         )
 
         # IterableDataset already yields fixed-size training batches.
@@ -955,123 +685,6 @@ def create_inference_loader(
     )
     
     return loader, dataset.gene_names
-
-
-def get_fold_indices(
-    use_set: str,
-    data_dir: str = 'data'
-) -> Dict[int, str]:
-    """
-    Get paths to fold index files for a dataset.
-    
-    Args:
-        use_set: Dataset name
-        data_dir: Base data directory
-        
-    Returns:
-        Dictionary mapping fold numbers to index file paths
-    """
-    index_dir = os.path.join(data_dir, use_set, 'fold_indices')
-    
-    if not os.path.exists(index_dir):
-        raise FileNotFoundError(f"Fold indices not found at {index_dir}. Run create_fold_index first.")
-    
-    fold_files = {}
-    for f in os.listdir(index_dir):
-        if f.startswith('fold_') and f.endswith('_index.json'):
-            fold_num = int(f.split('_')[1])
-            fold_files[fold_num] = os.path.join(index_dir, f)
-    
-    return fold_files
-
-
-def build_train_val_loaders(
-    use_set: str,
-    val_fold: int,
-    num_workers: int = 4,
-    data_dir: str = 'data',
-    loader_mode: str = 'gene',
-    chunk_size: int = 256,
-    genes_per_batch: int = 32,
-    shuffle_genes_in_batch: bool = True,
-    persistent_workers: bool = True,
-    prefetch_factor: int = 4,
-    seed: int = 42,
-) -> Tuple[DataLoader, DataLoader, int, int]:
-    """
-    Build training and validation DataLoaders for cross-validation.
-    
-    Args:
-        use_set: Dataset name
-        val_fold: Fold number to use for validation
-        num_workers: Number of workers
-        data_dir: Base data directory
-        
-    Returns:
-        train_loader, val_loader, train_steps, val_steps
-    """
-    fold_files = get_fold_indices(use_set, data_dir)
-    
-    # Combine non-validation folds for training
-    train_indices: List[str] = []
-    for fold_num, index_file in fold_files.items():
-        if fold_num != val_fold:
-            with open(index_file, 'r') as f:
-                train_indices.extend(_normalize_fold_index_to_sample_paths(json.load(f)))
-
-    # Deduplicate (folds may overlap in legacy formats)
-    train_indices = list(dict.fromkeys(train_indices))
-    
-    # Shuffle training indices deterministically (sample-path list order)
-    rng = np.random.RandomState(seed)
-    rng.shuffle(train_indices)
-    
-    # Create temporary index file for training
-    train_index_file = os.path.join(data_dir, use_set, 'fold_indices', f'train_excl_{val_fold}_temp.json')
-    with open(train_index_file, 'w') as f:
-        json.dump(train_indices, f)
-    
-    train_loader, train_steps = create_data_loader(
-        index_file=train_index_file,
-        num_workers=num_workers,
-        shuffle=(str(loader_mode).lower() == 'gene'),
-        labeled=True
-        ,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
-        loader_mode=loader_mode,
-        chunk_size=chunk_size,
-        genes_per_batch=genes_per_batch,
-        shuffle_genes_in_batch=shuffle_genes_in_batch,
-        seed=seed,
-        drop_last=(str(loader_mode).lower() == 'gene'),
-    )
-
-    # Normalize validation fold index to a v5-style sample-path list (chunk loader requirement).
-    with open(fold_files[val_fold], 'r') as f:
-        val_indices = _normalize_fold_index_to_sample_paths(json.load(f))
-    val_index_file = os.path.join(data_dir, use_set, 'fold_indices', f'val_fold_{val_fold}_temp.json')
-    with open(val_index_file, 'w') as f:
-        json.dump(val_indices, f)
-    
-    val_loader, val_steps = create_data_loader(
-        index_file=val_index_file,
-        num_workers=num_workers,
-        shuffle=False,
-        labeled=True
-        ,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
-        loader_mode=loader_mode,
-        chunk_size=chunk_size,
-        genes_per_batch=genes_per_batch,
-        shuffle_genes_in_batch=False,
-        seed=seed,
-        include_metadata=True,
-        drop_last=False,
-    )
-    
-    return train_loader, val_loader, train_steps, val_steps
 
 
 def build_loaders_from_splits(

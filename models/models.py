@@ -96,8 +96,7 @@ class BioDVNConfig:
     interaction_ksize: int = 3
     initial_reduction_channels: int = 64
     n_reductions: int = 3
-    reduction_dilation_small: int = 1
-    reduction_dilation_large: int = 11
+    reduction_dilation: int = 1
     signal_encoder_width: int = 1024  # First hidden dim of signal encoder funnel
     encoder_start: int = 128
     latent_size: int = 32
@@ -197,7 +196,7 @@ class SignalProcessingBlock(nn.Module):
 
 class ReductionBlock(nn.Module):
     """
-    Higher-order refinement and time-reduction block.
+    Higher-order refinement and time(spatial)-reduction block.
     
     Applies 2D convolutions to capture cross-channel relationships,
     interleaved with 1D average pooling for spatial reduction.
@@ -433,10 +432,10 @@ class BioDVN(nn.Module):
     
     Architecture:
     1. Signal Processing Block: Conv1D per fragmentomic channel + Conv2D for nucleotides
-    2. Dual Reduction Blocks: Small (local) and large (global) receptive fields
-    3. Signal Encoding: Dense layers to compress signal representation
+    2. Reduction Block: Conv2D cross-channel interaction with residual skips + AvgPool
+    3. Signal Encoding: Dense halving-funnel to compress spatial representation
     4. Dual Encoder Block: Parallel VAE encoders for tumor and background
-    5. Latent Merging: TFX-conditional combination of latent spaces
+    5. Latent Merging: Learned TFx-conditional combination of latent spaces
     6. Reconstruction: Decoder for scalar reconstruction (internal loss)
     7. Prediction Block: MDN mixture-density regression heads
     
@@ -451,8 +450,8 @@ class BioDVN(nn.Module):
             config = BioDVNConfig()
         self.config = config
         
-        # Signal processing block (always use all 8 biological signal channels).
-        n_signal_channels = 8
+        # Signal processing block (always use all 9 biological signal channels).
+        n_signal_channels = 9
         self.signal_processor = SignalProcessingBlock(
             n_signal_channels=n_signal_channels,
             signal_filters=config.signal_filters,
@@ -462,21 +461,16 @@ class BioDVN(nn.Module):
         # After signal processing: (n_signal_channels + 1) * signal_filters channels
         signal_channels = (n_signal_channels + 1) * config.signal_filters
         
-        # Dual reduction blocks (small and large receptive fields)
-        self.reduction_small = ReductionBlock(
+        # Spatial reduction block: Conv2D cross-channel interaction with
+        # residual skip connections, followed by AvgPool.  Skip connections
+        # preserve fine-grained features through coarser layers, naturally
+        # integrating local and broader spatial scales in a single path.
+        self.reduction = ReductionBlock(
             in_channels=signal_channels,
             initial_reduction_channels=config.initial_reduction_channels,
             n_reductions=config.n_reductions,
             interaction_ksize=config.interaction_ksize,
-            dilation=config.reduction_dilation_small,
-        )
-        
-        self.reduction_large = ReductionBlock(
-            in_channels=signal_channels,
-            initial_reduction_channels=config.initial_reduction_channels,
-            n_reductions=config.n_reductions,
-            interaction_ksize=15,  # Larger kernel for global patterns
-            dilation=config.reduction_dilation_large,
+            dilation=config.reduction_dilation,
         )
         
         # Signal encoding (must be built eagerly so all parameters exist before
@@ -494,10 +488,6 @@ class BioDVN(nn.Module):
 
         # Reference scalars always included.
         self.scalar_input_dim += 3
-
-        # TFX is never included in the encoder input.  The encoder learns
-        # TFX-invariant representations; TFX enters the model only through
-        # the merge weight predictor (via GRL discriminator prediction).
 
         self.encoder_input_dim = int(self.signal_encoded_dim + self.scalar_input_dim)
         
@@ -544,9 +534,10 @@ class BioDVN(nn.Module):
         )
         
         # Mixture Density Network output heads.
-        # Input is cat(z_mean, z_log_var) so the MDN has access to both the
-        # encoder's point estimate and its per-dimension uncertainty.
-        mdn_input_dim = 2 * config.latent_size
+        # Input is the reparameterized latent sample z (same representation
+        # the decoder sees), so the MDN's full input bandwidth is devoted
+        # to the biological signal rather than raw encoder uncertainty.
+        mdn_input_dim = config.latent_size
         self.tumor_mdn_head = MixtureDensityHead(
             input_dim=mdn_input_dim,
             hidden_dim=config.mdn_hidden,
@@ -608,7 +599,7 @@ class BioDVN(nn.Module):
         return out
 
     def _compute_signal_encoder_input_dim(self) -> int:
-        """Compute the concatenated flat dim feeding the signal encoder.
+        """Compute the flat dim feeding the signal encoder.
 
         This must match the actual tensor shapes produced in forward().
         """
@@ -625,31 +616,23 @@ class BioDVN(nn.Module):
             1,
         )
 
-        small_len = self._compute_reduction_output_length(
+        reduced_len = self._compute_reduction_output_length(
             base_len,
             interaction_ksize=int(self.config.interaction_ksize),
-            dilation=int(self.config.reduction_dilation_small),
-            n_reductions=int(self.config.n_reductions),
-        )
-        large_len = self._compute_reduction_output_length(
-            base_len,
-            interaction_ksize=15,
-            dilation=int(self.config.reduction_dilation_large),
+            dilation=int(self.config.reduction_dilation),
             n_reductions=int(self.config.n_reductions),
         )
 
-        if small_len <= 0 or large_len <= 0:
+        if reduced_len <= 0:
             raise ValueError(
                 'Invalid reduction configuration produced non-positive sequence length: '
-                f'small_len={small_len} large_len={large_len} '
+                f'reduced_len={reduced_len} '
                 f'(tss_len={self._tss_input_length}, signal_ksize={self.config.signal_ksize}, '
                 f'n_reductions={self.config.n_reductions}, interaction_ksize={self.config.interaction_ksize}, '
-                f'dilation_small={self.config.reduction_dilation_small}, dilation_large={self.config.reduction_dilation_large})'
+                f'dilation={self.config.reduction_dilation})'
             )
 
-        small_flat_dim = int(small_len) * int(out_channels)
-        large_flat_dim = int(large_len) * int(out_channels)
-        return int(small_flat_dim + large_flat_dim)
+        return int(reduced_len) * int(out_channels)
 
     def _build_signal_encoder(self, input_dim: int) -> nn.Module:
         """Build a halving-funnel MLP: input_dim → width → width//2 → … → signal_encoded_dim."""
@@ -695,7 +678,7 @@ class BioDVN(nn.Module):
         
         Args:
             features: Dictionary with keys:
-                - TSS_signals: (batch, 2000, 8) biological signals
+                - TSS_signals: (batch, 2000, 9) biological signals + NaN mask
                 - TSS_nucleotides: (batch, 2000, 4) one-hot nucleotides
                 - TSS_features: (batch, 11+) TSS region features (first 11 used)
                 - GB_features: (batch, 11) gene body features
@@ -716,30 +699,28 @@ class BioDVN(nn.Module):
         # Extract features
         x_signals = features['TSS_signals']
         x_nucleotides = features['TSS_nucleotides']
-        # Backward-compatible: old Zarr stores have 17 TSS features;
-        # we only use the first 11 (shared Triton features, no central-*/window-*).
+        # Defensive slice: current Zarr stores write exactly 11 TSS features,
+        # but we clip to 11 to guard against any older stores with extra columns.
         tss_features = features['TSS_features'][:, :11]
         gb_features = features['GB_features']
         ref_scalars = features['ref_scalars']
 
-        # Biological signals: the model always consumes all 8 channels.
-        if int(x_signals.shape[-1]) < 8:
-            raise ValueError(f"Expected at least 8 biological signal channels, got {int(x_signals.shape[-1])}")
-        x_signals = x_signals[:, :, :8]
+        # Biological signals: the model always consumes all 9 channels.
+        if int(x_signals.shape[-1]) < 9:
+            raise ValueError(f"Expected at least 9 biological signal channels, got {int(x_signals.shape[-1])}")
+        x_signals = x_signals[:, :, :9]
         
         # Signal processing (separate signals and nucleotides)
         x = self.signal_processor(x_signals, x_nucleotides)
         
-        # Dual reduction paths
-        x_small = self.reduction_small(x)
-        x_large = self.reduction_large(x)
+        # Spatial reduction (skip connections integrate multi-scale features)
+        x = self.reduction(x)
         
-        # Flatten and concatenate
-        x_small_flat = x_small.reshape(x_small.shape[0], -1)
-        x_large_flat = x_large.reshape(x_large.shape[0], -1)
+        # Flatten
+        x_flat = x.reshape(x.shape[0], -1)
 
         # Sanity check that precomputed encoder input dim matches runtime tensors.
-        runtime_dim = int(x_small_flat.shape[1] + x_large_flat.shape[1])
+        runtime_dim = int(x_flat.shape[1])
         if runtime_dim != int(self.signal_encoder_input_dim):
             raise ValueError(
                 'Signal encoder input dim mismatch. '
@@ -747,8 +728,7 @@ class BioDVN(nn.Module):
                 f'(TSS_signals length={int(x_signals.shape[1])}, configured_tss_len={self._tss_input_length})'
             )
 
-        x_concat = torch.cat([x_small_flat, x_large_flat], dim=1)
-        x_encoded = self.signal_encoder(x_concat)
+        x_encoded = self.signal_encoder(x_flat)
         
         # Combine with scalar features.
         # Build encoder input.  TFX is never included — the encoder learns
@@ -803,10 +783,10 @@ class BioDVN(nn.Module):
         # Reconstruction
         y_reconstructed = self.decoder(z_merged)
         
-        # MDN output heads: feed both mean and log-variance so the MDN
-        # can use encoder uncertainty for calibrated mixture outputs.
-        tumor_mdn = self.tumor_mdn_head(torch.cat([z_tumor_mean, z_tumor_log_var], dim=1))
-        background_mdn = self.background_mdn_head(torch.cat([z_background_mean, z_background_log_var], dim=1))
+        # MDN output heads: feed the reparameterized latent sample —
+        # the same representation the decoder path receives.
+        tumor_mdn = self.tumor_mdn_head(z_tumor)
+        background_mdn = self.background_mdn_head(z_background)
         
         # Point estimates (mixture mean) for backward-compatible metrics / analysis
         tumor_exp = mixture_mean(tumor_mdn)
@@ -836,9 +816,7 @@ class BioDVN(nn.Module):
         """Freeze signal processing layers for transfer learning."""
         for param in self.signal_processor.parameters():
             param.requires_grad = False
-        for param in self.reduction_small.parameters():
-            param.requires_grad = False
-        for param in self.reduction_large.parameters():
+        for param in self.reduction.parameters():
             param.requires_grad = False
         for param in self.signal_encoder.parameters():
             param.requires_grad = False
@@ -865,8 +843,7 @@ class BioDVN(nn.Module):
         
         if level in ['Medium-Heavy', 'Heavy', 'Extra-Heavy', 'Extreme']:
             frozen.extend([n for n, _ in self.signal_processor.named_parameters()])
-            frozen.extend([n for n, _ in self.reduction_small.named_parameters()])
-            frozen.extend([n for n, _ in self.reduction_large.named_parameters()])
+            frozen.extend([n for n, _ in self.reduction.named_parameters()])
         
         if level in ['Heavy', 'Extra-Heavy', 'Extreme']:
             frozen.extend([n for n, _ in self.signal_encoder.named_parameters()])
@@ -890,63 +867,54 @@ class BioDVN(nn.Module):
 class BioDVN_NoSeq(BioDVN):
     """
     BioDVN variant without sequence (nucleotide) information.
-    Only uses the 8 biological signal channels, ignoring TSS_nucleotides.
+    Only uses the 9 biological signal channels, ignoring TSS_nucleotides.
     """
     
     def __init__(self, config: Optional[BioDVNConfig] = None):
         # Modify signal processing to exclude nucleotide channels
         super().__init__(config)
         
-        # Override signal processor to only use 8 signal channels
+        # Override signal processor to only use 9 signal channels
         self.signal_processor = SignalProcessingBlock_NoSeq(
             signal_filters=self.config.signal_filters,
             signal_ksize=self.config.signal_ksize,
         )
         
-        # Update signal_channels to 8 * filters (no nucleotide block)
-        signal_channels = 8 * self.config.signal_filters
+        # Update signal_channels to 9 * filters (no nucleotide block)
+        signal_channels = 9 * self.config.signal_filters
         
-        # Recreate reduction blocks with correct input channels
-        self.reduction_small = ReductionBlock(
+        # Recreate reduction block with correct input channels
+        self.reduction = ReductionBlock(
             in_channels=signal_channels,
             initial_reduction_channels=self.config.initial_reduction_channels,
             n_reductions=self.config.n_reductions,
             interaction_ksize=self.config.interaction_ksize,
-            dilation=self.config.reduction_dilation_small,
-        )
-        
-        self.reduction_large = ReductionBlock(
-            in_channels=signal_channels,
-            initial_reduction_channels=self.config.initial_reduction_channels,
-            n_reductions=self.config.n_reductions,
-            interaction_ksize=15,
-            dilation=self.config.reduction_dilation_large,
+            dilation=self.config.reduction_dilation,
         )
         
         # Re-apply weight initialization to newly created layers
         self.signal_processor.apply(self._init_weights)
-        self.reduction_small.apply(self._init_weights)
-        self.reduction_large.apply(self._init_weights)
+        self.reduction.apply(self._init_weights)
 
 
 class SignalProcessingBlock_NoSeq(nn.Module):
     """
     Signal processing without nucleotide channels.
-    Only processes the 8 biological signal channels.
+    Only processes the 9 biological signal channels.
     """
     
     def __init__(self, signal_filters: int = 16, signal_ksize: int = 6):
         super().__init__()
         self.signal_filters = signal_filters
 
-        out_channels = 8 * signal_filters
+        out_channels = 9 * signal_filters
         self.conv1d_signals = nn.Sequential(
             nn.Conv1d(
-                in_channels=8,
+                in_channels=9,
                 out_channels=out_channels,
                 kernel_size=signal_ksize,
                 padding=0,
-                groups=8,
+                groups=9,
             ),
             get_norm_layer_conv1d(out_channels),
             nn.ReLU(),
@@ -957,7 +925,7 @@ class SignalProcessingBlock_NoSeq(nn.Module):
         Process only biological signal channels (ignore nucleotides).
         
         Args:
-            x_signals: TSS_signals tensor of shape (batch, 2000, 8)
+            x_signals: TSS_signals tensor of shape (batch, 2000, 9)
             x_nucleotides: Ignored (for interface compatibility)
             
         Returns:

@@ -14,7 +14,7 @@ Zarr layout (flat arrays for batch loading):
       ├── gene_names: array of gene IDs for indexing
       ├── attrs: {sample_name, n_genes, tfx}
       └── flat/
-          ├── TSS_signals      (n_genes, 2000, 8)   float32
+          ├── TSS_signals      (n_genes, 2000, 9)   float32
           ├── TSS_nucleotides  (n_genes, 2000, 4)   uint8
           ├── TSS_features     (n_genes, 11)        float32
           ├── GB_features      (n_genes, 11)        float32
@@ -31,8 +31,8 @@ Feature transforms (applied at Zarr conversion time):
     
 NaN handling:
     - Sample-mean imputation for features after transforms
-    - Channel-mean imputation for signals
-    - Genes with >50% NaN in signals or features are dropped
+    - Signal NaN positions are imputed to 0 and recorded in a 9th binary mask channel
+    - Genes with >50% NaN in features are dropped (no signal NaN threshold)
 """
 
 # Standard library imports
@@ -113,7 +113,7 @@ DEFAULT_ZARR_BASE = _get_default_zarr_base()
 # Compression settings for Zarr
 COMPRESSOR = Blosc(cname='zstd', clevel=3, shuffle=Blosc.BITSHUFFLE)
 
-# Signal channels (8 biological signals)
+# Signal channels (8 biological signals + 1 NaN mask)
 SIGNAL_CHANNELS = [
     'depth',                    # 0: GC-corrected coverage
     'frag_end_coverage',        # 1: Fragment end density
@@ -123,6 +123,7 @@ SIGNAL_CHANNELS = [
     'fl_entropy',               # 5: Shannon entropy
     'fl_gini_simpson',          # 6: Diversity index
     'pn_peaks',                 # 7: Local maxima/minima
+    'nan_mask',                 # 8: 1 where any signal channel had NaN, 0 otherwise
 ]
 
 # Nucleotide one-hot channels (stored separately as uint8)
@@ -164,8 +165,7 @@ GB_FEATURES = [
 LOG_ONLY_FEATURES = ['mean-region-depth']  # log1p only, NO z-score
 LOG_TRANSFORM_FEATURES = ['fl-kurtosis', 'pn-mean-spacing', 'pn-mean-amplitude']
 
-# NaN thresholds for gene exclusion
-MAX_SIGNAL_NAN_FRACTION = 0.5
+# NaN thresholds for gene exclusion (signal NaN is encoded, not thresholded)
 MAX_FEATURE_NAN_FRACTION = 0.5
 
 # Cohort name normalization: map legacy/alternative names to canonical names
@@ -186,7 +186,7 @@ def normalize_cohort_name(name: str) -> str:
 
 # Data shapes for Zarr stores
 SHAPES = {
-    'TSS_signals': (2000, 8),
+    'TSS_signals': (2000, 9),
     'TSS_nucleotides': (2000, 4),
     'TSS_features': (len(TSS_FEATURES),),
     'GB_features': (11,),
@@ -254,8 +254,10 @@ def get_samples(triton_results_dir: str, dataset: str = None) -> List[str]:
     return sorted(samples)
 
 
-def get_samples_from_tfx(tfx_path: Union[str, int, float]) -> List[str]:
+def get_samples_from_tfx(tfx_path: Union[str, int, float, None]) -> List[str]:
     """Get sample names from TFX labels file."""
+    if tfx_path is None:
+        return []
     if isinstance(tfx_path, (int, float)):
         return []
     if not os.path.exists(tfx_path):
@@ -288,8 +290,9 @@ def _load_signal_profiles(
     """
     Load signal profiles from TritonV2 output.
     
-    Separates biological signals (8 channels) from nucleotide OHE (4 channels).
-    Applies channel-mean imputation for NaN values in signals.
+    Separates biological signals (8 channels) from nucleotide OHE (4 channels),
+    then appends a 9th binary NaN mask channel (1 = any signal was NaN at that
+    position, 0 = all signals observed).  NaN values are imputed to 0.
     
     Args:
         sample_dir: Path to sample's Triton output folder
@@ -298,7 +301,7 @@ def _load_signal_profiles(
         
     Returns:
         Tuple of:
-            - signals_dict: Gene name -> (2000, 8) float32 biological signals
+            - signals_dict: Gene name -> (2000, 9) float32 signals + NaN mask
             - nucleotides_dict: Gene name -> (2000, 4) uint8 one-hot nucleotides
     """
     import warnings
@@ -346,38 +349,24 @@ def _load_signal_profiles(
             nuc_raw = np.nan_to_num(nuc_raw, nan=0.0, posinf=0.0, neginf=0.0)
             nucleotides = nuc_raw.astype(np.uint8)
         
-        # Check NaN fraction in signals
-        nan_fraction = np.isnan(signals).mean()
-        if nan_fraction > MAX_SIGNAL_NAN_FRACTION:
-            # Skip this gene if too many NaNs - silently track
-            if excluded_genes_tracker is not None:
-                excluded_genes_tracker['high_nan_signals'] = excluded_genes_tracker.get('high_nan_signals', 0) + 1
-            continue
+        # Build NaN mask BEFORE any imputation: 1 where any channel had NaN
+        nan_mask = np.isnan(signals).any(axis=1).astype(np.float32)  # (2000,)
         
-        # Apply channel-mean imputation for remaining NaNs (suppress empty slice warning)
+        # Mean-normalize channels 0, 1, 3 before imputation (nanmean ignores NaN)
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', RuntimeWarning)
-            for ch in range(signals.shape[1]):
-                ch_data = signals[:, ch]
-                nan_mask = np.isnan(ch_data)
-                if nan_mask.any():
-                    ch_mean = np.nanmean(ch_data)
-                    if np.isnan(ch_mean):
-                        ch_mean = 0.0
-                    ch_data[nan_mask] = ch_mean
-                    signals[:, ch] = ch_data
+            # Channel 0 (depth): normalize by mean
+            signals[:, 0] = _scale_signal(signals[:, 0])
+            # Channel 1 (frag end coverage): normalize by mean
+            signals[:, 1] = _scale_signal(signals[:, 1])
+            # Channel 3 (PN signal): normalize by mean
+            signals[:, 3] = _scale_signal(signals[:, 3])
         
-        # Normalize certain signal channels by their mean (already flank-normalized)
-        # Channel 0 (depth): normalize by mean
-        signals[:, 0] = _scale_signal(signals[:, 0])
-        # Channel 1 (frag end coverage): normalize by mean
-        signals[:, 1] = _scale_signal(signals[:, 1])
-        # Channel 3 (PN signal): normalize by mean  
-        signals[:, 3] = _scale_signal(signals[:, 3])
-        # Other channels (2, 4, 5, 6, 7) are already normalized or bounded
-        
-        # FINAL CHECK: Replace any remaining NaN/Inf with 0
+        # Impute all NaN/Inf to 0 (not channel-mean)
         signals = np.nan_to_num(signals, nan=0.0, posinf=0.0, neginf=0.0)
+        
+        # Append NaN mask as 9th channel
+        signals = np.concatenate([signals, nan_mask[:, np.newaxis]], axis=1)  # (2000, 9)
         
         signals_dict[gene] = signals
         nucleotides_dict[gene] = nucleotides
@@ -569,7 +558,7 @@ def process_sample_to_zarr(
     tss_dir: str,
     gb_dir: str,
     ref_path: str,
-    tfx_path: Union[str, float],
+    tfx_path: Union[str, float, None],
     tumor_exp_path: Optional[str],
     background_exp_path: Optional[str],
     out_dir: str,
@@ -583,7 +572,7 @@ def process_sample_to_zarr(
         sample.zarr/
             ├── gene_names (n_genes,)  (string)
             └── flat/
-                    ├── TSS_signals (n_genes, 2000, 8) float32
+                    ├── TSS_signals (n_genes, 2000, 9) float32
                     ├── TSS_nucleotides (n_genes, 2000, 4) uint8
                     ├── TSS_features (n_genes, 11) float32
                     ├── GB_features (n_genes, 11) float32
@@ -624,8 +613,10 @@ def process_sample_to_zarr(
     if not os.path.exists(tss_sample_dir):
         return (None, f'TSS directory not found', None)
     
-    # Get TFX value - samples not in TFX file are SKIPPED
-    if isinstance(tfx_path, (int, float)):
+    # Get TFX value - when no TFX file, assign NaN
+    if tfx_path is None:
+        tfx = float('nan')
+    elif isinstance(tfx_path, (int, float)):
         tfx = float(tfx_path)
     else:
         try:
@@ -650,7 +641,6 @@ def process_sample_to_zarr(
         'no_features': 0, 
         'high_nan': 0, 
         'no_ref': 0,
-        'high_nan_signals': 0,  # Tracked during signal loading
     }
 
     # Load all data - pass exclusion tracker to capture genes dropped during loading
@@ -678,7 +668,7 @@ def process_sample_to_zarr(
     
     for gene in tss_signals:
         # Check signals shape
-        if tss_signals[gene].shape != (2000, 8):
+        if tss_signals[gene].shape != (2000, 9):
             excluded_genes['no_signals'] += 1
             continue
         # Check nucleotides exist
@@ -724,7 +714,7 @@ def process_sample_to_zarr(
     # ==========================================================================
     
     # Pre-allocate numpy arrays
-    all_tss_signals = np.zeros((n_genes, 2000, 8), dtype=np.float32)
+    all_tss_signals = np.zeros((n_genes, 2000, 9), dtype=np.float32)
     all_tss_nucleotides = np.zeros((n_genes, 2000, 4), dtype=np.uint8)
     all_tss_features = np.zeros((n_genes, len(TSS_FEATURES)), dtype=np.float32)
     all_gb_features = np.zeros((n_genes, 11), dtype=np.float32)
@@ -802,7 +792,7 @@ def process_sample_to_zarr(
     flat.create_dataset(
         'TSS_signals',
         data=all_tss_signals,
-        chunks=(chunk_genes_large, 2000, 8),
+        chunks=(chunk_genes_large, 2000, 9),
         compressor=COMPRESSOR,
     )
     flat.create_dataset(
@@ -891,7 +881,7 @@ def process_dataset(
     gb_dir: str,
     ref_path: str,
     labels_dir: str,
-    tfx_file: str,
+    tfx_file: Optional[str],
     zarr_base_dir: Optional[str] = None,
     tumor_exp_file: Optional[str] = None,
     background_exp_file: Optional[str] = None,
@@ -907,7 +897,7 @@ def process_dataset(
         gb_dir: Absolute path to GB results directory
         ref_path: Path to reference file
         labels_dir: Directory containing label files
-        tfx_file: Name of TFX file in labels_dir (required)
+        tfx_file: Name of TFX file in labels_dir (None for unlabeled datasets)
         zarr_base_dir: Base directory for Zarr output (default: DEFAULT_ZARR_BASE)
         tumor_exp_file: Name of tumor expression file in labels_dir
         background_exp_file: Name of background expression file in labels_dir
@@ -934,7 +924,7 @@ def process_dataset(
     os.makedirs(out_dir, exist_ok=True)
 
     # Build label paths
-    tfx_path = os.path.join(labels_dir, tfx_file)
+    tfx_path = os.path.join(labels_dir, tfx_file) if tfx_file else None
     tumor_exp_path = os.path.join(labels_dir, tumor_exp_file) if tumor_exp_file else None
     background_exp_path = os.path.join(labels_dir, background_exp_file) if background_exp_file else None
     
@@ -1050,7 +1040,7 @@ def process_dataset(
     with open(manifest_path, 'w') as f:
         json.dump(manifest, f, indent=2)
     
-    print(f'\\nProcessed {len(created_paths)} / {len(samples)} samples for {dataset}')
+    print(f'\nProcessed {len(created_paths)} / {len(samples)} samples for {dataset}')
     if skipped_with_reasons:
         print(f'  Skipped {len(skipped_with_reasons)} samples:')
         # Group by reason
@@ -1072,155 +1062,6 @@ def process_dataset(
     print(f'  Manifest: {manifest_path}')
     
     return created_paths
-
-
-# =============================================================================
-# Fold Index Creation
-# =============================================================================
-
-def create_sample_splits(
-    dataset: str,
-    zarr_dir: str,
-    output_path: str,
-    n_folds: int = 5,
-    seed: int = 42
-) -> pd.DataFrame:
-    """
-    Create sample splits file for cross-validation from existing Zarr stores.
-    
-    Args:
-        dataset: Name of the dataset/cohort
-        zarr_dir: Directory containing sample Zarr stores
-        output_path: Path to save the splits TSV file
-        n_folds: Number of CV folds
-        seed: Random seed for reproducibility
-        
-    Returns:
-        DataFrame with Sample, Fold, Cohort columns
-    """
-    # Find all Zarr stores
-    zarr_files = [f for f in os.listdir(zarr_dir) if f.endswith('.zarr')]
-    samples = [f.replace('.zarr', '') for f in zarr_files]
-    
-    if not samples:
-        raise ValueError(f"No Zarr stores found in {zarr_dir}")
-    
-    # Shuffle and assign folds
-    np.random.seed(seed)
-    shuffled_samples = samples.copy()
-    np.random.shuffle(shuffled_samples)
-    
-    folds = [(i % n_folds) + 1 for i in range(len(shuffled_samples))]
-    
-    # Create DataFrame
-    df = pd.DataFrame({
-        'Sample': shuffled_samples,
-        'Fold': folds,
-        'Cohort': dataset
-    })
-    
-    # Save
-    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
-    df.to_csv(output_path, sep='\t', index=False)
-    
-    print(f'Created sample splits with {len(samples)} samples across {n_folds} folds')
-    print(f'Saved to: {output_path}')
-    
-    return df
-
-
-def create_fold_index(
-    dataset: str,
-    zarr_dir: str,
-    output_dir: str,
-    splits_file: Optional[str] = None,
-    n_folds: int = 5
-) -> Dict[int, List[str]]:
-    """
-    Create fold index files that map sample Zarr paths for each fold.
-
-    Each fold index is a JSON list of absolute `*.zarr` paths (one per sample).
-    During training, genes are shuffled in-memory across the batch of samples,
-    so we do NOT store per-gene indices in the fold files.
-    
-    Args:
-        dataset: Name of the dataset
-        zarr_dir: Directory containing sample Zarr stores
-        output_dir: Output directory for index files
-        splits_file: Path to sample splits file (optional, will create if missing)
-        n_folds: Number of CV folds (used if creating splits)
-        
-    Returns:
-        Dictionary mapping fold numbers to lists of sample zarr paths
-    """
-    # Handle splits file
-    if splits_file is None:
-        splits_file = os.path.join(zarr_dir, f'{dataset}_sample-splits.tsv')
-    
-    if not os.path.exists(splits_file):
-        print(f'Sample splits file not found: {splits_file}')
-        print('Creating sample splits from existing Zarr stores...')
-        create_sample_splits(dataset, zarr_dir, splits_file, n_folds=n_folds)
-    
-    splits_df = pd.read_csv(splits_file, sep='\t')
-    
-    # Make zarr_dir absolute
-    if not os.path.isabs(zarr_dir):
-        zarr_dir = os.path.abspath(zarr_dir)
-    
-    # Group by fold
-    fold_indices: Dict[int, List[str]] = {}
-    for _, row in splits_df.iterrows():
-        sample = row['Sample']
-        fold = int(row['Fold'])
-        
-        zarr_path = os.path.join(zarr_dir, f'{sample}.zarr')
-        
-        if not os.path.exists(zarr_path):
-            print(f'Warning: Zarr store not found for {sample}. Skipping.')
-            continue
-
-        # Light validation: ensure it's openable and has flat arrays
-        try:
-            store = zarr.open(zarr_path, mode='r')
-            if 'flat' not in store:
-                print(f'Warning: Missing flat/ group in {zarr_path}. Skipping.')
-                continue
-            if 'gene_names' not in store:
-                print(f'Warning: Missing gene_names in {zarr_path}. Skipping.')
-                continue
-        except Exception as e:
-            print(f'Error reading {zarr_path}: {e}. Skipping.')
-            continue
-
-        fold_indices.setdefault(fold, []).append(zarr_path)
-    
-    if not fold_indices:
-        raise ValueError("No valid samples found. Check Zarr stores and splits file.")
-    
-    # Save index files
-    os.makedirs(output_dir, exist_ok=True)
-    
-    for fold, indices in fold_indices.items():
-        np.random.seed(42 + fold)
-        np.random.shuffle(indices)
-        
-        index_file = os.path.join(output_dir, f'fold_{fold}_index.json')
-        with open(index_file, 'w') as f:
-            json.dump(indices, f)
-        
-        print(f'Fold {fold}: {len(indices)} samples')
-    
-    metadata = {
-        'dataset': dataset,
-        'n_folds': len(fold_indices),
-        'fold_sizes': {str(fold): len(indices) for fold, indices in fold_indices.items()},
-        'total_samples': sum(len(indices) for indices in fold_indices.values()),
-    }
-    with open(os.path.join(output_dir, 'metadata.json'), 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    return fold_indices
 
 
 # =============================================================================

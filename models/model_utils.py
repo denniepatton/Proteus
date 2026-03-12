@@ -23,6 +23,12 @@ Y_MAX: float = 19.93
 # Determined by empirical fitting of RNA-seq expression distributions.
 K_GAMMA: float = 0.80
 
+# Upper bound on log(normal_sigma) in the MDN.  Caps the Normal
+# component's scale at exp(LOG_SIGMA_CEIL) ≈ 5.0, which still allows
+# a 90% CI spanning ±8.2 in log₂(CPM+1) space but prevents the
+# over-dispersed calibration basin observed in phase 3.0.
+LOG_SIGMA_CEIL: float = math.log(5.0)  # ≈ 1.609
+
 
 # ---------------------------------------------------------------------------
 # Gauss-Laguerre quadrature constants for the analytical CRPS.
@@ -572,7 +578,7 @@ class MixtureDensityHead(nn.Module):
         - log_pi: (batch, 3) log-softmax mixture weights [pi_zero, pi_gamma, pi_normal]
         - gamma_beta: (batch, 1) Gamma rate parameter beta > 0
         - normal_mu: (batch, 1) Normal location, clamped to [0, y_max]
-        - normal_sigma: (batch, 1) Normal scale sigma > 0
+        - normal_sigma: (batch, 1) Normal scale sigma in (0, exp(LOG_SIGMA_CEIL)]
 
     Args:
         input_dim: Dimension of the input feature vector.
@@ -639,7 +645,7 @@ class MixtureDensityHead(nn.Module):
         # Log/exp parameterization with clamping for numerical stability.
         gamma_beta = torch.exp(log_gamma_beta.clamp(-20.0, 20.0))
         normal_mu = normal_mu_raw.clamp(0.0, Y_MAX)
-        normal_sigma = torch.exp(log_normal_sigma.clamp(-20.0, 20.0))
+        normal_sigma = torch.exp(log_normal_sigma.clamp(-20.0, LOG_SIGMA_CEIL))
 
         log_pi = F.log_softmax(logits, dim=-1)  # (batch, 3)
 

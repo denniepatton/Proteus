@@ -3,7 +3,7 @@
 PyTorch implementation of the Proteus pipeline for predicting gene expression from cfDNA.
 
 Primary model inputs (per gene):
-    - TSS_signals: (n_genes, 2000, 8) float32
+    - TSS_signals: (n_genes, 2000, 9) float32
     - TSS_nucleotides: (n_genes, 2000, 4) uint8/float32 one-hot nucleotides
     - TSS_features: (n_genes, 11) float32
     - GB_features: (n_genes, 11) float32
@@ -62,7 +62,7 @@ from proteus_utils import (
     get_samples, get_zarr_output_dir, process_dataset,
     process_sample_to_zarr,
     create_data_loader, create_inference_loader,
-    get_fold_indices, build_train_val_loaders, build_loaders_from_splits,
+    build_loaders_from_splits,
     DEFAULT_ZARR_BASE
 )
 from config.config_loader import ConfigLoader
@@ -183,23 +183,27 @@ def ensure_datasets_exist(
         # Discover expected samples from TSS folder structure
         discovered_samples = get_samples(tss_dir, dataset_name)
 
-        # Restrict to samples in the TFX file
-        tfx_file_path = os.path.join(labels_dir, dataset_config.tfx_file)
-        try:
-            tfx_df = pd.read_csv(tfx_file_path, sep='\t', index_col='sample')
-            tfx_index = [str(i) for i in tfx_df.index.tolist()]
+        # Restrict to samples in the TFX file (if TFX labels exist)
+        if dataset_config.tfx_file is not None:
+            tfx_file_path = os.path.join(labels_dir, dataset_config.tfx_file)
+            try:
+                tfx_df = pd.read_csv(tfx_file_path, sep='\t', index_col='sample')
+                tfx_index = [str(i) for i in tfx_df.index.tolist()]
 
-            def _matches_tfx(sample: str) -> bool:
-                if sample in tfx_df.index:
-                    return True
-                for idx in tfx_index:
-                    if sample in idx or idx in sample:
+                def _matches_tfx(sample: str) -> bool:
+                    if sample in tfx_df.index:
                         return True
-                return False
+                    for idx in tfx_index:
+                        if sample in idx or idx in sample:
+                            return True
+                    return False
 
-            expected_samples = [s for s in discovered_samples if _matches_tfx(s)]
-        except (FileNotFoundError, ValueError, UnicodeDecodeError) as e:
-            raise ValueError(f"Failed to read TFX file for '{dataset_name}': {e}")
+                expected_samples = [s for s in discovered_samples if _matches_tfx(s)]
+            except (FileNotFoundError, ValueError, UnicodeDecodeError) as e:
+                raise ValueError(f"Failed to read TFX file for '{dataset_name}': {e}")
+        else:
+            # No TFX file — all discovered samples are expected
+            expected_samples = discovered_samples
 
         # Existence-only check (fast): only regenerate missing/empty stores.
         missing_samples: List[str] = []
@@ -219,7 +223,7 @@ def ensure_datasets_exist(
         )
 
         # Build label paths for regeneration
-        tfx_path = os.path.join(labels_dir, dataset_config.tfx_file)
+        tfx_path = os.path.join(labels_dir, dataset_config.tfx_file) if dataset_config.tfx_file else None
         tumor_exp_path = os.path.join(labels_dir, dataset_config.tumor_exp_file) if dataset_config.tumor_exp_file else None
         background_exp_path = os.path.join(labels_dir, dataset_config.background_exp_file) if dataset_config.background_exp_file else None
 
@@ -257,7 +261,7 @@ def generate_data(
     gb_dir: str,
     labels_dir: str,
     ref_path: str,
-    tfx_file: str,
+    tfx_file: Optional[str],
     zarr_base_dir: Optional[str] = None,
     tumor_exp_file: Optional[str] = None,
     background_exp_file: Optional[str] = None,
@@ -275,7 +279,7 @@ def generate_data(
         gb_dir: Absolute path to GB results directory
         labels_dir: Directory containing label files
         ref_path: Path to reference file
-        tfx_file: Name of TFX file in labels_dir (required)
+        tfx_file: Name of TFX file in labels_dir (None for unlabeled datasets)
         zarr_base_dir: Base directory for Zarr output (default: /hpc/temp/...)
         tumor_exp_file: Name of tumor expression file
         background_exp_file: Name of background expression file
@@ -627,6 +631,20 @@ def train_model_cv(
         except Exception as e:
             print(f'  Warning: failed to generate fold plots for fold {fold_num}: {e}')
         
+        # Explicitly tear down DataLoader workers and free GPU memory
+        # before the next fold.  With persistent_workers=True the worker
+        # processes (and their open zarr store handles) survive until the
+        # DataLoader is garbage-collected.  Python's GC is lazy, so
+        # without this cleanup the old workers linger while the next
+        # fold spins up new ones — doubling I/O pressure on scratch and
+        # accumulating stale file-handle state.
+        del train_loader, val_loader
+        del trainer
+        del model, model_for_eval, model_for_save
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
         print(f'Finished fold {fold_num}/{n_folds}.')
     
     if test_fold is None:
@@ -1207,8 +1225,11 @@ def full_train_from_splits(
     """Train a single model on ALL samples in the training_set TSV (no fold holdout).
 
     This is for producing a final production model after CV tuning has selected
-    hyperparameters. All samples are used for training, with a 90/10 random split
-    for early stopping validation.
+    hyperparameters.  All samples are used for training.  A deterministic
+    gene-level chunk split (10% of 256-gene chunks) provides the early-stopping
+    validation signal — every sample and every gene contributes to both train
+    and val.  Gene-variance weights are computed from 100% of the data before
+    the split.
 
     Args:
         training_set_tsv: Path to TSV file with Cohort/Sample/Fold columns.
@@ -1253,35 +1274,25 @@ def full_train_from_splits(
                 raise FileNotFoundError(f"Zarr store not found: {zarr_path}")
             all_paths.append(zarr_path)
 
-    # Shuffle and split 90/10 for train/val
-    rng = np.random.RandomState(seed)
-    rng.shuffle(all_paths)
-    split_idx = int(len(all_paths) * 0.9)
-    train_paths = all_paths[:split_idx]
-    val_paths = all_paths[split_idx:]
+    print(f'Total samples: {len(all_paths)} (all used for train + val via gene-level chunk split)')
 
-    print(f'Total samples: {len(all_paths)}, Train: {len(train_paths)}, Val: {len(val_paths)}')
-
-    # Write temp index files
+    # Write a single index file containing ALL samples.
     temp_dir = tempfile.mkdtemp(prefix='proteus_full_train_')
-    train_index = os.path.join(temp_dir, 'full_train.json')
-    val_index = os.path.join(temp_dir, 'full_val.json')
-    with open(train_index, 'w') as f:
-        json.dump(train_paths, f)
-    with open(val_index, 'w') as f:
-        json.dump(val_paths, f)
+    all_index = os.path.join(temp_dir, 'full_all.json')
+    with open(all_index, 'w') as f:
+        json.dump(all_paths, f)
 
     # Log subsampling info if active
     if subsample_frac is not None and subsample_frac < 1.0:
         print(f"  [Subsample] Using ~{subsample_frac*100:.0f}% of genes for fast sanity check")
 
-    # Compute per-gene variance weights from all training samples.
+    # Compute per-gene variance weights from ALL samples (before split).
     # Clipped variance weights for the loss function.
-    print('Computing gene variance weights from all training samples...')
+    print('Computing gene variance weights from all samples...')
     from proteus_utils.proteus_utils import compute_gene_weights_from_zarr, compute_gene_variances_unclipped
-    _raw_var = compute_gene_variances_unclipped(train_paths, label_key='flat/tumor_exp')
+    _raw_var = compute_gene_variances_unclipped(all_paths, label_key='flat/tumor_exp')
     gene_weights = compute_gene_weights_from_zarr(
-        train_paths,
+        all_paths,
         label_key='flat/tumor_exp',
     )
     _raw_vals = list(_raw_var.values())
@@ -1289,9 +1300,11 @@ def full_train_from_splits(
           f'raw variance [{min(_raw_vals):.4f}, {max(_raw_vals):.4f}], '
           f'clipped to [0.100, 10.000]')
 
-    # Create loaders
+    # Create loaders — both use ALL samples; gene-level chunk split
+    # assigns 10% of chunks to val for early stopping.
+    val_frac = 0.10
     train_loader, train_steps = create_data_loader(
-        index_file=train_index,
+        index_file=all_index,
         num_workers=_loader_workers(),
         shuffle=False,
         labeled=True,
@@ -1303,10 +1316,12 @@ def full_train_from_splits(
         drop_last=False,
         subsample_frac=subsample_frac,
         gene_weights=gene_weights,
+        val_frac=val_frac,
+        val_split=False,
     )
 
     val_loader, val_steps = create_data_loader(
-        index_file=val_index,
+        index_file=all_index,
         num_workers=_loader_workers(),
         shuffle=False,
         labeled=True,
@@ -1319,6 +1334,8 @@ def full_train_from_splits(
         drop_last=False,
         subsample_frac=subsample_frac,
         gene_weights=gene_weights,
+        val_frac=val_frac,
+        val_split=True,
     )
 
     print(f'Training batches: {train_steps}, Validation batches: {val_steps}')
@@ -1647,8 +1664,7 @@ def main():
             interaction_ksize=int(experiment_spec.scale.interaction_ksize.fixed),
             initial_reduction_channels=int(experiment_spec.scale.initial_reduction_channels.fixed),
             n_reductions=int(experiment_spec.scale.n_reductions.fixed),
-            reduction_dilation_small=int(experiment_spec.scale.reduction_dilation_small.fixed),
-            reduction_dilation_large=int(experiment_spec.scale.reduction_dilation_large.fixed),
+            reduction_dilation=int(experiment_spec.scale.reduction_dilation.fixed),
             beta_background=float(experiment_spec.structural.beta_background.fixed),
             beta_tcvae=float(experiment_spec.structural.beta_tcvae.fixed),
             beta_contrastive=float(experiment_spec.structural.beta_contrastive.fixed),
@@ -1724,8 +1740,7 @@ def main():
             interaction_ksize=int(experiment_spec.scale.interaction_ksize.fixed),
             initial_reduction_channels=int(experiment_spec.scale.initial_reduction_channels.fixed),
             n_reductions=int(experiment_spec.scale.n_reductions.fixed),
-            reduction_dilation_small=int(experiment_spec.scale.reduction_dilation_small.fixed),
-            reduction_dilation_large=int(experiment_spec.scale.reduction_dilation_large.fixed),
+            reduction_dilation=int(experiment_spec.scale.reduction_dilation.fixed),
             beta_background=float(experiment_spec.structural.beta_background.fixed),
             beta_tcvae=float(experiment_spec.structural.beta_tcvae.fixed),
             beta_contrastive=float(experiment_spec.structural.beta_contrastive.fixed),

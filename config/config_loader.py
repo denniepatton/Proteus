@@ -29,15 +29,15 @@ class DatasetConfig:
         sources:
             triton_tss: str  # Relative path to TSS results dir
             triton_gb: str   # Relative path to GB results dir
-            tfx: str         # TFX labels filename
         labels:
+            tfx: Optional[str]            # TFX labels filename (null for unlabeled datasets)
             tumor_exp: Optional[str]      # Tumor expression filename
             background_exp: Optional[str] # Background expression filename
     """
     name: str
     triton_tss: str
     triton_gb: str
-    tfx_file: str
+    tfx_file: Optional[str]
     tumor_exp_file: Optional[str]
     background_exp_file: Optional[str]
 
@@ -257,8 +257,6 @@ class ConfigLoader:
             raise ValueError(f"Dataset config {dataset_file} missing required field: sources.triton_tss")
         if 'triton_gb' not in sources:
             raise ValueError(f"Dataset config {dataset_file} missing required field: sources.triton_gb")
-        if 'tfx' not in sources:
-            raise ValueError(f"Dataset config {dataset_file} missing required field: sources.tfx")
         
         labels = data.get('labels', {})
         
@@ -266,7 +264,7 @@ class ConfigLoader:
             name=data['name'],
             triton_tss=sources['triton_tss'],
             triton_gb=sources['triton_gb'],
-            tfx_file=sources['tfx'],
+            tfx_file=labels.get('tfx'),
             tumor_exp_file=labels.get('tumor_exp'),
             background_exp_file=labels.get('background_exp'),
         )

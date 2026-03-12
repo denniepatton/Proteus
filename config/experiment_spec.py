@@ -250,8 +250,7 @@ class ScaleSpec:
     interaction_ksize: ParamSpec
     initial_reduction_channels: ParamSpec
     n_reductions: ParamSpec
-    reduction_dilation_small: ParamSpec
-    reduction_dilation_large: ParamSpec
+    reduction_dilation: ParamSpec
     dropout_rate: ParamSpec
 
     @staticmethod
@@ -263,7 +262,7 @@ class ScaleSpec:
             "signal_filters", "signal_encoder_width",
             "signal_ksize", "interaction_ksize",
             "initial_reduction_channels", "n_reductions",
-            "reduction_dilation_small", "reduction_dilation_large",
+            "reduction_dilation",
             "dropout_rate",
         ]
         _check_no_unknown_keys(d, allowed=allowed, ctx="scale")
@@ -283,8 +282,7 @@ class ScaleSpec:
             interaction_ksize=p("interaction_ksize", 3),
             initial_reduction_channels=p("initial_reduction_channels", 64),
             n_reductions=p("n_reductions", 3),
-            reduction_dilation_small=p("reduction_dilation_small", 1),
-            reduction_dilation_large=p("reduction_dilation_large", 11),
+            reduction_dilation=p("reduction_dilation", 1),
             dropout_rate=p("dropout_rate", 0.15),
         )
 
@@ -401,6 +399,8 @@ class TuningSpec:
     promote_top_frac:   fraction of trials considered "top" for cross-fold
                         promotion (0.0 = disabled).  E.g. 0.10 → top 10%.
     max_promotions:     cap on how many distinct configs are promoted.
+    pruner_type:        Optuna pruning strategy ('hyperband', 'median', 'none').
+                        Default 'hyperband'.
     """
     phase: str
     n_trials_per_fold: int
@@ -409,6 +409,7 @@ class TuningSpec:
     enqueue_top_k: int
     promote_top_frac: float
     max_promotions: int
+    pruner_type: str
 
     @staticmethod
     def from_yaml(x: Any) -> "TuningSpec":
@@ -418,15 +419,21 @@ class TuningSpec:
                 n_trials_per_fold=10, prev_study=None,
                 top_fraction=0.2, enqueue_top_k=3,
                 promote_top_frac=0.0, max_promotions=3,
+                pruner_type="hyperband",
             )
         d = _expect_dict(x, "tuning")
         allowed = [
             "hp_group", "phase", "n_trials_per_fold",
             "prev_study", "top_fraction", "enqueue_top_k",
-            "promote_top_frac", "max_promotions",
+            "promote_top_frac", "max_promotions", "pruner_type",
         ]
         _check_no_unknown_keys(d, allowed=allowed, ctx="tuning")
         # hp_group is accepted for backward compatibility but ignored.
+        pruner_raw = _as_str(
+            d.get("pruner_type", "hyperband"), "tuning.pruner_type"
+        ).lower()
+        if pruner_raw not in ("hyperband", "median", "none"):
+            _fail("tuning.pruner_type must be one of: hyperband|median|none")
         return TuningSpec(
             phase=_as_str(d.get("phase", "1.0"), "tuning.phase"),
             n_trials_per_fold=_as_int(
@@ -443,6 +450,7 @@ class TuningSpec:
             max_promotions=_as_int(
                 d.get("max_promotions", 3),
                 "tuning.max_promotions"),
+            pruner_type=pruner_raw,
         )
 
 
@@ -525,10 +533,8 @@ class ExperimentSpec:
                 "initial_reduction_channels": m.get(
                     "initial_reduction_channels", 64),
                 "n_reductions": m.get("n_reductions", 3),
-                "reduction_dilation_small": m.get(
-                    "reduction_dilation_small", 1),
-                "reduction_dilation_large": m.get(
-                    "reduction_dilation_large", 11),
+                "reduction_dilation": m.get(
+                    "reduction_dilation", 1),
             }
 
         # Move dropout_rate from old model to training

@@ -22,10 +22,10 @@
 - **Edits must be exactly requested.** If a requested change appears to require additional refactors or new knobs, stop and ask for approval before editing.
 
 ## Big picture (what runs where)
-- **Proteus is a PyTorch + Zarr pipeline**: Triton outputs → per-sample `*.zarr` stores → CV fold index JSONs → PyTorch `DataLoader`s → `BioDVN` model train/infer.
+- **Proteus is a PyTorch + Zarr pipeline**: Triton outputs → per-sample `*.zarr` stores → sample-splits TSV → PyTorch `DataLoader`s → `BioDVN` model train/infer.
 - Main entrypoint is `Proteus.py` (CLI). Core components:
-  - Zarr compilation + validation: `proteus_utils/compile_sample_data.py` (`process_dataset()`, `create_fold_index()`, `verify_zarr_store()`)
-  - Datasets/loaders: `proteus_utils/proteus_utils.py` (`ProteusGeneDataset`, `build_train_val_loaders()`, `create_inference_loader()`)
+  - Zarr compilation + validation: `proteus_utils/compile_sample_data.py` (`process_dataset()`, `verify_zarr_store()`)
+  - Datasets/loaders: `proteus_utils/proteus_utils.py` (`ProteusGeneDataset`, `build_loaders_from_splits()`, `create_inference_loader()`)
   - Model: `models/models.py` (`BioDVN`, `BioDVNConfig`)
   - Training loop: `proteus_utils/trainer.py` (`Trainer`, AMP, cosine decay, checkpointing)
 
@@ -45,15 +45,13 @@
   - Zarr base defaults to fast scratch; override with `PROTEUS_ZARR_BASE`.
   - Raw Triton base dir can be overridden with `PROTEUS_RAW_DATA_DIR`.
 - **Zarr schema** is documented at the top of `proteus_utils/compile_sample_data.py`.
-  - Training expects `flat/` arrays + `gene_names` (light validation is done in `create_fold_index()`).
+  - Training expects `flat/` arrays + `gene_names`.
 
 ## Common workflows (CLI)
 - Process Triton → Zarr:
   - `python Proteus.py --process_data --use_set PC-PDX`
 - Verify Zarr stores:
   - `python Proteus.py --verify_data --use_set PC-PDX`
-- Create CV fold indices (writes to `data/<use_set>/fold_indices/`):
-  - `python Proteus.py --generate_folds --use_set PC-PDX`
 - Train (cross-validation):
   - `python Proteus.py --run_mode train --model_name BioDVN --use_set PC-PDX`
   - Fold-only (HPC parallelization): `python Proteus.py --run_mode train --use_set PC-PDX --test_fold 1`
@@ -64,7 +62,7 @@
 
 ## Project-specific gotchas (don’t miss these)
 - Prefer the single current Triton → Zarr pipeline.
-- Fold index JSONs produced by `create_fold_index()` are **lists of absolute `*.zarr` sample paths**.
+- CV fold assignments are pre-determined in `data/BTS_sample-splits.tsv` (Cohort/Sample/Fold columns). Training reads this TSV directly via `build_loaders_from_splits()`.
 - Zarr stores are typically placed on **ephemeral scratch**; they may be cleared periodically.
   - `ensure_datasets_exist()` in `Proteus.py` can auto-regenerate missing stores for datasets that have YAML configs.
 - Downstream analysis expects the on-disk naming convention used by `Proteus.py`, e.g.
@@ -75,4 +73,4 @@
 - Keep path handling CWD-independent (see `PROJECT_ROOT = Path(__file__).resolve().parent` in `Proteus.py`).
 - When adding a new dataset:
   - Add `config/datasets/<NAME>.yaml` (Triton relative paths under `sources`, label filenames under `labels`).
-  - Then run `--process_data` and `--generate_folds` for that dataset.
+  - Then run `--process_data` for that dataset.

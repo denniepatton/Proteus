@@ -97,36 +97,33 @@ scale:
   # signal_ksize: 3
   # interaction_ksize: 3
   # n_reductions: 3
-  # reduction_dilation_small: 2
-  # reduction_dilation_large: 7
+  # reduction_dilation: 2
   # signal_encoder_width: 1024
-  encoder_start: 128
-  latent_size: 64
+  encoder_start: 128  # (64 signal dims + 25 scalar dims) = 89 -> 128 (expand)
+  latent_size: 64  # 128 > 64 (halving) > 2x64 (mean and var latents)
   # decoder_start: 8
   # mdn_hidden: 32
-  mdn_final: 16 
+  mdn_final: 16  # -> reduces to 6 final MDN params
   # signal_filters: 16
   # initial_reduction_channels: 64
   dropout_rate: 0.10
   signal_ksize:
     suggest: {type: categorical, choices: [3, 6, 9]}
   interaction_ksize:
-    suggest: {type: categorical, choices: [6, 9, 12]} higiher?
+    suggest: {type: categorical, choices: [3, 6, 9]}
   n_reductions:
     suggest: {type: int, low: 2, high: 4}
-  reduction_dilation_small:
-    suggest: {type: categorical, choices: [1, 2, 3]} 2/3
-  reduction_dilation_large:
-    suggest: {type: categorical, choices: [3, 5, 7]} 3/7
+  reduction_dilation:
+    suggest: {type: categorical, choices: [1, 2, 3, 5, 8]}
   signal_encoder_width:
     suggest: {type: categorical, choices: [256, 512, 1024]}
   decoder_start:
-    suggest: {type: categorical, choices: [8, 16, 32]}
+    suggest: {type: categorical, choices: [32, 64, 128]}
   mdn_hidden:
-    suggest: {type: categorical, choices: [16, 32, 64]}
+    suggest: {type: categorical, choices: [32, 64, 128]}
   signal_filters:
-    suggest: {type: categorical, choices: [2, 4, 8]}
+    suggest: {type: categorical, choices: [4, 8, 16]}
   initial_reduction_channels:
-    suggest: {type: categorical, choices: [8, 16]}
+    suggest: {type: categorical, choices: [8, 16, 32]}
   # dropout_rate:
   #   suggest: {type: float, low: 0.05, high: 0.20}

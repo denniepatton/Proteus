@@ -100,7 +100,7 @@ GB_FEATURE_NAMES: List[str] = TSS_FEATURE_NAMES  # identical 11-feature set
 REF_SCALAR_NAMES: List[str] = ['num_exons', 'transcript_length', 'mRNA_length']
 
 # Model input groups in Captum tuple order:
-#   0: TSS_signals      (batch, 2000, 8)
+#   0: TSS_signals      (batch, 2000, 9)
 #   1: TSS_nucleotides  (batch, 2000, 4)
 #   2: TSS_features     (batch, 11)
 #   3: GB_features      (batch, 11)
@@ -189,7 +189,7 @@ def load_interpretation_data(
     Returns:
         Dictionary with keys::
 
-            TSS_signals      (N, 2000, 8)   float32
+            TSS_signals      (N, 2000, 9)   float32
             TSS_nucleotides  (N, 2000, 4)   float32
             TSS_features     (N, 11)        float32
             GB_features      (N, 11)        float32
@@ -462,7 +462,7 @@ def _get_conv_weights(module: nn.Module) -> np.ndarray:
 
 
 def plot_signal_conv1d_filters(model: BioDVN, folder_path: Optional[str] = None) -> None:
-    """Plot the 8 per-channel Conv1d first-layer signal filters.
+    """Plot the 9 per-channel Conv1d first-layer signal filters.
 
     Each signal channel has its own ``Conv1d(1, signal_filters, ksize)`` inside
     the :class:`SignalProcessingBlock`.  This visualizes the learned kernels.
@@ -906,17 +906,17 @@ def plot_signal_attributions(
     """Plot mean absolute attributions across TSS signal channels.
 
     Creates a (channels × 2000) heatmap showing the spatial pattern of
-    attribution for each of the 8 signal channels, plus a summed nucleotide
-    channel (total of 9 rows).
+    attribution for each of the 9 signal channels, plus a summed nucleotide
+    channel (total of 10 rows).
     """
-    sig_attr = attributions[0]    # (N, 2000, 8)
+    sig_attr = attributions[0]    # (N, 2000, 9)
     nuc_attr = attributions[1]    # (N, 2000, 4)
 
     # Sum nucleotide attributions to a single channel
     nuc_summed = np.abs(nuc_attr).sum(axis=-1, keepdims=True)   # (N, 2000, 1)
-    combined = np.concatenate([np.abs(sig_attr), nuc_summed], axis=-1)  # (N, 2000, 9)
+    combined = np.concatenate([np.abs(sig_attr), nuc_summed], axis=-1)  # (N, 2000, 10)
 
-    # Mean across samples, transpose to (9, 2000)
+    # Mean across samples, transpose to (10, 2000)
     means = combined.mean(axis=0).T
 
     labels = SIGNAL_AND_SEQ_DISPLAY_NAMES
@@ -952,8 +952,8 @@ def plot_signal_polarity(
     *up* (red) or *down* (blue).  Magnitude is the median absolute
     attribution.  The result is a per-position value in ``[-1, +1]``.
     """
-    sig_attr = attributions[0]   # (N, 2000, 8)
-    sig_vals = data['TSS_signals']  # (N, 2000, 8)
+    sig_attr = attributions[0]   # (N, 2000, 9)
+    sig_vals = data['TSS_signals']  # (N, 2000, 9)
 
     n_channels = sig_attr.shape[2]
     seq_len = sig_attr.shape[1]

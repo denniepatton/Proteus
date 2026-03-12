@@ -107,13 +107,32 @@ def _suggest_from_param(trial: optuna.Trial, name: str, spec: ParamSpec) -> Any:
         low = s.get("low", None)
         high = s.get("high", None)
         log = bool(s.get("log", False))
+        step = s.get("step", None)
         if low is None or high is None:
             raise ExperimentSpecError(f"Param '{name}': float requires low/high")
+        if step is not None:
+            # step and log are mutually exclusive in Optuna
+            return trial.suggest_float(name, float(low), float(high), step=float(step))
         return trial.suggest_float(name, float(low), float(high), log=log)
 
     raise ExperimentSpecError(
         f"Param '{name}': unsupported suggest.type='{stype}'. Expected categorical|int|float"
     )
+
+
+# =============================================================================
+# Duplicate-trial guard
+# =============================================================================
+
+_DEDUP_MAX_RETRIES = 100  # safety cap to avoid infinite loops
+
+
+def _is_duplicate_trial(study: optuna.Study, trial: optuna.Trial) -> bool:
+    """Return True if an earlier trial in the study has identical params."""
+    for t in study.trials:
+        if t.number < trial.number and t.params == trial.params:
+            return True
+    return False
 
 
 # =============================================================================
@@ -197,8 +216,7 @@ def _resolve_trial_configs(
     interaction_ksize = sc("interaction_ksize", exp.scale.interaction_ksize)
     initial_reduction_channels = sc("initial_reduction_channels", exp.scale.initial_reduction_channels)
     n_reductions = sc("n_reductions", exp.scale.n_reductions)
-    reduction_dilation_small = sc("reduction_dilation_small", exp.scale.reduction_dilation_small)
-    reduction_dilation_large = sc("reduction_dilation_large", exp.scale.reduction_dilation_large)
+    reduction_dilation = sc("reduction_dilation", exp.scale.reduction_dilation)
     dropout_rate = sc("dropout_rate", exp.scale.dropout_rate)
 
     # Geometry guard: prune combos that produce non-positive sequence
@@ -210,19 +228,17 @@ def _resolve_trial_configs(
         raise optuna.TrialPruned(
             f"signal_ksize={signal_ksize} produces non-positive base length"
         )
-    for _ksize, _dil, _label in [
-        (int(interaction_ksize), int(reduction_dilation_small), "small"),
-        (15,                     int(reduction_dilation_large), "large"),
-    ]:
-        _out = _base_len
-        for _ in range(int(n_reductions)):
-            _out = _out - _dil * (_ksize - 1)
-            _out = _out // 2
-        if _out <= 0:
-            raise optuna.TrialPruned(
-                f"Reduction {_label} produces non-positive seq length {_out} "
-                f"(n_reductions={int(n_reductions)}, ksize={_ksize}, dilation={_dil})"
-            )
+    _ksize = int(interaction_ksize)
+    _dil = int(reduction_dilation)
+    _out = _base_len
+    for _ in range(int(n_reductions)):
+        _out = _out - _dil * (_ksize - 1)
+        _out = _out // 2
+    if _out <= 0:
+        raise optuna.TrialPruned(
+            f"Reduction produces non-positive seq length {_out} "
+            f"(n_reductions={int(n_reductions)}, ksize={_ksize}, dilation={_dil})"
+        )
 
     # =====================================================================
     # Build configs
@@ -240,8 +256,7 @@ def _resolve_trial_configs(
         interaction_ksize=int(interaction_ksize),
         initial_reduction_channels=int(initial_reduction_channels),
         n_reductions=int(n_reductions),
-        reduction_dilation_small=int(reduction_dilation_small),
-        reduction_dilation_large=int(reduction_dilation_large),
+        reduction_dilation=int(reduction_dilation),
         # Structural
         beta_background=float(beta_background),
         beta_tcvae=float(beta_tcvae),
@@ -312,8 +327,7 @@ def _resolve_trial_configs(
             "interaction_ksize": int(interaction_ksize),
             "initial_reduction_channels": int(initial_reduction_channels),
             "n_reductions": int(n_reductions),
-            "reduction_dilation_small": int(reduction_dilation_small),
-            "reduction_dilation_large": int(reduction_dilation_large),
+            "reduction_dilation": int(reduction_dilation),
             "dropout_rate": float(dropout_rate),
         },
         "transfer": {
@@ -512,7 +526,7 @@ def run_optuna_cv_tuning(
     storage: str,
     study_name: Optional[str] = None,
     sampler_seed: int = 42,
-    pruner_type: Literal["hyperband", "median", "none"] = "hyperband",
+    pruner_type: Optional[Literal["hyperband", "median", "none"]] = None,
 ) -> None:
     """Run Optuna hyperparameter tuning with CV (all folds per trial).
 
@@ -526,6 +540,8 @@ def run_optuna_cv_tuning(
         study_name: Study name override.
         sampler_seed: Random seed for sampler.
         pruner_type: Pruning strategy ('hyperband', 'median', 'none').
+            If None, reads from experiment YAML tuning.pruner_type
+            (default 'hyperband').
     """
     exp = load_experiment_spec(experiment_path)
     study_name = str(study_name) if study_name is not None else exp.name
@@ -534,19 +550,22 @@ def run_optuna_cv_tuning(
 
     direction = exp.objective.direction
 
+    # Resolve pruner: explicit argument > experiment YAML > default
+    effective_pruner_type = pruner_type if pruner_type is not None else exp.tuning.pruner_type
+
     sampler = optuna.samplers.TPESampler(
         seed=int(sampler_seed),
         multivariate=True,
         constant_liar=True,
     )
 
-    if pruner_type == "hyperband":
+    if effective_pruner_type == "hyperband":
         pruner = optuna.pruners.HyperbandPruner(
             min_resource=HYPERBAND_MIN_RESOURCE,
             max_resource=_infer_hyperband_max_resource(exp),
             reduction_factor=HYPERBAND_REDUCTION_FACTOR,
         )
-    elif pruner_type == "median":
+    elif effective_pruner_type == "median":
         pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3)
     else:
         pruner = optuna.pruners.NopPruner()
@@ -560,25 +579,17 @@ def run_optuna_cv_tuning(
         pruner=pruner,
     )
 
-    # Phase transition: enqueue top-K from previous study
-    if exp.tuning.prev_study is not None:
-        try:
-            _, top_params = narrow_search_space_from_study(
-                prev_study_name=exp.tuning.prev_study,
-                storage=storage,
-                top_fraction=exp.tuning.top_fraction,
-                enqueue_top_k=exp.tuning.enqueue_top_k,
-            )
-            for params in top_params:
-                study.enqueue_trial(params)
-            print(f"[Phase transition] Enqueued {len(top_params)} top trials from '{exp.tuning.prev_study}'")
-        except Exception as e:
-            print(f"[Phase transition] Warning: could not load previous study: {e}")
-
     from Proteus import train_model_cv  # local import to avoid circulars
 
     def objective(trial: optuna.Trial) -> float:
         model_cfg, train_cfg, trial_cfg = _resolve_trial_configs(exp, trial)
+
+        # ---- duplicate guard ----
+        if _is_duplicate_trial(study, trial):
+            trial.set_user_attr("_duplicate", True)
+            raise optuna.TrialPruned(
+                f"Trial {trial.number}: duplicate config — re-sampling."
+            )
 
         run_dir = os.path.join(exp.output_dir, f"trial_{trial.number:05d}")
         os.makedirs(run_dir, exist_ok=True)
@@ -630,7 +641,17 @@ def run_optuna_cv_tuning(
 
         return _objective_value(obj, metric=exp.objective.metric, direction=direction)
 
-    study.optimize(objective, n_trials=int(n_trials_effective), catch=(Exception,))
+    # Run trials, retrying any that were pruned as duplicates.
+    _done = 0
+    for _ in range(_DEDUP_MAX_RETRIES):
+        if _done >= int(n_trials_effective):
+            break
+        study.optimize(objective, n_trials=1, catch=(Exception,))
+        latest = study.trials[-1]
+        if latest.state == optuna.trial.TrialState.PRUNED and latest.user_attrs.get("_duplicate"):
+            print(f"[Tuning] Trial {latest.number} was a duplicate — retrying.")
+            continue
+        _done += 1
 
     _write_study_report(study, exp.output_dir)
 
@@ -1068,7 +1089,7 @@ def run_optuna_fold_tuning(
     n_trials: Optional[int] = None,
     study_name: Optional[str] = None,
     sampler_seed: int = 42,
-    pruner_type: Literal['hyperband', 'median', 'none'] = 'hyperband',
+    pruner_type: Optional[Literal['hyperband', 'median', 'none']] = None,
 ) -> None:
     """Fold-parallel tuning: each fold is an independent Optuna trial.
 
@@ -1089,7 +1110,8 @@ def run_optuna_fold_tuning(
         study_name: Study name override (default: experiment name).
         sampler_seed: Base seed.  Actual seed = sampler_seed + fold_num
             so each fold explores slightly different regions.
-        pruner_type: Pruning strategy.
+        pruner_type: Pruning strategy.  If None, reads from experiment
+            YAML tuning.pruner_type (default 'hyperband').
     """
     exp = load_experiment_spec(experiment_path)
     study_name = str(study_name) if study_name is not None else exp.name
@@ -1097,6 +1119,9 @@ def run_optuna_fold_tuning(
     subsample_frac = exp.data.subsample_frac
 
     direction = exp.objective.direction
+
+    # Resolve pruner: explicit argument > experiment YAML > default
+    effective_pruner_type = pruner_type if pruner_type is not None else exp.tuning.pruner_type
 
     # Seed varies per fold so each worker explores different regions
     fold_seed = int(sampler_seed) + int(fold_num)
@@ -1106,13 +1131,13 @@ def run_optuna_fold_tuning(
         constant_liar=True,
     )
 
-    if pruner_type == 'hyperband':
+    if effective_pruner_type == 'hyperband':
         pruner = optuna.pruners.HyperbandPruner(
             min_resource=HYPERBAND_MIN_RESOURCE,
             max_resource=_infer_hyperband_max_resource(exp),
             reduction_factor=HYPERBAND_REDUCTION_FACTOR,
         )
-    elif pruner_type == 'median':
+    elif effective_pruner_type == 'median':
         pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3)
     else:
         pruner = optuna.pruners.NopPruner()
@@ -1126,27 +1151,17 @@ def run_optuna_fold_tuning(
         pruner=pruner,
     )
 
-    # Phase transition: enqueue top-K from previous study (idempotent;
-    # only the first fold to reach this will effectively enqueue since
-    # Optuna deduplicates enqueued params across workers).
-    if exp.tuning.prev_study is not None:
-        try:
-            _, top_params = narrow_search_space_from_study(
-                prev_study_name=exp.tuning.prev_study,
-                storage=storage,
-                top_fraction=exp.tuning.top_fraction,
-                enqueue_top_k=exp.tuning.enqueue_top_k,
-            )
-            for params in top_params:
-                study.enqueue_trial(params)
-            print(f"[Phase transition] Enqueued {len(top_params)} top trials from '{exp.tuning.prev_study}'")
-        except Exception as e:
-            print(f"[Phase transition] Warning: could not load previous study: {e}")
-
     from Proteus import train_model_cv  # local import to avoid circulars
 
     def objective(trial: optuna.Trial) -> float:
         model_cfg, train_cfg, trial_cfg = _resolve_trial_configs(exp, trial)
+
+        # ---- duplicate guard ----
+        if _is_duplicate_trial(study, trial):
+            trial.set_user_attr("_duplicate", True)
+            raise optuna.TrialPruned(
+                f"Trial {trial.number}: duplicate config — re-sampling."
+            )
 
         run_dir = os.path.join(exp.output_dir, f"trial_{trial.number:05d}")
         os.makedirs(run_dir, exist_ok=True)
@@ -1236,7 +1251,17 @@ def run_optuna_fold_tuning(
 
         return _objective_value(obj, metric=exp.objective.metric, direction=direction)
 
-    study.optimize(objective, n_trials=int(n_trials_effective), catch=(Exception,))
+    # Run trials, retrying any that were pruned as duplicates.
+    _done = 0
+    for _ in range(_DEDUP_MAX_RETRIES):
+        if _done >= int(n_trials_effective):
+            break
+        study.optimize(objective, n_trials=1, catch=(Exception,))
+        latest = study.trials[-1]
+        if latest.state == optuna.trial.TrialState.PRUNED and latest.user_attrs.get("_duplicate"):
+            print(f"[Tuning] Trial {latest.number} was a duplicate — retrying.")
+            continue
+        _done += 1
 
     # Cross-fold promotion phase (runs after main trial loop)
     _run_promotion_phase(study, exp, fold_num, direction, train_model_cv)
