@@ -41,6 +41,11 @@ class DatasetConfig:
     tumor_exp_file: Optional[str]
     background_exp_file: Optional[str]
 
+    @property
+    def has_truth_labels(self) -> bool:
+        """True if the dataset has at least one expression label file."""
+        return self.tumor_exp_file is not None or self.background_exp_file is not None
+
 
 @dataclass
 class CohortConfig:

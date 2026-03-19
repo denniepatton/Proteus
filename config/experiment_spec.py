@@ -165,14 +165,14 @@ class StructuralSpec:
             return ParamSpec.from_yaml(d.get(name, default), f"structural.{name}")
 
         return StructuralSpec(
-            beta_background=p("beta_background", 1.0),
-            beta_tcvae=p("beta_tcvae", 3.0),
-            beta_contrastive=p("beta_contrastive", 0.5),
-            beta_reconstruction=p("beta_reconstruction", 1.5),
-            beta_grl=p("beta_grl", 1.0),
-            beta_point_mse=p("beta_point_mse", 0.0),
-            cl_margin=p("cl_margin", 0.5),
-            internal_weight=p("internal_weight", 2.5),
+            beta_background=p("beta_background", 2.0),
+            beta_tcvae=p("beta_tcvae", 2.0),
+            beta_contrastive=p("beta_contrastive", 1.0),
+            beta_reconstruction=p("beta_reconstruction", 0.50),
+            beta_grl=p("beta_grl", 0.15),
+            beta_point_mse=p("beta_point_mse", 0.30),
+            cl_margin=p("cl_margin", 1.0),
+            internal_weight=p("internal_weight", 1.0),
         )
 
 
@@ -215,15 +215,15 @@ class TrainingSpec:
             return ParamSpec.from_yaml(d.get(name, default), f"training.{name}")
 
         return TrainingSpec(
-            max_lr=p("max_lr", 0.001),
-            min_lr_ratio=p("min_lr_ratio", 1e-4),
-            warmup_start_lr=p("warmup_start_lr", 0.0),
-            weight_decay=p("weight_decay", 0.002),
-            max_grad_norm=p("max_grad_norm", 1.0),
-            warmup_frac=p("warmup_frac", 0.0),
-            schedule_frac=p("schedule_frac", 1.0),
-            epochs=p("epochs", 30),
-            patience=p("patience", 5),
+            max_lr=p("max_lr", 0.0015),
+            min_lr_ratio=p("min_lr_ratio", 5e-4),
+            warmup_start_lr=p("warmup_start_lr", 2.5e-4),
+            weight_decay=p("weight_decay", 1e-5),
+            max_grad_norm=p("max_grad_norm", 18.0),
+            warmup_frac=p("warmup_frac", 0.10),
+            schedule_frac=p("schedule_frac", 0.90),
+            epochs=p("epochs", 15),
+            patience=p("patience", 3),
             use_amp=p("use_amp", True),
         )
 
@@ -272,18 +272,18 @@ class ScaleSpec:
 
         return ScaleSpec(
             encoder_start=p("encoder_start", 128),
-            latent_size=p("latent_size", 32),
-            decoder_start=p("decoder_start", 16),
+            latent_size=p("latent_size", 64),
+            decoder_start=p("decoder_start", 64),
             mdn_hidden=p("mdn_hidden", 64),
-            mdn_final=p("mdn_final", 16),
+            mdn_final=p("mdn_final", 32),
             signal_filters=p("signal_filters", 16),
-            signal_encoder_width=p("signal_encoder_width", 1024),
+            signal_encoder_width=p("signal_encoder_width", 256),
             signal_ksize=p("signal_ksize", 6),
             interaction_ksize=p("interaction_ksize", 3),
             initial_reduction_channels=p("initial_reduction_channels", 64),
             n_reductions=p("n_reductions", 3),
-            reduction_dilation=p("reduction_dilation", 1),
-            dropout_rate=p("dropout_rate", 0.15),
+            reduction_dilation=p("reduction_dilation", 3),
+            dropout_rate=p("dropout_rate", 0.20),
         )
 
 
@@ -293,16 +293,39 @@ class ScaleSpec:
 
 @dataclass(frozen=True)
 class TransferSpec:
-    """Transfer learning configuration."""
+    """Transfer learning configuration.
+
+    base_weights:           Path to pre-trained checkpoint (.pt).
+    freeze_level:           Legacy fixed freeze level string.
+    freeze_mode:            Tunable freeze mode (ParamSpec).  When used as a
+                            ``suggest: categorical`` all listed modes are
+                            explored by Optuna.  Valid modes:
+                            ``full_unfreeze``, ``backbone_only``,
+                            ``backbone_plus_encoders``,
+                            ``decoder_plus_heads``, ``heads_only``.
+    backbone_lr_multiplier: Multiplier applied to backbone param group LR.
+                            Values < 1 slow adaptation of pre-trained signal
+                            processing layers relative to downstream heads.
+    """
     base_weights: Optional[str]
     freeze_level: Optional[str]
+    freeze_mode: ParamSpec
+    backbone_lr_multiplier: ParamSpec
 
     @staticmethod
     def from_yaml(x: Any) -> "TransferSpec":
         if x is None:
-            return TransferSpec(base_weights=None, freeze_level=None)
+            return TransferSpec(
+                base_weights=None,
+                freeze_level=None,
+                freeze_mode=ParamSpec(fixed=None),
+                backbone_lr_multiplier=ParamSpec(fixed=1.0),
+            )
         d = _expect_dict(x, "transfer")
-        allowed = ["base_weights", "freeze_level"]
+        allowed = [
+            "base_weights", "freeze_level",
+            "freeze_mode", "backbone_lr_multiplier",
+        ]
         _check_no_unknown_keys(d, allowed=allowed, ctx="transfer")
 
         base_weights = d.get("base_weights", None)
@@ -313,7 +336,20 @@ class TransferSpec:
         if freeze_level is not None:
             freeze_level = _as_str(freeze_level, "transfer.freeze_level")
 
-        return TransferSpec(base_weights=base_weights, freeze_level=freeze_level)
+        freeze_mode = ParamSpec.from_yaml(
+            d.get("freeze_mode", None), "transfer.freeze_mode"
+        )
+        backbone_lr_multiplier = ParamSpec.from_yaml(
+            d.get("backbone_lr_multiplier", 1.0),
+            "transfer.backbone_lr_multiplier",
+        )
+
+        return TransferSpec(
+            base_weights=base_weights,
+            freeze_level=freeze_level,
+            freeze_mode=freeze_mode,
+            backbone_lr_multiplier=backbone_lr_multiplier,
+        )
 
 
 # =============================================================================
@@ -333,12 +369,15 @@ class DataSpec:
     zarr_base: str
     seed: int
     subsample_frac: Optional[float]
+    train_only_cohorts: Optional[List[str]]
+    balance_cohorts: Optional[List[str]]
 
     @staticmethod
     def from_yaml(x: Any) -> "DataSpec":
         d = _expect_dict(x, "data")
         allowed = ["training_set", "zarr_base", "seed",
-                    "subsample_frac"]
+                    "subsample_frac", "train_only_cohorts",
+                    "balance_cohorts"]
         _check_no_unknown_keys(d, allowed=allowed, ctx="data")
         subsample_raw = d.get("subsample_frac", None)
         subsample_frac: Optional[float] = None
@@ -347,6 +386,21 @@ class DataSpec:
             if not (0.0 < subsample_frac <= 1.0):
                 _fail(f"data.subsample_frac must be in (0.0, 1.0], "
                       f"got {subsample_frac}")
+
+        train_only_raw = d.get("train_only_cohorts", None)
+        train_only: Optional[List[str]] = None
+        if train_only_raw is not None:
+            if not isinstance(train_only_raw, list):
+                _fail("data.train_only_cohorts must be a list of strings")
+            train_only = [str(c).strip() for c in train_only_raw]
+
+        balance_raw = d.get("balance_cohorts", None)
+        balance: Optional[List[str]] = None
+        if balance_raw is not None:
+            if not isinstance(balance_raw, list):
+                _fail("data.balance_cohorts must be a list of strings")
+            balance = [str(c).strip() for c in balance_raw]
+
         return DataSpec(
             training_set=_as_str(d["training_set"], "data.training_set"),
             zarr_base=_as_str(
@@ -355,6 +409,8 @@ class DataSpec:
                 "data.zarr_base"),
             seed=_as_int(d.get("seed", 42), "data.seed"),
             subsample_frac=subsample_frac,
+            train_only_cohorts=train_only,
+            balance_cohorts=balance,
         )
 
 
@@ -506,9 +562,10 @@ class ExperimentSpec:
         # ------------------------------------------------------------------
         # Backward compat: build structural + scale from old model + loss
         # ------------------------------------------------------------------
+        m = dict(model_raw) if model_raw else {}
+        lo = dict(loss_raw) if loss_raw else {}
+
         if structural_raw is None and model_raw is not None:
-            m = dict(model_raw) if model_raw else {}
-            lo = dict(loss_raw) if loss_raw else {}
             structural_raw = {
                 "beta_background": lo.get("beta_background", 1.0),
                 "beta_tcvae": lo.get("beta_tcvae", lo.get("beta_vae", 3.0)),
@@ -519,7 +576,6 @@ class ExperimentSpec:
             }
 
         if scale_raw is None and model_raw is not None:
-            m = dict(model_raw) if model_raw else {}
             scale_raw = {
                 "encoder_start": m.get("encoder_start", 128),
                 "latent_size": m.get("latent_size", 32),
@@ -537,12 +593,14 @@ class ExperimentSpec:
                     "reduction_dilation", 1),
             }
 
-        # Move dropout_rate from old model to training
+        # Move dropout_rate from old model to scale (not training)
         if model_raw is not None:
-            m = dict(model_raw) if model_raw else {}
-            if "dropout_rate" in m and "dropout_rate" not in training_raw:
-                training_raw = dict(training_raw)
-                training_raw["dropout_rate"] = m["dropout_rate"]
+            if "dropout_rate" in m:
+                if scale_raw is None:
+                    scale_raw = {}
+                scale_raw = dict(scale_raw)
+                if "dropout_rate" not in scale_raw:
+                    scale_raw["dropout_rate"] = m["dropout_rate"]
 
         return ExperimentSpec(
             name=name,

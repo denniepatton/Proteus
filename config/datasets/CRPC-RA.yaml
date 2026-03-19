@@ -7,9 +7,9 @@ name: CRPC-RA
 sources:
   triton_tss: "PC-TAN_data/TritonV2_TSS/results/"
   triton_gb: "PC-TAN_data/TritonV2_GB/results/"
-  tfx: "CRPC-RA_TFX_Subtype.tsv"
 
 # Label files (relative to paths.base.labels_dir)
 labels:
+  tfx: "CRPC-RA_TFX_Subtype.tsv"
   tumor_exp: "CRPC-RA_Log2CPMplus1.tsv"
   background_exp: null

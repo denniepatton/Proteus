@@ -637,17 +637,25 @@ class MixtureDensityHead(nn.Module):
         h = self.shared(x)
         out = self.proj(h)  # (batch, 6)
 
-        logits = out[:, :3]          # mixture weight logits
-        log_gamma_beta = out[:, 3:4]
-        normal_mu_raw = out[:, 4:5]
-        log_normal_sigma = out[:, 5:6]
+        # Force float32 before parameterization.  Under AMP autocast the
+        # Linear layers above produce float16 tensors.  torch.exp() preserves
+        # dtype, and exp(v) overflows float16 (~65504) for v > ~11.09.  The
+        # clamp range [-20, 20] is safe for float32 but NOT for float16.
+        # Disabling autocast prevents the subsequent log_softmax (which is on
+        # the float32-safe list) from being undermined by float16 inputs.
+        out = out.float()
+        with torch.amp.autocast('cuda', enabled=False):
+            logits = out[:, :3]          # mixture weight logits
+            log_gamma_beta = out[:, 3:4]
+            normal_mu_raw = out[:, 4:5]
+            log_normal_sigma = out[:, 5:6]
 
-        # Log/exp parameterization with clamping for numerical stability.
-        gamma_beta = torch.exp(log_gamma_beta.clamp(-20.0, 20.0))
-        normal_mu = normal_mu_raw.clamp(0.0, Y_MAX)
-        normal_sigma = torch.exp(log_normal_sigma.clamp(-20.0, LOG_SIGMA_CEIL))
+            # Log/exp parameterization with clamping for numerical stability.
+            gamma_beta = torch.exp(log_gamma_beta.clamp(-20.0, 20.0))
+            normal_mu = normal_mu_raw.clamp(0.0, Y_MAX)
+            normal_sigma = torch.exp(log_normal_sigma.clamp(-20.0, LOG_SIGMA_CEIL))
 
-        log_pi = F.log_softmax(logits, dim=-1)  # (batch, 3)
+            log_pi = F.log_softmax(logits, dim=-1)  # (batch, 3)
 
         return {
             'log_pi': log_pi,

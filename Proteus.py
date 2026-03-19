@@ -25,8 +25,9 @@ Usage:
     # Optuna HP tuning
     python Proteus.py --run_mode tune --experiment config/experiments/biodvn_tune.yaml --n_trials 50
     
-    # Run inference on holdout samples
-    python Proteus.py --run_mode run --use_set Crompton
+    # Run inference on holdout samples (uses trained_models/ by default)
+    python Proteus.py --run_mode run --model_name BioDVN --use_set Crompton
+    python Proteus.py --run_mode run --model_name BioDVN_NoSeq --use_set Crompton
 """
 
 # Standard library imports
@@ -313,102 +314,29 @@ def generate_data(
     return created_paths
 
 
-def get_focus_set() -> set[str]:
-    """Load focus genes for subsetting data during training."""
-    print('Loading focus genes for subsetting...')
-    gene_files = [
-        'CCP31.txt',
-        'Targets_PC.txt',
-        'Targets_SCLC.txt',
-        'Targets_BC.txt',
-        'PC_PhenotypingGenes.txt',
-        'PAM50.txt',
-        'Fanconi-Anemia.txt',
-        'EMT.txt',
-        'Hypoxia.txt',
-    ]
-    gene_ids: set[str] = set()
-    for gene_file in gene_files:
-        with open(f'reference/{gene_file}', 'r') as file:
-            reader = csv.reader(file, delimiter='\t')
-            for row in reader:
-                gene_ids.add(row[0])
-    print(f'Loaded {len(gene_ids)} focus genes.')
-    return gene_ids
-
-
-def _collect_fold_zarr_paths(
+def _collect_zarr_paths(
     training_set_tsv: str,
     zarr_base: str,
-    exclude_fold: int,
+    exclude_fold: Optional[int] = None,
 ) -> List[str]:
-    """Collect Zarr paths for all samples NOT in the excluded fold.
+    """Collect Zarr paths from a training-set TSV.
 
-    This mirrors the path construction logic in build_loaders_from_splits
-    so that gene weights are computed from exactly the same samples used
-    for training.
+    Args:
+        training_set_tsv: TSV with Cohort/Sample/Fold columns.
+        zarr_base: Root directory for Zarr stores.
+        exclude_fold: If set, skip samples whose Fold == this value.
+            If None, include ALL samples (no fold filter).
+
+    Path construction mirrors build_loaders_from_splits (cohort prefix
+    stripping, zarr_files/ subdirectory) so that gene weights are computed
+    from exactly the same samples used for training.
     """
     paths: List[str] = []
     with open(training_set_tsv, 'r', newline='') as f:
         reader = csv.DictReader(f, delimiter='\t')
         for row in reader:
-            fold = int(row['Fold'])
-            if fold == exclude_fold:
+            if exclude_fold is not None and int(row['Fold']) == exclude_fold:
                 continue
-            cohort = row['Cohort'].strip()
-            sample = row['Sample'].strip()
-            sample_name = sample
-            if sample.startswith(f"{cohort}_"):
-                sample_name = sample[len(cohort) + 1:]
-            zarr_path = os.path.join(zarr_base, cohort, 'zarr_files', f"{sample_name}.zarr")
-            if os.path.isdir(zarr_path):
-                paths.append(zarr_path)
-    return paths
-
-
-def _collect_only_fold_zarr_paths(
-    training_set_tsv: str,
-    zarr_base: str,
-    fold_num: int,
-) -> List[str]:
-    """Collect Zarr paths for all samples in a single fold.
-
-    This mirrors the path construction logic in build_loaders_from_splits so that
-    validation-fold-only gene weights are computed from exactly the same samples
-    used in the held-out validation loader.
-    """
-    paths: List[str] = []
-    with open(training_set_tsv, 'r', newline='') as f:
-        reader = csv.DictReader(f, delimiter='\t')
-        for row in reader:
-            fold = int(row['Fold'])
-            if fold != int(fold_num):
-                continue
-            cohort = row['Cohort'].strip()
-            sample = row['Sample'].strip()
-            sample_name = sample
-            if sample.startswith(f"{cohort}_"):
-                sample_name = sample[len(cohort) + 1:]
-            zarr_path = os.path.join(zarr_base, cohort, 'zarr_files', f"{sample_name}.zarr")
-            if os.path.isdir(zarr_path):
-                paths.append(zarr_path)
-    return paths
-
-
-def _collect_all_zarr_paths(
-    training_set_tsv: str,
-    zarr_base: str,
-) -> List[str]:
-    """Collect Zarr paths for ALL samples in the training set TSV (no fold filter).
-
-    Used to compute full-dataset gene variance for GVW evaluation metrics
-    so that validation metrics reflect the true expression variability across
-    all samples rather than only the held-out fold.
-    """
-    paths: List[str] = []
-    with open(training_set_tsv, 'r', newline='') as f:
-        reader = csv.DictReader(f, delimiter='\t')
-        for row in reader:
             cohort = row['Cohort'].strip()
             sample = row['Sample'].strip()
             sample_name = sample
@@ -435,6 +363,8 @@ def train_model_cv(
     subsample_frac: Optional[float] = None,
     epoch_end_callback: Optional[Callable[..., None]] = None,
     external_stop_check: Optional[Callable[..., bool]] = None,
+    train_only_cohorts: Optional[List[str]] = None,
+    balance_cohorts: Optional[List[str]] = None,
 ):
     """Train a model using cross-validation with deterministic fold assignment.
 
@@ -456,7 +386,6 @@ def train_model_cv(
         FileNotFoundError: If training_set_tsv or Zarr stores don't exist.
         ValueError: If TSV format is invalid or no samples in folds.
     """
-    import csv
 
     # Determine folds from TSV
     if not os.path.exists(training_set_tsv):
@@ -489,7 +418,7 @@ def train_model_cv(
     # This gives validation metrics a stable, unbiased variance estimate.
     from proteus_utils.proteus_utils import compute_gene_weights_from_zarr, compute_gene_variances_unclipped
     print('Computing full-dataset gene variance for GVW evaluation...')
-    all_zarr_paths = _collect_all_zarr_paths(training_set_tsv, zarr_base)
+    all_zarr_paths = _collect_zarr_paths(training_set_tsv, zarr_base)
     full_tumor_variance = compute_gene_variances_unclipped(
         all_zarr_paths, label_key='flat/tumor_exp',
     )
@@ -500,6 +429,19 @@ def train_model_cv(
           f'(range [{min(full_tumor_variance.values()):.3f}, {max(full_tumor_variance.values()):.3f}])')
     print(f'  Full-dataset background variance: {len(full_background_variance)} genes '
           f'(range [{min(full_background_variance.values()):.3f}, {max(full_background_variance.values()):.3f}])')
+
+    # Build sample-name → cohort mapping for per-cohort validation metrics.
+    # Uses the same cohort-prefix stripping as build_loaders_from_splits.
+    sample_to_cohort: Dict[str, str] = {}
+    with open(training_set_tsv, 'r', newline='') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            cohort = row['Cohort'].strip()
+            sample = row['Sample'].strip()
+            sample_name = sample
+            if sample.startswith(f"{cohort}_"):
+                sample_name = sample[len(cohort) + 1:]
+            sample_to_cohort[sample_name] = cohort
 
     for fold_num in fold_list:
         if test_fold is not None and fold_num != test_fold:
@@ -520,7 +462,7 @@ def train_model_cv(
         # (excluding the held-out validation fold).  Clipped variance weights
         # scale the CRPS loss so high-variance genes contribute more.
         print(f'Computing gene variance weights from training folds (excluding fold {fold_num})...')
-        train_zarr_paths = _collect_fold_zarr_paths(
+        train_zarr_paths = _collect_zarr_paths(
             training_set_tsv, zarr_base, exclude_fold=fold_num,
         )
         _raw_var = compute_gene_variances_unclipped(train_zarr_paths, label_key='flat/tumor_exp')
@@ -547,6 +489,8 @@ def train_model_cv(
             seed=seed,
             subsample_frac=subsample_frac,
             gene_weights=gene_weights,
+            train_only_cohorts=train_only_cohorts,
+            balance_cohorts=balance_cohorts,
         )
         print(f'Training batches: {train_steps}, Validation batches: {val_steps}')
         
@@ -601,6 +545,7 @@ def train_model_cv(
             device,
             full_tumor_variance=full_tumor_variance,
             full_background_variance=full_background_variance,
+            sample_to_cohort=sample_to_cohort if sample_to_cohort else None,
         )
 
         # Per-fold plots
@@ -787,6 +732,7 @@ def _save_fold_predictions(
     device: torch.device,
     full_tumor_variance: Optional[Dict[str, float]] = None,
     full_background_variance: Optional[Dict[str, float]] = None,
+    sample_to_cohort: Optional[Dict[str, str]] = None,
 ):
     """Save MDN predictions, full distribution params, and quantile CIs for a validation fold.
 
@@ -837,6 +783,9 @@ def _save_fold_predictions(
     tumor_crps_denom = torch.tensor(0.0)
     bg_crps_sum = torch.tensor(0.0)
     bg_crps_denom = torch.tensor(0.0)
+
+    # Per-cohort CRPS accumulators (for balanced fine-tuning objective)
+    _cohort_crps: Dict[str, List[torch.Tensor]] = {}  # cohort -> [t_sum, t_den]
 
     with torch.no_grad():
         for features, labels in val_loader:
@@ -920,6 +869,30 @@ def _save_fold_predictions(
             bg_crps_s, bg_crps_d = mixture_crps(b_mdn, labels_device['background_exp'], sample_weight=w_bg)
             bg_crps_sum += bg_crps_s.cpu()
             bg_crps_denom += bg_crps_d.cpu()
+
+            # ---- Per-cohort GVW-CRPS (tumor) ----
+            if sample_to_cohort and 'sample_name' in features:
+                batch_samples = features['sample_name']
+                if not isinstance(batch_samples, (list, tuple)):
+                    batch_samples = [batch_samples]
+                cohort_labels = [sample_to_cohort.get(str(s), 'unknown')
+                                 for s in batch_samples]
+                for coh in set(cohort_labels):
+                    idx = torch.tensor(
+                        [i for i, c in enumerate(cohort_labels) if c == coh],
+                        dtype=torch.long, device=device,
+                    )
+                    c_mdn = {k: v[idx] for k, v in t_mdn.items()}
+                    c_w = w_tumor[idx] if w_tumor is not None else None
+                    cs, cd = mixture_crps(
+                        c_mdn, labels_device['tumor_exp'][idx],
+                        sample_weight=c_w,
+                    )
+                    if coh not in _cohort_crps:
+                        _cohort_crps[coh] = [torch.tensor(0.0),
+                                              torch.tensor(0.0)]
+                    _cohort_crps[coh][0] += cs.cpu()
+                    _cohort_crps[coh][1] += cd.cpu()
 
             # Metadata
             sample_names = features['sample_name']
@@ -1079,11 +1052,65 @@ def _save_fold_predictions(
     t_metrics['quantile_coverage'] = _coverage(truth_t, q5_t, q95_t)
     b_metrics['quantile_coverage'] = _coverage(truth_b, q5_b, q95_b)
 
+    # ---- Per-cohort metrics (for balanced fine-tuning objective) ----
+    per_cohort: Dict[str, Dict[str, Any]] = {}
+    if sample_to_cohort:
+        samples_arr = np.asarray(all_samples, dtype=object)
+        cohort_arr = np.array(
+            [sample_to_cohort.get(str(s), 'unknown') for s in samples_arr],
+            dtype=object,
+        )
+        for cohort_name in sorted(set(cohort_arr)):
+            mask_c = cohort_arr == cohort_name
+            if mask_c.sum() == 0:
+                continue
+            c_tumor = _compute_regression_metrics(
+                truth_t[mask_c], pred_mean_t[mask_c],
+            )
+            c_bg = _compute_regression_metrics(
+                truth_b[mask_c], pred_mean_b[mask_c],
+            )
+            c_tumor['gvw_mean_r2'] = _weighted_r2(
+                truth_t[mask_c], pred_mean_t[mask_c],
+                [g for g, m in zip(all_genes, mask_c) if m],
+                full_tumor_variance,
+            )
+            c_bg['gvw_mean_r2'] = _weighted_r2(
+                truth_b[mask_c], pred_mean_b[mask_c],
+                [g for g, m in zip(all_genes, mask_c) if m],
+                full_background_variance,
+            )
+            # Per-cohort GVW-CRPS from streaming accumulators
+            if cohort_name in _cohort_crps:
+                s, d = _cohort_crps[cohort_name]
+                c_tumor['gvw_crps'] = (
+                    float((s / d).item()) if float(d.item()) > 0
+                    else float('nan')
+                )
+            per_cohort[cohort_name] = {
+                'tumor': c_tumor,
+                'background': c_bg,
+            }
+
     metrics = {
         'fold': int(fold_num),
         'tumor': t_metrics,
         'background': b_metrics,
     }
+    if per_cohort:
+        metrics['per_cohort'] = per_cohort
+        # Balanced tumor metric: equal-weight average of per-cohort GVW-CRPS
+        # across patient cohorts (excludes PDX admixtures whose cohort
+        # typically starts with 'PH').
+        patient_gvw_crps = [
+            v['tumor'].get('gvw_crps', float('nan'))
+            for k, v in per_cohort.items()
+            if not k.startswith('PH')
+        ]
+        finite_vals = [x for x in patient_gvw_crps if np.isfinite(x)]
+        metrics['balanced_tumor_gvw_crps'] = (
+            float(np.mean(finite_vals)) if finite_vals else float('nan')
+        )
     with open(os.path.join(fold_dir, f'validation-fold_{fold_num}_metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=2)
 
@@ -1211,8 +1238,9 @@ def _save_fold_predictions(
 
 
 def full_train_from_splits(
-    training_set_tsv: str,
-    zarr_base: str,
+    model_name: str = 'BioDVN',
+    training_set_tsv: str = '',
+    zarr_base: str = '',
     out_dir: str = 'final_models/',
     model_config: Optional[BioDVNConfig] = None,
     training_config: Optional[TrainingConfig] = None,
@@ -1232,6 +1260,7 @@ def full_train_from_splits(
     the split.
 
     Args:
+        model_name: Name of the model class (e.g. 'BioDVN', 'BioDVN_NoSeq').
         training_set_tsv: Path to TSV file with Cohort/Sample/Fold columns.
         zarr_base: Base directory for Zarr stores.
         out_dir: Output directory for final model.
@@ -1243,7 +1272,6 @@ def full_train_from_splits(
         seed: Random seed for reproducibility.
         subsample_frac: Optional fraction (0.0-1.0) of genes for fast sanity checks.
     """
-    import csv
     import tempfile
 
     print('Full training mode (all samples)...')
@@ -1264,15 +1292,32 @@ def full_train_from_splits(
         raise FileNotFoundError(f"Training set TSV not found: {training_set_tsv}")
 
     all_paths: List[str] = []
+    missing_samples: List[str] = []
     with open(training_set_tsv, 'r', newline='') as f:
         reader = csv.DictReader(f, delimiter='\t')
         for row in reader:
             cohort = row['Cohort'].strip()
             sample = row['Sample'].strip()
-            zarr_path = os.path.join(zarr_base, cohort, f"{sample}.zarr")
+
+            # Strip cohort prefix from sample name if present
+            # (e.g., "CRPC-RA_00-147" -> "00-147")
+            sample_name = sample
+            if sample.startswith(f"{cohort}_"):
+                sample_name = sample[len(cohort) + 1:]
+
+            zarr_path = os.path.join(zarr_base, cohort, 'zarr_files', f"{sample_name}.zarr")
             if not os.path.isdir(zarr_path):
-                raise FileNotFoundError(f"Zarr store not found: {zarr_path}")
+                missing_samples.append(
+                    f"  {cohort}/zarr_files/{sample_name}.zarr  (TSV sample={sample})"
+                )
+                continue
             all_paths.append(zarr_path)
+
+    if missing_samples:
+        raise FileNotFoundError(
+            f"Missing {len(missing_samples)} Zarr store(s) under {zarr_base}:\n"
+            + "\n".join(missing_samples)
+        )
 
     print(f'Total samples: {len(all_paths)} (all used for train + val via gene-level chunk split)')
 
@@ -1344,7 +1389,8 @@ def full_train_from_splits(
     _seed_everything(seed)
 
     # Create model
-    model = BioDVN(model_config)
+    ModelClass = get_model_instance(model_name)
+    model = ModelClass(model_config)
 
     # Save config
     with open(os.path.join(out_dir, 'model_config.json'), 'w') as f:
@@ -1363,7 +1409,12 @@ def full_train_from_splits(
     print(f'Saved final model to: {final_path}')
 
 
-def run_model(model_path: str, sample_files: List[str], out_dir: str):
+def run_model(
+    model_path: str,
+    sample_files: List[str],
+    out_dir: str,
+    model_name: str = 'BioDVN',
+):
     """Run the model on samples for inference.
 
     Outputs long-format TSVs (one row per gene × sample) with full MDN
@@ -1374,6 +1425,9 @@ def run_model(model_path: str, sample_files: List[str], out_dir: str):
         model_path: Path to saved model weights.
         sample_files: List of paths to sample Zarr stores.
         out_dir: Output directory.
+        model_name: Model architecture name (e.g. 'BioDVN', 'BioDVN_NoSeq',
+            'BioDVN_OnlySeq').  Must match the architecture that produced
+            the checkpoint at *model_path*.
     """
     from models.model_utils import mixture_quantile
 
@@ -1398,8 +1452,13 @@ def run_model(model_path: str, sample_files: List[str], out_dir: str):
         model_config = BioDVNConfig()
         print('WARNING: No model_config.json found; using BioDVNConfig defaults for inference.')
 
-    model = BioDVN(model_config).to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    ModelClass = get_model_instance(model_name)
+    model = ModelClass(model_config).to(device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+    else:
+        model.load_state_dict(checkpoint)
     model.eval()
 
     # Long-format accumulators (shared across all samples).
@@ -1415,9 +1474,10 @@ def run_model(model_path: str, sample_files: List[str], out_dir: str):
     all_tumor_samples: List[str] = []
     all_bg_samples: List[str] = []
 
-    for sample_file in sample_files:
+    n_samples = len(sample_files)
+    for idx, sample_file in enumerate(sample_files, 1):
         sample = Path(sample_file).stem.replace('.zarr', '')
-        print(f'Processing {sample}...')
+        print(f'[{idx}/{n_samples}] Running inference on {sample}...')
 
         loader, gene_names = create_inference_loader(sample_file)
 
@@ -1450,7 +1510,7 @@ def run_model(model_path: str, sample_files: List[str], out_dir: str):
         all_tumor_samples.extend([sample] * n_genes)
         all_bg_samples.extend([sample] * n_genes)
 
-        print(f'Finished {sample}.')
+        print(f'[{idx}/{n_samples}] Done  ({n_genes} genes).')
 
     # Build and save long-format TSVs (one row per gene × sample).
     tumor_rows['sample'] = all_tumor_samples
@@ -1463,6 +1523,58 @@ def run_model(model_path: str, sample_files: List[str], out_dir: str):
     df_bg.to_csv(os.path.join(out_dir, 'predictions_background.tsv'), sep='\t')
 
     print('Finished running model on all samples.')
+
+
+def _build_configs_from_spec(experiment_spec, args) -> tuple:
+    """Build BioDVNConfig and TrainingConfig from an experiment spec.
+
+    Returns (model_cfg, train_cfg).
+    """
+    model_cfg = BioDVNConfig(
+        encoder_start=int(experiment_spec.scale.encoder_start.fixed),
+        latent_size=int(experiment_spec.scale.latent_size.fixed),
+        decoder_start=int(experiment_spec.scale.decoder_start.fixed),
+        mdn_hidden=int(experiment_spec.scale.mdn_hidden.fixed),
+        mdn_final=int(experiment_spec.scale.mdn_final.fixed),
+        signal_filters=int(experiment_spec.scale.signal_filters.fixed),
+        signal_encoder_width=int(experiment_spec.scale.signal_encoder_width.fixed),
+        signal_ksize=int(experiment_spec.scale.signal_ksize.fixed),
+        interaction_ksize=int(experiment_spec.scale.interaction_ksize.fixed),
+        initial_reduction_channels=int(experiment_spec.scale.initial_reduction_channels.fixed),
+        n_reductions=int(experiment_spec.scale.n_reductions.fixed),
+        reduction_dilation=int(experiment_spec.scale.reduction_dilation.fixed),
+        beta_background=float(experiment_spec.structural.beta_background.fixed),
+        beta_tcvae=float(experiment_spec.structural.beta_tcvae.fixed),
+        beta_contrastive=float(experiment_spec.structural.beta_contrastive.fixed),
+        beta_reconstruction=float(experiment_spec.structural.beta_reconstruction.fixed),
+        beta_grl=float(experiment_spec.structural.beta_grl.fixed),
+        beta_point_mse=float(experiment_spec.structural.beta_point_mse.fixed),
+        cl_margin=float(experiment_spec.structural.cl_margin.fixed),
+        internal_weight=float(experiment_spec.structural.internal_weight.fixed),
+        dropout_rate=float(experiment_spec.scale.dropout_rate.fixed),
+        weight_decay=float(experiment_spec.training.weight_decay.fixed),
+        max_lr=float(experiment_spec.training.max_lr.fixed),
+        max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
+    )
+
+    train_cfg = TrainingConfig(
+        checkpoint_dir='',
+        max_lr=float(experiment_spec.training.max_lr.fixed),
+        min_lr_ratio=float(experiment_spec.training.min_lr_ratio.fixed),
+        warmup_start_lr=float(experiment_spec.training.warmup_start_lr.fixed),
+        weight_decay=float(experiment_spec.training.weight_decay.fixed),
+        max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
+        warmup_frac=float(experiment_spec.training.warmup_frac.fixed),
+        schedule_frac=float(experiment_spec.training.schedule_frac.fixed),
+        epochs=int(experiment_spec.training.epochs.fixed),
+        patience=int(experiment_spec.training.patience.fixed),
+        use_amp=bool(experiment_spec.training.use_amp.fixed),
+        runtime_device_banner=bool(args.runtime_device_banner),
+        base_weights=experiment_spec.transfer.base_weights,
+        freeze_level=experiment_spec.transfer.freeze_level,
+    )
+
+    return model_cfg, train_cfg
 
 
 def main():
@@ -1485,8 +1597,9 @@ def main():
     # Optuna CV tuning
     python Proteus.py --run_mode tune --experiment config/experiments/biodvn_tune.yaml --n_trials 50
     
-    # Run inference on holdout samples
-    python Proteus.py --run_mode run --use_set Crompton
+    # Run inference on holdout samples (uses trained_models/ by default)
+    python Proteus.py --run_mode run --model_name BioDVN --use_set Crompton
+    python Proteus.py --run_mode run --model_name BioDVN_NoSeq --use_set Crompton
     """
     )
     
@@ -1619,26 +1732,26 @@ def main():
         return
     
     # ==========================================================================
-    # AUTO-CHECK: Ensure required datasets exist before training/inference
-    # This handles the case where scratch storage has been cleared.
-    # Only check datasets actively being used.
+    # AUTO-CHECK: Ensure required datasets exist before training/tuning.
+    # Skipped in inference mode — inference should only run on existing data.
     # ==========================================================================
-    raw_data_dir = args.raw_data_dir or "/fh/fast/ha_g/user/rpatton"
+    if args.run_mode != 'run':
+        raw_data_dir = args.raw_data_dir or "/fh/fast/ha_g/user/rpatton"
 
-    datasets_to_check: List[str] = []
-    if get_dataset_config(active_use_set) is not None:
-        datasets_to_check.append(active_use_set)
+        datasets_to_check: List[str] = []
+        if get_dataset_config(active_use_set) is not None:
+            datasets_to_check.append(active_use_set)
 
-    if datasets_to_check:
-        ensure_datasets_exist(
-            config_loader=config_loader,
-            dataset_names=datasets_to_check,
-            zarr_base=zarr_base,
-            raw_data_base=raw_data_dir,
-            labels_dir=labels_dir,
-            ref_path=args.scalars_reference_path or default_ref_path,
-            n_workers=0  # 0 = auto-detect (use all available CPUs)
-        )
+        if datasets_to_check:
+            ensure_datasets_exist(
+                config_loader=config_loader,
+                dataset_names=datasets_to_check,
+                zarr_base=zarr_base,
+                raw_data_base=raw_data_dir,
+                labels_dir=labels_dir,
+                ref_path=args.scalars_reference_path or default_ref_path,
+                n_workers=0  # 0 = auto-detect (use all available CPUs)
+            )
 
     # NOTE: transfer learning (including freeze_level) is HP-controlled in experiment YAML.
     # CLI --base_weights is a manual warm-start convenience only.
@@ -1652,49 +1765,7 @@ def main():
             )
 
         # Resolve fixed parameters from experiment spec
-        model_cfg = BioDVNConfig(
-            encoder_start=int(experiment_spec.scale.encoder_start.fixed),
-            latent_size=int(experiment_spec.scale.latent_size.fixed),
-            decoder_start=int(experiment_spec.scale.decoder_start.fixed),
-            mdn_hidden=int(experiment_spec.scale.mdn_hidden.fixed),
-            mdn_final=int(experiment_spec.scale.mdn_final.fixed),
-            signal_filters=int(experiment_spec.scale.signal_filters.fixed),
-            signal_encoder_width=int(experiment_spec.scale.signal_encoder_width.fixed),
-            signal_ksize=int(experiment_spec.scale.signal_ksize.fixed),
-            interaction_ksize=int(experiment_spec.scale.interaction_ksize.fixed),
-            initial_reduction_channels=int(experiment_spec.scale.initial_reduction_channels.fixed),
-            n_reductions=int(experiment_spec.scale.n_reductions.fixed),
-            reduction_dilation=int(experiment_spec.scale.reduction_dilation.fixed),
-            beta_background=float(experiment_spec.structural.beta_background.fixed),
-            beta_tcvae=float(experiment_spec.structural.beta_tcvae.fixed),
-            beta_contrastive=float(experiment_spec.structural.beta_contrastive.fixed),
-            beta_reconstruction=float(experiment_spec.structural.beta_reconstruction.fixed),
-            beta_grl=float(experiment_spec.structural.beta_grl.fixed),
-            beta_point_mse=float(experiment_spec.structural.beta_point_mse.fixed),
-            cl_margin=float(experiment_spec.structural.cl_margin.fixed),
-            internal_weight=float(experiment_spec.structural.internal_weight.fixed),
-            dropout_rate=float(experiment_spec.training.dropout_rate.fixed),
-            weight_decay=float(experiment_spec.training.weight_decay.fixed),
-            max_lr=float(experiment_spec.training.max_lr.fixed),
-            max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
-        )
-        
-        train_cfg = TrainingConfig(
-            checkpoint_dir='',
-            max_lr=float(experiment_spec.training.max_lr.fixed),
-            min_lr_ratio=float(experiment_spec.training.min_lr_ratio.fixed),
-            warmup_start_lr=float(experiment_spec.training.warmup_start_lr.fixed),
-            weight_decay=float(experiment_spec.training.weight_decay.fixed),
-            max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
-            warmup_frac=float(experiment_spec.training.warmup_frac.fixed),
-            schedule_frac=float(experiment_spec.training.schedule_frac.fixed),
-            epochs=int(experiment_spec.training.epochs.fixed),
-            patience=int(experiment_spec.training.patience.fixed),
-            use_amp=bool(experiment_spec.training.use_amp.fixed),
-            runtime_device_banner=bool(args.runtime_device_banner),
-            base_weights=experiment_spec.transfer.base_weights,
-            freeze_level=experiment_spec.transfer.freeze_level,
-        )
+        model_cfg, train_cfg = _build_configs_from_spec(experiment_spec, args)
 
         out_dir = experiment_spec.output_dir
         test_fold = args.test_fold  # CLI override for HPC parallelization
@@ -1705,7 +1776,7 @@ def main():
             print('Running all folds from training_set TSV...')
 
         train_model_cv(
-            model_name='BioDVN',
+            model_name=args.model_name,
             training_set_tsv=experiment_spec.data.training_set,
             zarr_base=experiment_spec.data.zarr_base,
             test_fold=test_fold,
@@ -1717,6 +1788,8 @@ def main():
             shuffle_genes_in_batch=True,
             seed=experiment_spec.data.seed,
             subsample_frac=args.subsample,
+            train_only_cohorts=experiment_spec.data.train_only_cohorts,
+            balance_cohorts=experiment_spec.data.balance_cohorts,
         )
     
     elif args.run_mode == 'full-train':
@@ -1728,53 +1801,12 @@ def main():
 
         # For full-train, we train on ALL samples in the TSV (no fold held out)
         # This produces a single model using all available data.
-        model_cfg = BioDVNConfig(
-            encoder_start=int(experiment_spec.scale.encoder_start.fixed),
-            latent_size=int(experiment_spec.scale.latent_size.fixed),
-            decoder_start=int(experiment_spec.scale.decoder_start.fixed),
-            mdn_hidden=int(experiment_spec.scale.mdn_hidden.fixed),
-            mdn_final=int(experiment_spec.scale.mdn_final.fixed),
-            signal_filters=int(experiment_spec.scale.signal_filters.fixed),
-            signal_encoder_width=int(experiment_spec.scale.signal_encoder_width.fixed),
-            signal_ksize=int(experiment_spec.scale.signal_ksize.fixed),
-            interaction_ksize=int(experiment_spec.scale.interaction_ksize.fixed),
-            initial_reduction_channels=int(experiment_spec.scale.initial_reduction_channels.fixed),
-            n_reductions=int(experiment_spec.scale.n_reductions.fixed),
-            reduction_dilation=int(experiment_spec.scale.reduction_dilation.fixed),
-            beta_background=float(experiment_spec.structural.beta_background.fixed),
-            beta_tcvae=float(experiment_spec.structural.beta_tcvae.fixed),
-            beta_contrastive=float(experiment_spec.structural.beta_contrastive.fixed),
-            beta_reconstruction=float(experiment_spec.structural.beta_reconstruction.fixed),
-            beta_grl=float(experiment_spec.structural.beta_grl.fixed),
-            beta_point_mse=float(experiment_spec.structural.beta_point_mse.fixed),
-            cl_margin=float(experiment_spec.structural.cl_margin.fixed),
-            internal_weight=float(experiment_spec.structural.internal_weight.fixed),
-            dropout_rate=float(experiment_spec.training.dropout_rate.fixed),
-            weight_decay=float(experiment_spec.training.weight_decay.fixed),
-            max_lr=float(experiment_spec.training.max_lr.fixed),
-            max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
-        )
-        
-        train_cfg = TrainingConfig(
-            checkpoint_dir='',
-            max_lr=float(experiment_spec.training.max_lr.fixed),
-            min_lr_ratio=float(experiment_spec.training.min_lr_ratio.fixed),
-            warmup_start_lr=float(experiment_spec.training.warmup_start_lr.fixed),
-            weight_decay=float(experiment_spec.training.weight_decay.fixed),
-            max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
-            warmup_frac=float(experiment_spec.training.warmup_frac.fixed),
-            schedule_frac=float(experiment_spec.training.schedule_frac.fixed),
-            epochs=int(experiment_spec.training.epochs.fixed),
-            patience=int(experiment_spec.training.patience.fixed),
-            use_amp=bool(experiment_spec.training.use_amp.fixed),
-            runtime_device_banner=bool(args.runtime_device_banner),
-            base_weights=experiment_spec.transfer.base_weights,
-            freeze_level=experiment_spec.transfer.freeze_level,
-        )
+        model_cfg, train_cfg = _build_configs_from_spec(experiment_spec, args)
 
         out_dir = os.path.join(experiment_spec.output_dir, 'full_train')
 
         full_train_from_splits(
+            model_name=args.model_name,
             training_set_tsv=experiment_spec.data.training_set,
             zarr_base=experiment_spec.data.zarr_base,
             out_dir=out_dir,
@@ -1815,27 +1847,48 @@ def main():
             )
     
     elif args.run_mode == 'run':
-        for model_version in ['TL-NoBC-v3_BioDVN']:
-            model_path = f'final_models/{model_version}_model.pt'
+        # Resolve model weights path.  When an experiment YAML is provided,
+        # use its output_dir (mirrors full-train).  Otherwise, derive from
+        # the standard trained_models/ naming convention.
+        if experiment_spec is not None:
+            model_dir = os.path.join(experiment_spec.output_dir, 'full_train')
+        else:
+            # Convention: trained_models/proteus_<variant>/full_train/
+            _MODEL_DIR_MAP = {
+                'BioDVN':        'proteus_base-model',
+                'BioDVN_NoSeq':  'proteus_base-model_no-seq',
+                'BioDVN_OnlySeq':'proteus_base-model_only-seq',
+            }
+            dir_name = _MODEL_DIR_MAP.get(args.model_name)
+            if dir_name is None:
+                raise ValueError(
+                    f"No known trained-model directory for model_name='{args.model_name}'. "
+                    f"Available: {list(_MODEL_DIR_MAP.keys())}. "
+                    f"Provide --experiment <yaml> to specify the model location explicitly."
+                )
+            model_dir = os.path.join('trained_models', dir_name, 'full_train')
 
-            # Inference runs on the dataset specified by --use_set
-            patient_set = args.use_set
-            zarr_dir = get_zarr_output_dir(patient_set, zarr_base)
+        model_path = os.path.join(model_dir, 'best_model.pt')
+        if not os.path.isfile(model_path):
+            raise FileNotFoundError(
+                f"Trained model not found at: {model_path}\n"
+                f"Run --run_mode full-train first, or provide --experiment <yaml> "
+                f"to point to the correct model directory."
+            )
 
-            # Legacy fallback (older runs stored under project/data)
-            legacy_dir = str(PROJECT_ROOT / 'data' / patient_set / 'zarr_files')
-            if not (os.path.exists(zarr_dir) and any(f.endswith('.zarr') for f in os.listdir(zarr_dir))):
-                if os.path.exists(legacy_dir) and any(f.endswith('.zarr') for f in os.listdir(legacy_dir)):
-                    zarr_dir = legacy_dir
-                else:
-                    raise FileNotFoundError(
-                        f"No Zarr stores found for '{patient_set}' in:\n  - {zarr_dir}\n  - {legacy_dir}\n"
-                        "Run --process_data for that dataset (or point --zarr_output_dir to the correct base)."
-                    )
+        # Inference runs on the dataset specified by --use_set
+        patient_set = args.use_set
+        zarr_dir = get_zarr_output_dir(patient_set, zarr_base)
 
-            sample_files = [os.path.join(zarr_dir, f) for f in os.listdir(zarr_dir) if f.endswith('.zarr')]
-            output_base = f'results_holdout/{model_version}/{patient_set}/'
-            run_model(model_path, sample_files, output_base)
+        if not (os.path.exists(zarr_dir) and any(f.endswith('.zarr') for f in os.listdir(zarr_dir))):
+            raise FileNotFoundError(
+                f"No Zarr stores found for '{patient_set}' in: {zarr_dir}\n"
+                "Run --process_data for that dataset (or point --zarr_output_dir to the correct base)."
+            )
+
+        sample_files = [os.path.join(zarr_dir, f) for f in os.listdir(zarr_dir) if f.endswith('.zarr')]
+        output_base = f'results_holdout/{args.model_name}/{patient_set}/'
+        run_model(model_path, sample_files, output_base, model_name=args.model_name)
     
     else:
         print('Invalid run mode. Exiting.')

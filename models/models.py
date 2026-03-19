@@ -79,6 +79,7 @@ def get_model_instance(model_name: str = 'BioDVN') -> nn.Module:
     models = {
         'BioDVN': BioDVN,
         'BioDVN_NoSeq': BioDVN_NoSeq,
+        'BioDVN_OnlySeq': BioDVN_OnlySeq,
     }
     
     if model_name not in models:
@@ -96,33 +97,33 @@ class BioDVNConfig:
     interaction_ksize: int = 3
     initial_reduction_channels: int = 64
     n_reductions: int = 3
-    reduction_dilation: int = 1
-    signal_encoder_width: int = 1024  # First hidden dim of signal encoder funnel
+    reduction_dilation: int = 3
+    signal_encoder_width: int = 256  # First hidden dim of signal encoder funnel
     encoder_start: int = 128
-    latent_size: int = 32
-    decoder_start: int = 16
-    dropout_rate: float = 0.15
+    latent_size: int = 64
+    decoder_start: int = 64
+    dropout_rate: float = 0.20
     
     # MDN output head hyperparameters
     mdn_hidden: int = 64       # Hidden dim inside MixtureDensityHead
-    mdn_final: int = 16        # Final hidden dim before 6-output projection
+    mdn_final: int = 32        # Final hidden dim before 6-output projection
     
     # Loss function hyperparameters
-    beta_tcvae: float = 3.0    # β-TCVAE TC weight: loss = KL + (beta_tcvae − 1) × TC
-    beta_contrastive: float = 0.5
-    beta_reconstruction: float = 1.5
-    beta_background: float = 1.0
-    internal_weight: float = 2.5
-    cl_margin: float = 0.5
-    beta_grl: float = 1.0
-    beta_point_mse: float = 0.0  # Auxiliary MSE on mixture_mean; 0 = off
+    beta_tcvae: float = 2.0    # β-TCVAE TC weight: loss = KL + (beta_tcvae − 1) × TC
+    beta_contrastive: float = 1.0
+    beta_reconstruction: float = 0.50
+    beta_background: float = 2.0
+    internal_weight: float = 1.0
+    cl_margin: float = 1.0
+    beta_grl: float = 0.15
+    beta_point_mse: float = 0.30  # Auxiliary MSE on mixture_mean; 0 = off
     
     # Training hyperparameters
-    weight_decay: float = 0.002
-    max_lr: float = 0.001  # Peak learning rate
+    weight_decay: float = 1e-5
+    max_lr: float = 0.0015  # Peak learning rate
 
     # Gradient clipping
-    max_grad_norm: float = 1.0
+    max_grad_norm: float = 18.0
 
 
 class SignalProcessingBlock(nn.Module):
@@ -604,7 +605,7 @@ class BioDVN(nn.Module):
         This must match the actual tensor shapes produced in forward().
         """
         # SignalProcessingBlock reduces length by (signal_ksize - 1) with padding=0.
-        base_len = int(self._tss_input_length) - int(self.config.signal_ksize) + 1
+        base_len = self._tss_input_length - self.config.signal_ksize + 1
         if base_len <= 0:
             raise ValueError(
                 f'Invalid signal_ksize={self.config.signal_ksize} for TSS length {self._tss_input_length}'
@@ -612,15 +613,15 @@ class BioDVN(nn.Module):
 
         # ReductionBlock output channels: initial_reduction_channels // (2 ** i) per iteration.
         out_channels = max(
-            int(self.config.initial_reduction_channels) // (2 ** max(int(self.config.n_reductions) - 1, 0)),
+            self.config.initial_reduction_channels // (2 ** max(self.config.n_reductions - 1, 0)),
             1,
         )
 
         reduced_len = self._compute_reduction_output_length(
             base_len,
-            interaction_ksize=int(self.config.interaction_ksize),
-            dilation=int(self.config.reduction_dilation),
-            n_reductions=int(self.config.n_reductions),
+            interaction_ksize=self.config.interaction_ksize,
+            dilation=self.config.reduction_dilation,
+            n_reductions=self.config.n_reductions,
         )
 
         if reduced_len <= 0:
@@ -734,13 +735,13 @@ class BioDVN(nn.Module):
         # Build encoder input.  TFX is never included — the encoder learns
         # TFX-invariant representations.  TFX enters only through the merge
         # weight predictor (via GRL discriminator prediction).
-        y_parts: List[torch.Tensor] = [
+        encoder_inputs: List[torch.Tensor] = [
             x_encoded,
             tss_features,
             gb_features,
             ref_scalars,
         ]
-        y = torch.cat(y_parts, dim=1)
+        y = torch.cat(encoder_inputs, dim=1)
         
         # Dual encoding
         z_tumor_mean, z_tumor_log_var = self.tumor_encoder(y)
@@ -863,6 +864,82 @@ class BioDVN(nn.Module):
         
         return frozen
 
+    # ------------------------------------------------------------------
+    # Freeze mode dispatch (fine-tuning)
+    # ------------------------------------------------------------------
+
+    _FREEZE_MODES = (
+        'full_unfreeze',
+        'backbone_only',
+        'backbone_plus_encoders',
+        'decoder_plus_heads',
+        'heads_only',
+    )
+
+    def apply_freeze_mode(self, mode: str) -> None:
+        """Apply a named freeze configuration for fine-tuning.
+
+        Normalization layers (GroupNorm, LayerNorm) keep their affine
+        parameters trainable in all modes so that running statistics can
+        adapt to the new data distribution (norm adaptation).
+
+        Modes (from least to most constrained):
+            full_unfreeze          All parameters trainable.
+            backbone_only          Freeze signal_processor + reduction +
+                                   signal_encoder.
+            backbone_plus_encoders Freeze backbone + both VAE encoders.
+            decoder_plus_heads     Freeze everything except decoder +
+                                   MDN heads.
+            heads_only             Only MDN output heads are trainable.
+        """
+        if mode not in self._FREEZE_MODES:
+            raise ValueError(
+                f"Unknown freeze_mode '{mode}'. "
+                f"Valid modes: {self._FREEZE_MODES}"
+            )
+
+        if mode == 'full_unfreeze':
+            return  # Nothing to freeze
+
+        # Define which top-level modules to freeze for each mode.
+        backbone_modules = [self.signal_processor, self.reduction,
+                            self.signal_encoder]
+        encoder_modules = [self.tumor_encoder, self.background_encoder]
+        latent_modules = [self.tfx_discriminator, self.weight_predictor,
+                          self.merge_latents]
+        decoder_modules = [self.decoder]
+        head_modules = [self.tumor_mdn_head, self.background_mdn_head]
+
+        freeze_map = {
+            'backbone_only': backbone_modules,
+            'backbone_plus_encoders': backbone_modules + encoder_modules,
+            'decoder_plus_heads': (backbone_modules + encoder_modules
+                                   + latent_modules),
+            'heads_only': (backbone_modules + encoder_modules
+                           + latent_modules + decoder_modules),
+        }
+
+        modules_to_freeze = freeze_map[mode]
+        norm_types = (nn.GroupNorm, nn.LayerNorm, nn.BatchNorm1d,
+                      nn.BatchNorm2d)
+
+        for mod in modules_to_freeze:
+            for name, param in mod.named_parameters():
+                # Keep normalization affine params trainable for distribution
+                # adaptation, freeze everything else.
+                is_norm = False
+                for sub_name, sub_mod in mod.named_modules():
+                    if isinstance(sub_mod, norm_types):
+                        for pname, _ in sub_mod.named_parameters():
+                            full = f"{sub_name}.{pname}" if sub_name else pname
+                            if name == full:
+                                is_norm = True
+                                break
+                    if is_norm:
+                        break
+                if not is_norm:
+                    param.requires_grad = False
+
 
 class BioDVN_NoSeq(BioDVN):
     """
@@ -934,4 +1011,198 @@ class SignalProcessingBlock_NoSeq(nn.Module):
         x = self.conv1d_signals(x_signals.permute(0, 2, 1))
         x = x.permute(0, 2, 1)
         
+        return x
+
+
+class BioDVN_OnlySeq(BioDVN):
+    """
+    BioDVN variant using only nucleotide sequence information.
+    Drops all 9 biological signal channels, keeping only the 4 one-hot
+    encoded nucleotide channels processed via Conv2D.
+
+    To ensure a true sequence-only ablation, this variant also excludes
+    sample-derived scalar features (TSS_features, GB_features) from the
+    encoder input.  Only reference scalars (gene-level annotation constants
+    that do not vary across samples) are retained alongside the encoded
+    nucleotide signal.
+    """
+
+    def __init__(self, config: Optional[BioDVNConfig] = None):
+        super().__init__(config)
+
+        # Override signal processor to only use nucleotide channels
+        self.signal_processor = SignalProcessingBlock_OnlySeq(
+            signal_filters=self.config.signal_filters,
+            signal_ksize=self.config.signal_ksize,
+        )
+
+        # Only nucleotide-derived channels: 1 * signal_filters
+        signal_channels = 1 * self.config.signal_filters
+
+        # Recreate reduction block with correct input channels
+        self.reduction = ReductionBlock(
+            in_channels=signal_channels,
+            initial_reduction_channels=self.config.initial_reduction_channels,
+            n_reductions=self.config.n_reductions,
+            interaction_ksize=self.config.interaction_ksize,
+            dilation=self.config.reduction_dilation,
+        )
+
+        # Exclude sample-derived scalar features (TSS_features=11, GB_features=11).
+        # Only reference scalars (3) are retained — these are gene-level
+        # constants (NumExons, transcript_length, mRNA_size) that do not
+        # vary across samples.
+        self.scalar_input_dim = 3  # ref_scalars only
+        self.encoder_input_dim = int(self.signal_encoded_dim + self.scalar_input_dim)
+
+        # Rebuild all layers downstream of the encoder input dimension change.
+        self.tumor_encoder = Encoder(
+            input_dim=self.encoder_input_dim,
+            latent_dim=self.config.latent_size,
+            start_dim=self.config.encoder_start,
+            dropout_rate=self.config.dropout_rate,
+        )
+        self.background_encoder = Encoder(
+            input_dim=self.encoder_input_dim,
+            latent_dim=self.config.latent_size,
+            start_dim=self.config.encoder_start,
+            dropout_rate=self.config.dropout_rate,
+        )
+        self.decoder = Decoder(
+            input_dim=self.config.latent_size,
+            output_dim=self.encoder_input_dim,
+            start_dim=self.config.decoder_start,
+            dropout_rate=0.0,
+        )
+
+        # Re-apply weight initialization to all newly created layers
+        self.signal_processor.apply(self._init_weights)
+        self.reduction.apply(self._init_weights)
+        self.tumor_encoder.apply(self._init_weights)
+        self.background_encoder.apply(self._init_weights)
+        self.decoder.apply(self._init_weights)
+
+    def forward(
+        self,
+        features: Dict[str, torch.Tensor],
+        return_internal_loss: bool = True,
+        tfx: Optional[torch.Tensor] = None,
+    ) -> Tuple[Dict[str, torch.Tensor], Optional[Tuple[torch.Tensor, Dict]]]:
+        """Forward pass using only nucleotide sequence + reference scalars."""
+        x_nucleotides = features['TSS_nucleotides']
+        ref_scalars = features['ref_scalars']
+
+        # Signal processing (nucleotide-only)
+        x = self.signal_processor(None, x_nucleotides)
+
+        # Spatial reduction
+        x = self.reduction(x)
+
+        # Flatten + encode spatial features
+        x_flat = x.reshape(x.shape[0], -1)
+        x_encoded = self.signal_encoder(x_flat)
+
+        # Encoder input: signal encoding + reference scalars only.
+        # TSS_features and GB_features are deliberately excluded — they
+        # are sample-derived fragmentomic summaries that would leak
+        # biological signal information into the sequence-only ablation.
+        y = torch.cat([x_encoded, ref_scalars], dim=1)
+
+        # Dual encoding
+        z_tumor_mean, z_tumor_log_var = self.tumor_encoder(y)
+        z_background_mean, z_background_log_var = self.background_encoder(y)
+
+        # Sampling
+        z_tumor = self.sampling(z_tumor_mean, z_tumor_log_var)
+        z_background = self.sampling(z_background_mean, z_background_log_var)
+
+        # TFX discriminator + merge
+        predicted_tfx = self.tfx_discriminator(z_tumor_mean, z_background_mean)
+
+        grl_loss = None
+        if self.training:
+            if tfx is None:
+                raise ValueError(
+                    "tfx (ground-truth tumor fraction) must be provided "
+                    "during training for the GRL discriminator loss."
+                )
+            grl_loss = F.mse_loss(predicted_tfx.float(), tfx.float())
+
+        merge_input = torch.cat([
+            predicted_tfx, z_tumor_mean, z_tumor_log_var,
+            z_background_mean, z_background_log_var,
+        ], dim=1)
+        weights = self.weight_predictor(merge_input)
+
+        z_merged_mean, z_merged_log_var = self.merge_latents(
+            weights, z_tumor_mean, z_tumor_log_var,
+            z_background_mean, z_background_log_var,
+        )
+        z_merged = self.sampling(z_merged_mean, z_merged_log_var)
+
+        # Reconstruction
+        y_reconstructed = self.decoder(z_merged)
+
+        # MDN output heads
+        tumor_mdn = self.tumor_mdn_head(z_tumor)
+        background_mdn = self.background_mdn_head(z_background)
+
+        tumor_exp = mixture_mean(tumor_mdn)
+        background_exp = mixture_mean(background_mdn)
+
+        predictions = {
+            'tumor_mdn': tumor_mdn,
+            'background_mdn': background_mdn,
+            'tumor_exp': tumor_exp,
+            'background_exp': background_exp,
+        }
+
+        if return_internal_loss and self.training:
+            internal_loss, internal_metrics = self.internal_loss_fn(
+                z_tumor, z_background,
+                z_tumor_mean, z_tumor_log_var,
+                z_background_mean, z_background_log_var,
+                y, y_reconstructed,
+                grl_loss=grl_loss,
+            )
+            return predictions, (internal_loss, internal_metrics)
+
+        return predictions, None
+
+
+class SignalProcessingBlock_OnlySeq(nn.Module):
+    """
+    Signal processing using only nucleotide sequence channels.
+    Processes the 4 one-hot nucleotide channels via Conv2D, ignoring
+    biological signal channels entirely.
+    """
+
+    def __init__(self, signal_filters: int = 16, signal_ksize: int = 6):
+        super().__init__()
+        self.signal_filters = signal_filters
+
+        # Conv2D for nucleotide channels: (batch, 1, 4, 2000) -> (batch, filters, 1, ~1995)
+        self.conv2d_nt = nn.Sequential(
+            nn.Conv2d(1, signal_filters, kernel_size=(4, signal_ksize), padding=0),
+            get_norm_layer_2d(signal_filters),
+            nn.ReLU(),
+        )
+
+    def forward(self, x_signals: torch.Tensor = None, x_nucleotides: torch.Tensor = None) -> torch.Tensor:
+        """
+        Process only nucleotide channels (ignore biological signals).
+
+        Args:
+            x_signals: Ignored (for interface compatibility).
+            x_nucleotides: TSS_nucleotides tensor of shape (batch, 2000, 4)
+
+        Returns:
+            Processed tensor of shape (batch, ~1995, signal_filters)
+        """
+        # (batch, 2000, 4) -> (batch, 4, 2000) -> (batch, 1, 4, 2000)
+        x_nt_2d = x_nucleotides.permute(0, 2, 1).unsqueeze(1)
+        x_nt_conv = self.conv2d_nt(x_nt_2d)   # (batch, signal_filters, 1, ~1995)
+        x_nt_conv = x_nt_conv.squeeze(2)       # (batch, signal_filters, ~1995)
+        x = x_nt_conv.permute(0, 2, 1)         # (batch, ~1995, signal_filters)
+
         return x

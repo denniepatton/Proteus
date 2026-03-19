@@ -17,14 +17,14 @@ from torch.utils.data import DataLoader
 try:
     from torch.amp import autocast, GradScaler  # type: ignore[attr-defined]
     _USE_TORCH_AMP = True
-except Exception:
+except (ImportError, AttributeError):
     from torch.cuda.amp import autocast, GradScaler  # type: ignore[assignment]
     _USE_TORCH_AMP = False
 
 # Progress bars (optional)
 try:
     from tqdm.auto import tqdm
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     tqdm = None
 
 try:
@@ -36,7 +36,7 @@ try:
         TimeRemainingColumn,
         TextColumn,
     )
-except Exception:  # pragma: no cover
+except ImportError:  # pragma: no cover
     Progress = None
 
 # Local imports
@@ -52,18 +52,18 @@ from models.model_utils import (
 class TrainingConfig:
     """Configuration for training."""
     # Optimizer settings
-    weight_decay: float = 0.002
+    weight_decay: float = 1e-5
     
     # LR schedule settings (step-based cosine annealing with warmup)
-    max_lr: float = 0.001        # Peak learning rate
-    min_lr_ratio: float = 1e-4   # Minimum LR as fraction of max_lr (eta_min = min_lr_ratio * max_lr)
-    warmup_start_lr: float = 0.0 # LR at the start of warmup (0 = start from 0)
-    warmup_frac: float = 0.0     # Warmup as fraction of total training steps
-    schedule_frac: float = 1.0   # Fraction of total training for cosine cycle (1.0 = full, 0.5 = half)
+    max_lr: float = 0.0015       # Peak learning rate
+    min_lr_ratio: float = 5e-4   # Minimum LR as fraction of max_lr (eta_min = min_lr_ratio * max_lr)
+    warmup_start_lr: float = 2.5e-4 # LR at the start of warmup (0 = start from 0)
+    warmup_frac: float = 0.10    # Warmup as fraction of total training steps
+    schedule_frac: float = 0.90  # Fraction of total training for cosine cycle (1.0 = full, 0.5 = half)
     
     # Training settings
     epochs: int = 15
-    max_grad_norm: float = 1.0  # Gradient clipping threshold (prevents explosion)
+    max_grad_norm: float = 18.0  # Gradient clipping threshold (prevents explosion)
     
     # Mixed precision
     use_amp: bool = True
@@ -76,7 +76,7 @@ class TrainingConfig:
     compile_mode: str = 'reduce-overhead'  # 'default', 'reduce-overhead', 'max-autotune'
     
     # Early stopping
-    patience: int = 5
+    patience: int = 3
     min_delta: float = 0.0
     
     # Checkpointing
@@ -101,7 +101,9 @@ class TrainingConfig:
     
     # Transfer learning
     freeze_level: Optional[str] = None  # 'Medium-Heavy', 'Heavy', 'Extra-Heavy', 'Extreme'
+    freeze_mode: Optional[str] = None   # 'full_unfreeze', 'backbone_only', etc.
     base_weights: Optional[str] = None
+    backbone_lr_multiplier: float = 1.0  # Multiplier for backbone param group LR
 
 
 class CosineDecayScheduler:
@@ -242,8 +244,10 @@ class Trainer:
         if config.base_weights is not None:
             self._load_weights(config.base_weights)
         
-        # Apply freezing if specified
-        if config.freeze_level is not None:
+        # Apply freezing if specified (freeze_mode takes precedence)
+        if config.freeze_mode is not None:
+            self._apply_freeze_mode(config.freeze_mode)
+        elif config.freeze_level is not None:
             self._apply_freeze_level(config.freeze_level)
 
         # Optimizer is created lazily (after optional warmup/compile) to ensure
@@ -293,18 +297,46 @@ class Trainer:
         self._active_rich_progress = None
         self._active_pbar = None
 
+    _BACKBONE_MODULE_PREFIXES = (
+        'signal_processor.', 'reduction.', 'signal_encoder.',
+    )
+
     def _create_optimizer(self) -> torch.optim.Optimizer:
+        mult = self.config.backbone_lr_multiplier
+        use_groups = mult < 1.0
+
+        if use_groups:
+            backbone_params = []
+            other_params = []
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if any(name.startswith(p) for p in self._BACKBONE_MODULE_PREFIXES):
+                    backbone_params.append(param)
+                else:
+                    other_params.append(param)
+            param_groups = [
+                {'params': other_params, 'lr': self.config.max_lr},
+                {'params': backbone_params, 'lr': self.config.max_lr * mult},
+            ]
+            print(f'  Differential LR: backbone={self.config.max_lr * mult:.2e} '
+                  f'({len(backbone_params)} params), '
+                  f'other={self.config.max_lr:.2e} ({len(other_params)} params)')
+        else:
+            param_groups = filter(lambda p: p.requires_grad,
+                                  self.model.parameters())
+
         # Optimizer with fused AdamW if available (PyTorch 2.0+)
         try:
             return torch.optim.AdamW(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
+                param_groups,
                 lr=self.config.max_lr,
                 weight_decay=self.config.weight_decay,
                 fused=True,
             )
         except TypeError:
             return torch.optim.AdamW(
-                filter(lambda p: p.requires_grad, self.model.parameters()),
+                param_groups,
                 lr=self.config.max_lr,
                 weight_decay=self.config.weight_decay,
             )
@@ -375,9 +407,19 @@ class Trainer:
                 pass
     
     def _load_weights(self, weights_path: str):
-        """Load pre-trained weights."""
+        """Load pre-trained weights (raw state_dict or full checkpoint)."""
         print(f'Loading weights from {weights_path}')
-        state_dict = torch.load(weights_path, map_location=self.device)
+        loaded = torch.load(
+            weights_path,
+            map_location=self.device,
+            weights_only=False,
+        )
+        # Full checkpoint dict has 'model_state_dict'; raw saves are the
+        # state_dict directly.
+        if isinstance(loaded, dict) and 'model_state_dict' in loaded:
+            state_dict = loaded['model_state_dict']
+        else:
+            state_dict = loaded
         self.model.load_state_dict(state_dict, strict=False)
     
     def _apply_freeze_level(self, level: str):
@@ -396,6 +438,14 @@ class Trainer:
                 for name, param in self.model.background_encoder.named_parameters():
                     if any(f'layers.{i}' in name for i in range(4)):
                         param.requires_grad = False
+
+    def _apply_freeze_mode(self, mode: str):
+        """Apply freeze_mode via the model's apply_freeze_mode() dispatch."""
+        print(f'Applying freeze mode: {mode}')
+        self.model.apply_freeze_mode(mode)
+        n_frozen = sum(1 for p in self.model.parameters() if not p.requires_grad)
+        n_total = sum(1 for p in self.model.parameters())
+        print(f'  Frozen {n_frozen}/{n_total} parameter tensors')
     
     def _move_batch_to_device(
         self,
@@ -502,6 +552,17 @@ class Trainer:
             for i, b in enumerate(data_iter, start=1):
                 yield i, b
 
+        # AMP non-finite tracking.  Float16 forward passes can produce
+        # non-finite results when intermediate conv outputs exceed fp16
+        # range (~65504).  PyTorch's GradScaler is designed to handle this:
+        # it detects non-finite gradients and skips the optimizer step,
+        # preventing weight corruption.  We allow a small number of
+        # consecutive non-finite batches before treating it as a fatal
+        # divergence (which would indicate a root-cause issue beyond
+        # transient fp16 overflow).
+        _MAX_CONSECUTIVE_NAN = 3
+        _consecutive_nan = 0
+
         # Reset timing origin now that we've accounted for first-batch wait.
         last_iter_end = time.time()
 
@@ -548,22 +609,25 @@ class Trainer:
                 internal_metrics = {}
                 total_loss = external_loss
 
-            # Fail-fast on non-finite loss to avoid corrupting weights.
-            # This is especially important under AMP, where a single NaN step
-            # can poison subsequent epochs.
-            if not torch.isfinite(total_loss):
+            # ----------------------------------------------------------
+            # Non-finite loss handling
+            # ----------------------------------------------------------
+            _loss_is_finite = torch.isfinite(total_loss)
+            if not _loss_is_finite:
+                _consecutive_nan += 1
                 current_lr = (
                     self.scheduler.get_last_lr()[0]
                     if self.scheduler is not None
                     else self.config.max_lr
                 )
+
+                # Build diagnostic breakdown (used for both warning and fatal).
                 ext_val = float(external_loss.detach().cpu().item())
                 int_val = (
                     float(internal_loss.detach().cpu().item())
                     if internal_loss_result is not None
                     else 'N/A'
                 )
-                # Build per-component breakdown for diagnosis.
                 parts = []
                 for k, v in external_metrics.items():
                     val = float(v) if not isinstance(v, torch.Tensor) else float(v.detach().cpu().item())
@@ -572,12 +636,51 @@ class Trainer:
                     val = float(v) if not isinstance(v, torch.Tensor) else float(v.detach().cpu().item())
                     parts.append(f'{k}={val}')
                 breakdown = ', '.join(parts)
-                raise RuntimeError(
-                    f'Non-finite total_loss={float(total_loss.detach().cpu().item())} '
-                    f'(external={ext_val}, internal={int_val}) '
-                    f'at batch {batch_idx} (lr={current_lr:.3e}). '
-                    f'Components: {breakdown}'
+
+                # Identify where the NaN originates.
+                origin_parts = []
+                for fname, ftensor in features.items():
+                    if isinstance(ftensor, torch.Tensor) and not torch.isfinite(ftensor).all():
+                        n_bad = int((~torch.isfinite(ftensor)).sum().item())
+                        origin_parts.append(f'input:{fname}({n_bad} non-finite)')
+                for pname in ('tumor_mdn', 'background_mdn'):
+                    if pname in predictions:
+                        for pk, pv in predictions[pname].items():
+                            if isinstance(pv, torch.Tensor) and not torch.isfinite(pv).all():
+                                n_bad = int((~torch.isfinite(pv)).sum().item())
+                                origin_parts.append(f'{pname}.{pk}({n_bad} non-finite)')
+                origin_info = '; '.join(origin_parts) if origin_parts else 'undetermined'
+
+                if not self.use_amp or _consecutive_nan > _MAX_CONSECUTIVE_NAN:
+                    # Without AMP there is no GradScaler to recover, so NaN
+                    # is always fatal.  With AMP, persistent NaN (beyond the
+                    # tolerance) indicates a root-cause issue rather than
+                    # transient fp16 overflow.
+                    raise RuntimeError(
+                        f'Non-finite total_loss={float(total_loss.detach().cpu().item())} '
+                        f'(external={ext_val}, internal={int_val}) '
+                        f'at batch {batch_idx} (lr={current_lr:.3e}). '
+                        f'Consecutive non-finite batches: {_consecutive_nan}. '
+                        f'Origin: {origin_info}. '
+                        f'Components: {breakdown}'
+                    )
+
+                # Transient fp16 overflow under AMP: skip this batch's
+                # weight update.  The GradScaler detects non-finite
+                # gradients after backward/unscale and skips the optimizer
+                # step automatically, then halves its internal scale to
+                # reduce future overflow probability.  Model weights are
+                # NOT modified — this is safe by design.
+                print(
+                    f'  [AMP] Non-finite loss at batch {batch_idx} '
+                    f'(lr={current_lr:.3e}, skip {_consecutive_nan}/{_MAX_CONSECUTIVE_NAN}). '
+                    f'Origin: {origin_info}. '
+                    f'GradScaler will skip optimizer step and reduce scale.',
+                    flush=True,
                 )
+                # Fall through to backward — GradScaler handles the rest.
+            else:
+                _consecutive_nan = 0
             
             # Backward pass with gradient scaling
             if self.use_amp:
@@ -606,13 +709,15 @@ class Trainer:
                 iter_time = data_time + step_time
                 ema_iter_time = iter_time if ema_iter_time is None else (1 - alpha) * ema_iter_time + alpha * iter_time
             
-            # Track metrics - use TSS_signals for batch size
-            batch_size = features['TSS_signals'].shape[0]
-            metrics_tracker.update('loss', total_loss.item(), batch_size)
-            for k, v in external_metrics.items():
-                metrics_tracker.update(k, float(v) if not isinstance(v, torch.Tensor) else float(v.detach().cpu().item()), batch_size)
-            for k, v in internal_metrics.items():
-                metrics_tracker.update(k, float(v) if not isinstance(v, torch.Tensor) else float(v.detach().cpu().item()), batch_size)
+            # Track metrics - use TSS_signals for batch size.
+            # Skip on non-finite loss to avoid polluting running averages.
+            if _loss_is_finite:
+                batch_size = features['TSS_signals'].shape[0]
+                metrics_tracker.update('loss', total_loss.item(), batch_size)
+                for k, v in external_metrics.items():
+                    metrics_tracker.update(k, float(v) if not isinstance(v, torch.Tensor) else float(v.detach().cpu().item()), batch_size)
+                for k, v in internal_metrics.items():
+                    metrics_tracker.update(k, float(v) if not isinstance(v, torch.Tensor) else float(v.detach().cpu().item()), batch_size)
             
             # Logging
             if batch_idx % self.config.log_interval == 0:
@@ -749,15 +854,25 @@ class Trainer:
                 data_time = time.time() - last_iter_end
             features, labels = self._move_batch_to_device(features, labels)
 
+            # Run validation forward pass in full float32 (AMP disabled).
+            # Unlike training, validation has no GradScaler to recover from
+            # fp16 overflow — a single non-finite batch poisons the entire
+            # epoch's running metrics.  The validation wall-clock cost is
+            # dominated by data loading, so the fp16 speed-up is negligible.
             if _USE_TORCH_AMP:
-                amp_ctx = autocast(device_type=self.device.type, enabled=self.use_amp)
+                amp_ctx = autocast(device_type=self.device.type, enabled=False)
             else:
-                amp_ctx = autocast(enabled=self.use_amp)
+                amp_ctx = autocast(enabled=False)
 
             with amp_ctx:
+                # Ensure model inputs are float32 (weights may still be fp32
+                # from training; inputs moved to device may inherit fp16 from
+                # a prior autocast context, but with autocast disabled they
+                # stay in their storage dtype which is float32 from the
+                # dataloader).
                 predictions, _ = self.model(features, return_internal_loss=False)
 
-            # Compute loss in float32 (outside autocast), same as training loop.
+            # Compute loss in float32, same as training loop.
             external_loss, external_metrics = self.external_loss_fn(
                 predictions,
                 labels,
@@ -1041,7 +1156,11 @@ class Trainer:
     
     def load_checkpoint(self, path: str):
         """Load model from checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(
+            path,
+            map_location=self.device,
+            weights_only=False,
+        )
 
         model_for_load = getattr(self.model, '_orig_mod', self.model)
         model_for_load.load_state_dict(checkpoint['model_state_dict'])

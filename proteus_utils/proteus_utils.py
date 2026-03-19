@@ -132,7 +132,8 @@ class ProteusGeneDataset(Dataset):
     def __len__(self) -> int:
         if self._explicit_pairs is not None:
             return len(self._explicit_pairs)
-        assert self._cum_gene_offsets is not None
+        if self._cum_gene_offsets is None:
+            raise RuntimeError('Dataset not initialized: _cum_gene_offsets is None')
         return self._cum_gene_offsets[-1]
 
     def _get_store(self, zarr_path: str) -> zarr.Group:
@@ -177,8 +178,8 @@ class ProteusGeneDataset(Dataset):
             data_grp = store['flat']
             gene_idx = self._resolve_gene_index(store, zarr_path, gene_id)
         else:
-            assert self._sample_paths is not None
-            assert self._cum_gene_offsets is not None
+            if self._sample_paths is None or self._cum_gene_offsets is None:
+                raise RuntimeError('Dataset not initialized: _sample_paths or _cum_gene_offsets is None')
             # Find which sample this gene index belongs to
             sample_i = bisect.bisect_right(self._cum_gene_offsets, idx) - 1
             zarr_path = self._sample_paths[sample_i]
@@ -257,6 +258,8 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         gene_weights: Optional[Dict[str, float]] = None,
         val_frac: Optional[float] = None,
         val_split: bool = False,
+        cohort_map: Optional[Dict[str, str]] = None,
+        balance_cohorts: Optional[List[str]] = None,
     ):
         super().__init__()
         self.index_file = str(index_file)
@@ -270,6 +273,9 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         self.gene_weights = gene_weights
         self.val_frac = val_frac
         self.val_split = val_split
+        self.cohort_map = cohort_map       # zarr_path -> cohort name
+        self.balance_cohorts = balance_cohorts  # cohorts to balance
+        self._balance_iter = 0
 
         if self.genes_per_batch <= 0:
             raise ValueError('genes_per_batch must be > 0')
@@ -331,17 +337,64 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
                 self._chunks = [c for i, c in enumerate(self._chunks) if i not in val_indices]
 
         # Compute how many fixed-size microbatches we will yield.
-        self._n_batches = 0
-        for _path, start, end in self._chunks:
-            self._n_batches += max(0, int((int(end) - int(start)) // self.genes_per_batch))
+        self._n_batches = self._count_batches(self._chunks)
 
         # These caches live per-process (per DataLoader worker).
         self._store_cache: Dict[str, zarr.Group] = {}
         self._flat_grp_cache: Dict[str, zarr.Group] = {}
         self._gene_names_cache: Dict[str, List[str]] = {}
 
+    def _count_batches(self, chunks: List[Tuple[str, int, int]]) -> int:
+        n_batches = 0
+        for _path, start, end in chunks:
+            n_batches += max(0, int((int(end) - int(start)) // self.genes_per_batch))
+        return int(n_batches)
+
     def __len__(self) -> int:
+        if self.cohort_map and self.balance_cohorts:
+            next_epoch = self._balance_iter + 1
+            return self._count_batches(self._balanced_chunks(next_epoch))
         return int(self._n_batches)
+
+    def _balanced_chunks(self, epoch: int) -> List[Tuple[str, int, int]]:
+        """Return chunks filtered for cohort-balanced training.
+
+        For each epoch, selects a balanced subset of samples from the
+        cohorts listed in ``balance_cohorts`` (minority count rules).
+        Samples from cohorts NOT in ``balance_cohorts`` (e.g. PDX
+        admixtures) are always included at full count.
+        """
+        # Group sample paths by cohort.
+        from collections import defaultdict
+        cohort_paths: Dict[str, List[str]] = defaultdict(list)
+        all_paths = set()
+        for path in self.sample_paths:
+            coh = self.cohort_map.get(path, None)
+            if coh is not None:
+                cohort_paths[coh].append(path)
+            all_paths.add(path)
+
+        # Find minority count among balance cohorts.
+        counts = {c: len(cohort_paths[c]) for c in self.balance_cohorts
+                  if c in cohort_paths}
+        if not counts:
+            return self._chunks
+        n_min = min(counts.values())
+
+        # Select balanced subset with epoch-varying seed.
+        rng = random.Random(self.seed + epoch * 997)
+        selected_paths: set = set()
+        for coh in self.balance_cohorts:
+            paths = cohort_paths.get(coh, [])
+            chosen = rng.sample(paths, min(n_min, len(paths)))
+            selected_paths.update(chosen)
+
+        # Always include paths from non-balanced cohorts.
+        for coh, paths in cohort_paths.items():
+            if coh not in self.balance_cohorts:
+                selected_paths.update(paths)
+
+        return [c for c in self._chunks if c[0] in selected_paths]
 
     def _get_store(self, zarr_path: str) -> zarr.Group:
         if self.cache_stores:
@@ -387,9 +440,17 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
             worker_id = int(worker_info.id)
             num_workers = int(worker_info.num_workers)
 
+        # Per-epoch cohort-balanced filtering.  _balance_iter increments
+        # on every __iter__() call so each worker (persistent or not)
+        # deterministically varies the selected majority-cohort samples.
+        active_chunks = self._chunks
+        if self.cohort_map and self.balance_cohorts:
+            self._balance_iter += 1
+            active_chunks = self._balanced_chunks(self._balance_iter)
+
         # Deterministic sharding of chunks across workers.
-        for chunk_idx in range(worker_id, len(self._chunks), num_workers):
-            zarr_path, start, end = self._chunks[chunk_idx]
+        for chunk_idx in range(worker_id, len(active_chunks), num_workers):
+            zarr_path, start, end = active_chunks[chunk_idx]
             store = self._get_store(zarr_path)
             data_grp = self._get_flat_grp(zarr_path)
 
@@ -565,6 +626,8 @@ def create_data_loader(
     gene_weights: Optional[Dict[str, float]] = None,
     val_frac: Optional[float] = None,
     val_split: bool = False,
+    cohort_map: Optional[Dict[str, str]] = None,
+    balance_cohorts: Optional[List[str]] = None,
 ) -> Tuple[DataLoader, int]:
     """
     Create a DataLoader for Proteus training/validation.
@@ -616,6 +679,8 @@ def create_data_loader(
             gene_weights=gene_weights,
             val_frac=val_frac,
             val_split=val_split,
+            cohort_map=cohort_map,
+            balance_cohorts=balance_cohorts,
         )
 
         # IterableDataset already yields fixed-size training batches.
@@ -701,6 +766,8 @@ def build_loaders_from_splits(
     seed: int = 42,
     subsample_frac: Optional[float] = None,
     gene_weights: Optional[Dict[str, float]] = None,
+    train_only_cohorts: Optional[List[str]] = None,
+    balance_cohorts: Optional[List[str]] = None,
 ) -> Tuple[DataLoader, DataLoader, int, int]:
     """Build train/val DataLoaders from a deterministic splits TSV file.
 
@@ -723,6 +790,13 @@ def build_loaders_from_splits(
         seed: Random seed for reproducibility.
         subsample_frac: Optional fraction (0.0-1.0) of genes to use per epoch.
                         Useful for fast sanity checks. None = use all genes.
+        train_only_cohorts: Cohorts that always go to training (never
+                            validation), regardless of fold assignment.
+                            E.g. ``['PHT']`` for PDX admixtures.
+        balance_cohorts: Cohorts to balance by per-epoch undersampling
+                         of the majority cohort(s) to the minority count.
+                         E.g. ``['CRPC-RA', 'SCLC']``.  Cohorts not
+                         listed are always included at full count.
 
     Returns:
         (train_loader, val_loader, train_steps, val_steps)
@@ -739,6 +813,8 @@ def build_loaders_from_splits(
     train_paths: List[str] = []
     val_paths: List[str] = []
     missing_samples: List[str] = []
+    zarr_path_to_cohort: Dict[str, str] = {}       # for cohort balancing
+    _train_only = set(train_only_cohorts or [])
 
     with open(training_set_tsv, 'r', newline='') as f:
         reader = csv.DictReader(f, delimiter='\t')
@@ -764,7 +840,12 @@ def build_loaders_from_splits(
                 missing_samples.append(f"  {cohort}/zarr_files/{sample_name}.zarr  (Fold={fold}, TSV sample={sample})")
                 continue
 
-            if fold == val_fold:
+            zarr_path_to_cohort[zarr_path] = cohort
+
+            if cohort in _train_only:
+                # Always route to training (e.g. PDX admixtures).
+                train_paths.append(zarr_path)
+            elif fold == val_fold:
                 val_paths.append(zarr_path)
             else:
                 train_paths.append(zarr_path)
@@ -814,6 +895,8 @@ def build_loaders_from_splits(
         drop_last=(loader_mode.lower() == 'gene'),
         subsample_frac=subsample_frac,
         gene_weights=gene_weights,
+        cohort_map=zarr_path_to_cohort if balance_cohorts else None,
+        balance_cohorts=balance_cohorts,
     )
 
     val_loader, val_steps = create_data_loader(

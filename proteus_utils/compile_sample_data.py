@@ -272,12 +272,16 @@ def get_samples_from_tfx(tfx_path: Union[str, int, float, None]) -> List[str]:
 # =============================================================================
 
 def _scale_signal(input_array: np.ndarray) -> np.ndarray:
-    """Scale an input array by dividing by its mean (avoid division by zero/Inf)."""
+    """Scale an input array by dividing by its mean (avoid division by zero/Inf).
+
+    After division the expected baseline is ~1.0.  Values beyond [-10, 10] are
+    extreme spikes (>10× the gene-level mean) and are clipped to prevent
+    float16 overflow under AMP and to suppress noise.
+    """
     mean_val = np.nanmean(input_array)
     if mean_val > 1e-10 and not np.isnan(mean_val):  # Use small threshold, not just != 0
         result = input_array / mean_val
-        # Clip any Inf values that might result from extreme inputs
-        result = np.clip(result, -1e6, 1e6)
+        result = np.clip(result, -10.0, 10.0)
         return result
     return input_array
 

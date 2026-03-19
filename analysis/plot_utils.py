@@ -25,14 +25,8 @@ import seaborn as sns
 from scipy.stats import pearsonr, spearmanr
 
 from .analysis_utils import (
-    _pearson_r,
-    _spearman_rho,
-    compute_gene_variance,
     format_pval,
     load_palette,
-    pearson_with_ci,
-    spearman_with_ci,
-    VARIANCE_BINS,
 )
 
 # ---------------------------------------------------------------------------
@@ -65,63 +59,7 @@ def _ensure_dir(path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 1. (removed — density_scatter)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 2. (removed — scatter_by_gene_set)
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# 3. Variance-group boxplot
-# ---------------------------------------------------------------------------
-
-def variance_group_boxplot(
-    gene_metrics: pd.DataFrame,
-    var_map: Dict[str, float],
-    name: str,
-    *,
-    metric: str = "pearson_r",
-    title: Optional[str] = None,
-) -> None:
-    """Box + strip plot of per-gene metric split by variance group."""
-    _ensure_dir(name)
-    df = gene_metrics.copy()
-    df["variance"] = df.index.map(lambda g: var_map.get(g, 0.0))
-
-    def _bin(v: float) -> str:
-        for grp, (lo, hi) in VARIANCE_BINS.items():
-            if lo <= v < hi:
-                return grp
-        return "high"
-
-    df["group"] = df["variance"].apply(_bin)
-    order = ["low", "medium", "high"]
-
-    fig, ax = plt.subplots(figsize=(7, 5))
-    sns.violinplot(
-        x="group", y=metric, data=df, order=order, hue="group",
-        ax=ax, palette="Set2", legend=False, inner="quart", cut=0,
-    )
-
-    counts = df["group"].value_counts()
-    labels = [f"{g}\n(n={counts.get(g, 0):,})" for g in order]
-    tick_positions = list(range(len(order)))
-    ax.set_xticks(tick_positions)
-    ax.set_xticklabels(labels)
-    ax.set_ylabel(metric.replace("_", " ").title())
-    ax.set_xlabel("Variance Group")
-    ax.set_title(title or f"Per-gene {metric} by variance group")
-
-    fig.tight_layout()
-    fig.savefig(f"{name}.pdf", bbox_inches="tight")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# 4. Sample-level scatter (single sample: genes as dots)
+# Sample-level scatter (single sample: genes as dots)
 # ---------------------------------------------------------------------------
 
 def sample_scatter(
@@ -135,11 +73,15 @@ def sample_scatter(
     goi: Optional[Dict[str, List[str]]] = None,
     tfx: Optional[float] = None,
     depth: Optional[float] = None,
+    is_holdout: bool = False,
 ) -> None:
     """Scatter for one sample: genes as dots with hexbin density background.
 
     GOI genes are highlighted and colored by subtype (from goi dict keys).
     ``goi`` maps subtype name → list of gene names.
+
+    If ``is_holdout`` is True, GOI dots are drawn as filled diamonds
+    instead of filled circles.  Axes are fixed to [0, 15].
     """
     _ensure_dir(name)
 
@@ -159,8 +101,8 @@ def sample_scatter(
 
     fig, ax = plt.subplots(figsize=(8, 8))
 
-    # Hexbin density background (matches legacy scatter_plot)
-    axis_max = max(t.max(), p.max()) * 1.03
+    # Fixed axis range
+    axis_max = 15.0
     hb = ax.hexbin(
         t.values, p.values, gridsize=100, cmap="viridis_r", bins="log",
         extent=(0, axis_max, 0, axis_max),
@@ -190,10 +132,19 @@ def sample_scatter(
                 )
 
             color = pal.get(subtype, "#999999")
-            ax.scatter(
-                gt.values, gp.values,
-                s=300, edgecolors="black", linewidths=0.5, color=color, zorder=3,
-            )
+            if is_holdout:
+                # Filled diamond for holdout samples
+                ax.scatter(
+                    gt.values, gp.values,
+                    s=300, edgecolors="black", linewidths=0.5, color=color,
+                    marker="D", zorder=3,
+                )
+            else:
+                # Filled circle for validation samples
+                ax.scatter(
+                    gt.values, gp.values,
+                    s=300, edgecolors="black", linewidths=0.5, color=color, zorder=3,
+                )
             for g in present:
                 ax.annotate(
                     g, (gt[g], gp[g]),
@@ -210,7 +161,8 @@ def sample_scatter(
     ax.set_xlabel(r"RNA-Seq log$_2$(CPM+1)")
     ax.set_ylabel(r"Predicted log$_2$(CPM+1)")
 
-    info_lines = [sample_name]
+    status_tag = " [HO]" if is_holdout else ""
+    info_lines = [f"{sample_name}{status_tag}"]
     if tfx is not None:
         info_lines[0] += f"  TFx={tfx:.2f}"
     if depth is not None:
@@ -225,7 +177,7 @@ def sample_scatter(
 
 
 # ---------------------------------------------------------------------------
-# 5. Gene target scatter (samples as dots, colored by subtype)
+# Gene target scatter (samples as dots, colored by subtype)
 # ---------------------------------------------------------------------------
 
 def gene_target_scatter(
@@ -236,10 +188,13 @@ def gene_target_scatter(
     *,
     subtypes_df: Optional[pd.DataFrame] = None,
     tfx_dict: Optional[Dict[str, float]] = None,
+    ci_lo_wide: Optional[pd.DataFrame] = None,
+    ci_hi_wide: Optional[pd.DataFrame] = None,
 ) -> None:
     """Scatter: samples as dots for one gene, truth vs pred.
 
     Colored by subtype, sized by TFx.  Fit line + 95% CI band.
+    Vertical error bars show per-sample model CIs when available.
     """
     _ensure_dir(name)
     if gene not in truth_wide.index or gene not in pred_wide.index:
@@ -257,13 +212,31 @@ def gene_target_scatter(
     r_val, p_val = pearsonr(t.values, p.values)
     rmse = float(np.sqrt(np.mean((t.values - p.values) ** 2)))
 
+    # Dynamic axis range (includes CI bounds so bars are fully visible).
+    # Calibrated CIs are already clamped to [0, 19.93] by the calibrator.
+    all_vals = np.concatenate([t.values, p.values])
+    if (ci_lo_wide is not None and ci_hi_wide is not None
+            and gene in ci_lo_wide.index and gene in ci_hi_wide.index):
+        lo_ci_vals = ci_lo_wide.loc[gene, common].reindex(t.index).dropna().values
+        hi_ci_vals = ci_hi_wide.loc[gene, common].reindex(t.index).dropna().values
+        all_vals = np.concatenate([all_vals, lo_ci_vals, hi_ci_vals])
+    data_min = max(float(np.nanmin(all_vals)) - 0.5, 0.0)
+    data_max = float(np.nanmax(all_vals)) + 0.5
+    axis_lo = np.floor(data_min)
+    axis_hi = np.ceil(data_max)
+    # Ensure a minimum span of 2
+    if axis_hi - axis_lo < 2:
+        mid = (axis_lo + axis_hi) / 2
+        axis_lo = mid - 1
+        axis_hi = mid + 1
+
     fig, ax = plt.subplots(figsize=(6, 6))
 
     # Fit line
     coeffs = np.polyfit(t.values, p.values, 1)
     fit_fn = np.poly1d(coeffs)
-    x_line = np.linspace(t.min(), t.max(), 100)
-    ax.plot(x_line, fit_fn(x_line), "k-", lw=1, zorder=1)
+    x_line = np.linspace(axis_lo, axis_hi, 100)
+    ax.plot(x_line, np.clip(fit_fn(x_line), axis_lo, axis_hi), "k-", lw=1, zorder=1)
 
     # CI band
     n = len(t)
@@ -278,7 +251,22 @@ def gene_target_scatter(
 
         y_line = fit_fn(x_line)
         ci = t_val * s_err * np.sqrt(1 / n + (x_line - mean_x) ** 2 / Sxx)
-        ax.fill_between(x_line, y_line - ci, y_line + ci, color="gray", alpha=0.25, zorder=0)
+        ax.fill_between(x_line, np.clip(y_line - ci, axis_lo, axis_hi),
+                         np.clip(y_line + ci, axis_lo, axis_hi),
+                         color="gray", alpha=0.25, zorder=0)
+
+    # Per-sample CI series for this gene (if available)
+    has_ci = (
+        ci_lo_wide is not None
+        and ci_hi_wide is not None
+        and gene in ci_lo_wide.index
+        and gene in ci_hi_wide.index
+    )
+    ci_lo_gene: Optional[pd.Series] = None
+    ci_hi_gene: Optional[pd.Series] = None
+    if has_ci:
+        ci_lo_gene = ci_lo_wide.loc[gene, common].reindex(t.index).astype(np.float64)
+        ci_hi_gene = ci_hi_wide.loc[gene, common].reindex(t.index).astype(np.float64)
 
     # Plot points
     pal = _palette()
@@ -289,18 +277,38 @@ def gene_target_scatter(
             if tfx_dict is not None:
                 sz = max(30, tfx_dict.get(sample, 1.0) * 300)
             color = "#999999"
-            marker = "o"
+            is_holdout = False
             if sample in subtypes_df.index:
                 sub = subtypes_df.loc[sample, "subtype"] if "subtype" in subtypes_df.columns else "Unknown"
                 color = pal.get(sub, "#999999")
                 seen.add(sub)
                 if "status" in subtypes_df.columns:
-                    status = subtypes_df.loc[sample, "status"]
-                    marker = "^" if status == "holdout" else "o"
-            ax.scatter(
-                t[sample], p[sample], s=sz, c=color, marker=marker,
-                edgecolors="black", linewidths=0.5, alpha=0.75, zorder=2,
-            )
+                    is_holdout = subtypes_df.loc[sample, "status"] == "holdout"
+
+            # Error bar (CI) — drawn before marker so marker sits on top
+            if ci_lo_gene is not None and ci_hi_gene is not None:
+                lo = ci_lo_gene[sample]
+                hi = ci_hi_gene[sample]
+                if np.isfinite(lo) and np.isfinite(hi):
+                    ax.errorbar(
+                        t[sample], p[sample],
+                        yerr=[[max(p[sample] - lo, 0)], [max(hi - p[sample], 0)]],
+                        fmt="none", ecolor="black", elinewidth=0.8,
+                        capsize=2, zorder=2,
+                    )
+
+            if is_holdout:
+                # Filled diamond for holdout
+                ax.scatter(
+                    t[sample], p[sample], s=sz, c=color, marker="D",
+                    edgecolors="black", linewidths=0.5, alpha=0.75, zorder=3,
+                )
+            else:
+                # Filled circle for validation
+                ax.scatter(
+                    t[sample], p[sample], s=sz, c=color, marker="o",
+                    edgecolors="black", linewidths=0.5, alpha=0.75, zorder=3,
+                )
         handles = [
             plt.Line2D([0], [0], marker="o", color="w",
                        markerfacecolor=pal.get(s, "#999999"), markersize=8, label=s)
@@ -309,23 +317,39 @@ def gene_target_scatter(
         if handles:
             ax.legend(handles=handles, title="Subtype", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
     else:
+        # Error bars (CI) for the non-subtype branch
+        if ci_lo_gene is not None and ci_hi_gene is not None:
+            yerr_lo = (p - ci_lo_gene).clip(lower=0).values
+            yerr_hi = (ci_hi_gene - p).clip(lower=0).values
+            ax.errorbar(
+                t.values, p.values,
+                yerr=np.vstack([yerr_lo, yerr_hi]),
+                fmt="none", ecolor="black", elinewidth=0.8,
+                capsize=2, zorder=2,
+            )
         sizes = [200] * len(t)
         if tfx_dict is not None:
             sizes = [max(30, tfx_dict.get(s, 1.0) * 300) for s in t.index]
         ax.scatter(
             t.values, p.values, s=sizes,
-            edgecolors="black", linewidths=0.5, alpha=0.75, zorder=2,
+            edgecolors="black", linewidths=0.5, alpha=0.75, zorder=3,
         )
 
     ax.set_xlabel(r"RNA-Seq log$_2$(CPM+1)")
     ax.set_ylabel(r"Predicted log$_2$(CPM+1)")
+    ax.set_xlim(axis_lo, axis_hi)
+    ax.set_ylim(axis_lo, axis_hi)
+    tick_step = max(1, int(np.round((axis_hi - axis_lo) / 5)))
+    ticks = np.arange(axis_lo, axis_hi + tick_step, tick_step)
+    ax.set_xticks(ticks)
+    ax.set_yticks(ticks)
+    ax.set_box_aspect(1)
     ax.set_title(gene)
     ax.text(
         0.05, 0.95,
         f"Pearson r = {r_val:.3f}\n{format_pval(p_val)}\nRMSE = {rmse:.3f}",
         transform=ax.transAxes, va="top", fontsize=9,
     )
-    ax.set_aspect("equal", adjustable="box")
 
     fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
@@ -333,7 +357,7 @@ def gene_target_scatter(
 
 
 # ---------------------------------------------------------------------------
-# 6. Double heatmap (true vs pred side-by-side)
+# Double heatmap (true vs pred side-by-side)
 # ---------------------------------------------------------------------------
 
 def double_heatmap(
@@ -434,7 +458,7 @@ def double_heatmap(
 
 
 # ---------------------------------------------------------------------------
-# 7. Single heatmap with TFx bar
+# Single heatmap with TFx bar
 # ---------------------------------------------------------------------------
 
 def single_heatmap(
@@ -507,7 +531,7 @@ def single_heatmap(
 
 
 # ---------------------------------------------------------------------------
-# 8. Expression profile KDEs
+# Expression profile KDEs
 # ---------------------------------------------------------------------------
 
 def sample_expression_kde(
@@ -539,7 +563,7 @@ def sample_expression_kde(
 
 
 # ---------------------------------------------------------------------------
-# 9. Metric distribution histogram
+# Metric distribution histogram
 # ---------------------------------------------------------------------------
 
 def metric_distribution(
@@ -548,22 +572,32 @@ def metric_distribution(
     name: str,
     *,
     xlim: Optional[Tuple[float, float]] = None,
+    square: bool = False,
 ) -> None:
-    """Histogram + KDE of a per-gene or per-sample metric."""
+    """Histogram + KDE of a per-gene or per-sample metric.
+
+    If ``square`` is True, figure uses equal aspect and a dashed gray
+    vertical line is drawn at x=0.
+    """
     _ensure_dir(name)
     vals = values.dropna()
     if len(vals) < 3:
         return
 
-    fig, ax = plt.subplots(figsize=(7, 4))
+    size = (6, 6) if square else (7, 4)
+    fig, ax = plt.subplots(figsize=size)
     sns.histplot(vals, kde=True, stat="density", bins=40, ax=ax)
     ax.set_xlabel(metric_name.replace("_", " ").title())
     ax.set_ylabel("Density")
     ax.axvline(vals.mean(), color="blue", ls="--", lw=1, label=f"mean={vals.mean():.3f}")
     ax.axvline(vals.median(), color="red", ls="--", lw=1, label=f"median={vals.median():.3f}")
+    if square:
+        ax.axvline(0, color="gray", ls="--", lw=0.8, alpha=0.6)
     ax.legend(fontsize=9)
     if xlim:
         ax.set_xlim(xlim)
+    if square:
+        ax.set_box_aspect(1)
     ax.set_title(f"Distribution of {metric_name} (n={len(vals):,})")
 
     fig.tight_layout()
@@ -572,7 +606,7 @@ def metric_distribution(
 
 
 # ---------------------------------------------------------------------------
-# 9b. Metric distribution colored by variance group
+# Metric distribution colored by variance group
 # ---------------------------------------------------------------------------
 
 def metric_distribution_by_variance(
@@ -583,59 +617,75 @@ def metric_distribution_by_variance(
     *,
     xlim: Optional[Tuple[float, float]] = None,
     title: Optional[str] = None,
+    square: bool = False,
 ) -> None:
     """Three overlaid distributions (low/med/high variance) that add to 1.
 
     Each group's KDE is scaled by its proportion of total genes so the
-    three distributions visually sum to the total distribution.
+    three distributions visually sum to the total distribution.  A
+    dashed vertical line marks each group's median, and the legend
+    includes ``n=`` counts.
     """
+    from scipy.stats import gaussian_kde
+
     _ensure_dir(name)
     df = gene_metrics[[metric_name]].copy()
     df["variance"] = df.index.map(lambda g: var_map.get(g, 0.0))
 
     groups = {
         "low (var<1)": df[(df["variance"] >= 0) & (df["variance"] < 1)][metric_name].dropna(),
-        "medium (1≤var<3)": df[(df["variance"] >= 1) & (df["variance"] < 3)][metric_name].dropna(),
-        "high (var≥3)": df[df["variance"] >= 3][metric_name].dropna(),
+        "medium (1\u2264var<3)": df[(df["variance"] >= 1) & (df["variance"] < 3)][metric_name].dropna(),
+        "high (var\u22653)": df[df["variance"] >= 3][metric_name].dropna(),
     }
 
     total_n = sum(len(v) for v in groups.values())
     if total_n < 3:
         return
 
-    colors = {"low (var<1)": "#33BBEE", "medium (1≤var<3)": "#EE7733", "high (var≥3)": "#EE3377"}
+    colors = {"low (var<1)": "#33BBEE", "medium (1\u2264var<3)": "#EE7733", "high (var\u22653)": "#EE3377"}
 
-    fig, ax = plt.subplots(figsize=(7, 4))
+    size = (6, 6) if square else (7, 4)
+    fig, ax = plt.subplots(figsize=size)
+
+    # Determine x-range for KDE evaluation
+    if xlim is not None:
+        x_eval = np.linspace(xlim[0], xlim[1], 512)
+    else:
+        all_vals = pd.concat(groups.values())
+        x_eval = np.linspace(float(all_vals.min()) - 0.5,
+                             float(all_vals.max()) + 0.5, 512)
+
     for label, vals in groups.items():
         if len(vals) < 3:
             continue
         weight = len(vals) / total_n
-        sns.kdeplot(
-            vals, ax=ax, color=colors[label], linewidth=1.5, label=label,
-            fill=True, alpha=0.25, common_norm=False,
-        )
-        # Re-scale the last fill and line by the group weight.
-        # sns.kdeplot draws a PolyCollection (fill) and a Line2D.
-        # We scale the y-data of both by the group proportion.
-        for child in ax.get_children():
-            # Scale the most recently added PolyCollection
-            if hasattr(child, "get_paths") and isinstance(child, mpl.collections.PolyCollection):
-                for path in child.get_paths():
-                    verts = path.vertices
-                    verts[:, 1] *= weight
-                break
-        # Scale the most recently added Line2D (the KDE line)
-        for line in reversed(ax.lines):
-            ydata = line.get_ydata()
-            if len(ydata) > 2:
-                line.set_ydata(ydata * weight)
-                break
+        color = colors[label]
+
+        # Compute KDE manually so we can scale exactly by group proportion
+        kde = gaussian_kde(vals.values)
+        y_eval = kde(x_eval) * weight
+
+        legend_label = f"{label}  (n={len(vals):,})"
+        ax.plot(x_eval, y_eval, color=color, linewidth=1.5, label=legend_label)
+        ax.fill_between(x_eval, y_eval, alpha=0.25, color=color)
+
+        # Dotted vertical line at group median
+        med = float(vals.median())
+        y_at_med = float(kde(np.array([med]))[0]) * weight
+        ax.axvline(med, color=color, ls=":", lw=1.5, alpha=0.85)
+        ax.text(med, y_at_med * 1.05, f"med={med:.3f}", color=color,
+                fontsize=7, ha="center", va="bottom",
+                path_effects=[PathEffects.withStroke(linewidth=1.5, foreground="white")])
 
     ax.set_xlabel(metric_name.replace("_", " ").title())
     ax.set_ylabel("Density (scaled to total)")
-    ax.legend(fontsize=9)
+    if square:
+        ax.axvline(0, color="gray", ls="--", lw=0.8, alpha=0.6)
+    ax.legend(fontsize=8)
     if xlim:
         ax.set_xlim(xlim)
+    if square:
+        ax.set_box_aspect(1)
     ax.set_title(title or f"Distribution of {metric_name} by variance group (n={total_n:,})")
 
     fig.tight_layout()
@@ -644,170 +694,342 @@ def metric_distribution_by_variance(
 
 
 # ---------------------------------------------------------------------------
-# 10. (removed — plot_roc)
+# Calibration coverage comparison
 # ---------------------------------------------------------------------------
 
-
-# ---------------------------------------------------------------------------
-# 11. Calibration plot
-# ---------------------------------------------------------------------------
-
-def plot_calibration(
-    pred_mean: pd.Series,
-    pred_q5: pd.Series,
-    pred_q95: pd.Series,
-    truth: pd.Series,
-    name: str,
-) -> None:
-    """Calibration: fraction of truths falling inside predicted 90% CI vs expected 90%."""
-    _ensure_dir(name)
-    common = pred_mean.index.intersection(truth.index)
-    pm = pred_mean.loc[common].astype(float)
-    q5 = pred_q5.loc[common].astype(float)
-    q95 = pred_q95.loc[common].astype(float)
-    t = truth.loc[common].astype(float)
-    mask = np.isfinite(pm) & np.isfinite(q5) & np.isfinite(q95) & np.isfinite(t)
-    q5, q95, t = q5[mask], q95[mask], t[mask]
-
-    if len(t) < 10:
-        return
-
-    inside = ((t >= q5) & (t <= q95)).sum()
-    coverage = inside / len(t)
-
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.bar(["Observed", "Expected"], [coverage, 0.90], color=["#0077BB", "#BBBBBB"], edgecolor="black")
-    ax.set_ylim(0, 1.05)
-    ax.set_ylabel("Coverage")
-    ax.set_title(f"90% CI Calibration\nn={len(t):,}, coverage={coverage:.3f}")
-
-    fig.tight_layout()
-    fig.savefig(f"{name}.pdf", bbox_inches="tight")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# 12. Samples summary bar (depth × subtype)
-# ---------------------------------------------------------------------------
-
-def samples_summary_bar(
-    meta_df: pd.DataFrame,
+def plot_calibration_coverage(
+    base_curve: Dict,
+    conf_curve: Dict,
     name: str,
     *,
-    tfx_col: str = "tfx",
-    depth_col: str = "depth",
-    subtype_col: str = "subtype",
-) -> None:
-    """Bar chart: one bar per sample, height=depth, colored by subtype, TFx shading."""
-    _ensure_dir(name)
-    if depth_col not in meta_df.columns:
-        return
-
-    df = meta_df.sort_values(depth_col, ascending=False).copy()
-    pal = _palette()
-
-    width = max(8, len(df) * 0.3 + 2)
-    fig, ax = plt.subplots(figsize=(width, 4))
-
-    for i, (sample, row) in enumerate(df.iterrows()):
-        depth = row.get(depth_col, 0)
-        tfx = row.get(tfx_col, 1.0)
-        sub = row.get(subtype_col, "Unknown")
-        color = pal.get(str(sub), "#999999")
-
-        if tfx < 1.0:
-            ax.bar(i, depth * tfx, color=color, width=1.0, edgecolor="black", linewidth=0.1)
-            ax.bar(i, depth * (1 - tfx), bottom=depth * tfx, color="gray", width=1.0, edgecolor="black", linewidth=0.1)
-        else:
-            ax.bar(i, depth, color=color, width=1.0, edgecolor="black", linewidth=0.1)
-
-    ax.set_xticks(range(len(df)))
-    ax.set_xticklabels(df.index, rotation=90, fontsize=max(4, min(8, 150 // len(df))))
-    ax.set_ylabel("Mean Depth")
-    ax.set_xlim(-0.5, len(df) - 0.5)
-
-    fig.tight_layout()
-    fig.savefig(f"{name}.pdf", bbox_inches="tight")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# 13. Benchmark grouped bar
-# ---------------------------------------------------------------------------
-
-def benchmark_bar(
-    metrics_dict: Dict[str, Dict[str, float]],
-    name: str,
-    *,
-    metrics_to_plot: Optional[List[str]] = None,
     title: Optional[str] = None,
 ) -> None:
-    """Grouped bar chart: methods × metrics.
+    """Plot empirical coverage vs nominal level for base and CQR-calibrated CIs.
 
-    ``metrics_dict`` maps method_name → {metric_name: value, ...}.
+    Accepts two curve formats:
+      - old style: ``{level: coverage}`` dict
+      - new style: ``{"nominal": [...], "empirical": [...], ...}`` dict
+        (as returned by ``calibration.evaluate_calibration``).
+
+    A diagonal identity line indicates perfect calibration.
     """
     _ensure_dir(name)
-    methods = list(metrics_dict.keys())
-    if metrics_to_plot is None:
-        metrics_to_plot = sorted({k for d in metrics_dict.values() for k in d})
 
-    n_methods = len(methods)
-    n_metrics = len(metrics_to_plot)
-    x = np.arange(n_metrics)
-    width = 0.8 / n_methods
-    colors = ["#0077BB", "#EE7733", "#33BBEE", "#EE3377", "#009988", "#CC3311"]
+    # Normalise both curves to (levels, values) lists
+    def _unpack(curve):
+        if "nominal" in curve:
+            return list(curve["nominal"]), list(curve["empirical"])
+        levels = sorted(curve.keys())
+        return levels, [curve[l] for l in levels]
 
-    fig, ax = plt.subplots(figsize=(max(8, n_metrics * 1.5), 5))
-    for i, method in enumerate(methods):
-        vals = [metrics_dict[method].get(m, 0) for m in metrics_to_plot]
-        ax.bar(x + i * width, vals, width, label=method, color=colors[i % len(colors)], edgecolor="black", linewidth=0.3)
+    base_levels, base_vals = _unpack(base_curve)
+    conf_levels, conf_vals = _unpack(conf_curve)
 
-    ax.set_xticks(x + width * (n_methods - 1) / 2)
-    ax.set_xticklabels([m.replace("_", " ") for m in metrics_to_plot], rotation=30, ha="right")
-    ax.legend(title="Method")
-    ax.set_title(title or "Benchmark Comparison")
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.plot([0, 1], [0, 1], "k--", lw=0.8, alpha=0.5, label="Perfect calibration")
+    ax.plot(base_levels, base_vals, "o-", color="#0077BB", label="Base model", markersize=6)
+    ax.plot(conf_levels, conf_vals, "s-", color="#EE3377", label="CQR calibrated", markersize=6)
+    ax.set_xlabel("Nominal coverage level")
+    ax.set_ylabel("Empirical coverage")
+    ax.set_xlim(0.45, 1.0)
+    ax.set_ylim(0.45, 1.05)
+    ax.set_box_aspect(1)
+    ax.legend(fontsize=9, loc="lower right")
+    ax.set_title(title or "Calibration Coverage")
+    ax.grid(True, alpha=0.2)
 
     fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# 14. Thresholding boxes (accuracy by TFx/depth bins)
-# ---------------------------------------------------------------------------
-
-def thresholding_boxes(
-    sample_metrics: pd.DataFrame,
-    meta_df: pd.DataFrame,
+def plot_regime_coverage_heatmap(
+    regime_coverage: Dict[str, float],
     name: str,
     *,
-    metric: str = "pearson_r",
-    group_col: str = "tfx",
-    n_bins: int = 10,
+    n_var_bins: int = 4,
+    n_zero_bins: int = 4,
+    target_coverage: float = 0.95,
+    title: Optional[str] = None,
 ) -> None:
-    """Box plots of per-sample metric binned by TFx or depth."""
+    """Heatmap of empirical coverage by (variance quartile × zero-rate quartile).
+
+    ``regime_coverage`` maps regime labels like "(2, 3)" to empirical
+    coverage floats.  The heatmap shows how well calibration performs
+    in each gene regime, with the target coverage level annotated.
+    """
     _ensure_dir(name)
-    common = sample_metrics.index.intersection(meta_df.index)
-    if len(common) < 3:
+
+    grid = np.full((n_var_bins, n_zero_bins), np.nan)
+    for label, cov in regime_coverage.items():
+        # Parse "(var_q, zero_q)"
+        parts = label.strip("()").split(",")
+        if len(parts) != 2:
+            continue
+        vq, zq = int(parts[0].strip()), int(parts[1].strip())
+        if 0 <= vq < n_var_bins and 0 <= zq < n_zero_bins:
+            grid[vq, zq] = cov
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(grid, cmap="RdYlGn", vmin=0.80, vmax=1.0,
+                   aspect="auto", origin="lower")
+
+    # Annotate cells
+    for i in range(n_var_bins):
+        for j in range(n_zero_bins):
+            val = grid[i, j]
+            if np.isfinite(val):
+                color = "white" if val < 0.88 else "black"
+                ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                        fontsize=10, fontweight="bold", color=color)
+
+    ax.set_xticks(range(n_zero_bins))
+    ax.set_xticklabels([f"Q{q+1}" for q in range(n_zero_bins)])
+    ax.set_yticks(range(n_var_bins))
+    ax.set_yticklabels([f"Q{q+1}" for q in range(n_var_bins)])
+    ax.set_xlabel("Zero-Rate Quartile")
+    ax.set_ylabel("Variance Quartile")
+
+    cb = fig.colorbar(im, ax=ax, shrink=0.8)
+    cb.set_label("Empirical Coverage")
+
+    # Target reference line on colorbar
+    cb.ax.axhline(y=target_coverage, color="black", linewidth=1.5, linestyle="--")
+
+    ax.set_title(title or f"Regime Coverage (target={target_coverage:.0%})")
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_reliability_scatter(
+    predicted_r: pd.Series,
+    true_r: pd.Series,
+    name: str,
+    *,
+    title: Optional[str] = None,
+) -> None:
+    """Scatter plot: predicted gene reliability (r̂) vs true holdout Pearson r.
+
+    Includes identity line, Spearman ρ annotation, and marginal density.
+    """
+    _ensure_dir(name)
+
+    common = predicted_r.index.intersection(true_r.index)
+    pred = predicted_r.loc[common].dropna()
+    true = true_r.reindex(pred.index).dropna()
+    pred = pred.reindex(true.index)
+
+    if len(pred) < 5:
         return
 
-    df = sample_metrics.loc[common, [metric]].copy()
-    df[group_col] = meta_df.loc[common, group_col].astype(float)
+    x = pred.values
+    y = true.values
 
-    if df[group_col].nunique() < n_bins:
-        bin_col = group_col
-    else:
-        bins = np.linspace(df[group_col].min(), df[group_col].max(), n_bins + 1)
-        bin_col = f"{group_col}_bin"
-        df[bin_col] = pd.cut(df[group_col], bins=bins, include_lowest=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        rho, _ = spearmanr(x, y)
 
-    fig, ax = plt.subplots(figsize=(10, 5))
-    sns.boxplot(x=bin_col, y=metric, data=df, hue=bin_col, ax=ax, legend=False)
-    sns.stripplot(x=bin_col, y=metric, data=df, ax=ax, color="black", alpha=0.4, size=3)
-    ax.set_title(f"{metric} by {group_col}")
-    ax.set_xlabel(group_col)
-    ax.set_ylabel(metric.replace("_", " ").title())
-    plt.xticks(rotation=90)
+    fig, ax = plt.subplots(figsize=(6.5, 6))
+    ax.scatter(x, y, s=6, alpha=0.3, color="#4477AA", edgecolors="none")
+    ax.plot([-1, 1], [-1, 1], "k--", lw=0.8, alpha=0.5)
+    ax.set_xlabel("Predicted Gene Reliability (r̂)")
+    ax.set_ylabel("True Holdout Pearson r")
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_box_aspect(1)
+    ax.text(0.05, 0.95, f"Spearman ρ = {rho:.3f}\nn = {len(pred)}",
+            transform=ax.transAxes, fontsize=10, va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+    ax.set_title(title or "Gene Reliability: Predicted vs True")
+    ax.grid(True, alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_retention_curve(
+    retention: Dict[str, Any],
+    name: str,
+    *,
+    baseline_mean_r: Optional[float] = None,
+    title: Optional[str] = None,
+) -> None:
+    """Top-K gene retention curve: mean true Pearson r vs retention fraction.
+
+    If the reliability model works, retaining only the top-predicted genes
+    should yield substantially higher actual r than retaining all genes.
+
+    ``retention`` is the dict from ``reliability.retention_curve`` with
+    keys ``fractions``, ``mean_true_r``, ``n_genes``.
+    """
+    _ensure_dir(name)
+
+    fractions = retention.get("fractions", [])
+    mean_r = retention.get("mean_true_r", [])
+    n_genes = retention.get("n_genes", [])
+
+    if not fractions or all(np.isnan(v) for v in mean_r):
+        return
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+
+    # Main curve
+    ax.plot(
+        [f * 100 for f in fractions], mean_r,
+        "o-", color="#EE3377", linewidth=2, markersize=7, label="Reliability-ranked"
+    )
+
+    # Annotate gene counts
+    for f, r_val, n in zip(fractions, mean_r, n_genes):
+        if np.isfinite(r_val):
+            ax.annotate(f"n={n}", (f * 100, r_val), fontsize=7,
+                        textcoords="offset points", xytext=(0, 8),
+                        ha="center", color="#666666")
+
+    # Baseline: mean r using all genes
+    if baseline_mean_r is not None:
+        ax.axhline(y=baseline_mean_r, color="#999999", linestyle="--", linewidth=1,
+                   label=f"All genes (r={baseline_mean_r:.3f})")
+
+    ax.set_xlabel("Genes Retained (%)")
+    ax.set_ylabel("Mean True Pearson r")
+    ax.set_xlim(5, 105)
+    ax.legend(fontsize=9, loc="lower right")
+    ax.set_title(title or "Gene Retention Curve")
+    ax.grid(True, alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_regime_qhat_heatmap(
+    q_hats: Dict[str, float],
+    name: str,
+    *,
+    n_var_bins: int = 4,
+    n_zero_bins: int = 4,
+    title: Optional[str] = None,
+) -> None:
+    """Heatmap of per-regime q̂ values (the normalized conformal quantile).
+
+    Visualises how much calibration correction each gene regime requires.
+    Higher q̂ means the model's base intervals were more under-covering
+    in that regime.
+    """
+    _ensure_dir(name)
+
+    grid = np.full((n_var_bins, n_zero_bins), np.nan)
+    for label, qval in q_hats.items():
+        parts = label.strip("()").split(",")
+        if len(parts) != 2:
+            continue
+        vq, zq = int(parts[0].strip()), int(parts[1].strip())
+        if 0 <= vq < n_var_bins and 0 <= zq < n_zero_bins:
+            grid[vq, zq] = qval
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    vmax = max(0.5, np.nanmax(grid) * 1.1) if np.any(np.isfinite(grid)) else 1.0
+    im = ax.imshow(grid, cmap="YlOrRd", vmin=0, vmax=vmax,
+                   aspect="auto", origin="lower")
+
+    for i in range(n_var_bins):
+        for j in range(n_zero_bins):
+            val = grid[i, j]
+            if np.isfinite(val):
+                color = "white" if val > vmax * 0.7 else "black"
+                ax.text(j, i, f"{val:.3f}", ha="center", va="center",
+                        fontsize=10, fontweight="bold", color=color)
+
+    ax.set_xticks(range(n_zero_bins))
+    ax.set_xticklabels([f"Q{q+1}" for q in range(n_zero_bins)])
+    ax.set_yticks(range(n_var_bins))
+    ax.set_yticklabels([f"Q{q+1}" for q in range(n_var_bins)])
+    ax.set_xlabel("Zero-Rate Quartile")
+    ax.set_ylabel("Variance Quartile")
+
+    cb = fig.colorbar(im, ax=ax, shrink=0.8)
+    cb.set_label("Normalized q̂")
+
+    ax.set_title(title or "Per-Regime Conformal q̂")
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_reliability_weights(
+    feature_columns: List[str],
+    weights: np.ndarray,
+    name: str,
+    *,
+    title: Optional[str] = None,
+) -> None:
+    """Horizontal bar chart of ridge regression feature weights.
+
+    Shows which prediction features contribute most to the gene-level
+    reliability estimate.
+    """
+    _ensure_dir(name)
+
+    n = len(feature_columns)
+    if n == 0:
+        return
+
+    # Sort by absolute weight for visual clarity
+    order = np.argsort(np.abs(weights))[::-1]
+    cols = [feature_columns[i] for i in order]
+    vals = weights[order]
+
+    fig, ax = plt.subplots(figsize=(7, max(3, 0.5 * n + 1)))
+    colors = ["#EE3377" if v < 0 else "#0077BB" for v in vals]
+    ax.barh(range(n), vals, color=colors, edgecolor="none", height=0.6)
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(cols, fontsize=9)
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_xlabel("Ridge Weight")
+    ax.set_title(title or "Reliability Model — Feature Weights")
+    ax.invert_yaxis()
+    ax.grid(True, alpha=0.2, axis="x")
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_error_vs_width(
+    width_base: pd.Series,
+    width_conf: pd.Series,
+    gene_metrics: pd.DataFrame,
+    name: str,
+    *,
+    title: Optional[str] = None,
+) -> None:
+    """Scatter: mean CI width per gene vs gene-level metric (Spearman rho).
+
+    Two series: base and conformal-adjusted widths.  ``gene_metrics`` must
+    have a ``spearman_rho`` column indexed by gene name.
+    """
+    _ensure_dir(name)
+    common = width_base.index.intersection(gene_metrics.index)
+    if len(common) < 10:
+        return
+
+    wb = width_base.loc[common]
+    wc = width_conf.loc[common]
+    rho = gene_metrics.loc[common, "spearman_rho"]
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(wb.values, rho.values, s=8, alpha=0.3, color="#0077BB", label="Base width")
+    ax.scatter(wc.values, rho.values, s=8, alpha=0.3, color="#EE3377", label="Conformal width")
+    ax.set_xlabel("Mean CI width (per gene)")
+    ax.set_ylabel("Gene Spearman ρ")
+    ax.legend(fontsize=9)
+    ax.set_title(title or "Interval Width vs Gene Spearman ρ")
+    ax.grid(True, alpha=0.2)
 
     fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
@@ -815,16 +1037,17 @@ def thresholding_boxes(
 
 
 # ---------------------------------------------------------------------------
-# 15. Parallelised sample scatter generation
+# Parallelised sample scatter generation
 # ---------------------------------------------------------------------------
 
 def _render_sample_scatter(args: Tuple) -> str:
     """Worker function for parallel sample scatter generation."""
     (truth_col, pred_col, sample_name, out_path,
-     ci_lo, ci_hi, goi, tfx, depth) = args
+     ci_lo, ci_hi, goi, tfx, depth, is_holdout) = args
     sample_scatter(
         truth_col, pred_col, sample_name, out_path,
         ci_lo=ci_lo, ci_hi=ci_hi, goi=goi, tfx=tfx, depth=depth,
+        is_holdout=is_holdout,
     )
     return sample_name
 
@@ -843,6 +1066,8 @@ def batch_sample_scatters(
     """Generate per-sample scatter plots in parallel.
 
     ``goi`` maps subtype name → list of gene names (passed through to sample_scatter).
+    If ``subtypes_df`` has a ``status`` column, samples with status == "holdout"
+    will be drawn with hollow markers.
     """
     common_samples = truth_wide.columns.intersection(pred_wide.columns)
     os.makedirs(out_dir, exist_ok=True)
@@ -854,10 +1079,12 @@ def batch_sample_scatters(
     for sample in common_samples:
         tfx = None
         depth = None
+        is_holdout = False
         if subtypes_df is not None and sample in subtypes_df.index:
             row = subtypes_df.loc[sample]
             tfx = row.get("tfx")
             depth = row.get("depth")
+            is_holdout = row.get("status") == "holdout"
 
         ci_lo = ci_lo_wide[sample] if ci_lo_wide is not None and sample in ci_lo_wide.columns else None
         ci_hi = ci_hi_wide[sample] if ci_hi_wide is not None and sample in ci_hi_wide.columns else None
@@ -865,10 +1092,12 @@ def batch_sample_scatters(
         args_list.append((
             truth_wide[sample], pred_wide[sample], sample,
             os.path.join(out_dir, sample),
-            ci_lo, ci_hi, goi, tfx, depth,
+            ci_lo, ci_hi, goi, tfx, depth, is_holdout,
         ))
 
     if n_workers > 1 and len(args_list) > 4:
+        print(f"    Rendering {len(args_list)} sample scatters "
+              f"across {n_workers} workers (multi-process) ...")
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             futures = [pool.submit(_render_sample_scatter, a) for a in args_list]
             for fut in futures:
@@ -879,15 +1108,16 @@ def batch_sample_scatters(
 
 
 # ---------------------------------------------------------------------------
-# 16. Parallelised gene target scatter generation
+# Parallelised gene target scatter generation
 # ---------------------------------------------------------------------------
 
 def _render_gene_scatter(args: Tuple) -> str:
     """Worker for parallel gene target scatters."""
-    truth_wide, pred_wide, gene, out_path, subtypes_df, tfx_dict = args
+    truth_wide, pred_wide, gene, out_path, subtypes_df, tfx_dict, ci_lo_wide, ci_hi_wide = args
     gene_target_scatter(
         truth_wide, pred_wide, gene, out_path,
         subtypes_df=subtypes_df, tfx_dict=tfx_dict,
+        ci_lo_wide=ci_lo_wide, ci_hi_wide=ci_hi_wide,
     )
     return gene
 
@@ -900,6 +1130,8 @@ def batch_gene_scatters(
     *,
     subtypes_df: Optional[pd.DataFrame] = None,
     tfx_dict: Optional[Dict[str, float]] = None,
+    ci_lo_wide: Optional[pd.DataFrame] = None,
+    ci_hi_wide: Optional[pd.DataFrame] = None,
     n_workers: Optional[int] = None,
 ) -> None:
     """Generate per-gene target scatter plots in parallel."""
@@ -908,12 +1140,14 @@ def batch_gene_scatters(
         n_workers = max(1, (os.cpu_count() or 1))
 
     args_list = [
-        (truth_wide, pred_wide, gene, os.path.join(out_dir, gene), subtypes_df, tfx_dict)
+        (truth_wide, pred_wide, gene, os.path.join(out_dir, gene), subtypes_df, tfx_dict, ci_lo_wide, ci_hi_wide)
         for gene in genes
         if gene in truth_wide.index and gene in pred_wide.index
     ]
 
     if n_workers > 1 and len(args_list) > 4:
+        print(f"    Rendering {len(args_list)} gene scatters "
+              f"across {n_workers} workers (multi-process) ...")
         with ProcessPoolExecutor(max_workers=n_workers) as pool:
             futures = [pool.submit(_render_gene_scatter, a) for a in args_list]
             for fut in futures:
@@ -921,3 +1155,351 @@ def batch_gene_scatters(
     else:
         for a in args_list:
             _render_gene_scatter(a)
+
+
+# ---------------------------------------------------------------------------
+# Benchmarking grid plots
+# ---------------------------------------------------------------------------
+
+# Consistent model palette for all benchmark figures
+_BENCH_COLORS = [
+    "#0077BB", "#EE7733", "#33BBEE", "#EE3377", "#009988", "#CC3311",
+    "#332288", "#DDCC77", "#882255", "#44AA99", "#88CCEE", "#AA4499",
+    "#BBBBBB",
+]
+
+
+def _bench_color_map(model_names: Sequence[str]) -> Dict[str, str]:
+    return {m: _BENCH_COLORS[i % len(_BENCH_COLORS)] for i, m in enumerate(model_names)}
+
+
+def benchmark_grid_boxplots(
+    metrics_table: pd.DataFrame,
+    name: str,
+    *,
+    metric_col: str,
+    ylabel: str,
+    title: str,
+    tfx_order: Sequence[str],
+    depth_order: Sequence[str],
+    model_order: Sequence[str],
+    null_model: str = "Null",
+) -> None:
+    """TFx x Depth grid of box plots, one box per model/score.
+
+    ``metrics_table`` must have columns: tfx, depth, model, and ``metric_col``.
+    A dashed gray horizontal line is drawn at the Null model's mean value
+    (or single value) in each panel for reference.
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+    n_rows = len(tfx_order)
+    n_cols = len(depth_order)
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(6 * n_cols + 1, 3.2 * n_rows + 1),
+        sharex=True, sharey=True, squeeze=False,
+    )
+
+    for ri, tfx in enumerate(tfx_order):
+        for ci, depth in enumerate(depth_order):
+            ax = axes[ri, ci]
+            sub = metrics_table[
+                (metrics_table["tfx"] == tfx) & (metrics_table["depth"] == depth)
+            ]
+            if sub.empty:
+                ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                        ha="center", va="center", fontsize=9, color="gray")
+            else:
+                # Null reference line — dashed gray spanning full x-extent
+                null_vals = sub.loc[sub["model"] == null_model, metric_col].dropna().values
+                if len(null_vals) > 0:
+                    null_ref = float(np.mean(null_vals))
+                    ax.axhline(null_ref, color="#BBBBBB", ls="--", lw=1.2, zorder=0)
+
+                plot_data = []
+                labels = []
+                colors = []
+                for model in model_order:
+                    vals = sub.loc[sub["model"] == model, metric_col].dropna().values
+                    if len(vals) > 0:
+                        plot_data.append(vals)
+                        labels.append(model)
+                        colors.append("#BBBBBB" if model == "Null" else cmap[model])
+                if plot_data:
+                    # If every model has exactly 1 value, use dot plot
+                    all_scalar = all(len(v) == 1 for v in plot_data)
+                    if all_scalar:
+                        for i, (vals, c) in enumerate(zip(plot_data, colors), start=1):
+                            ax.plot(i, vals[0], "o", color=c, markersize=8, zorder=3)
+                        ax.set_xticks(range(1, len(labels) + 1))
+                        ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=6)
+                    else:
+                        bp = ax.boxplot(
+                            plot_data, patch_artist=True, widths=0.6,
+                            medianprops=dict(color="black", linewidth=1.2),
+                            flierprops=dict(markersize=2),
+                        )
+                        for patch, c in zip(bp["boxes"], colors):
+                            patch.set_facecolor(c)
+                            patch.set_alpha(0.7)
+                        ax.set_xticks(range(1, len(labels) + 1))
+                        ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=6)
+
+            if ri == 0:
+                ax.set_title(depth, fontsize=10, fontweight="bold")
+            if ci == 0:
+                ax.set_ylabel(f"TFx {tfx}\n{ylabel}", fontsize=8)
+
+    fig.suptitle(title, fontsize=13, fontweight="bold", y=1.01)
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def benchmark_grid_histograms(
+    gene_rho_table: pd.DataFrame,
+    name: str,
+    *,
+    tfx_order: Sequence[str],
+    depth_order: Sequence[str],
+    model_order: Sequence[str],
+    title: Optional[str] = None,
+) -> None:
+    """TFx x Depth grid of overlaid Spearman rho histograms across models.
+
+    ``gene_rho_table`` has columns: tfx, depth, model, spearman_rho, n_rho_ge070.
+    Each row is one gene.
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+    n_rows = len(tfx_order)
+    n_cols = len(depth_order)
+
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(4.5 * n_cols + 1, 4 * n_rows + 1),
+        sharex=True, sharey=False, squeeze=False,
+    )
+
+    for ri, tfx in enumerate(tfx_order):
+        for ci, depth in enumerate(depth_order):
+            ax = axes[ri, ci]
+            sub = gene_rho_table[
+                (gene_rho_table["tfx"] == tfx) & (gene_rho_table["depth"] == depth)
+            ]
+            if sub.empty:
+                ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                        ha="center", va="center", fontsize=9, color="gray")
+            else:
+                legend_entries = []
+                for model in model_order:
+                    vals = sub.loc[sub["model"] == model, "spearman_rho"].dropna().values
+                    if len(vals) < 3:
+                        continue
+                    n_good = int((vals >= 0.70).sum())
+                    color = "#BBBBBB" if model == "Null" else cmap[model]
+                    sns.kdeplot(
+                        vals, ax=ax, color=color, linewidth=1.5,
+                        fill=True, alpha=0.15, clip=(-1, 1),
+                    )
+                    legend_entries.append(f"{model} (n≥0.7={n_good})")
+                if legend_entries:
+                    ax.legend(legend_entries, fontsize=5, loc="upper left",
+                              framealpha=0.6)
+            ax.set_xlim(-1, 1)
+            if ri == 0:
+                ax.set_title(depth, fontsize=10, fontweight="bold")
+            if ci == 0:
+                ax.set_ylabel(f"TFx {tfx}\nDensity", fontsize=8)
+            if ri == n_rows - 1:
+                ax.set_xlabel("Spearman ρ", fontsize=8)
+
+    fig.suptitle(title or "Per-Gene Spearman ρ Distribution", fontsize=13,
+                 fontweight="bold", y=1.01)
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def benchmark_ecdna_lines(
+    ecdna_table: pd.DataFrame,
+    name: str,
+    *,
+    model_order: Sequence[str],
+) -> None:
+    """Line plots of 6 metrics vs effective ctDNA (TFx * depth).
+
+    Layout: 2 columns x 3 rows.  A single shared legend is placed at the
+    bottom of the figure.  Bootstrap CIs (columns ``*_ci_lo`` / ``*_ci_hi``)
+    are drawn as shaded bands when present in ``ecdna_table``.
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+
+    metric_defs = [
+        ("sample_rho_mean", "Mean Sample Spearman \u03c1"),
+        ("mean_gene_rho", "Mean Gene Spearman \u03c1"),
+        ("median_gene_rho", "Median Gene Spearman \u03c1"),
+        ("gvw_rho", "GVW Spearman \u03c1"),
+        ("rmse", "Mean Gene RMSE"),
+        ("mean_top10pct_gene_rho", "Mean \u03c1 (Top 10% Var.)"),
+    ]
+
+    n_rows, n_cols = 3, 2
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 12), squeeze=False)
+
+    legend_handles = []
+    for idx, (col, label) in enumerate(metric_defs):
+        ri, ci = divmod(idx, n_cols)
+        ax = axes[ri, ci]
+        for model in model_order:
+            sub = ecdna_table[ecdna_table["model"] == model].sort_values("ecdna")
+            if sub.empty or col not in sub.columns or sub[col].isna().all():
+                continue
+            color = "#BBBBBB" if model == "Null" else cmap[model]
+            line, = ax.plot(sub["ecdna"], sub[col], "o-",
+                            color=color, markersize=4, linewidth=1.2)
+            # Collect legend entries from first panel only
+            if idx == 0:
+                legend_handles.append((line, model))
+            # Bootstrap CI band
+            ci_lo_col = f"{col}_ci_lo"
+            ci_hi_col = f"{col}_ci_hi"
+            if ci_lo_col in sub.columns and ci_hi_col in sub.columns:
+                lo = sub[ci_lo_col].values
+                hi = sub[ci_hi_col].values
+                if not (np.isnan(lo).all() or np.isnan(hi).all()):
+                    ax.fill_between(sub["ecdna"].values, lo, hi,
+                                    color=color, alpha=0.15)
+        ax.set_xlabel("Effective ctDNA (TFx \u00d7 depth)", fontsize=9)
+        ax.set_ylabel(label, fontsize=9)
+        ax.set_xscale("log")
+        ax.set_title(label, fontsize=10, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+
+    # Shared legend at bottom
+    if legend_handles:
+        handles, labels = zip(*legend_handles)
+        fig.legend(handles, labels, loc="lower center",
+                   ncol=min(len(labels), 6), fontsize=8,
+                   framealpha=0.8, bbox_to_anchor=(0.5, -0.02))
+
+    fig.suptitle("Benchmark Metrics vs Effective ctDNA",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.04, 1, 0.97])
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def benchmark_marginal_boxplots(
+    metrics_table: pd.DataFrame,
+    name: str,
+    *,
+    metric_col: str,
+    ylabel: str,
+    title: str,
+    panel_col: str,
+    panel_order: Sequence[str],
+    hue_col: str,
+    model_order: Sequence[str],
+) -> None:
+    """One-dimensional grid of boxplots — one panel per ``panel_col`` level.
+
+    Inside each panel the x-axis is grouped first by ``hue_col`` level then
+    by model.  Points for the same model across hue levels are connected
+    with lines.  Scalar (single-value) metrics are drawn as connected
+    dot-plots; distribution metrics use box-plots.
+
+    ``metrics_table`` must have columns: ``panel_col``, ``hue_col``, model,
+    and ``metric_col``.
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+    n_panels = len(panel_order)
+
+    fig, axes = plt.subplots(
+        1, n_panels,
+        figsize=(max(8, 5 * n_panels), 5),
+        sharey=True, squeeze=False,
+    )
+
+    # Collect the unique hue levels present in the data (in desired order
+    # if we can infer one; otherwise alphabetical).
+    hue_levels = sorted(metrics_table[hue_col].unique(), key=str)
+
+    for pi, panel_val in enumerate(panel_order):
+        ax = axes[0, pi]
+        sub = metrics_table[metrics_table[panel_col] == panel_val]
+        if sub.empty:
+            ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=9, color="gray")
+            ax.set_title(f"{panel_col} {panel_val}", fontsize=10,
+                         fontweight="bold")
+            continue
+
+        # Build groups: one box per (hue_level, model) that has data
+        plot_data = []
+        tick_labels = []
+        colors = []
+        group_keys = []  # (hue_val, model)
+        for hue_val in hue_levels:
+            hue_sub = sub[sub[hue_col] == hue_val]
+            if hue_sub.empty:
+                continue
+            for model in model_order:
+                vals = hue_sub.loc[hue_sub["model"] == model, metric_col].dropna().values
+                if len(vals) == 0:
+                    continue
+                plot_data.append(vals)
+                tick_labels.append(f"{hue_val}\n{model}")
+                colors.append("#BBBBBB" if model == "Null" else cmap[model])
+                group_keys.append((hue_val, model))
+
+        if plot_data:
+            all_scalar = all(len(v) == 1 for v in plot_data)
+            if all_scalar:
+                for i, (vals, c) in enumerate(zip(plot_data, colors), start=1):
+                    ax.plot(i, vals[0], "o", color=c, markersize=7, zorder=3)
+                # Connect points belonging to the same model with lines
+                for model in model_order:
+                    xs, ys = [], []
+                    for i, ((hue_val, mod), vals) in enumerate(
+                            zip(group_keys, plot_data), start=1):
+                        if mod == model:
+                            xs.append(i)
+                            ys.append(vals[0])
+                    if len(xs) > 1:
+                        c = "#BBBBBB" if model == "Null" else cmap[model]
+                        ax.plot(xs, ys, "-", color=c, linewidth=1, alpha=0.6, zorder=2)
+                ax.set_xticks(range(1, len(tick_labels) + 1))
+                ax.set_xticklabels(tick_labels, rotation=55, ha="right", fontsize=5)
+            else:
+                bp = ax.boxplot(
+                    plot_data, patch_artist=True, widths=0.6,
+                    medianprops=dict(color="black", linewidth=1.2),
+                    flierprops=dict(markersize=2),
+                )
+                for patch, c in zip(bp["boxes"], colors):
+                    patch.set_facecolor(c)
+                    patch.set_alpha(0.7)
+                # Connect medians of the same model across hue levels
+                for model in model_order:
+                    xs, ys = [], []
+                    for i, ((hue_val, mod), vals) in enumerate(
+                            zip(group_keys, plot_data), start=1):
+                        if mod == model:
+                            xs.append(i)
+                            ys.append(float(np.median(vals)))
+                    if len(xs) > 1:
+                        c = "#BBBBBB" if model == "Null" else cmap[model]
+                        ax.plot(xs, ys, "-", color=c, linewidth=1, alpha=0.6, zorder=2)
+                ax.set_xticks(range(1, len(tick_labels) + 1))
+                ax.set_xticklabels(tick_labels, rotation=55, ha="right", fontsize=5)
+        ax.set_title(f"{panel_col} {panel_val}", fontsize=10, fontweight="bold")
+        if pi == 0:
+            ax.set_ylabel(ylabel, fontsize=9)
+
+    fig.suptitle(title, fontsize=13, fontweight="bold", y=1.02)
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)

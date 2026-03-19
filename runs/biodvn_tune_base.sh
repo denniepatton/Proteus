@@ -53,7 +53,9 @@ submit_fold() {
 #SBATCH --time=${time_limit}
 #SBATCH -A nelson_p
 
-micromamba run -n ${ENV_NAME} python Proteus.py \\
+eval "\$(micromamba shell hook -s bash)"
+micromamba activate ${ENV_NAME}
+python Proteus.py \\
     --run_mode tune \\
     --experiment ${YAML} \\
     --test_fold ${fold}

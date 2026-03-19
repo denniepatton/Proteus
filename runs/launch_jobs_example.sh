@@ -15,7 +15,9 @@ for test_fold in {1..5}; do
 #SBATCH --time=120:00:00
 #SBATCH -A nelson_p
 
-micromamba run -n proteus python Proteus.py --run_mode train --experiment config/experiments/biodvn_train_ProteusV1HPs.yaml --test_fold ${test_fold}
+eval "\$(micromamba shell hook -s bash)"
+micromamba activate proteus
+python Proteus.py --run_mode train --experiment config/experiments/biodvn_train_ProteusV1HPs.yaml --test_fold ${test_fold}
 
 EOL
 

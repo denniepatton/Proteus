@@ -282,7 +282,7 @@ def subsample(
     Returns:
         Subsampled dict with the same keys as *data*.
     """
-    rng = np.random.RandomState(seed)
+    rng = np.random.default_rng(seed)
 
     # mean-region-depth is the last (index 10) TSS feature, stored as log1p
     depth_col = data['TSS_features'][:, 10]

@@ -48,6 +48,26 @@ from proteus_utils.trainer import TrainingConfig
 # Hyperband / Phased Search Configuration
 # =============================================================================
 
+
+def _make_storage(url: str) -> Any:
+    """Wrap a storage URL for better concurrent-write handling.
+
+    SQLite can only handle one writer at a time.  With many parallel
+    workers the default 5-second busy timeout is too short and causes
+    ``database is locked`` errors.  This helper creates an
+    ``RDBStorage`` with a 300-second timeout so workers wait rather
+    than crash.  Non-SQLite URLs are returned unchanged.
+    """
+    if url.startswith("sqlite"):
+        return optuna.storages.RDBStorage(
+            url=url,
+            engine_kwargs={
+                "connect_args": {"timeout": 300},
+                "pool_pre_ping": True,
+            },
+        )
+    return url
+
 HYPERBAND_MIN_RESOURCE = 3
 HYPERBAND_REDUCTION_FACTOR = 3
 
@@ -241,6 +261,17 @@ def _resolve_trial_configs(
         )
 
     # =====================================================================
+    # Transfer learning group
+    # =====================================================================
+    freeze_mode = _suggest_from_param(
+        trial, "transfer.freeze_mode", exp.transfer.freeze_mode,
+    )
+    backbone_lr_multiplier = _suggest_from_param(
+        trial, "transfer.backbone_lr_multiplier",
+        exp.transfer.backbone_lr_multiplier,
+    )
+
+    # =====================================================================
     # Build configs
     # =====================================================================
     model_cfg = BioDVNConfig(
@@ -287,6 +318,11 @@ def _resolve_trial_configs(
         use_amp=bool(use_amp),
         base_weights=exp.transfer.base_weights,
         freeze_level=exp.transfer.freeze_level,
+        freeze_mode=str(freeze_mode) if freeze_mode is not None else None,
+        backbone_lr_multiplier=(
+            float(backbone_lr_multiplier)
+            if backbone_lr_multiplier is not None else 1.0
+        ),
     )
 
     # =====================================================================
@@ -333,6 +369,11 @@ def _resolve_trial_configs(
         "transfer": {
             "base_weights": exp.transfer.base_weights,
             "freeze_level": exp.transfer.freeze_level,
+            "freeze_mode": str(freeze_mode) if freeze_mode is not None else None,
+            "backbone_lr_multiplier": (
+                float(backbone_lr_multiplier)
+                if backbone_lr_multiplier is not None else 1.0
+            ),
         },
     }
 
@@ -427,6 +468,18 @@ def compute_cv_objective(run_dir: str) -> Dict[str, Any]:
         # Combined objective: average of tumor and background MAE
         "val_loss": _nanmean([_nanmean(tumor_mae), _nanmean(bg_mae)]),
     }
+
+    # Balanced fine-tuning objective: per-fold balanced_tumor_gvw_crps
+    # (equal-weight average of per-patient-cohort GVW-CRPS, computed in
+    # _save_fold_predictions when sample_to_cohort is provided).
+    balanced_crps = [
+        float(r["balanced_tumor_gvw_crps"])
+        for r in rows
+        if r.get("balanced_tumor_gvw_crps") is not None
+    ]
+    if balanced_crps:
+        obj["balanced_tumor_gvw_crps_mean"] = _nanmean(balanced_crps)
+        obj["balanced_tumor_gvw_crps_std"] = _nanstd(balanced_crps)
 
     out_path = os.path.join(run_dir, "cv_objective.json")
     with open(out_path, "w") as f:
@@ -557,6 +610,7 @@ def run_optuna_cv_tuning(
         seed=int(sampler_seed),
         multivariate=True,
         constant_liar=True,
+        warn_independent_sampling=False,
     )
 
     if effective_pruner_type == "hyperband":
@@ -573,7 +627,7 @@ def run_optuna_cv_tuning(
     study = optuna.create_study(
         study_name=study_name,
         direction=direction,
-        storage=storage,
+        storage=_make_storage(storage),
         load_if_exists=True,
         sampler=sampler,
         pruner=pruner,
@@ -583,13 +637,6 @@ def run_optuna_cv_tuning(
 
     def objective(trial: optuna.Trial) -> float:
         model_cfg, train_cfg, trial_cfg = _resolve_trial_configs(exp, trial)
-
-        # ---- duplicate guard ----
-        if _is_duplicate_trial(study, trial):
-            trial.set_user_attr("_duplicate", True)
-            raise optuna.TrialPruned(
-                f"Trial {trial.number}: duplicate config — re-sampling."
-            )
 
         run_dir = os.path.join(exp.output_dir, f"trial_{trial.number:05d}")
         os.makedirs(run_dir, exist_ok=True)
@@ -611,6 +658,8 @@ def run_optuna_cv_tuning(
                 shuffle_genes_in_batch=True,
                 seed=exp.data.seed,
                 subsample_frac=subsample_frac,
+                train_only_cohorts=exp.data.train_only_cohorts,
+                balance_cohorts=exp.data.balance_cohorts,
             )
         except optuna.TrialPruned:
             raise  # Let Optuna handle pruning
@@ -1129,6 +1178,7 @@ def run_optuna_fold_tuning(
         seed=fold_seed,
         multivariate=True,
         constant_liar=True,
+        warn_independent_sampling=False,
     )
 
     if effective_pruner_type == 'hyperband':
@@ -1145,7 +1195,7 @@ def run_optuna_fold_tuning(
     study = optuna.create_study(
         study_name=study_name,
         direction=direction,
-        storage=storage,
+        storage=_make_storage(storage),
         load_if_exists=True,
         sampler=sampler,
         pruner=pruner,
@@ -1155,13 +1205,6 @@ def run_optuna_fold_tuning(
 
     def objective(trial: optuna.Trial) -> float:
         model_cfg, train_cfg, trial_cfg = _resolve_trial_configs(exp, trial)
-
-        # ---- duplicate guard ----
-        if _is_duplicate_trial(study, trial):
-            trial.set_user_attr("_duplicate", True)
-            raise optuna.TrialPruned(
-                f"Trial {trial.number}: duplicate config — re-sampling."
-            )
 
         run_dir = os.path.join(exp.output_dir, f"trial_{trial.number:05d}")
         os.makedirs(run_dir, exist_ok=True)
@@ -1197,6 +1240,8 @@ def run_optuna_fold_tuning(
                 seed=exp.data.seed,
                 subsample_frac=subsample_frac,
                 epoch_end_callback=_epoch_end_callback,
+                train_only_cohorts=exp.data.train_only_cohorts,
+                balance_cohorts=exp.data.balance_cohorts,
             )
         except optuna.TrialPruned:
             raise  # Let Optuna handle it
@@ -1245,6 +1290,10 @@ def run_optuna_fold_tuning(
                 bg.get("mae", float("nan")),
             ]),
         }
+        # Balanced fine-tuning objective (single-fold value)
+        balanced_val = fold_metrics.get("balanced_tumor_gvw_crps", None)
+        if balanced_val is not None:
+            obj["balanced_tumor_gvw_crps_mean"] = float(balanced_val)
         for k, v in obj.items():
             if isinstance(v, (int, float)) and math.isfinite(float(v)):
                 trial.set_user_attr(k, float(v))
@@ -1273,6 +1322,139 @@ def run_optuna_fold_tuning(
 # Report Helper
 # =============================================================================
 
+def _compute_fold_stability(
+    study: optuna.Study, output_dir: str, direction: str,
+) -> Optional[Dict[str, Any]]:
+    """Compute cross-fold stability analysis from a fold-parallel study.
+
+    Groups completed trials by their ``fold_num`` user attribute, then
+    reports:
+
+    * **per_fold** — best score, mean score, trial count per fold.
+    * **study_fold_spread** — std of best-per-fold scores (how much
+      fold difficulty varies).
+    * **stability_score** — mean-of-best + std-of-best for ``minimize``
+      (or mean - std for ``maximize``).  Penalises configs that only
+      perform well on easy folds.
+    * **promoted_configs** — if a promotion ledger exists, per-config
+      cross-fold mean/std/stability from configs tested on >1 fold.
+
+    Returns the report dict (also written to ``fold_stability.json``).
+    """
+    completed = [
+        t for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+        and t.value is not None
+        and math.isfinite(t.value)
+    ]
+    if not completed:
+        return None
+
+    # --- per-fold grouping ---
+    fold_trials: Dict[int, List[Tuple[int, float]]] = {}
+    for t in completed:
+        fnum = t.user_attrs.get("fold_num")
+        if fnum is None:
+            continue
+        fnum = int(fnum)
+        fold_trials.setdefault(fnum, []).append((t.number, float(t.value)))
+
+    if not fold_trials:
+        return None
+
+    is_minimize = direction == "minimize"
+    per_fold: Dict[str, Any] = {}
+    best_per_fold: List[float] = []
+    for fnum in sorted(fold_trials):
+        trials = fold_trials[fnum]
+        scores = [s for _, s in trials]
+        best_score = min(scores) if is_minimize else max(scores)
+        best_trial = min(trials, key=lambda x: x[1]) if is_minimize else max(trials, key=lambda x: x[1])
+        per_fold[str(fnum)] = {
+            "n_complete": len(trials),
+            "best_score": round(best_score, 6),
+            "mean_score": round(_nanmean(scores), 6),
+            "best_trial": best_trial[0],
+        }
+        best_per_fold.append(best_score)
+
+    mean_of_best = _nanmean(best_per_fold)
+    std_of_best = _nanstd(best_per_fold) if len(best_per_fold) > 1 else 0.0
+    if is_minimize:
+        stability_score = mean_of_best + std_of_best
+    else:
+        stability_score = mean_of_best - std_of_best
+
+    report: Dict[str, Any] = {
+        "per_fold": per_fold,
+        "study_fold_spread": {
+            "best_per_fold": [round(v, 6) for v in best_per_fold],
+            "mean_of_best": round(mean_of_best, 6),
+            "std_of_best": round(std_of_best, 6),
+            "stability_score": round(stability_score, 6),
+        },
+    }
+
+    # --- promoted-config stability (if ledger exists) ---
+    ledger_path = os.path.join(output_dir, "promotion_ledger.json")
+    if os.path.exists(ledger_path):
+        try:
+            with open(ledger_path, "r") as f:
+                ledger = json.load(f)
+            promoted: List[Dict[str, Any]] = []
+            for chash, entry in ledger.get("configs", {}).items():
+                done = {
+                    k: v for k, v in entry.get("fold_results", {}).items()
+                    if isinstance(v, dict) and v.get("status") == "done"
+                }
+                scores = [
+                    float(v["score"]) for v in done.values()
+                    if isinstance(v.get("score"), (int, float))
+                    and math.isfinite(v["score"])
+                ]
+                if len(scores) < 2:
+                    continue
+                pmean = _nanmean(scores)
+                pstd = _nanstd(scores)
+                pstab = (pmean + pstd) if is_minimize else (pmean - pstd)
+                promoted.append({
+                    "config_hash": chash,
+                    "params": entry.get("params", {}),
+                    "fold_scores": {k: round(v["score"], 6) for k, v in done.items()
+                                    if isinstance(v.get("score"), (int, float))},
+                    "n_folds": len(scores),
+                    "mean": round(pmean, 6),
+                    "std": round(pstd, 6),
+                    "stability_score": round(pstab, 6),
+                })
+            if promoted:
+                promoted.sort(key=lambda x: x["stability_score"],
+                              reverse=not is_minimize)
+                report["promoted_configs"] = promoted
+        except (json.JSONDecodeError, OSError):
+            pass  # ledger unreadable, skip
+
+    # --- write report ---
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, "fold_stability.json")
+    _write_json_atomic(out_path, report)
+
+    # --- console summary ---
+    spread = report["study_fold_spread"]
+    print(f"\n[Fold Stability] best-per-fold: {spread['best_per_fold']}")
+    print(f"[Fold Stability] mean={spread['mean_of_best']:.4f}  "
+          f"std={spread['std_of_best']:.4f}  "
+          f"stability_score={spread['stability_score']:.4f}")
+    if "promoted_configs" in report:
+        for pc in report["promoted_configs"]:
+            print(f"  promoted {pc['config_hash'][:8]}… "
+                  f"mean={pc['mean']:.4f} std={pc['std']:.4f} "
+                  f"stability={pc['stability_score']:.4f} "
+                  f"({pc['n_folds']} folds)")
+
+    return report
+
+
 def _write_study_report(study: optuna.Study, output_dir: str) -> None:
     """Write best-trial summary and param importance to disk."""
     try:
@@ -1282,9 +1464,11 @@ def _write_study_report(study: optuna.Study, output_dir: str) -> None:
         print("[Tuning] No completed trials in study.")
         return
 
+    direction = str(study.direction).split(".")[-1].lower()
+
     out = {
         "study_name": study.study_name,
-        "direction": str(study.direction).split(".")[-1].lower(),
+        "direction": direction,
         "n_trials": len(study.trials),
         "best_trial": {
             "number": best.number,
@@ -1306,3 +1490,6 @@ def _write_study_report(study: optuna.Study, output_dir: str) -> None:
         _write_json_atomic(imp_path, {k: float(v) for k, v in imp.items()})
     except Exception:
         pass
+
+    # Fold-stability analysis (fold-parallel studies)
+    _compute_fold_stability(study, output_dir, direction)
