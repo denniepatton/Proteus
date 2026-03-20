@@ -975,6 +975,26 @@ def plot_reliability_weights(
     """
     _ensure_dir(name)
 
+    # Human-readable display names for reliability model features.
+    _DISPLAY_NAMES: Dict[str, str] = {
+        "f1_mean_width": "Mean CI Width",
+        "f2_median_width": "Median CI Width",
+        "f3_mean_entropy": "Mixture Entropy (δ/γ/n)",
+        "f4_mean_hurdle_amb": "Hurdle Ambiguity (πδ·(1−πδ))",
+        "f5_mean_cont_amb": "Continuous Ambiguity (πγ·πn)",
+        "f6_mean_pmax": "Mean Max Component π",
+        "f7_median_pmax": "Median Max Component π",
+        "f8_mean_gap": "Component Gap (πmax − π2nd)",
+        "f9_mean_u_normal": "Normal Variance (πn·σ²n)",
+        "f10_mean_u_gamma": "Gamma Variance (πγ·k/β²)",
+        "f11_mean_d_mu": "Fold-to-Fold SD(μ)",
+        "f12_mean_d_width": "Fold-to-Fold SD(CI Width)",
+        "f13_mean_d_delta": "Fold-to-Fold SD(πδ)",
+        "f14_pred_sd": "Prediction SD (across samples)",
+        "f15_gene_zero_rate": "Gene Zero-Rate",
+        "f16_gene_variance": "Gene Expression Variance",
+    }
+
     n = len(feature_columns)
     if n == 0:
         return
@@ -983,12 +1003,13 @@ def plot_reliability_weights(
     order = np.argsort(np.abs(weights))[::-1]
     cols = [feature_columns[i] for i in order]
     vals = weights[order]
+    display_cols = [_DISPLAY_NAMES.get(c, c) for c in cols]
 
     fig, ax = plt.subplots(figsize=(7, max(3, 0.5 * n + 1)))
     colors = ["#EE3377" if v < 0 else "#0077BB" for v in vals]
     ax.barh(range(n), vals, color=colors, edgecolor="none", height=0.6)
     ax.set_yticks(range(n))
-    ax.set_yticklabels(cols, fontsize=9)
+    ax.set_yticklabels(display_cols, fontsize=9)
     ax.axvline(0, color="black", linewidth=0.8)
     ax.set_xlabel("Ridge Weight")
     ax.set_title(title or "Reliability Model — Feature Weights")
@@ -1300,7 +1321,7 @@ def benchmark_grid_histograms(
                     color = "#BBBBBB" if model == "Null" else cmap[model]
                     sns.kdeplot(
                         vals, ax=ax, color=color, linewidth=1.5,
-                        fill=True, alpha=0.15, clip=(-1, 1),
+                        fill=False, clip=(-1, 1),
                     )
                     legend_entries.append(f"{model} (n≥0.7={n_good})")
                 if legend_entries:
@@ -1330,8 +1351,7 @@ def benchmark_ecdna_lines(
     """Line plots of 6 metrics vs effective ctDNA (TFx * depth).
 
     Layout: 2 columns x 3 rows.  A single shared legend is placed at the
-    bottom of the figure.  Bootstrap CIs (columns ``*_ci_lo`` / ``*_ci_hi``)
-    are drawn as shaded bands when present in ``ecdna_table``.
+    bottom of the figure.
     """
     _ensure_dir(name)
     cmap = _bench_color_map(model_order)
@@ -1362,15 +1382,6 @@ def benchmark_ecdna_lines(
             # Collect legend entries from first panel only
             if idx == 0:
                 legend_handles.append((line, model))
-            # Bootstrap CI band
-            ci_lo_col = f"{col}_ci_lo"
-            ci_hi_col = f"{col}_ci_hi"
-            if ci_lo_col in sub.columns and ci_hi_col in sub.columns:
-                lo = sub[ci_lo_col].values
-                hi = sub[ci_hi_col].values
-                if not (np.isnan(lo).all() or np.isnan(hi).all()):
-                    ax.fill_between(sub["ecdna"].values, lo, hi,
-                                    color=color, alpha=0.15)
         ax.set_xlabel("Effective ctDNA (TFx \u00d7 depth)", fontsize=9)
         ax.set_ylabel(label, fontsize=9)
         ax.set_xscale("log")
@@ -1390,116 +1401,3 @@ def benchmark_ecdna_lines(
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
 
-
-def benchmark_marginal_boxplots(
-    metrics_table: pd.DataFrame,
-    name: str,
-    *,
-    metric_col: str,
-    ylabel: str,
-    title: str,
-    panel_col: str,
-    panel_order: Sequence[str],
-    hue_col: str,
-    model_order: Sequence[str],
-) -> None:
-    """One-dimensional grid of boxplots — one panel per ``panel_col`` level.
-
-    Inside each panel the x-axis is grouped first by ``hue_col`` level then
-    by model.  Points for the same model across hue levels are connected
-    with lines.  Scalar (single-value) metrics are drawn as connected
-    dot-plots; distribution metrics use box-plots.
-
-    ``metrics_table`` must have columns: ``panel_col``, ``hue_col``, model,
-    and ``metric_col``.
-    """
-    _ensure_dir(name)
-    cmap = _bench_color_map(model_order)
-    n_panels = len(panel_order)
-
-    fig, axes = plt.subplots(
-        1, n_panels,
-        figsize=(max(8, 5 * n_panels), 5),
-        sharey=True, squeeze=False,
-    )
-
-    # Collect the unique hue levels present in the data (in desired order
-    # if we can infer one; otherwise alphabetical).
-    hue_levels = sorted(metrics_table[hue_col].unique(), key=str)
-
-    for pi, panel_val in enumerate(panel_order):
-        ax = axes[0, pi]
-        sub = metrics_table[metrics_table[panel_col] == panel_val]
-        if sub.empty:
-            ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
-                    ha="center", va="center", fontsize=9, color="gray")
-            ax.set_title(f"{panel_col} {panel_val}", fontsize=10,
-                         fontweight="bold")
-            continue
-
-        # Build groups: one box per (hue_level, model) that has data
-        plot_data = []
-        tick_labels = []
-        colors = []
-        group_keys = []  # (hue_val, model)
-        for hue_val in hue_levels:
-            hue_sub = sub[sub[hue_col] == hue_val]
-            if hue_sub.empty:
-                continue
-            for model in model_order:
-                vals = hue_sub.loc[hue_sub["model"] == model, metric_col].dropna().values
-                if len(vals) == 0:
-                    continue
-                plot_data.append(vals)
-                tick_labels.append(f"{hue_val}\n{model}")
-                colors.append("#BBBBBB" if model == "Null" else cmap[model])
-                group_keys.append((hue_val, model))
-
-        if plot_data:
-            all_scalar = all(len(v) == 1 for v in plot_data)
-            if all_scalar:
-                for i, (vals, c) in enumerate(zip(plot_data, colors), start=1):
-                    ax.plot(i, vals[0], "o", color=c, markersize=7, zorder=3)
-                # Connect points belonging to the same model with lines
-                for model in model_order:
-                    xs, ys = [], []
-                    for i, ((hue_val, mod), vals) in enumerate(
-                            zip(group_keys, plot_data), start=1):
-                        if mod == model:
-                            xs.append(i)
-                            ys.append(vals[0])
-                    if len(xs) > 1:
-                        c = "#BBBBBB" if model == "Null" else cmap[model]
-                        ax.plot(xs, ys, "-", color=c, linewidth=1, alpha=0.6, zorder=2)
-                ax.set_xticks(range(1, len(tick_labels) + 1))
-                ax.set_xticklabels(tick_labels, rotation=55, ha="right", fontsize=5)
-            else:
-                bp = ax.boxplot(
-                    plot_data, patch_artist=True, widths=0.6,
-                    medianprops=dict(color="black", linewidth=1.2),
-                    flierprops=dict(markersize=2),
-                )
-                for patch, c in zip(bp["boxes"], colors):
-                    patch.set_facecolor(c)
-                    patch.set_alpha(0.7)
-                # Connect medians of the same model across hue levels
-                for model in model_order:
-                    xs, ys = [], []
-                    for i, ((hue_val, mod), vals) in enumerate(
-                            zip(group_keys, plot_data), start=1):
-                        if mod == model:
-                            xs.append(i)
-                            ys.append(float(np.median(vals)))
-                    if len(xs) > 1:
-                        c = "#BBBBBB" if model == "Null" else cmap[model]
-                        ax.plot(xs, ys, "-", color=c, linewidth=1, alpha=0.6, zorder=2)
-                ax.set_xticks(range(1, len(tick_labels) + 1))
-                ax.set_xticklabels(tick_labels, rotation=55, ha="right", fontsize=5)
-        ax.set_title(f"{panel_col} {panel_val}", fontsize=10, fontweight="bold")
-        if pi == 0:
-            ax.set_ylabel(ylabel, fontsize=9)
-
-    fig.suptitle(title, fontsize=13, fontweight="bold", y=1.02)
-    fig.tight_layout()
-    fig.savefig(f"{name}.pdf", bbox_inches="tight")
-    plt.close(fig)

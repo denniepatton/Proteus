@@ -502,12 +502,23 @@ def _transform_features(
 
 
 def _process_label(filepath: str, sample: str) -> Dict[str, float]:
-    """Process a label file and return data as a dictionary."""
+    """Process a label file and return data as a dictionary.
+
+    Uses exact column match first; if that fails, falls back to
+    substring matching (e.g. bare sample name ``22-002`` matching
+    prefixed column ``CRPC-RA_22-002``).  The fuzzy match must be
+    unique (exactly one column) to succeed.
+    """
     if filepath is None:
         return {}
     df = pd.read_csv(filepath, sep='\t', index_col=0)
     if sample not in df.columns:
-        return {}
+        # Fuzzy match: bare sample name vs prefixed columns (or vice-versa)
+        matching = [c for c in df.columns if sample in c or c in sample]
+        if len(matching) == 1:
+            sample = matching[0]
+        else:
+            return {}
     df = df[[sample]]
     df = df.apply(lambda x: pd.to_numeric(x, errors='coerce'))
     return df[sample].to_dict()
@@ -658,7 +669,15 @@ def process_sample_to_zarr(
     ref_data = _process_ref(ref_path)
     tumor_exp_data = _process_label(tumor_exp_path, sample) if tumor_exp_path else {}
     background_exp_data = _process_label(background_exp_path, sample) if background_exp_path else {}
-    
+
+    # Warn when a label file was provided but returned no data (likely naming mismatch)
+    if tumor_exp_path and not tumor_exp_data:
+        print(f'  WARNING: tumor_exp file provided but sample "{sample}" not matched '
+              f'in {os.path.basename(tumor_exp_path)}')
+    if background_exp_path and not background_exp_data:
+        print(f'  WARNING: background_exp file provided but sample "{sample}" not matched '
+              f'in {os.path.basename(background_exp_path)}')
+
     # Apply feature-specific transforms
     tss_features = _transform_features(tss_features_raw, TSS_FEATURES)
     gb_features = _transform_features(gb_features_raw, GB_FEATURES)
@@ -939,6 +958,35 @@ def process_dataset(
     print(f'  Tumor exp: {tumor_exp_path}')
     print(f'  Background exp: {background_exp_path}')
     print(f'  Output: {out_dir}')
+
+    # Pre-flight: warn if a label file is provided but no samples match its columns.
+    # This catches naming mismatches (e.g. bare "22-002" vs prefixed "CRPC-RA_22-002")
+    # before spending time on per-sample Zarr writes.
+    for label_tag, label_path in [('tumor_exp', tumor_exp_path),
+                                  ('background_exp', background_exp_path)]:
+        if label_path is None:
+            continue
+        try:
+            label_cols = set(pd.read_csv(label_path, sep='\t', index_col=0, nrows=0).columns)
+        except Exception:
+            continue
+        exact_hits = sum(1 for s in samples if s in label_cols)
+        fuzzy_hits = sum(
+            1 for s in samples
+            if s not in label_cols and
+            len([c for c in label_cols if s in c or c in s]) == 1
+        )
+        if exact_hits == 0 and fuzzy_hits == 0:
+            raise ValueError(
+                f'Label file {os.path.basename(label_path)} ({label_tag}) has '
+                f'{len(label_cols)} columns but NONE match any of the '
+                f'{len(samples)} discovered samples.  First 3 samples: '
+                f'{samples[:3]}, first 3 columns: {sorted(label_cols)[:3]}.  '
+                f'This is almost certainly a naming mismatch.'
+            )
+        if exact_hits == 0 and fuzzy_hits > 0:
+            print(f'  Note: {label_tag} labels matched {fuzzy_hits}/{len(samples)} '
+                  f'samples via fuzzy (substring) matching.')
     
     # Process samples - now returns (path, skip_reason, excluded_genes) tuples
     created_paths = []

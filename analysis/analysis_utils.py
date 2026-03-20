@@ -431,29 +431,46 @@ def gene_level_metrics(
     with np.errstate(divide="ignore", invalid="ignore"):
         pearson_r = np.where(den > 0, num / den, np.nan)
 
-    # ── Spearman rho (vectorised via ranking) ──
-    # Rank each gene's truth/pred across samples, then Pearson on ranks.
-    n_rho = float(n_samples)  # ranks have no NaN, use full count
-    T_ranked = _rankdata_columns(T.T)  # (S, G) — rank along samples axis
-    P_ranked = _rankdata_columns(P.T)
-    # Pearson on ranks — same formula, transposed: genes along columns
-    sum_tr = T_ranked.sum(axis=0)
-    sum_pr = P_ranked.sum(axis=0)
-    sum_trtr = (T_ranked * T_ranked).sum(axis=0)
-    sum_prpr = (P_ranked * P_ranked).sum(axis=0)
-    sum_trpr = (T_ranked * P_ranked).sum(axis=0)
-    num_s = n_rho * sum_trpr - sum_tr * sum_pr
-    den_tr = n_rho * sum_trtr - sum_tr ** 2
-    den_pr = n_rho * sum_prpr - sum_pr ** 2
-    den_s = np.sqrt(den_tr * den_pr)
+    # ── Spearman rho (vectorised via NaN-aware ranking) ──
+    # Rank each gene's truth/pred across samples, excluding NaN entries
+    # so that NaN values don't inflate ranks for valid observations.
+    T_masked_sp = np.where(finite_mask, T, np.nan)
+    P_masked_sp = np.where(finite_mask, P, np.nan)
+    T_ranked = _rankdata_columns_nan(T_masked_sp.T)  # (S, G)
+    P_ranked = _rankdata_columns_nan(P_masked_sp.T)
+    # Replace NaN ranks with 0; use per-gene valid count for Pearson-on-ranks
+    rank_valid = np.isfinite(T_ranked) & np.isfinite(P_ranked)  # (S, G)
+    T_rk = np.where(rank_valid, T_ranked, 0.0)
+    P_rk = np.where(rank_valid, P_ranked, 0.0)
+    n_rk = rank_valid.sum(axis=0).astype(np.float64)  # per-gene valid count
+    n_rk_safe = np.where(n_rk >= 3, n_rk, np.nan)
+    sum_tr = T_rk.sum(axis=0)
+    sum_pr = P_rk.sum(axis=0)
+    sum_trtr = (T_rk * T_rk).sum(axis=0)
+    sum_prpr = (P_rk * P_rk).sum(axis=0)
+    sum_trpr = (T_rk * P_rk).sum(axis=0)
+    num_s = n_rk_safe * sum_trpr - sum_tr * sum_pr
+    den_tr = n_rk_safe * sum_trtr - sum_tr ** 2
+    den_pr = n_rk_safe * sum_prpr - sum_pr ** 2
+    with np.errstate(invalid="ignore"):
+        den_s = np.sqrt(den_tr * den_pr)
     with np.errstate(divide="ignore", invalid="ignore"):
         spearman_rho = np.where(den_s > 0, num_s / den_s, np.nan)
 
-    # ── RMSE, MAE, truth variance (vectorised) ──
-    err = P - T
-    rmse = np.sqrt(np.nanmean(err ** 2, axis=1))
-    mae = np.nanmean(np.abs(err), axis=1)
-    truth_var = np.nanvar(T, axis=1, ddof=0)
+    # ── RMSE, MAE, truth variance (vectorised, NaN-safe) ──
+    # Genes where all samples are NaN produce empty slices; handle
+    # explicitly to avoid RuntimeWarning from nanmean/nanvar.
+    any_valid = finite_mask.any(axis=1)  # (G,) — True if gene has ≥1 valid pair
+    any_truth = np.isfinite(T).any(axis=1)
+    err = P - T  # NaN propagates naturally
+    rmse = np.full(T.shape[0], np.nan)
+    mae = np.full(T.shape[0], np.nan)
+    truth_var = np.full(T.shape[0], np.nan)
+    if any_valid.any():
+        rmse[any_valid] = np.sqrt(np.nanmean(err[any_valid] ** 2, axis=1))
+        mae[any_valid] = np.nanmean(np.abs(err[any_valid]), axis=1)
+    if any_truth.any():
+        truth_var[any_truth] = np.nanvar(T[any_truth], axis=1, ddof=0)
 
     return pd.DataFrame({
         "n": n_samples,
@@ -510,24 +527,35 @@ def sample_level_metrics(
     with np.errstate(divide="ignore", invalid="ignore"):
         pearson_r = np.where(den > 0, num / den, np.nan)
 
-    # ── Spearman rho per sample — rank along gene axis ──
-    n_rho = float(n_genes)  # ranks have no NaN, use full count
-    T_ranked = _rankdata_columns(T)   # (G, S) — rank each column (sample) along genes
-    P_ranked = _rankdata_columns(P)
-    sum_tr = T_ranked.sum(axis=0)
-    sum_pr = P_ranked.sum(axis=0)
-    sum_trtr = (T_ranked * T_ranked).sum(axis=0)
-    sum_prpr = (P_ranked * P_ranked).sum(axis=0)
-    sum_trpr = (T_ranked * P_ranked).sum(axis=0)
-    num_s = n_rho * sum_trpr - sum_tr * sum_pr
-    den_s = np.sqrt((n_rho * sum_trtr - sum_tr ** 2) * (n_rho * sum_prpr - sum_pr ** 2))
+    # ── Spearman rho per sample — NaN-aware rank along gene axis ──
+    T_masked_sp = np.where(finite_mask, T, np.nan)
+    P_masked_sp = np.where(finite_mask, P, np.nan)
+    T_ranked = _rankdata_columns_nan(T_masked_sp)   # (G, S) — rank each column along genes
+    P_ranked = _rankdata_columns_nan(P_masked_sp)
+    rank_valid = np.isfinite(T_ranked) & np.isfinite(P_ranked)  # (G, S)
+    T_rk = np.where(rank_valid, T_ranked, 0.0)
+    P_rk = np.where(rank_valid, P_ranked, 0.0)
+    n_rk = rank_valid.sum(axis=0).astype(np.float64)  # per-sample valid count
+    n_rk_safe = np.where(n_rk >= 3, n_rk, np.nan)
+    sum_tr = T_rk.sum(axis=0)
+    sum_pr = P_rk.sum(axis=0)
+    sum_trtr = (T_rk * T_rk).sum(axis=0)
+    sum_prpr = (P_rk * P_rk).sum(axis=0)
+    sum_trpr = (T_rk * P_rk).sum(axis=0)
+    num_s = n_rk_safe * sum_trpr - sum_tr * sum_pr
+    with np.errstate(invalid="ignore"):
+        den_s = np.sqrt((n_rk_safe * sum_trtr - sum_tr ** 2) * (n_rk_safe * sum_prpr - sum_pr ** 2))
     with np.errstate(divide="ignore", invalid="ignore"):
         spearman_rho = np.where(den_s > 0, num_s / den_s, np.nan)
 
-    # ── RMSE, MAE ──
+    # ── RMSE, MAE (NaN-safe) ──
+    any_valid = finite_mask.any(axis=0)  # (S,) — True if sample has ≥1 valid pair
     err = P - T
-    rmse = np.sqrt(np.nanmean(err ** 2, axis=0))
-    mae = np.nanmean(np.abs(err), axis=0)
+    rmse = np.full(T.shape[1], np.nan)
+    mae = np.full(T.shape[1], np.nan)
+    if any_valid.any():
+        rmse[any_valid] = np.sqrt(np.nanmean(err[:, any_valid] ** 2, axis=0))
+        mae[any_valid] = np.nanmean(np.abs(err[:, any_valid]), axis=0)
 
     return pd.DataFrame({
         "n": n_genes,
@@ -545,6 +573,37 @@ def compute_gene_variance(truth_wide: pd.DataFrame) -> Dict[str, float]:
     return truth_wide.var(axis=1, ddof=1).to_dict()
 
 
+def _rankdata_columns_nan(arr: np.ndarray) -> np.ndarray:
+    """Rank each column independently, skipping NaN entries.
+
+    arr : (n_rows, n_cols) — each column is ranked independently.
+    Returns same shape with float64 ranks (1-based, ties averaged).
+    NaN entries in the input receive NaN ranks (excluded from ranking).
+    Only the finite entries within each column participate in ranking.
+    """
+    from scipy.stats import rankdata as _scipy_rankdata
+
+    result = np.full_like(arr, np.nan, dtype=np.float64)
+    finite_mask = np.isfinite(arr)
+
+    # Fast path: no NaN at all — rank everything in one vectorised call
+    if finite_mask.all():
+        return _scipy_rankdata(arr, axis=0, method='average').astype(np.float64)
+
+    # Per-column ranking of only finite values
+    for j in range(arr.shape[1]):
+        col_mask = finite_mask[:, j]
+        if col_mask.sum() < 2:
+            # 0 or 1 finite values — rank is trivially 1 (or leave NaN)
+            if col_mask.any():
+                result[col_mask, j] = 1.0
+            continue
+        result[col_mask, j] = _scipy_rankdata(
+            arr[col_mask, j], method='average',
+        ).astype(np.float64)
+    return result
+
+
 def _gvw_rho_from_wide(
     T: np.ndarray,
     P: np.ndarray,
@@ -557,40 +616,35 @@ def _gvw_rho_from_wide(
     T, P : (n_genes, n_samples) truth and prediction arrays.
     w_gene : (n_genes,) per-gene variance weights.
 
-    Ranks each gene's values across samples (within-gene ranking), then
-    computes weighted Pearson r on the interleaved ranks with per-observation
-    weight equal to that gene's variance.
+    For each gene, computes the exact Spearman rho across samples,
+    dropping any NaN observations.  Genes with fewer than 5 valid
+    sample-pairs are excluded entirely.  The final result is the
+    variance-weighted average of per-gene rho values.
     """
+    from scipy.stats import spearmanr as _spearmanr
+
     n_genes, n_samples = T.shape
     if n_samples < 2 or n_genes < 1:
         return np.nan
 
-    # Rank within each gene across samples — _rankdata_columns ranks
-    # along axis=0 (rows), so transpose: (S, G)
-    T_ranked = _rankdata_columns(T.T)  # (S, G)
-    P_ranked = _rankdata_columns(P.T)
+    rho_per_gene = np.full(n_genes, np.nan)
+    for g in range(n_genes):
+        valid = np.isfinite(T[g]) & np.isfinite(P[g])
+        if valid.sum() < 5:
+            continue
+        tv, pv = T[g, valid], P[g, valid]
+        if np.ptp(tv) == 0 or np.ptp(pv) == 0:
+            continue
+        rho_per_gene[g] = _spearmanr(tv, pv).statistic
 
-    # Flatten to (G*S,) with gene weights broadcast
-    tr = T_ranked.T.ravel()  # back to (G, S) then flatten
-    pr = P_ranked.T.ravel()
-    w = np.repeat(w_gene, n_samples)
-
-    total_w = w.sum()
-    if total_w < 1e-12:
+    # Keep only genes with a valid rho and positive variance weight
+    usable = np.isfinite(rho_per_gene) & (w_gene > 0)
+    if not usable.any():
         return np.nan
 
-    mean_t = np.dot(w, tr) / total_w
-    mean_p = np.dot(w, pr) / total_w
-    dt = tr - mean_t
-    dp = pr - mean_p
-    cov_tp = np.dot(w, dt * dp) / total_w
-    var_t = np.dot(w, dt * dt) / total_w
-    var_p = np.dot(w, dp * dp) / total_w
-
-    denom = np.sqrt(var_t * var_p)
-    if denom < 1e-12:
-        return np.nan
-    return float(cov_tp / denom)
+    w = w_gene[usable]
+    rho = rho_per_gene[usable]
+    return float(np.dot(w, rho) / w.sum())
 
 
 def _gvw_r_from_wide(
@@ -600,42 +654,45 @@ def _gvw_r_from_wide(
 ) -> float:
     """Gene-variance-weighted Pearson r from (G, S) arrays.
 
-    Each observation (gene × sample) is weighted by the gene's variance.
-    NaN observations are masked out (their weight is set to zero).
+    Parameters
+    ----------
+    T, P : (n_genes, n_samples) truth and prediction arrays.
+    w_gene : (n_genes,) per-gene variance weights.
+
+    For each gene, computes the exact Pearson r across samples,
+    dropping any NaN observations.  Genes with fewer than 5 valid
+    sample-pairs are excluded entirely.  The final result is the
+    variance-weighted average of per-gene r values.
     """
     n_genes, n_samples = T.shape
     if n_samples < 2 or n_genes < 1:
         return np.nan
 
-    # Flatten to (G*S,) with per-gene weights broadcast
-    t = T.ravel()
-    p = P.ravel()
-    w = np.repeat(w_gene, n_samples)
+    r_per_gene = np.full(n_genes, np.nan)
+    for g in range(n_genes):
+        valid = np.isfinite(T[g]) & np.isfinite(P[g])
+        n = valid.sum()
+        if n < 5:
+            continue
+        t = T[g, valid]
+        p = P[g, valid]
+        mean_t = t.mean()
+        mean_p = p.mean()
+        dt = t - mean_t
+        dp = p - mean_p
+        denom = np.sqrt(np.dot(dt, dt) * np.dot(dp, dp))
+        if denom < 1e-12:
+            continue
+        r_per_gene[g] = np.dot(dt, dp) / denom
 
-    # Mask out NaN observations
-    valid = np.isfinite(t) & np.isfinite(p)
-    if not valid.any():
+    # Keep only genes with a valid r and positive variance weight
+    usable = np.isfinite(r_per_gene) & (w_gene > 0)
+    if not usable.any():
         return np.nan
-    t = t[valid]
-    p = p[valid]
-    w = w[valid]
 
-    total_w = w.sum()
-    if total_w < 1e-12:
-        return np.nan
-
-    mean_t = np.dot(w, t) / total_w
-    mean_p = np.dot(w, p) / total_w
-    dt = t - mean_t
-    dp = p - mean_p
-    cov_tp = np.dot(w, dt * dp) / total_w
-    var_t = np.dot(w, dt * dt) / total_w
-    var_p = np.dot(w, dp * dp) / total_w
-
-    denom = np.sqrt(var_t * var_p)
-    if denom < 1e-12:
-        return np.nan
-    return float(cov_tp / denom)
+    w = w_gene[usable]
+    r = r_per_gene[usable]
+    return float(np.dot(w, r) / w.sum())
 
 
 def gvw_r(
@@ -644,32 +701,33 @@ def gvw_r(
     genes_flat: np.ndarray,
     var_map: Dict[str, float],
 ) -> float:
-    """Gene-variance-weighted Pearson r.
+    """Gene-variance-weighted Pearson r (flat-array interface).
 
-    Each observation (gene×sample) is weighted by the variance of that gene
-    across truth samples.  Returns the weighted correlation.
+    Reshapes into (G, S) arrays and delegates to ``_gvw_r_from_wide``.
     """
     mask = np.isfinite(truth_flat) & np.isfinite(pred_flat)
     t = truth_flat[mask]
     p = pred_flat[mask]
     g = genes_flat[mask]
-    w = np.array([var_map.get(str(gene), 0.0) for gene in g], dtype=np.float64)
-    np.nan_to_num(w, nan=0.0, copy=False)
-
-    total_w = w.sum()
-    if total_w < 1e-12 or len(t) < 3:
+    if len(t) < 3:
         return np.nan
 
-    mean_t = np.average(t, weights=w)
-    mean_p = np.average(p, weights=w)
-    cov_tp = np.sum(w * (t - mean_t) * (p - mean_p)) / total_w
-    var_t = np.sum(w * (t - mean_t) ** 2) / total_w
-    var_p = np.sum(w * (p - mean_p) ** 2) / total_w
-
-    denom = np.sqrt(var_t * var_p)
-    if denom < 1e-12:
-        return np.nan
-    return float(cov_tp / denom)
+    unique_genes = np.unique(g)
+    n_genes = len(unique_genes)
+    # Build (G, S) arrays — pad with NaN for ragged counts
+    gene_to_idx = {ug: i for i, ug in enumerate(unique_genes)}
+    max_count = max(np.sum(g == ug) for ug in unique_genes)
+    T = np.full((n_genes, max_count), np.nan)
+    P = np.full((n_genes, max_count), np.nan)
+    counters = np.zeros(n_genes, dtype=int)
+    for k in range(len(t)):
+        gi = gene_to_idx[g[k]]
+        T[gi, counters[gi]] = t[k]
+        P[gi, counters[gi]] = p[k]
+        counters[gi] += 1
+    w_gene = np.array([var_map.get(str(ug), 0.0) for ug in unique_genes],
+                      dtype=np.float64)
+    return _gvw_r_from_wide(T, P, w_gene)
 
 
 def gvw_rho(
@@ -680,57 +738,30 @@ def gvw_rho(
 ) -> float:
     """Gene-variance-weighted Spearman rho (flat-array interface).
 
-    Ranks truth and pred *within each gene* (across samples), then computes
-    GVW-weighted Pearson on the within-gene ranks.  Delegates to the
-    vectorised ``_gvw_rho_from_wide`` after reshaping.
+    Reshapes into (G, S) arrays and delegates to ``_gvw_rho_from_wide``.
     """
     mask = np.isfinite(truth_flat) & np.isfinite(pred_flat)
     t = truth_flat[mask]
     p = pred_flat[mask]
     g = genes_flat[mask]
-
     if len(t) < 3:
         return np.nan
 
-    unique_genes, counts = np.unique(g, return_counts=True)
-    n_per_gene = int(counts[0]) if np.all(counts == counts[0]) else 0
-
-    if n_per_gene > 0:
-        # Fast path: all genes have the same sample count — reshape directly
-        n_genes = len(unique_genes)
-        # Sort by gene to get contiguous blocks
-        sort_idx = np.argsort(g, kind="mergesort")
-        T = t[sort_idx].reshape(n_genes, n_per_gene)
-        P = p[sort_idx].reshape(n_genes, n_per_gene)
-        w_gene = np.array([var_map.get(str(ug), 0.0) for ug in unique_genes],
-                          dtype=np.float64)
-        return _gvw_rho_from_wide(T, P, w_gene)
-
-    # Slow fallback for ragged gene counts (shouldn't happen in practice)
-    from scipy.stats import rankdata as _rankdata
-    t_ranked = np.empty_like(t, dtype=np.float64)
-    p_ranked = np.empty_like(p, dtype=np.float64)
-    for gene in unique_genes:
-        idx = g == gene
-        t_ranked[idx] = _rankdata(t[idx])
-        p_ranked[idx] = _rankdata(p[idx])
-
-    w = np.array([var_map.get(str(gene), 0.0) for gene in g], dtype=np.float64)
-    np.nan_to_num(w, nan=0.0, copy=False)
-    total_w = w.sum()
-    if total_w < 1e-12:
-        return np.nan
-
-    mean_t = np.average(t_ranked, weights=w)
-    mean_p = np.average(p_ranked, weights=w)
-    cov_tp = np.sum(w * (t_ranked - mean_t) * (p_ranked - mean_p)) / total_w
-    var_t = np.sum(w * (t_ranked - mean_t) ** 2) / total_w
-    var_p = np.sum(w * (p_ranked - mean_p) ** 2) / total_w
-
-    denom = np.sqrt(var_t * var_p)
-    if denom < 1e-12:
-        return np.nan
-    return float(cov_tp / denom)
+    unique_genes = np.unique(g)
+    n_genes = len(unique_genes)
+    gene_to_idx = {ug: i for i, ug in enumerate(unique_genes)}
+    max_count = max(np.sum(g == ug) for ug in unique_genes)
+    T = np.full((n_genes, max_count), np.nan)
+    P = np.full((n_genes, max_count), np.nan)
+    counters = np.zeros(n_genes, dtype=int)
+    for k in range(len(t)):
+        gi = gene_to_idx[g[k]]
+        T[gi, counters[gi]] = t[k]
+        P[gi, counters[gi]] = p[k]
+        counters[gi] += 1
+    w_gene = np.array([var_map.get(str(ug), 0.0) for ug in unique_genes],
+                      dtype=np.float64)
+    return _gvw_rho_from_wide(T, P, w_gene)
 
 
 def _flatten_wide_pair(
@@ -1010,16 +1041,22 @@ def generate_null_predictions(
     truth_wide: pd.DataFrame,
     seed: int = 42,
 ) -> pd.DataFrame:
-    """Null model: shuffle gene values independently within each sample."""
+    """Null model: shuffle sample values independently within each gene (row).
+
+    For each gene, the expression values across samples are permuted,
+    destroying per-gene cross-sample correlations.  This is the correct
+    null for per-gene Spearman rho (shuffling within columns instead
+    would preserve per-gene structure and produce a bimodal null).
+    """
     rng = np.random.default_rng(seed)
     shuffled = truth_wide.copy()
-    for col in shuffled.columns:
-        vals = shuffled[col].values.copy()
-        finite = np.isfinite(vals)
-        finite_vals = vals[finite]
+    arr = shuffled.values  # (G, S)
+    for g in range(arr.shape[0]):
+        row = arr[g]
+        finite = np.isfinite(row)
+        finite_vals = row[finite].copy()
         rng.shuffle(finite_vals)
-        vals[finite] = finite_vals
-        shuffled[col] = vals
+        row[finite] = finite_vals
     return shuffled
 
 
@@ -1028,7 +1065,6 @@ def compute_subset_metrics(
     pred_wide: pd.DataFrame,
     n_workers: Optional[int] = None,
     var_map: Optional[Dict[str, float]] = None,
-    n_bootstraps: int = 0,
 ) -> Dict[str, Any]:
     """Compute the benchmark metrics on an aligned (truth, pred) pair.
 
@@ -1037,8 +1073,6 @@ def compute_subset_metrics(
     var_map : optional pre-computed gene variance dict from the full truth
         cohort.  When supplied, GVW metrics use these weights instead of
         recomputing from the (potentially tiny) truth subset.
-    n_bootstraps : if > 0, compute bootstrap CIs (resampling samples) for
-        each scalar metric and include ``*_ci_lo`` / ``*_ci_hi`` keys.
 
     Returns dict with:
       sample_rho  : np.ndarray of per-sample transcriptome-wide Spearman rho
@@ -1049,7 +1083,6 @@ def compute_subset_metrics(
       mean_top10pct_gene_rho : float (mean Spearman rho in top 10% most variable genes)
       gene_rho_array : np.ndarray of per-gene Spearman rho
       n_genes_rho_ge070 : int (genes with Spearman rho >= 0.70)
-      *_ci_lo / *_ci_hi : bootstrap CI bounds (only when n_bootstraps > 0)
     """
     empty = {
         "sample_rho": np.array([]),
@@ -1059,6 +1092,7 @@ def compute_subset_metrics(
         "rmse": np.nan,
         "mean_top10pct_gene_rho": np.nan,
         "gene_rho_array": np.array([]),
+        "gene_rho_genes": np.array([], dtype=object),
         "top10pct_gene_rho_array": np.array([]),
         "n_genes_rho_ge070": 0,
     }
@@ -1078,141 +1112,62 @@ def compute_subset_metrics(
                                 category=RuntimeWarning)
         warnings.filterwarnings("ignore", message="All-NaN slice encountered",
                                 category=RuntimeWarning)
-        return _compute_subset_metrics_impl(
-            tw, pw, common_genes, common_samples, n_workers, var_map,
-            n_bootstraps,
-        )
 
+        if var_map is None:
+            var_map = compute_gene_variance(tw)
 
-def _compute_subset_metrics_impl(
-    tw: pd.DataFrame,
-    pw: pd.DataFrame,
-    common_genes: pd.Index,
-    common_samples: pd.Index,
-    n_workers: Optional[int],
-    var_map: Optional[Dict[str, float]],
-    n_bootstraps: int,
-) -> Dict[str, Any]:
-    """Inner implementation of compute_subset_metrics (no warning noise)."""
-    if var_map is None:
-        var_map = compute_gene_variance(tw)
+        T_arr = tw.values.astype(np.float64)
+        P_arr = pw.values.astype(np.float64)
 
-    gmet = gene_level_metrics(tw, pw, n_workers=n_workers)
-    smet = sample_level_metrics(tw, pw, n_workers=n_workers)
+        # Per-gene valid pair count; exclude genes with < 5 valid samples
+        n_valid_per_gene = (np.isfinite(T_arr) & np.isfinite(P_arr)).sum(axis=1)
+        usable_genes = n_valid_per_gene >= 5
 
-    gene_rho_s = gmet["spearman_rho"].dropna()
-    gene_rho = gene_rho_s.values
-    sample_rho = smet["spearman_rho"].dropna().values
+        # Fully-vectorised gene-level and sample-level metrics
+        gmet = gene_level_metrics(tw, pw)
+        smet = sample_level_metrics(tw, pw)
 
-    # GVW-rho using wide-format vectorised path (no flattening)
-    T_arr = tw.values.astype(np.float64)
-    P_arr = pw.values.astype(np.float64)
-    w_gene = np.array([var_map.get(g, 0.0) for g in common_genes], dtype=np.float64)
-    gvw_rho_val = _gvw_rho_from_wide(T_arr, P_arr, w_gene)
+        # Filter gene rho to genes with >= 5 valid samples
+        gene_rho_raw = gmet["spearman_rho"].values.copy()
+        gene_rho_raw[~usable_genes] = np.nan
+        gene_rho_s = pd.Series(gene_rho_raw, index=common_genes).dropna()
+        gene_rho = gene_rho_s.values
+        sample_rho = smet["spearman_rho"].dropna().values
 
-    # Mean Spearman rho in the top 10% most variable genes
-    gene_vars = pd.Series({g: var_map.get(g, 0.0) for g in common_genes})
-    n_top = max(1, int(np.ceil(len(gene_vars) * 0.10)))
-    top_genes = gene_vars.nlargest(n_top).index
-    top_gene_mask = np.array([g in set(top_genes) for g in common_genes])
-    top_rho_vals = gene_rho_s.reindex(top_genes).dropna().values
-    mean_top10 = float(np.nanmean(top_rho_vals)) if len(top_rho_vals) else np.nan
+        # GVW-rho: weighted average of per-gene rho (no Python loop —
+        # reuses the vectorised rho from gene_level_metrics above)
+        w_gene = np.array([var_map.get(g, 0.0) for g in common_genes],
+                          dtype=np.float64)
+        gvw_ok = np.isfinite(gene_rho_raw) & (w_gene > 0)
+        gvw_rho_val = (float(np.dot(w_gene[gvw_ok], gene_rho_raw[gvw_ok])
+                             / w_gene[gvw_ok].sum())
+                       if gvw_ok.any() else np.nan)
 
-    result: Dict[str, Any] = {
-        "sample_rho": sample_rho,
-        "mean_gene_rho": float(np.nanmean(gene_rho)) if len(gene_rho) else np.nan,
-        "median_gene_rho": float(np.nanmedian(gene_rho)) if len(gene_rho) else np.nan,
-        "gvw_rho": gvw_rho_val,
-        "rmse": float(gmet["rmse"].mean()),
-        "mean_top10pct_gene_rho": mean_top10,
-        "gene_rho_array": gene_rho,
-        "top10pct_gene_rho_array": top_rho_vals,
-        "n_genes_rho_ge070": int((gene_rho >= 0.70).sum()) if len(gene_rho) else 0,
-    }
+        # Mean Spearman rho in the top 10% most variable genes
+        gene_vars = pd.Series(
+            {g: var_map.get(g, 0.0) for g in common_genes[usable_genes]})
+        n_top = max(1, int(np.ceil(len(gene_vars) * 0.10)))
+        top_genes = gene_vars.nlargest(n_top).index
+        top_rho_vals = gene_rho_s.reindex(top_genes).dropna().values
+        mean_top10 = float(np.nanmean(top_rho_vals)) if len(top_rho_vals) else np.nan
 
-    # Bootstrap CIs for scalar metrics
-    if n_bootstraps > 0 and len(common_samples) >= 3:
-        rng = np.random.default_rng(42)
-        n = len(common_samples)
-        alpha_ci = 0.025  # 95% CI
+        # RMSE: mean across usable genes only
+        gene_rmse = gmet["rmse"].values.copy()
+        gene_rmse[~usable_genes] = np.nan
+        rmse_val = float(np.nanmean(gene_rmse))
 
-        boot = {k: np.empty(n_bootstraps, dtype=np.float64)
-                for k in ("gvw_rho", "rmse", "sample_rho_mean",
-                           "mean_gene_rho", "mean_top10pct_gene_rho")}
-
-        # Pre-compute repeated weight vector for GVW-rho (does not change
-        # across bootstrap iterations).
-        w_rep = np.repeat(w_gene, n)    # (G*S,)
-        total_w = w_rep.sum()
-
-        for i in range(n_bootstraps):
-            idx = rng.choice(n, size=n, replace=True)
-            # Resample columns directly from numpy arrays
-            T_b = T_arr[:, idx]
-            P_b = P_arr[:, idx]
-
-            # Vectorised gene-level RMSE
-            err = P_b - T_b
-            rmse_b = np.sqrt(np.mean(err ** 2, axis=1))
-
-            # Spearman rho per gene: rank within each gene, then Pearson
-            n_s = float(n)
-            Tr = _rankdata_columns(T_b.T)  # (S, G)
-            Pr = _rankdata_columns(P_b.T)
-            sr_t = Tr.sum(axis=0)
-            sr_p = Pr.sum(axis=0)
-            sr_tp = (Tr * Pr).sum(axis=0)
-            sr_tt = (Tr * Tr).sum(axis=0)
-            sr_pp = (Pr * Pr).sum(axis=0)
-            num_s = n_s * sr_tp - sr_t * sr_p
-            den_s = np.sqrt((n_s * sr_tt - sr_t ** 2) * (n_s * sr_pp - sr_p ** 2))
-            with np.errstate(divide="ignore", invalid="ignore"):
-                gene_rho_b = np.where(den_s > 0, num_s / den_s, np.nan)
-
-            # Spearman rho per sample: rank within each sample, then Pearson
-            Tr_samp = _rankdata_columns(T_b)   # (G, S) — rank each sample
-            Pr_samp = _rankdata_columns(P_b)
-            n_g = float(T_b.shape[0])
-            ss_t = Tr_samp.sum(axis=0)
-            ss_p = Pr_samp.sum(axis=0)
-            ss_tp = (Tr_samp * Pr_samp).sum(axis=0)
-            ss_tt = (Tr_samp * Tr_samp).sum(axis=0)
-            ss_pp = (Pr_samp * Pr_samp).sum(axis=0)
-            num_ss = n_g * ss_tp - ss_t * ss_p
-            den_ss = np.sqrt((n_g * ss_tt - ss_t ** 2) * (n_g * ss_pp - ss_p ** 2))
-            with np.errstate(divide="ignore", invalid="ignore"):
-                sample_rho_b = np.where(den_ss > 0, num_ss / den_ss, np.nan)
-
-            # GVW-rho: reuse gene-level ranks (Tr, Pr) to avoid redundant
-            # _rankdata_columns calls inside _gvw_rho_from_wide.
-            if total_w >= 1e-12:
-                tr_flat = Tr.T.ravel()  # (G*S,)
-                pr_flat = Pr.T.ravel()
-                mt = np.dot(w_rep, tr_flat) / total_w
-                mp = np.dot(w_rep, pr_flat) / total_w
-                dt_gvw = tr_flat - mt
-                dp_gvw = pr_flat - mp
-                cov_tp = np.dot(w_rep, dt_gvw * dp_gvw) / total_w
-                var_t = np.dot(w_rep, dt_gvw * dt_gvw) / total_w
-                var_p = np.dot(w_rep, dp_gvw * dp_gvw) / total_w
-                d = np.sqrt(var_t * var_p)
-                gvw_rho_b = float(cov_tp / d) if d >= 1e-12 else np.nan
-            else:
-                gvw_rho_b = np.nan
-
-            boot["gvw_rho"][i] = gvw_rho_b
-            boot["rmse"][i] = float(np.nanmean(rmse_b))
-            boot["sample_rho_mean"][i] = float(np.nanmean(sample_rho_b))
-            boot["mean_gene_rho"][i] = float(np.nanmean(gene_rho_b))
-            top_rho_b = gene_rho_b[top_gene_mask]
-            finite_top = top_rho_b[np.isfinite(top_rho_b)]
-            boot["mean_top10pct_gene_rho"][i] = (
-                float(np.mean(finite_top)) if len(finite_top) else np.nan
-            )
-
-        for key in boot:
-            result[f"{key}_ci_lo"] = float(np.nanpercentile(boot[key], 100 * alpha_ci))
-            result[f"{key}_ci_hi"] = float(np.nanpercentile(boot[key], 100 * (1 - alpha_ci)))
+        result: Dict[str, Any] = {
+            "sample_rho": sample_rho,
+            "mean_gene_rho": float(np.nanmean(gene_rho)) if len(gene_rho) else np.nan,
+            "median_gene_rho": float(np.nanmedian(gene_rho)) if len(gene_rho) else np.nan,
+            "gvw_rho": gvw_rho_val,
+            "rmse": rmse_val,
+            "mean_top10pct_gene_rho": mean_top10,
+            "gene_rho_array": gene_rho,
+            "gene_rho_genes": gene_rho_s.index.values,
+            "top10pct_gene_rho_array": top_rho_vals,
+            "n_genes_rho_ge070": int((gene_rho >= 0.70).sum()) if len(gene_rho) else 0,
+        }
 
     return result
 
