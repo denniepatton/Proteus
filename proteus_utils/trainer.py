@@ -805,6 +805,10 @@ class Trainer:
         bg_crps_sum = torch.tensor(0.0)
         bg_crps_denom = torch.tensor(0.0)
 
+        # Per-cohort CRPS accumulators for balanced metric (when cohort info available).
+        cohort_map = getattr(self, 'val_sample_cohort_map', None)
+        cohort_crps: Dict[str, List[torch.Tensor]] = {}  # cohort -> [sum, denom]
+
         from models.model_utils import mixture_crps
 
         backend = str(getattr(self.config, 'progress_backend', 'auto')).lower()
@@ -909,6 +913,17 @@ class Trainer:
             tumor_crps_sum += crps_sum_b.cpu()
             tumor_crps_denom += crps_denom_b.cpu()
 
+            # Per-cohort CRPS accumulation (requires sample_name metadata).
+            if isinstance(cohort_map, dict) and cohort_map and 'sample_name' in features:
+                snames = features['sample_name']
+                batch_sname = snames[0] if isinstance(snames, (list, tuple)) else snames
+                cohort = cohort_map.get(str(batch_sname))
+                if cohort is not None:
+                    if cohort not in cohort_crps:
+                        cohort_crps[cohort] = [torch.tensor(0.0), torch.tensor(0.0)]
+                    cohort_crps[cohort][0] += crps_sum_b.cpu()
+                    cohort_crps[cohort][1] += crps_denom_b.cpu()
+
             # Background GVW weights
             w_bg = None
             bg_map = getattr(self, 'val_background_gene_weight_map', None)
@@ -988,6 +1003,18 @@ class Trainer:
             metrics['val_background_gvw_crps'] = float((bg_crps_sum / bg_crps_denom).item())
         else:
             metrics['val_background_gvw_crps'] = float('nan')
+
+        # Balanced tumor GVW-CRPS: equal-weight average across patient cohorts.
+        if cohort_crps:
+            per_cohort_vals = []
+            for cname, (cs, cd) in sorted(cohort_crps.items()):
+                if float(cd.item()) > 0:
+                    val = float((cs / cd).item())
+                    per_cohort_vals.append(val)
+                    metrics[f'val_tumor_gvw_crps_{cname}'] = val
+            if per_cohort_vals:
+                balanced = sum(per_cohort_vals) / len(per_cohort_vals)
+                metrics['val_balanced_tumor_gvw_crps'] = balanced
 
         if rich_progress is not None:
             rich_progress.stop()
@@ -1091,16 +1118,33 @@ class Trainer:
                 history['val_tumor_gvw_crps'].append(val_metrics.get('val_tumor_gvw_crps', float('nan')))
                 history['val_tumor_aggregate_r2'].append(val_metrics.get('val_tumor_aggregate_r2', 0))
                 history['val_tumor_gvw_r2'].append(val_metrics.get('val_tumor_gvw_r2', 0))
+                if 'val_balanced_tumor_gvw_crps' in val_metrics:
+                    history.setdefault('val_balanced_tumor_gvw_crps', []).append(
+                        val_metrics['val_balanced_tumor_gvw_crps'])
 
+                # Log line: show balanced CRPS when available.
+                bal_crps = val_metrics.get('val_balanced_tumor_gvw_crps')
+                crps_label = 'Bal-CRPS' if bal_crps is not None else 'GVW-CRPS'
+                crps_value = bal_crps if bal_crps is not None else val_metrics.get('val_tumor_gvw_crps', float('nan'))
                 print(
                     f'  Val Loss: {val_metrics["val_loss"]:.4f} '
+                    f'| {crps_label}: {crps_value:.4f} '
                     f'| GVW-CRPS: {val_metrics.get("val_tumor_gvw_crps", float("nan")):.4f} '
                     f'| Agg R²: {val_metrics.get("val_tumor_aggregate_r2", 0):.4f} '
                     f'| GVW R²: {val_metrics.get("val_tumor_gvw_r2", 0):.4f}'
                 )
 
-                # Model selection / early stopping metric
-                val_score = val_metrics.get('val_tumor_gvw_crps', val_metrics['val_loss'])
+                # Model selection / early stopping metric.
+                # Prefer balanced (per-cohort equal-weight) CRPS when available;
+                # fall back to pooled GVW-CRPS, then val_loss.
+                _bal = val_metrics.get('val_balanced_tumor_gvw_crps')
+                _gvw = val_metrics.get('val_tumor_gvw_crps')
+                if _bal is not None:
+                    val_score = _bal
+                elif _gvw is not None:
+                    val_score = _gvw
+                else:
+                    val_score = val_metrics['val_loss']
 
                 # If validation collapses to NaN/Inf, stop immediately.
                 if not isinstance(val_score, (int, float)) or not math.isfinite(float(val_score)):
@@ -1128,7 +1172,8 @@ class Trainer:
                     print(f'Best epoch: {self.early_stopping.best_epoch}')
                     break
         
-        print(f'\nTraining complete. Best validation score (GVW-CRPS): {best_val_score:.4f}')
+        metric_label = 'Balanced-CRPS' if 'val_balanced_tumor_gvw_crps' in (history or {}) else 'GVW-CRPS'
+        print(f'\nTraining complete. Best validation score ({metric_label}): {best_val_score:.4f}')
         
         return history
     

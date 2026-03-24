@@ -339,6 +339,48 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         # Compute how many fixed-size microbatches we will yield.
         self._n_batches = self._count_batches(self._chunks)
 
+        # For balanced training, pre-compute a guaranteed upper-bound
+        # batch count.  With persistent_workers the main-process
+        # _balance_iter never advances, so __len__ can't predict
+        # exactly which epoch the workers will use.  Instead we take
+        # the maximum over all possible random subsets by selecting the
+        # n_min samples with the highest per-sample batch counts from
+        # each balanced cohort.  The bound is tight (within 1-2
+        # batches of the actual count) and prevents the PyTorch
+        # "more samples fetched than reported" warning.
+        if self.cohort_map and self.balance_cohorts:
+            from collections import defaultdict
+            batches_per_sample: Dict[str, int] = {}
+            for path, start, end in self._chunks:
+                batches_per_sample[path] = (
+                    batches_per_sample.get(path, 0)
+                    + (end - start) // self.genes_per_batch
+                )
+            cohort_paths_map: Dict[str, List[str]] = defaultdict(list)
+            for path in self.sample_paths:
+                coh = self.cohort_map.get(path)
+                if coh is not None:
+                    cohort_paths_map[coh].append(path)
+            balance_set = set(self.balance_cohorts)
+            per_cohort_counts = {
+                c: len(cohort_paths_map[c])
+                for c in self.balance_cohorts if c in cohort_paths_map
+            }
+            n_min = min(per_cohort_counts.values()) if per_cohort_counts else 0
+            max_balanced = 0
+            for coh, paths in cohort_paths_map.items():
+                per_sample = sorted(
+                    [batches_per_sample.get(p, 0) for p in paths],
+                    reverse=True,
+                )
+                if coh in balance_set:
+                    max_balanced += sum(per_sample[:n_min])
+                else:
+                    max_balanced += sum(per_sample)
+            self._balanced_n_batches = max_balanced
+        else:
+            self._balanced_n_batches = self._n_batches
+
         # These caches live per-process (per DataLoader worker).
         self._store_cache: Dict[str, zarr.Group] = {}
         self._flat_grp_cache: Dict[str, zarr.Group] = {}
@@ -352,8 +394,7 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
 
     def __len__(self) -> int:
         if self.cohort_map and self.balance_cohorts:
-            next_epoch = self._balance_iter + 1
-            return self._count_batches(self._balanced_chunks(next_epoch))
+            return self._balanced_n_batches
         return int(self._n_batches)
 
     def _balanced_chunks(self, epoch: int) -> List[Tuple[str, int, int]]:

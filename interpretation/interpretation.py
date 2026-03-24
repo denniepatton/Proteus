@@ -1,18 +1,23 @@
 """
 interpretation.py
-v2.0.0
+v3.0.0
 Author: Alexander Netzley, anetzley@fredhutch.org
 Updates: Robert Patton, rpatton@fredhutch.org
 Ha Lab, Fred Hutchinson Cancer Research Center
 
 Command-line wrapper for model interpretation analysis on trained BioDVN
-models.  Supports kernel visualisation and Captum-based attribution analysis.
+models.  Supports kernel visualisation, Captum-based attribution analysis,
+signal–sequence interaction, ReductionBlock activations, latent-space
+UMAP, and zero-component (hurdle) attribution.
 """
 
 import argparse
+import csv
+import glob
 import os
 import sys
 from pathlib import Path
+from typing import List
 
 import torch
 
@@ -29,6 +34,55 @@ from interpretation.interpretation_utils import (
     kernel_visualization,
     load_model,
 )
+from proteus_utils.compile_sample_data import (
+    DEFAULT_ZARR_BASE,
+    get_zarr_output_dir,
+)
+
+# BTS training-set TSV that maps Cohort/Sample/Fold
+_BTS_SPLITS_TSV = str(_PROJECT_ROOT / 'data' / 'BTS_sample-splits.tsv')
+
+
+def _resolve_zarr_paths(use_set: str, zarr_base: str) -> List[str]:
+    """Resolve a dataset name to a list of existing .zarr store paths.
+
+    Supports two modes:
+    - **BTS** (or BTS-CV): reads the BTS_sample-splits.tsv to gather zarr
+      paths from *all* cohorts used in training (HD-L, PC-PDX, PHT, SCLC-PDX).
+    - **Single cohort** (e.g. PC-PDX, PHT): globs ``*.zarr`` from the
+      cohort's zarr directory.
+    """
+    if use_set.upper() in ('BTS', 'BTS-CV'):
+        paths: List[str] = []
+        with open(_BTS_SPLITS_TSV, 'r', newline='') as f:
+            reader = csv.DictReader(f, delimiter='\t')
+            for row in reader:
+                cohort = row['Cohort'].strip()
+                sample = row['Sample'].strip()
+                sample_name = sample
+                if sample.startswith(f'{cohort}_'):
+                    sample_name = sample[len(cohort) + 1:]
+                zarr_path = os.path.join(
+                    zarr_base, cohort, 'zarr_files', f'{sample_name}.zarr',
+                )
+                if os.path.isdir(zarr_path) and zarr_path not in paths:
+                    paths.append(zarr_path)
+        if not paths:
+            raise FileNotFoundError(
+                f'No zarr stores found for BTS in {zarr_base}.  '
+                f'Run --process_data first or check PROTEUS_ZARR_BASE.'
+            )
+        return paths
+
+    # Single-cohort: glob the dataset's zarr directory
+    zarr_dir = get_zarr_output_dir(use_set, zarr_base)
+    paths = sorted(glob.glob(os.path.join(zarr_dir, '*.zarr')))
+    if not paths:
+        raise FileNotFoundError(
+            f'No zarr stores found in {zarr_dir}.  '
+            f'Run --process_data --use_set {use_set} first.'
+        )
+    return paths
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +99,10 @@ def interpretation_analysis(
     attribution: bool = True,
     method: str = 'integrated_gradients',
     n_steps: int = 50,
-    batch_size: int = 256,
+    batch_size: int = 32,
+    run_interaction: bool = True,
+    run_reduction: bool = True,
+    run_umap: bool = True,
 ) -> None:
     """Run interpretation analyses on a trained BioDVN model.
 
@@ -61,6 +118,9 @@ def interpretation_analysis(
         method: ``'integrated_gradients'`` or ``'gradient_shap'``.
         n_steps: Interpolation steps (IG) or samples (GradientShap).
         batch_size: Internal batch size for attribution computation.
+        run_interaction: Whether to run signal–sequence interaction analysis.
+        run_reduction: Whether to run ReductionBlock activation analysis.
+        run_umap: Whether to run latent-space UMAP visualization.
     """
     print('Performing interpretation analysis...')
 
@@ -78,6 +138,9 @@ def interpretation_analysis(
             n_steps=n_steps,
             batch_size=batch_size,
             save_filepath=save_filepath,
+            run_interaction=run_interaction,
+            run_reduction=run_reduction,
+            run_umap=run_umap,
         )
 
 
@@ -93,9 +156,21 @@ def main() -> None:
         '--model_dir', type=str, required=True,
         help='Directory containing best_model.pt and model_config.json',
     )
+    # Data source: either --use_set or --zarr_paths (at least one required)
+    data_group = parser.add_mutually_exclusive_group(required=True)
+    data_group.add_argument(
+        '--use_set', type=str, default=None,
+        help=('Dataset name to auto-resolve zarr paths '
+              '(e.g. BTS, PC-PDX, PHT, SCLC-PDX)'),
+    )
+    data_group.add_argument(
+        '--zarr_paths', type=str, nargs='+', default=None,
+        help='Explicit paths to sample .zarr stores',
+    )
     parser.add_argument(
-        '--zarr_paths', type=str, nargs='+', required=True,
-        help='One or more paths to sample .zarr stores',
+        '--zarr_base', type=str, default=None,
+        help=('Base directory for zarr stores (default: PROTEUS_ZARR_BASE '
+              'or paths.yaml). Only used with --use_set.'),
     )
     parser.add_argument(
         '--kernel_viz', action='store_true', default=True,
@@ -131,14 +206,51 @@ def main() -> None:
         help='Interpolation steps (IG) or samples (GradientShap) (default: 50)',
     )
     parser.add_argument(
-        '--batch_size', type=int, default=256,
-        help='Batch size for attribution computation (default: 256)',
+        '--batch_size', type=int, default=32,
+        help='Batch size for attribution computation (default: 32)',
+    )
+    parser.add_argument(
+        '--max_genes', type=int, default=200_000,
+        help='Max total genes to load (distributed across stores). '
+             'Default 200k ≈ 20 GB RAM. Sufficient for all analyses.',
     )
     parser.add_argument(
         '--output_dir', type=str, default=None,
         help='Output directory for figures (default: <model_dir>/interpretation/)',
     )
+    # ── New analysis toggles ──
+    parser.add_argument(
+        '--no_interaction', dest='run_interaction', action='store_false',
+        help='Skip signal–sequence interaction analysis',
+    )
+    parser.add_argument(
+        '--no_reduction', dest='run_reduction', action='store_false',
+        help='Skip ReductionBlock activation analysis',
+    )
+    parser.add_argument(
+        '--no_umap', dest='run_umap', action='store_false',
+        help='Skip latent-space UMAP visualization',
+    )
+    parser.set_defaults(
+        run_interaction=True, run_reduction=True,
+        run_umap=True,
+    )
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Hardware report
+    # ------------------------------------------------------------------
+    n_cpus = os.cpu_count() or 1
+    torch.set_num_threads(n_cpus)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f'Hardware: device={device}, CPUs={n_cpus}, '
+          f'PyTorch threads={torch.get_num_threads()}')
+    if device.type == 'cuda':
+        print(f'  GPU: {torch.cuda.get_device_name(0)}, '
+              f'VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB')
+    else:
+        print('  ⚠ Running on CPU — attribution analysis will be slow. '
+              'Use a GPU node for 10-50x speedup.')
 
     # ------------------------------------------------------------------
     # Load model
@@ -148,9 +260,18 @@ def main() -> None:
     if not model_path.exists():
         raise FileNotFoundError(f'No checkpoint found at {model_path}')
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = load_model(str(model_path), device=device)
-    print(f'Model loaded from {model_path}  (device={device})')
+    print(f'Model loaded from {model_path}')
+
+    # ------------------------------------------------------------------
+    # Resolve zarr paths
+    # ------------------------------------------------------------------
+    if args.use_set is not None:
+        zarr_base = args.zarr_base or DEFAULT_ZARR_BASE
+        zarr_paths = _resolve_zarr_paths(args.use_set, zarr_base)
+        print(f'Resolved --use_set {args.use_set!r} → {len(zarr_paths)} zarr stores')
+    else:
+        zarr_paths = args.zarr_paths
 
     # ------------------------------------------------------------------
     # Load data
@@ -158,11 +279,9 @@ def main() -> None:
     output_dir = args.output_dir or str(model_dir / 'interpretation')
     os.makedirs(output_dir, exist_ok=True)
 
-    npz_cache = os.path.join(output_dir, 'cached_data.npz')
     data = get_data(
-        zarr_paths=args.zarr_paths,
-        save_filepath=npz_cache,
-        regenerate_data=False,
+        source=zarr_paths,
+        max_genes=args.max_genes,
     )
     print(f'Data loaded: {data["TSS_signals"].shape[0]} genes')
 
@@ -179,6 +298,9 @@ def main() -> None:
         method=args.method,
         n_steps=args.n_steps,
         batch_size=args.batch_size,
+        run_interaction=args.run_interaction,
+        run_reduction=args.run_reduction,
+        run_umap=args.run_umap,
     )
 
     print('Interpretation analysis complete.')

@@ -1,0 +1,69 @@
+# PAN-FT — final full training (all data, no CV holdout)
+#
+# Fine-tuning the BioDVN base model on ALL PAN-FT patient cfDNA.
+# Base weights: trained_models/proteus_base-model/full_train/best_model.pt
+# All 80 samples used: 44 CRPC-RA + 16 SCLC + 20 PHT.
+# 10% gene-level chunk split for early-stopping validation.
+#
+# HPs identical to PAN-FT_cv except: epochs=25, patience=5.
+# Output: trained_models/proteus_PAN-FT/full_train/best_model.pt
+#                                                  /final_model.pt
+
+name: proteus_PAN-FT
+output_dir: trained_models/proteus_PAN-FT
+
+transfer:
+  base_weights: trained_models/proteus_base-model/full_train/best_model.pt
+  freeze_mode: full_unfreeze
+  backbone_lr_multiplier: 0.25
+
+data:
+  training_set: data/PAN-FT_sample-splits.tsv
+  zarr_base: /hpc/temp/ha_g/user/rpatton/ProteusZarrs
+  seed: 23
+  subsample_frac: 1.0
+  train_only_cohorts: [PHT]
+  balance_cohorts: [CRPC-RA, SCLC]
+
+structural:
+  beta_point_mse: 0.30
+  beta_background: 2.0
+  beta_tcvae: 2.0
+  beta_contrastive: 1.0
+  beta_grl: 0.15
+  beta_reconstruction: 0.50
+  cl_margin: 1.0
+  internal_weight: 1.0
+
+training:
+  epochs: 25
+  patience: 5
+  use_amp: true
+  min_lr_ratio: 5.0e-4
+  warmup_start_lr: 2.5e-4
+  warmup_frac: 0.10
+  schedule_frac: 0.90
+  max_grad_norm: 18.0
+  max_lr: 0.001
+  weight_decay: 5.0e-5
+
+scale:
+  signal_ksize: 6
+  interaction_ksize: 3
+  n_reductions: 3
+  reduction_dilation: 3
+  signal_encoder_width: 256
+  encoder_start: 128
+  latent_size: 64
+  decoder_start: 64
+  mdn_hidden: 64
+  mdn_final: 32
+  signal_filters: 16
+  initial_reduction_channels: 64
+  dropout_rate: 0.15
+
+objective:
+  metric: balanced_tumor_gvw_crps_mean
+  direction: minimize
+
+tuning: ~

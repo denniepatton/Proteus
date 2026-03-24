@@ -4,14 +4,30 @@
 # Base weights: trained_models/proteus_base-model/full_train/best_model.pt
 # PAN-FT: 38 CRPC-RA + 16 SCLC + 20 PHT (PDX admixtures)
 # 5-fold stratified CV, cohort-balanced sampling, PHT always train-only.
+#
+# Phase 1.0 findings (116 completed trials):
+#   - freeze_mode: full_unfreeze dominant (all top-20), nailed down as fixed.
+#   - backbone_lr_mult: strong positive correlation (rho=-0.57); top-20 range [0.12, 0.49].
+#     Narrowed from [0.01, 0.50] → [0.10, 0.50].
+#   - max_lr: strong positive signal; top-20 concentrated in [3e-4, 1.5e-3].
+#     Narrowed from [1e-5, 1.5e-3] → [3e-4, 1.5e-3].
+#   - epochs: 5 totally absent from top-20; median 20. Narrowed [5,30] → [10,30].
+#   - weight_decay: no convergence signal (rho≈0). Kept at full range [1e-6, 1e-3].
+#   - dropout_rate: weak signal; 0.50 absent from top-20. Narrowed → [0.10, 0.45].
+#   - CRPC-RA consistently easier than SCLC (gap ~0.14 CRPS in top-20).
+#
+# Mode: sequential (all 5 folds per trial) — each trial produces a full CV
+# objective with mean/std, enabling direct cross-config comparison.
+# No Hyperband pruning (epoch_end_callback not wired in sequential path).
 
 name: biodvn_fine-tune_phase1-1
 output_dir: results_training/biodvn_fine-tune_phase1-1
 
 transfer:
   base_weights: trained_models/proteus_base-model/full_train/best_model.pt
+  freeze_mode: full_unfreeze
   backbone_lr_multiplier:
-    suggest: {type: float, low: 0.05, high: 0.5, log: true}
+    suggest: {type: float, low: 0.10, high: 0.50, log: true}
 
 data:
   training_set: data/PAN-FT_sample-splits.tsv
@@ -33,7 +49,7 @@ structural:
 
 training:
   epochs:
-    suggest: {type: int, low: 5, high: 10, step: 5}
+    suggest: {type: int, low: 15, high: 25, step: 5}
   patience: 999
   use_amp: true
   min_lr_ratio: 5.0e-4
@@ -42,9 +58,9 @@ training:
   schedule_frac: 0.90
   max_grad_norm: 18.0
   max_lr:
-    suggest: {type: float, low: 5.0e-4, high: 0.0015, log: true}
+    suggest: {type: float, low: 3.0e-4, high: 1.5e-3, log: true}
   weight_decay:
-    suggest: {type: float, low: 1.0e-5, high: 5.0e-4, log: true}
+    suggest: {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
 
 scale:
   signal_ksize: 6
@@ -60,14 +76,14 @@ scale:
   signal_filters: 16
   initial_reduction_channels: 64
   dropout_rate:
-    suggest: {type: float, low: 0.10, high: 0.25, step: 0.05}
+    suggest: {type: float, low: 0.10, high: 0.30, step: 0.05}
 
 objective:
   metric: balanced_tumor_gvw_crps_mean
   direction: minimize
 
 tuning:
-  promote_top_frac: 0.10
-  phase: "1.0"
-  n_trials_per_fold: 50
-  pruner_type: hyperband
+  promote_top_frac: 0.0     # promotion is fold-parallel only; sequential mode ignores this
+  phase: "1.1"
+  n_trials_per_fold: 30      # per-worker budget (shell script passes --n_trials explicitly)
+  pruner_type: none          # sequential mode has no epoch_end_callback, pruning is a no-op

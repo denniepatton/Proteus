@@ -49,6 +49,18 @@ DEFAULT_STUDY_NAME = "xgboost_finetune"
 FOLDS = [1, 2, 3, 4, 5]
 TRAIN_ONLY_COHORTS = ["PHT"]
 
+# Tree-structure params inherited from the BTS base model (Optuna trial 186).
+# Fine-tune rounds must use the same structural params as the base model's
+# trees to maintain consistent ensemble behavior.
+BASE_TREE_PARAMS: Dict[str, Any] = {
+    "max_depth": 9,
+    "min_child_weight": 11.225050344590567,
+    "colsample_bytree": 0.9250965537025436,
+    "reg_alpha": 2.6042291082394298e-05,
+    "reg_lambda": 3.5824108347711833e-07,
+    "gamma": 0.0030623006705801535,
+}
+
 
 # ---------------------------------------------------------------------------
 # Objective
@@ -69,9 +81,14 @@ def _build_objective(
     # Pre-load fold data once
     fold_data: Dict[int, Dict[str, Any]] = {}
     for fold_num in FOLDS:
-        # Training: all folds except the held-out fold (PHT always included)
+        # Training: non-PHT from all folds except held-out,
+        # plus ALL PHT regardless of fold (matches Proteus convention)
         train_zarr = collect_zarr_paths(
             tsv_path, zarr_base, exclude_fold=fold_num,
+            exclude_cohorts=TRAIN_ONLY_COHORTS,
+        )
+        train_zarr += collect_zarr_paths(
+            tsv_path, zarr_base, include_cohorts=TRAIN_ONLY_COHORTS,
         )
         # Validation: only the held-out fold, excluding PHT
         val_zarr = collect_zarr_paths(
@@ -95,20 +112,29 @@ def _build_objective(
             "y_val": y_val,
         }
 
+    # Determine base model tree count for relative iteration logging
+    _base = xgb.Booster()
+    _base.load_model(base_model_path)
+    base_n_trees = _base.num_boosted_rounds()
+    del _base
+
     print(f"Data pre-loaded for {len(FOLDS)} folds "
           f"(PHT train-only, excluded from val).")
     print(f"  Train DMatrix: {fold_data[1]['dtrain'].num_row():,} rows")
     print(f"  Val DMatrix:   {fold_data[1]['dval'].num_row():,} rows")
+    print(f"  Base model: {base_n_trees} trees "
+          f"(fine-tune appends from tree {base_n_trees})")
 
     def objective(trial: optuna.Trial) -> float:
         t0 = time.perf_counter()
 
         # Fine-tuning HPs
-        lr = trial.suggest_float("learning_rate", 0.005, 0.05, log=True)
-        n_rounds = trial.suggest_int("n_rounds", 50, 500, step=50)
+        lr = trial.suggest_float("learning_rate", 0.01, 0.15, log=True)
+        n_rounds = trial.suggest_int("n_rounds", 100, 2000, step=100)
         subsample = trial.suggest_float("subsample", 0.7, 1.0)
 
         params: Dict[str, Any] = {
+            **BASE_TREE_PARAMS,
             "objective": "reg:squarederror",
             "tree_method": "hist",
             "nthread": nthread,
@@ -136,10 +162,11 @@ def _build_objective(
             err = (pred - fd["y_val"].astype(np.float64)) ** 2
             wmse = float(np.sum(fd["w_val"] * err) / np.sum(fd["w_val"]))
             fold_scores.append(wmse)
-            fold_iters.append(int(model.best_iteration))
+            ft_iter = int(model.best_iteration) - base_n_trees + 1
+            fold_iters.append(ft_iter)
             print(
                 f"    T{trial.number} F{fold_num}: "
-                f"{model.best_iteration} iters, "
+                f"{ft_iter}/{n_rounds} ft-iters, "
                 f"{time.perf_counter() - t_fold:.1f}s",
                 flush=True,
             )

@@ -1249,6 +1249,8 @@ def full_train_from_splits(
     shuffle_genes_in_batch: bool = True,
     seed: int = 42,
     subsample_frac: Optional[float] = None,
+    train_only_cohorts: Optional[List[str]] = None,
+    balance_cohorts: Optional[List[str]] = None,
 ):
     """Train a single model on ALL samples in the training_set TSV (no fold holdout).
 
@@ -1258,6 +1260,12 @@ def full_train_from_splits(
     validation signal — every sample and every gene contributes to both train
     and val.  Gene-variance weights are computed from 100% of the data before
     the split.
+
+    When ``train_only_cohorts`` is set, those cohorts (e.g. PHT admixtures)
+    are used for training only.  The validation loader draws exclusively from
+    patient cohorts so that early-stopping reflects clinical performance.
+    When multiple patient cohorts exist, the Trainer computes a balanced
+    (equal-weight) per-cohort CRPS for model selection.
 
     Args:
         model_name: Name of the model class (e.g. 'BioDVN', 'BioDVN_NoSeq').
@@ -1271,6 +1279,8 @@ def full_train_from_splits(
         shuffle_genes_in_batch: Whether to shuffle genes within batch.
         seed: Random seed for reproducibility.
         subsample_frac: Optional fraction (0.0-1.0) of genes for fast sanity checks.
+        train_only_cohorts: Cohorts used only for training (excluded from val).
+        balance_cohorts: Cohorts to balance via per-epoch undersampling.
     """
     import tempfile
 
@@ -1291,8 +1301,14 @@ def full_train_from_splits(
     if not os.path.exists(training_set_tsv):
         raise FileNotFoundError(f"Training set TSV not found: {training_set_tsv}")
 
+    _train_only = set(train_only_cohorts or [])
+
     all_paths: List[str] = []
+    patient_paths: List[str] = []          # excludes train_only_cohorts
+    zarr_cohort_map: Dict[str, str] = {}   # zarr_path → cohort (for train loader)
+    sample_cohort_map: Dict[str, str] = {} # sample_name (stem) → cohort (for Trainer)
     missing_samples: List[str] = []
+
     with open(training_set_tsv, 'r', newline='') as f:
         reader = csv.DictReader(f, delimiter='\t')
         for row in reader:
@@ -1312,6 +1328,10 @@ def full_train_from_splits(
                 )
                 continue
             all_paths.append(zarr_path)
+            zarr_cohort_map[zarr_path] = cohort
+            sample_cohort_map[sample_name] = cohort
+            if cohort not in _train_only:
+                patient_paths.append(zarr_path)
 
     if missing_samples:
         raise FileNotFoundError(
@@ -1319,13 +1339,22 @@ def full_train_from_splits(
             + "\n".join(missing_samples)
         )
 
-    print(f'Total samples: {len(all_paths)} (all used for train + val via gene-level chunk split)')
+    print(f'Total samples: {len(all_paths)} ({len(patient_paths)} patient, '
+          f'{len(all_paths) - len(patient_paths)} train-only)')
 
-    # Write a single index file containing ALL samples.
+    # Write index files: one for all samples (training), one for
+    # patient-only samples (validation early-stopping signal).
     temp_dir = tempfile.mkdtemp(prefix='proteus_full_train_')
     all_index = os.path.join(temp_dir, 'full_all.json')
     with open(all_index, 'w') as f:
         json.dump(all_paths, f)
+
+    if patient_paths and _train_only:
+        patient_index = os.path.join(temp_dir, 'full_patient.json')
+        with open(patient_index, 'w') as f:
+            json.dump(patient_paths, f)
+    else:
+        patient_index = all_index
 
     # Log subsampling info if active
     if subsample_frac is not None and subsample_frac < 1.0:
@@ -1345,8 +1374,11 @@ def full_train_from_splits(
           f'raw variance [{min(_raw_vals):.4f}, {max(_raw_vals):.4f}], '
           f'clipped to [0.100, 10.000]')
 
-    # Create loaders — both use ALL samples; gene-level chunk split
-    # assigns 10% of chunks to val for early stopping.
+    # Create loaders.
+    # Train: ALL samples with gene-level 10% chunk split; cohort-balanced
+    # sampling so minority cohorts are not under-represented per epoch.
+    # Val: PATIENT-ONLY samples with the same chunk split, metadata enabled
+    # so the Trainer can compute per-cohort balanced CRPS for early stopping.
     val_frac = 0.10
     train_loader, train_steps = create_data_loader(
         index_file=all_index,
@@ -1363,10 +1395,12 @@ def full_train_from_splits(
         gene_weights=gene_weights,
         val_frac=val_frac,
         val_split=False,
+        cohort_map=zarr_cohort_map if balance_cohorts else None,
+        balance_cohorts=balance_cohorts,
     )
 
     val_loader, val_steps = create_data_loader(
-        index_file=all_index,
+        index_file=patient_index,
         num_workers=_loader_workers(),
         shuffle=False,
         labeled=True,
@@ -1375,7 +1409,7 @@ def full_train_from_splits(
         genes_per_batch=genes_per_batch,
         shuffle_genes_in_batch=False,
         seed=seed,
-        include_metadata=False,
+        include_metadata=True,
         drop_last=False,
         subsample_frac=subsample_frac,
         gene_weights=gene_weights,
@@ -1400,6 +1434,13 @@ def full_train_from_splits(
 
     # Train
     trainer = Trainer(model, training_config, model_config, device)
+    # Provide sample→cohort mapping so the Trainer can compute per-cohort
+    # balanced CRPS for early stopping (patient cohorts only).
+    if sample_cohort_map and _train_only:
+        patient_cohort_map = {
+            k: v for k, v in sample_cohort_map.items() if v not in _train_only
+        }
+        trainer.val_sample_cohort_map = patient_cohort_map
     history = trainer.fit(train_loader, val_loader, epochs=training_config.epochs)
 
     # Save final model
@@ -1557,6 +1598,12 @@ def _build_configs_from_spec(experiment_spec, args) -> tuple:
         max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
     )
 
+    # Resolve transfer-learning parameters.  freeze_mode and
+    # backbone_lr_multiplier are ParamSpec; extract their .fixed values.
+    _freeze_mode_raw = experiment_spec.transfer.freeze_mode.fixed
+    _freeze_mode = str(_freeze_mode_raw) if _freeze_mode_raw is not None else None
+    _backbone_lr_mult = float(experiment_spec.transfer.backbone_lr_multiplier.fixed)
+
     train_cfg = TrainingConfig(
         checkpoint_dir='',
         max_lr=float(experiment_spec.training.max_lr.fixed),
@@ -1572,6 +1619,8 @@ def _build_configs_from_spec(experiment_spec, args) -> tuple:
         runtime_device_banner=bool(args.runtime_device_banner),
         base_weights=experiment_spec.transfer.base_weights,
         freeze_level=experiment_spec.transfer.freeze_level,
+        freeze_mode=_freeze_mode,
+        backbone_lr_multiplier=_backbone_lr_mult,
     )
 
     return model_cfg, train_cfg
@@ -1817,6 +1866,8 @@ def main():
             shuffle_genes_in_batch=True,
             seed=experiment_spec.data.seed,
             subsample_frac=args.subsample,
+            train_only_cohorts=experiment_spec.data.train_only_cohorts,
+            balance_cohorts=experiment_spec.data.balance_cohorts,
         )
 
     elif args.run_mode == 'tune':

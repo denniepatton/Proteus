@@ -1,11 +1,11 @@
 {
-  "best_trial": 121,
-  "best_value": 4.233033552187492,
+  "best_trial": 382,
+  "best_value": 3.6820567358246237,
   "best_params": {
-    "learning_rate": 0.049403932576921945,
+    "learning_rate": 0.04992877727949545,
     "n_rounds": 500,
-    "subsample": 0.8350800717101573
+    "subsample": 0.9361741956200327
   },
-  "n_trials": 200,
+  "n_trials": 400,
   "base_model_dir": "/fh/fast/ha_g/user/rpatton/TritonCNN/Proteus/analysis/XGBoost/trained_models/final"
 }

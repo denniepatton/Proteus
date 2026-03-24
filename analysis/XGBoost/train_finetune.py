@@ -59,13 +59,25 @@ DEFAULT_PARAMS_JSON = str(
 )
 TRAIN_ONLY_COHORTS = ["PHT"]
 
-# Cemented fine-tuning HPs — updated after Optuna study completes.
-# These serve as fallback defaults so runs are reproducible without
-# re-reading the Optuna DB.
+# Cemented fine-tuning HPs — from Optuna study trial 382
+# (GVW-MSE 3.682, 400-trial search).  These serve as fallback defaults
+# so runs are reproducible without re-reading the Optuna DB.
 CEMENTED_FT_PARAMS: Dict[str, Any] = {
-    "learning_rate": 0.01,
-    "n_rounds": 200,
-    "subsample": 0.9,
+    "learning_rate": 0.04992877727949545,
+    "n_rounds": 500,
+    "subsample": 0.9361741956200327,
+}
+
+# Tree-structure params inherited from the BTS base model (Optuna trial 186).
+# Fine-tune rounds must use the same structural params as the base model's
+# trees to maintain consistent ensemble behavior.
+BASE_TREE_PARAMS: Dict[str, Any] = {
+    "max_depth": 9,
+    "min_child_weight": 11.225050344590567,
+    "colsample_bytree": 0.9250965537025436,
+    "reg_alpha": 2.6042291082394298e-05,
+    "reg_lambda": 3.5824108347711833e-07,
+    "gamma": 0.0030623006705801535,
 }
 
 
@@ -103,11 +115,18 @@ def run_finetune_cv(
     zarr_base = zarr_base or default_zarr_base()
     os.makedirs(out_dir, exist_ok=True)
 
+    # Determine base model tree count for relative iteration logging
+    _base = xgb.Booster()
+    _base.load_model(base_model_path)
+    base_n_trees = _base.num_boosted_rounds()
+    del _base
+
     n_rounds = ft_params.get("n_rounds", 200)
     lr = ft_params.get("learning_rate", 0.01)
     subsample = ft_params.get("subsample", 0.9)
 
     xgb_params: Dict[str, Any] = {
+        **BASE_TREE_PARAMS,
         "objective": "reg:squarederror",
         "tree_method": "hist",
         "nthread": nthread,
@@ -124,9 +143,14 @@ def run_finetune_cv(
         print(f"  Fold {fold_num}")
         print(f"{'='*60}")
 
-        # Train: all folds except held-out (PHT always in training)
+        # Train: non-PHT from all folds except held-out,
+        # plus ALL PHT regardless of fold (matches Proteus convention)
         train_zarr = collect_zarr_paths(
             tsv_path, zarr_base, exclude_fold=fold_num,
+            exclude_cohorts=TRAIN_ONLY_COHORTS,
+        )
+        train_zarr += collect_zarr_paths(
+            tsv_path, zarr_base, include_cohorts=TRAIN_ONLY_COHORTS,
         )
         # Val: held-out fold, excluding PHT
         val_zarr = collect_zarr_paths(
@@ -168,7 +192,8 @@ def run_finetune_cv(
         )
 
         best_iter = int(model.best_iteration)
-        print(f"  Best iteration: {best_iter}")
+        ft_best_iter = best_iter - base_n_trees + 1
+        print(f"  Best fine-tune iteration: {ft_best_iter}/{n_rounds}")
 
         # Evaluate using the existing evaluate_fold infrastructure
         fold_info = {
@@ -258,11 +283,18 @@ def run_finetune_full_train(
     zarr_base = zarr_base or default_zarr_base()
     os.makedirs(out_dir, exist_ok=True)
 
+    # Determine base model tree count for relative iteration logging
+    _base = xgb.Booster()
+    _base.load_model(base_model_path)
+    base_n_trees = _base.num_boosted_rounds()
+    del _base
+
     n_rounds = ft_params.get("n_rounds", 200)
     lr = ft_params.get("learning_rate", 0.01)
     subsample = ft_params.get("subsample", 0.9)
 
     xgb_params: Dict[str, Any] = {
+        **BASE_TREE_PARAMS,
         "objective": "reg:squarederror",
         "tree_method": "hist",
         "nthread": nthread,
@@ -310,7 +342,8 @@ def run_finetune_full_train(
     )
 
     best_iter = int(model.best_iteration)
-    print(f"\nBest iteration: {best_iter}")
+    ft_best_iter = best_iter - base_n_trees + 1
+    print(f"\nBest fine-tune iteration: {ft_best_iter}/{n_rounds}")
     model.save_model(os.path.join(out_dir, "model.ubj"))
 
     meta = {

@@ -13,7 +13,7 @@ transfer:
   freeze_mode:
     suggest: {type: categorical, choices: [full_unfreeze, backbone_only, backbone_plus_encoders, decoder_plus_heads, heads_only]}
   backbone_lr_multiplier:
-    suggest: {type: float, low: 0.01, high: 1.0, log: true}
+    suggest: {type: float, low: 0.01, high: 0.50, log: true}
 
 data:
   training_set: data/PAN-FT_sample-splits.tsv
@@ -69,6 +69,7 @@ objective:
   direction: minimize
 
 tuning:
+  promote_top_frac: 0.05
   phase: "1.0"
-  n_trials_per_fold: 50
+  n_trials_per_fold: 100
   pruner_type: hyperband

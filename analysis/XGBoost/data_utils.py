@@ -54,6 +54,7 @@ def collect_zarr_paths(
     fold: Optional[int] = None,
     exclude_fold: Optional[int] = None,
     exclude_cohorts: Optional[List[str]] = None,
+    include_cohorts: Optional[List[str]] = None,
 ) -> List[str]:
     """Collect Zarr paths filtered by fold and/or cohort.
 
@@ -65,6 +66,8 @@ def collect_zarr_paths(
         If given, include everything *except* this fold.
     exclude_cohorts:
         If given, skip samples whose Cohort is in this list.
+    include_cohorts:
+        If given, include *only* samples whose Cohort is in this list.
     Neither fold filter → all samples.
     """
     rows = parse_splits_tsv(tsv_path)
@@ -75,6 +78,8 @@ def collect_zarr_paths(
         if exclude_fold is not None and r["Fold"] == exclude_fold:
             continue
         if exclude_cohorts and r["Cohort"] in exclude_cohorts:
+            continue
+        if include_cohorts and r["Cohort"] not in include_cohorts:
             continue
         zp = _resolve_zarr_path(r["Cohort"], r["Sample"], zarr_base)
         if os.path.isdir(zp):
