@@ -640,9 +640,10 @@ class MixtureDensityHead(nn.Module):
         # Force float32 before parameterization.  Under AMP autocast the
         # Linear layers above produce float16 tensors.  torch.exp() preserves
         # dtype, and exp(v) overflows float16 (~65504) for v > ~11.09.  The
-        # clamp range [-20, 20] is safe for float32 but NOT for float16.
-        # Disabling autocast prevents the subsequent log_softmax (which is on
-        # the float32-safe list) from being undermined by float16 inputs.
+        # clamp range below is chosen so that gamma_mean = K/exp(-6) ≈ 806
+        # (still above typical Y_MAX ≈ 20) and gamma_mean at +4 gives
+        # K/exp(4) ≈ 0.037 — covering the biologically relevant range while
+        # preventing the >10^8 gamma_mean that caused CRPS overflow.
         out = out.float()
         with torch.amp.autocast('cuda', enabled=False):
             logits = out[:, :3]          # mixture weight logits
@@ -651,9 +652,9 @@ class MixtureDensityHead(nn.Module):
             log_normal_sigma = out[:, 5:6]
 
             # Log/exp parameterization with clamping for numerical stability.
-            gamma_beta = torch.exp(log_gamma_beta.clamp(-20.0, 20.0))
+            gamma_beta = torch.exp(log_gamma_beta.clamp(-6.0, 4.0))
             normal_mu = normal_mu_raw.clamp(0.0, Y_MAX)
-            normal_sigma = torch.exp(log_normal_sigma.clamp(-20.0, LOG_SIGMA_CEIL))
+            normal_sigma = torch.exp(log_normal_sigma.clamp(-6.0, LOG_SIGMA_CEIL))
 
             log_pi = F.log_softmax(logits, dim=-1)  # (batch, 3)
 

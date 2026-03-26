@@ -230,7 +230,7 @@ class ReductionBlock(nn.Module):
         self.skip_norms = nn.ModuleList()
         self.post_add_norms = nn.ModuleList()
         self.pools = nn.ModuleList()
-        self._skip_offsets: List[int] = []  # center-crop offsets for residual alignment
+        self._residual_crop_offsets: List[int] = []  # center-crop offsets for residual alignment
         
         current_channels = in_channels
         for i in range(n_reductions):
@@ -253,7 +253,7 @@ class ReductionBlock(nn.Module):
             
             # Center-crop offset so the residual aligns with the conv output
             field_reduction = dilation * (interaction_ksize - 1)
-            self._skip_offsets.append(field_reduction // 2)
+            self._residual_crop_offsets.append(field_reduction // 2)
             
             self.pools.append(nn.AvgPool1d(kernel_size=2))
             current_channels = out_channels
@@ -271,7 +271,7 @@ class ReductionBlock(nn.Module):
         for conv, conv_norm, pool, skip_proj, skip_norm, post_norm, offset in zip(
             self.convs, self.conv_norms, self.pools,
             self.skip_projections, self.skip_norms,
-            self.post_add_norms, self._skip_offsets,
+            self.post_add_norms, self._residual_crop_offsets,
         ):
             # Skip path: project channels + normalize
             residual = skip_norm(skip_proj(x))  # (batch, length, out_channels)

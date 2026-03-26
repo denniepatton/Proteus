@@ -12,14 +12,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-
-# AMP (use new torch.amp API when available; keep fallback for older torch)
-try:
-    from torch.amp import autocast, GradScaler  # type: ignore[attr-defined]
-    _USE_TORCH_AMP = True
-except (ImportError, AttributeError):
-    from torch.cuda.amp import autocast, GradScaler  # type: ignore[assignment]
-    _USE_TORCH_AMP = False
+from torch.amp import autocast, GradScaler
 
 # Progress bars (optional)
 try:
@@ -258,11 +251,7 @@ class Trainer:
         # Mixed precision
         self.use_amp = config.use_amp and self.device.type == 'cuda'
         if self.use_amp:
-            if _USE_TORCH_AMP:
-                # New API: torch.amp.GradScaler(device_type, ...)
-                self.scaler = GradScaler('cuda')
-            else:
-                self.scaler = GradScaler()
+            self.scaler = GradScaler('cuda')
         else:
             self.scaler = None
         
@@ -367,7 +356,7 @@ class Trainer:
         self._printed_runtime_device_banner = True
 
         print('Runtime device check:')
-        print(f'  device={self.device} amp={self.use_amp} torch_amp_api={_USE_TORCH_AMP}')
+        print(f'  device={self.device} amp={self.use_amp}')
 
         if self.device.type == 'cuda' and torch.cuda.is_available():
             try:
@@ -579,10 +568,7 @@ class Trainer:
             self.optimizer.zero_grad(set_to_none=True)
             
             # Forward pass with AMP
-            if _USE_TORCH_AMP:
-                amp_ctx = autocast(device_type=self.device.type, enabled=self.use_amp)
-            else:
-                amp_ctx = autocast(enabled=self.use_amp)
+            amp_ctx = autocast(device_type=self.device.type, enabled=self.use_amp)
 
             with amp_ctx:
                 predictions, internal_loss_result = self.model(
@@ -801,9 +787,19 @@ class Trainer:
         bg_crps_sum = torch.tensor(0.0)
         bg_crps_denom = torch.tensor(0.0)
 
-        # Per-cohort CRPS accumulators for balanced metric (when cohort info available).
+        # Per-cohort/source CRPS accumulators for balanced metric.
         cohort_map = getattr(self, 'val_sample_cohort_map', None)
         cohort_crps: Dict[str, List[torch.Tensor]] = {}  # cohort -> [sum, denom]
+
+        # Per-source variance maps for source-level GVW-CRPS/GVW-r.
+        # When set, each source's CRPS uses its own gene variance weights
+        # so that epoch-level checkpoint selection matches fold-final metrics.
+        source_var_maps = getattr(self, 'val_source_gene_weight_map', None)
+
+        # Welford online accumulators for per-gene GVW Pearson r, keyed by
+        # source (or '__pooled__' for overall).  Each entry stores
+        # {gene: [n, sum_x, sum_y, sum_x2, sum_y2, sum_xy]}.
+        _gvw_r_accum: Dict[str, Dict[str, list]] = {}
 
         from models.model_utils import mixture_crps
 
@@ -859,10 +855,7 @@ class Trainer:
             # fp16 overflow — a single non-finite batch poisons the entire
             # epoch's running metrics.  The validation wall-clock cost is
             # dominated by data loading, so the fp16 speed-up is negligible.
-            if _USE_TORCH_AMP:
-                amp_ctx = autocast(device_type=self.device.type, enabled=False)
-            else:
-                amp_ctx = autocast(enabled=False)
+            amp_ctx = autocast(device_type=self.device.type, enabled=False)
 
             with amp_ctx:
                 # Ensure model inputs are float32 (weights may still be fp32
@@ -879,28 +872,21 @@ class Trainer:
                 sample_weight=labels.get('sample_weight')
             )
 
-            # Resolve gene variance weights for this batch.
+            # Resolve gene variance weights for this batch (pooled for overall GVW-CRPS).
             w_val = None
             val_map = getattr(self, 'val_gene_weight_map', None)
-            if isinstance(val_map, dict) and val_map and 'gene_name' in features:
-                gnames = features['gene_name']
-                if isinstance(gnames, (list, tuple)):
-                    w_val = torch.tensor(
-                        [float(val_map.get(str(g), 1.0)) for g in gnames],
-                        dtype=torch.float32,
-                        device=self.device,
-                    ).unsqueeze(-1)
-                else:
-                    w_val = torch.tensor(
-                        [[float(val_map.get(str(gnames), 1.0))]],
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
+            gnames = features.get('gene_name')
+            gnames_list = list(gnames) if isinstance(gnames, (list, tuple)) else ([gnames] if gnames is not None else [])
+            if isinstance(val_map, dict) and val_map and gnames_list:
+                w_val = torch.tensor(
+                    [float(val_map.get(str(g), 1.0)) for g in gnames_list],
+                    dtype=torch.float32,
+                    device=self.device,
+                ).unsqueeze(-1)
             else:
-                # Fallback: use the (training-fold) gene weights attached by the loader.
                 w_val = labels.get('sample_weight')
 
-            # GVW CRPS: analytical CRPS for tumor head.
+            # GVW CRPS: analytical CRPS for tumor head (pooled variance).
             crps_sum_b, crps_denom_b = mixture_crps(
                 predictions['tumor_mdn'],
                 labels['tumor_exp'],
@@ -909,16 +895,63 @@ class Trainer:
             tumor_crps_sum += crps_sum_b.cpu()
             tumor_crps_denom += crps_denom_b.cpu()
 
-            # Per-cohort CRPS accumulation (requires sample_name metadata).
+            # Per-cohort/source CRPS accumulation (requires sample_name metadata).
+            # When source_var_maps is set, each source uses its own gene
+            # variance weights — aligning epoch-level checkpoint selection
+            # with the final fold metric.
             if isinstance(cohort_map, dict) and cohort_map and 'sample_name' in features:
                 snames = features['sample_name']
-                batch_sname = snames[0] if isinstance(snames, (list, tuple)) else snames
-                cohort = cohort_map.get(str(batch_sname))
+                batch_sname = str(snames[0] if isinstance(snames, (list, tuple)) else snames)
+                cohort = cohort_map.get(batch_sname)
                 if cohort is not None:
+                    # Determine per-source/cohort variance weights.
+                    if isinstance(source_var_maps, dict) and cohort in source_var_maps and gnames_list:
+                        svar = source_var_maps[cohort]
+                        w_cohort = torch.tensor(
+                            [float(svar.get(str(g), 1.0)) for g in gnames_list],
+                            dtype=torch.float32,
+                            device=self.device,
+                        ).unsqueeze(-1)
+                    else:
+                        w_cohort = w_val
+                    cs, cd = mixture_crps(
+                        predictions['tumor_mdn'],
+                        labels['tumor_exp'],
+                        sample_weight=w_cohort,
+                    )
                     if cohort not in cohort_crps:
                         cohort_crps[cohort] = [torch.tensor(0.0), torch.tensor(0.0)]
-                    cohort_crps[cohort][0] += crps_sum_b.cpu()
-                    cohort_crps[cohort][1] += crps_denom_b.cpu()
+                    cohort_crps[cohort][0] += cs.cpu()
+                    cohort_crps[cohort][1] += cd.cpu()
+
+            # Accumulate per-gene (truth, pred) for GVW Pearson r.
+            if gnames_list:
+                truth_np = labels['tumor_exp'].detach().cpu().float().squeeze(-1).numpy()
+                pred_np = predictions['tumor_exp'].detach().cpu().float().squeeze(-1).numpy()
+                # Determine which source this batch belongs to.
+                _src_key = '__pooled__'
+                if isinstance(cohort_map, dict) and 'sample_name' in features:
+                    snames_r = features['sample_name']
+                    _sname = str(snames_r[0] if isinstance(snames_r, (list, tuple)) else snames_r)
+                    _src_key = cohort_map.get(_sname, '__pooled__')
+                for idx_g, gname in enumerate(gnames_list):
+                    g = str(gname)
+                    x_val = float(truth_np[idx_g])
+                    y_val = float(pred_np[idx_g])
+                    if not (math.isfinite(x_val) and math.isfinite(y_val)):
+                        continue
+                    for key in (_src_key, '__pooled__'):
+                        if key not in _gvw_r_accum:
+                            _gvw_r_accum[key] = {}
+                        if g not in _gvw_r_accum[key]:
+                            _gvw_r_accum[key][g] = [0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                        acc = _gvw_r_accum[key][g]
+                        acc[0] += 1
+                        acc[1] += x_val
+                        acc[2] += y_val
+                        acc[3] += x_val * x_val
+                        acc[4] += y_val * y_val
+                        acc[5] += x_val * y_val
 
             # Background GVW weights
             w_bg = None
@@ -1007,6 +1040,47 @@ class Trainer:
                 balanced = sum(per_cohort_vals) / len(per_cohort_vals)
                 metrics['val_balanced_tumor_gvw_crps'] = balanced
 
+        # GVW Pearson r: variance-weighted per-gene r across sources.
+        if _gvw_r_accum:
+            source_gvw_r = {}
+            for src_key, gene_stats in _gvw_r_accum.items():
+                r_vals, var_weights = [], []
+                for g, acc in gene_stats.items():
+                    n, sx, sy, sx2, sy2, sxy = acc
+                    if n < 3:
+                        continue
+                    denom = math.sqrt((n * sx2 - sx * sx) * (n * sy2 - sy * sy))
+                    if denom < 1e-12:
+                        continue
+                    r = (n * sxy - sx * sy) / denom
+                    r_vals.append(r)
+                    # Weight by gene variance from the appropriate source map.
+                    if src_key != '__pooled__' and isinstance(source_var_maps, dict) and src_key in source_var_maps:
+                        var_weights.append(source_var_maps[src_key].get(g, 1.0))
+                    elif isinstance(val_map, dict) and val_map:
+                        var_weights.append(val_map.get(g, 1.0))
+                    else:
+                        var_weights.append(1.0)
+                if r_vals:
+                    total_w = sum(var_weights)
+                    if total_w > 0:
+                        gvw_r = sum(r * w for r, w in zip(r_vals, var_weights)) / total_w
+                    else:
+                        gvw_r = sum(r_vals) / len(r_vals)
+                    source_gvw_r[src_key] = gvw_r
+            # Pooled (all-sample) GVW-r.
+            if '__pooled__' in source_gvw_r:
+                metrics['val_tumor_gvw_r'] = source_gvw_r['__pooled__']
+            # Per-source GVW-r and balanced mean.
+            per_src_r = []
+            for src_key in sorted(source_gvw_r):
+                if src_key == '__pooled__':
+                    continue
+                metrics[f'val_tumor_gvw_r_{src_key}'] = source_gvw_r[src_key]
+                per_src_r.append(source_gvw_r[src_key])
+            if per_src_r:
+                metrics['val_balanced_tumor_gvw_r'] = sum(per_src_r) / len(per_src_r)
+
         if rich_progress is not None:
             rich_progress.stop()
         
@@ -1061,6 +1135,7 @@ class Trainer:
             'val_loss': [],
             'val_tumor_gvw_crps': [],
             'val_tumor_aggregate_r2': [],
+            'val_balanced_tumor_gvw_r': [],
             'learning_rate': [],
         }
 
@@ -1107,18 +1182,34 @@ class Trainer:
                 history['val_loss'].append(val_metrics['val_loss'])
                 history['val_tumor_gvw_crps'].append(val_metrics.get('val_tumor_gvw_crps', float('nan')))
                 history['val_tumor_aggregate_r2'].append(val_metrics.get('val_tumor_aggregate_r2', 0))
+                history['val_balanced_tumor_gvw_r'].append(val_metrics.get('val_balanced_tumor_gvw_r', float('nan')))
                 if 'val_balanced_tumor_gvw_crps' in val_metrics:
                     history.setdefault('val_balanced_tumor_gvw_crps', []).append(
                         val_metrics['val_balanced_tumor_gvw_crps'])
 
-                # Log line: show balanced CRPS when available.
+                # Log line: show balanced CRPS + GVW-r when available.
                 bal_crps = val_metrics.get('val_balanced_tumor_gvw_crps')
                 crps_label = 'Bal-CRPS' if bal_crps is not None else 'GVW-CRPS'
                 crps_value = bal_crps if bal_crps is not None else val_metrics.get('val_tumor_gvw_crps', float('nan'))
+                bal_r = val_metrics.get('val_balanced_tumor_gvw_r')
+                pooled_r = val_metrics.get('val_tumor_gvw_r')
+                r_str = ''
+                if bal_r is not None:
+                    r_str = f' | Bal-r: {bal_r:.4f}'
+                elif pooled_r is not None:
+                    r_str = f' | GVW-r: {pooled_r:.4f}'
+                # Per-source CRPS std for multi-cohort diagnostics.
+                src_crps_keys = [k for k in val_metrics if k.startswith('val_tumor_gvw_crps_')]
+                crps_std_str = ''
+                if len(src_crps_keys) > 1:
+                    src_vals = [val_metrics[k] for k in src_crps_keys]
+                    mu = sum(src_vals) / len(src_vals)
+                    std = math.sqrt(sum((v - mu) ** 2 for v in src_vals) / len(src_vals))
+                    crps_std_str = f' (std={std:.4f})'
                 print(
                     f'  Val Loss: {val_metrics["val_loss"]:.4f} '
-                    f'| {crps_label}: {crps_value:.4f} '
-                    f'| GVW-CRPS: {val_metrics.get("val_tumor_gvw_crps", float("nan")):.4f} '
+                    f'| {crps_label}: {crps_value:.4f}{crps_std_str}'
+                    f'{r_str} '
                     f'| Agg R²: {val_metrics.get("val_tumor_aggregate_r2", 0):.4f}'
                 )
 

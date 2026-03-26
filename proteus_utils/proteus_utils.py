@@ -33,20 +33,15 @@ import bisect
 def _normalize_fold_index_to_sample_paths(loaded: Any) -> List[str]:
     """Normalize a fold index JSON payload to a unique list of sample Zarr paths.
 
-    Supports:
-    - sample-path list: ["/abs/path/sample1.zarr", ...]
-      - legacy explicit gene indices: [["/abs/path/sample1.zarr", 123], ...]
+    Expects a flat list of absolute Zarr paths:
+        ["/abs/path/sample1.zarr", "/abs/path/sample2.zarr", ...]
 
     Returns paths in first-seen order with duplicates removed.
     """
     if not isinstance(loaded, list):
         raise ValueError('Fold index JSON must be a list.')
 
-    # Legacy explicit indices: list of 2-tuples/lists.
-    if loaded and isinstance(loaded[0], (list, tuple)) and len(loaded[0]) == 2:
-        paths = [str(p) for (p, _gene) in loaded]
-    else:
-        paths = [str(p) for p in loaded]
+    paths = [str(p) for p in loaded]
 
     seen: set[str] = set()
     uniq: List[str] = []
@@ -63,11 +58,9 @@ class ProteusGeneDataset(Dataset):
     This keeps the model's training semantics intact (each item = one gene),
     while still avoiding the on-disk per-gene hierarchy.
 
-    Input index formats supported:
-      - New (v5 fold indices): ["/path/to/sampleA.zarr", "/path/to/sampleB.zarr", ...]
+    Input index format:
+      - ["/path/to/sampleA.zarr", "/path/to/sampleB.zarr", ...]
         -> dataset length is total genes across all samples.
-      - Legacy (v4.x fold indices): [["/path/to/sample.zarr", "GENE"], ...]
-        -> dataset length is the explicit list length.
     """
 
     def __init__(
@@ -84,7 +77,6 @@ class ProteusGeneDataset(Dataset):
         self.include_metadata = bool(include_metadata)
         self.gene_weights = gene_weights
         self._store_cache: Dict[str, zarr.Group] = {}
-        self._gene_name_to_index: Dict[str, Dict[str, int]] = {}
         self._gene_names_cache: Dict[str, List[str]] = {}
         self._sample_name_cache: Dict[str, str] = {}
 
@@ -96,42 +88,30 @@ class ProteusGeneDataset(Dataset):
         else:
             raise ValueError("Either index_file or zarr_paths must be provided")
 
-        self._explicit_pairs: Optional[List[Tuple[str, Union[str, int]]]] = None
         self._sample_paths: Optional[List[str]] = None
         self._cum_gene_offsets: Optional[List[int]] = None
         self._n_genes_per_sample: Optional[List[int]] = None
 
-        # Determine index format
-        if isinstance(loaded, list) and loaded and isinstance(loaded[0], (list, tuple)) and len(loaded[0]) == 2:
-            # Legacy explicit pairs: [[zarr_path, gene_id], ...]
-            self._explicit_pairs = [(p[0], p[1]) for p in loaded]
-            if cache_stores:
-                for path in set(p[0] for p in self._explicit_pairs):
-                    self._store_cache[path] = zarr.open(path, mode='r')
-        else:
-            # Sample-path list
-            self._sample_paths = [str(p) for p in loaded]
-            if cache_stores:
-                for path in set(self._sample_paths):
-                    self._store_cache[path] = zarr.open(path, mode='r')
+        self._sample_paths = [str(p) for p in loaded]
+        if cache_stores:
+            for path in set(self._sample_paths):
+                self._store_cache[path] = zarr.open(path, mode='r')
 
-            n_genes_per_sample: List[int] = []
-            for path in self._sample_paths:
-                store = self._get_store(path)
-                data_grp = store['flat']
-                n_genes_per_sample.append(int(data_grp['TSS_signals'].shape[0]))
-            self._n_genes_per_sample = n_genes_per_sample
+        n_genes_per_sample: List[int] = []
+        for path in self._sample_paths:
+            store = self._get_store(path)
+            data_grp = store['flat']
+            n_genes_per_sample.append(int(data_grp['TSS_signals'].shape[0]))
+        self._n_genes_per_sample = n_genes_per_sample
 
-            cum = [0]
-            running = 0
-            for n in n_genes_per_sample:
-                running += int(n)
-                cum.append(running)
-            self._cum_gene_offsets = cum
+        cum = [0]
+        running = 0
+        for n in n_genes_per_sample:
+            running += int(n)
+            cum.append(running)
+        self._cum_gene_offsets = cum
 
     def __len__(self) -> int:
-        if self._explicit_pairs is not None:
-            return len(self._explicit_pairs)
         if self._cum_gene_offsets is None:
             raise RuntimeError('Dataset not initialized: _cum_gene_offsets is None')
         return self._cum_gene_offsets[-1]
@@ -141,25 +121,20 @@ class ProteusGeneDataset(Dataset):
             return self._store_cache[zarr_path]
         return zarr.open(zarr_path, mode='r')
 
-    def _resolve_gene_index(self, store: zarr.Group, zarr_path: str, gene_id: Union[str, int]) -> int:
-        if isinstance(gene_id, int):
-            return gene_id
-        # gene_id as string
-        mapping = self._gene_name_to_index.get(zarr_path)
-        if mapping is None:
-            gene_names = [str(g) for g in list(store['gene_names'][:])]
-            self._gene_names_cache[zarr_path] = gene_names
-            mapping = {g: i for i, g in enumerate(gene_names)}
-            self._gene_name_to_index[zarr_path] = mapping
-        return mapping[gene_id]
-
     def _get_sample_name(self, store: zarr.Group, zarr_path: str) -> str:
         cached = self._sample_name_cache.get(zarr_path)
         if cached is not None:
             return cached
-        name = store.attrs.get('sample_name')
-        if name is None:
-            name = Path(zarr_path).stem.replace('.zarr', '')
+        # Prefer explicit display name (full TSV sample name with cohort
+        # prefix) so that internal maps and output TSVs carry unambiguous
+        # identifiers like "CRPC-RA_00-010" instead of bare "00-010".
+        name_map = getattr(self, 'sample_name_map', None)
+        if isinstance(name_map, dict) and zarr_path in name_map:
+            name = name_map[zarr_path]
+        else:
+            name = store.attrs.get('sample_name')
+            if name is None:
+                name = Path(zarr_path).stem.replace('.zarr', '')
         name = str(name)
         self._sample_name_cache[zarr_path] = name
         return name
@@ -172,20 +147,14 @@ class ProteusGeneDataset(Dataset):
         return str(names[int(gene_idx)])
 
     def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        if self._explicit_pairs is not None:
-            zarr_path, gene_id = self._explicit_pairs[idx]
-            store = self._get_store(zarr_path)
-            data_grp = store['flat']
-            gene_idx = self._resolve_gene_index(store, zarr_path, gene_id)
-        else:
-            if self._sample_paths is None or self._cum_gene_offsets is None:
-                raise RuntimeError('Dataset not initialized: _sample_paths or _cum_gene_offsets is None')
-            # Find which sample this gene index belongs to
-            sample_i = bisect.bisect_right(self._cum_gene_offsets, idx) - 1
-            zarr_path = self._sample_paths[sample_i]
-            gene_idx = idx - self._cum_gene_offsets[sample_i]
-            store = self._get_store(zarr_path)
-            data_grp = store['flat']
+        if self._sample_paths is None or self._cum_gene_offsets is None:
+            raise RuntimeError('Dataset not initialized: _sample_paths or _cum_gene_offsets is None')
+        # Find which sample this gene index belongs to
+        sample_i = bisect.bisect_right(self._cum_gene_offsets, idx) - 1
+        zarr_path = self._sample_paths[sample_i]
+        gene_idx = idx - self._cum_gene_offsets[sample_i]
+        store = self._get_store(zarr_path)
+        data_grp = store['flat']
 
         features = {
             'TSS_signals': torch.from_numpy(data_grp['TSS_signals'][gene_idx]),
@@ -262,6 +231,7 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         balance_cohorts: Optional[List[str]] = None,
         source_map: Optional[Dict[str, str]] = None,
         target_n_per_source: Optional[int] = None,
+        sample_name_map: Optional[Dict[str, str]] = None,
     ):
         super().__init__()
         self.index_file = str(index_file)
@@ -279,6 +249,7 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         self.balance_cohorts = balance_cohorts  # cohorts to balance
         self.source_map = source_map       # zarr_path -> source group name
         self.target_n_per_source = target_n_per_source
+        self.sample_name_map = sample_name_map  # zarr_path -> display name (TSV sample)
         self._balance_iter = 0
 
         if self.genes_per_batch <= 0:
@@ -418,6 +389,7 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         self._store_cache: Dict[str, zarr.Group] = {}
         self._flat_grp_cache: Dict[str, zarr.Group] = {}
         self._gene_names_cache: Dict[str, List[str]] = {}
+        self._sample_name_cache: Dict[str, str] = {}
 
     def _count_batches(self, chunks: List[Tuple[str, int, int]]) -> int:
         n_batches = 0
@@ -472,7 +444,9 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
                     remainder = n_target % n_avail
                     chosen = paths * full_copies + rng.sample(paths, remainder)
                 selected_paths.update(chosen)
-            return [c for c in self._chunks if c[0] in selected_paths]
+            filtered = [c for c in self._chunks if c[0] in selected_paths]
+            rng.shuffle(filtered)
+            return filtered
 
         # ------- Legacy cohort-balanced sampling -------
         cohort_paths: Dict[str, List[str]] = defaultdict(list)
@@ -498,7 +472,9 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
             if coh not in self.balance_cohorts:
                 selected_paths.update(paths)
 
-        return [c for c in self._chunks if c[0] in selected_paths]
+        filtered = [c for c in self._chunks if c[0] in selected_paths]
+        rng.shuffle(filtered)
+        return filtered
 
     def _get_store(self, zarr_path: str) -> zarr.Group:
         if self.cache_stores:
@@ -526,6 +502,20 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         if self.cache_stores:
             self._flat_grp_cache[zarr_path] = grp
         return grp
+
+    def _get_sample_name(self, store: zarr.Group, zarr_path: str) -> str:
+        cached = self._sample_name_cache.get(zarr_path)
+        if cached is not None:
+            return cached
+        if isinstance(self.sample_name_map, dict) and zarr_path in self.sample_name_map:
+            name = self.sample_name_map[zarr_path]
+        else:
+            name = store.attrs.get('sample_name')
+            if name is None:
+                name = Path(zarr_path).stem.replace('.zarr', '')
+        name = str(name)
+        self._sample_name_cache[zarr_path] = name
+        return name
 
     def _get_gene_names(self, store: zarr.Group, zarr_path: str) -> List[str]:
         cached = self._gene_names_cache.get(zarr_path)
@@ -586,10 +576,7 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
                 background_exp = torch.from_numpy(data_grp['background_exp'][start:end]).to(torch.float32).reshape(-1)
 
             if self.include_metadata:
-                sample_name = store.attrs.get('sample_name')
-                if sample_name is None:
-                    sample_name = Path(zarr_path).stem.replace('.zarr', '')
-                sample_name = str(sample_name)
+                sample_name = self._get_sample_name(store, zarr_path)
                 gene_names = self._get_gene_names(store, zarr_path)
 
             # Yield fixed-size microbatches.
@@ -737,6 +724,7 @@ def create_data_loader(
     balance_cohorts: Optional[List[str]] = None,
     source_map: Optional[Dict[str, str]] = None,
     target_n_per_source: Optional[int] = None,
+    sample_name_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[DataLoader, int]:
     """
     Create a DataLoader for Proteus training/validation.
@@ -792,6 +780,7 @@ def create_data_loader(
             balance_cohorts=balance_cohorts,
             source_map=source_map,
             target_n_per_source=target_n_per_source,
+            sample_name_map=sample_name_map,
         )
 
         # IterableDataset already yields fixed-size training batches.
@@ -935,6 +924,7 @@ def build_loaders_from_splits(
     val_paths: List[str] = []
     missing_samples: List[str] = []
     zarr_path_to_cohort: Dict[str, str] = {}       # for cohort balancing
+    zarr_path_to_sample_name: Dict[str, str] = {}  # zarr_path -> full TSV sample name
     _train_only = set(train_only_cohorts or [])
 
     with open(training_set_tsv, 'r', newline='') as f:
@@ -951,17 +941,19 @@ def build_loaders_from_splits(
             sample = row['Sample'].strip()
             fold = int(row['Fold'])
 
-            # Strip cohort prefix from sample name if present (e.g., "CRPC-RA_00-147" -> "00-147")
-            sample_name = sample
+            # Zarr files on disk use bare names (without cohort prefix),
+            # but we retain the full TSV name for internal maps / outputs.
+            zarr_name = sample
             if sample.startswith(f"{cohort}_"):
-                sample_name = sample[len(cohort) + 1:]
+                zarr_name = sample[len(cohort) + 1:]
 
-            zarr_path = os.path.join(zarr_base, cohort, 'zarr_files', f"{sample_name}.zarr")
+            zarr_path = os.path.join(zarr_base, cohort, 'zarr_files', f"{zarr_name}.zarr")
             if not os.path.isdir(zarr_path):
-                missing_samples.append(f"  {cohort}/zarr_files/{sample_name}.zarr  (Fold={fold}, TSV sample={sample})")
+                missing_samples.append(f"  {cohort}/zarr_files/{zarr_name}.zarr  (Fold={fold}, TSV sample={sample})")
                 continue
 
             zarr_path_to_cohort[zarr_path] = cohort
+            zarr_path_to_sample_name[zarr_path] = sample
 
             if cohort in _train_only:
                 # Always route to training (e.g. PDX admixtures).
@@ -1099,6 +1091,7 @@ def build_loaders_from_splits(
         drop_last=False,
         subsample_frac=subsample_frac,
         gene_weights=gene_weights,
+        sample_name_map=zarr_path_to_sample_name,
     )
 
     return train_loader, val_loader, train_steps, val_steps

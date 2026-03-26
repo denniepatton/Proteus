@@ -42,37 +42,37 @@ data:
 # Base model converged values noted in comments.
 structural:
   beta_point_mse:                                    # base: 0.30
-    suggest: {type: float, low: 0.05, high: 1.0}
+    suggest: {type: float, low: 0.10, high: 0.50}
   beta_background:                                   # base: 2.0
-    suggest: {type: float, low: 0.5, high: 5.0}
+    suggest: {type: float, low: 0.5, high: 3.0}
   beta_tcvae:                                        # base: 2.0
-    suggest: {type: float, low: 0.5, high: 8.0, log: true}
+    suggest: {type: float, low: 1.0, high: 5.0}
   beta_contrastive:                                  # base: 1.0
-    suggest: {type: float, low: 0.1, high: 3.0, log: true}
+    suggest: {type: float, low: 0.5, high: 2.0}
   beta_grl:                                          # base: 0.15
-    suggest: {type: float, low: 0.01, high: 0.50, log: true}
+    suggest: {type: float, low: 0.05, high: 0.50}
   beta_reconstruction:                               # base: 0.50
     suggest: {type: float, low: 0.1, high: 2.0}
   cl_margin:                                         # base: 1.0
-    suggest: {type: float, low: 0.3, high: 2.0}
+    suggest: {type: float, low: 0.5, high: 2.0}
   internal_weight:                                   # base: 1.0
-    suggest: {type: float, low: 0.3, high: 3.0}
+    suggest: {type: float, low: 0.5, high: 2.0}
 
 
 # =========================================================================
 # GROUP 2: Training HPs  (optimizer, schedule, regularisation)
 # =========================================================================
 training:
-  epochs: 30
+  epochs: 20
   patience: 3
   use_amp: true
   min_lr_ratio: 5.0e-4
   warmup_start_lr: 2.5e-4
   warmup_frac: 0.10
   schedule_frac: 0.90
-  max_grad_norm: 18.0
+  max_grad_norm: 10.0
   max_lr:
-    suggest: {type: float, low: 5.0e-4, high: 5.0e-3, log: true}
+    suggest: {type: float, low: 0.0010, high: 0.0020, log: true}
   weight_decay:
     suggest: {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
 

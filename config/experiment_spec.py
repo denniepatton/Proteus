@@ -518,12 +518,11 @@ class TuningSpec:
             )
         d = _expect_dict(x, "tuning")
         allowed = [
-            "hp_group", "phase", "n_trials_per_fold",
+            "phase", "n_trials_per_fold",
             "prev_study", "top_fraction", "enqueue_top_k",
             "promote_top_frac", "max_promotions", "pruner_type",
         ]
         _check_no_unknown_keys(d, allowed=allowed, ctx="tuning")
-        # hp_group is accepted for backward compatibility but ignored.
         pruner_raw = _as_str(
             d.get("pruner_type", "hyperband"), "tuning.pruner_type"
         ).lower()
@@ -557,14 +556,11 @@ class TuningSpec:
 class ExperimentSpec:
     """Complete experiment specification.
 
-    New canonical YAML layout uses three HP groups::
+    YAML layout uses three HP groups::
 
         structural:  ...
         training:    ...
         scale:       ...
-
-    For backward compatibility, old-style ``model`` + ``loss`` top-level
-    sections are auto-mapped into the new groups.
     """
     name: str
     output_dir: str
@@ -583,8 +579,6 @@ class ExperimentSpec:
             "name", "output_dir", "data",
             "structural", "training", "scale",
             "transfer", "objective", "tuning",
-            # backward-compat aliases ----------------------------------
-            "model", "loss",
         ]
         _check_no_unknown_keys(d, allowed=allowed, ctx="experiment")
 
@@ -592,62 +586,13 @@ class ExperimentSpec:
         output_dir = _as_str(d.get("output_dir", "results_training"),
                              "output_dir")
 
-        structural_raw = d.get("structural", None)
-        scale_raw = d.get("scale", None)
-        model_raw = d.get("model", None)
-        loss_raw = d.get("loss", None)
-        training_raw = d.get("training", {})
-
-        # ------------------------------------------------------------------
-        # Backward compat: build structural + scale from old model + loss
-        # ------------------------------------------------------------------
-        m = dict(model_raw) if model_raw else {}
-        lo = dict(loss_raw) if loss_raw else {}
-
-        if structural_raw is None and model_raw is not None:
-            structural_raw = {
-                "beta_background": lo.get("beta_background", 1.0),
-                "beta_tcvae": lo.get("beta_tcvae", lo.get("beta_vae", 3.0)),
-                "beta_contrastive": lo.get("beta_contrastive", 0.5),
-                "beta_reconstruction": lo.get("beta_reconstruction", 1.5),
-                "cl_margin": lo.get("cl_margin", 0.5),
-                "internal_weight": lo.get("internal_weight", 2.5),
-            }
-
-        if scale_raw is None and model_raw is not None:
-            scale_raw = {
-                "encoder_start": m.get("encoder_start", 128),
-                "latent_size": m.get("latent_size", 32),
-                "decoder_start": m.get("decoder_start", 16),
-                "mdn_hidden": m.get("mdn_hidden", 64),
-                "mdn_final": m.get("mdn_final", 16),
-                "signal_filters": m.get("signal_filters", 16),
-                "signal_encoder_width": m.get("signal_encoder_width", 1024),
-                "signal_ksize": m.get("signal_ksize", 6),
-                "interaction_ksize": m.get("interaction_ksize", 3),
-                "initial_reduction_channels": m.get(
-                    "initial_reduction_channels", 64),
-                "n_reductions": m.get("n_reductions", 3),
-                "reduction_dilation": m.get(
-                    "reduction_dilation", 1),
-            }
-
-        # Move dropout_rate from old model to scale (not training)
-        if model_raw is not None:
-            if "dropout_rate" in m:
-                if scale_raw is None:
-                    scale_raw = {}
-                scale_raw = dict(scale_raw)
-                if "dropout_rate" not in scale_raw:
-                    scale_raw["dropout_rate"] = m["dropout_rate"]
-
         return ExperimentSpec(
             name=name,
             output_dir=output_dir,
             data=DataSpec.from_yaml(d["data"]),
-            structural=StructuralSpec.from_yaml(structural_raw or {}),
-            training=TrainingSpec.from_yaml(training_raw),
-            scale=ScaleSpec.from_yaml(scale_raw or {}),
+            structural=StructuralSpec.from_yaml(d.get("structural", {})),
+            training=TrainingSpec.from_yaml(d.get("training", {})),
+            scale=ScaleSpec.from_yaml(d.get("scale", {})),
             transfer=TransferSpec.from_yaml(d.get("transfer", None)),
             objective=ObjectiveSpec.from_yaml(d.get("objective", None)),
             tuning=TuningSpec.from_yaml(d.get("tuning", None)),

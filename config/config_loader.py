@@ -149,9 +149,11 @@ class PathsConfig:
         
         # Then expand references like ${data_dir}
         for key, value in self.base.items():
-            path = path.replace(f"${{{key}}}", os.path.expandvars(value))
+            if isinstance(value, str):
+                path = path.replace(f"${{{key}}}", os.path.expandvars(value))
         for key, value in self.reference.items():
-            path = path.replace(f"${{{key}}}", os.path.expandvars(value))
+            if isinstance(value, str):
+                path = path.replace(f"${{{key}}}", os.path.expandvars(value))
             
         return path
 
@@ -423,7 +425,7 @@ class ConfigLoader:
         
         try:
             cohort = self.load_cohort(name)
-        except Exception as e:
+        except (FileNotFoundError, KeyError, ValueError) as e:
             return [f"Failed to load cohort '{name}': {e}"]
         
         # Check all referenced datasets exist

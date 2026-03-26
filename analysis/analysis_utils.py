@@ -102,9 +102,9 @@ def get_gene_list(name: str) -> List[str]:
 
 STANDARD_GENE_SETS: Dict[str, str] = {
     "PC-Phenotyping": "PC_PhenotypingGenes",
-    "Targets_PC": "Targets_PC",
+    "Targets_CRPC": "Targets_CRPC",
     "Targets_SCLC": "Targets_SCLC",
-    "Targets_BC": "Targets_BC",
+    "Targets_BLCA": "Targets_BLCA",
     "PAM50": "PAM50",
     "CCP31": "CCP31",
     "DruggableGenome": "DruggableGenome_Tier1",
@@ -1109,12 +1109,23 @@ def load_holdout_predictions_epicseq(
     Reads the file once, replaces Inf/-Inf with NaN, aggregates multiple
     TSS IDs per gene (mean), and pivots each requested score column.
 
+    NDR (nucleosome depletion ratio) is inverted at load time because it is
+    expected to be inversely correlated with expression: higher NDR ⇒ more
+    open chromatin ⇒ higher expression, but the raw score is a *depletion*
+    ratio so the sign must be flipped for comparison with log₂(CPM+1).
+
     Returns dict mapping score_col -> wide DataFrame.
     """
     df = pd.read_csv(path, sep="\t")
     for col in score_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
         df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+
+    # NDR is inversely correlated with expression — flip sign at the outset
+    _NDR_COLS = {"NDR_relative_2k"}
+    for col in score_cols:
+        if col in _NDR_COLS:
+            df[col] = -df[col]
 
     grouped = df.groupby(["gene", "Sample"])[list(score_cols)].mean().reset_index()
     result: Dict[str, pd.DataFrame] = {}

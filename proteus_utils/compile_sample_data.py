@@ -38,6 +38,7 @@ NaN handling:
 # Standard library imports
 import os
 import json
+import logging
 import shutil
 from functools import partial
 from typing import Dict, List, Optional, Tuple, Union
@@ -73,8 +74,8 @@ def _get_default_zarr_base() -> str:
         loader = ConfigLoader()
         paths_config = loader.load_paths()
         return paths_config.get_path('zarr_base_dir')
-    except Exception:
-        pass
+    except (ImportError, FileNotFoundError, KeyError, OSError) as e:
+        logging.debug('Config-based zarr_base_dir lookup failed: %s', e)
     
     # Fallback to hardcoded default
     return "/hpc/temp/ha_g/user/rpatton/ProteusZarrs"
@@ -100,8 +101,8 @@ def _get_default_raw_data_dir() -> str:
         loader = ConfigLoader()
         paths_config = loader.load_paths()
         return paths_config.get_path('raw_data_dir')
-    except Exception:
-        pass
+    except (ImportError, FileNotFoundError, KeyError, OSError) as e:
+        logging.debug('Config-based raw_data_dir lookup failed: %s', e)
     
     # Fallback to hardcoded default
     return "/fh/fast/ha_g/user/rpatton"
@@ -168,22 +169,6 @@ LOG_TRANSFORM_FEATURES = ['fl-kurtosis', 'pn-mean-spacing', 'pn-mean-amplitude']
 # NaN thresholds for gene exclusion (signal NaN is encoded, not thresholded)
 MAX_FEATURE_NAN_FRACTION = 0.5
 
-# Cohort name normalization: map legacy/alternative names to canonical names
-# PC-TAN and CRPC-RA refer to the same prostate cancer cohort -> use CRPC-RA
-# BC-TAN and BLCA-RA refer to the same bladder cancer cohort -> use BLCA-RA
-COHORT_NAME_MAP = {
-    'PC-TAN': 'CRPC-RA',
-    'BC-TAN': 'BLCA-RA',
-}
-
-def normalize_cohort_name(name: str) -> str:
-    """Normalize cohort name to canonical form.
-    
-    PC-TAN, CRPC-RA -> CRPC-RA
-    BC-TAN, BLCA-RA -> BLCA-RA
-    """
-    return COHORT_NAME_MAP.get(name, name)
-
 # Data shapes for Zarr stores
 SHAPES = {
     'TSS_signals': (2000, 9),
@@ -246,25 +231,7 @@ def get_samples(triton_results_dir: str, dataset: str = None) -> List[str]:
         if os.path.exists(signal_file) or os.path.exists(features_file):
             samples.append(item)
     
-    # Handle TAN naming convention with canonical cohort name
-    if dataset and 'TAN' in dataset:
-        canonical_cohort = normalize_cohort_name(dataset)
-        samples = [f'{canonical_cohort}_{sample[:6]}' for sample in samples]
-    
     return sorted(samples)
-
-
-def get_samples_from_tfx(tfx_path: Union[str, int, float, None]) -> List[str]:
-    """Get sample names from TFX labels file."""
-    if tfx_path is None:
-        return []
-    if isinstance(tfx_path, (int, float)):
-        return []
-    if not os.path.exists(tfx_path):
-        return []
-    df = pd.read_csv(tfx_path, sep='\t')
-    # First column should be sample names
-    return df.iloc[:, 0].tolist()
 
 
 # =============================================================================
@@ -325,22 +292,16 @@ def _load_signal_profiles(
         if raw_data.size == 0:
             continue
         
-        # Handle shape - expect (2000, 12) or (12, 2000)
+        # Handle shape — expect (2000, 12); accept transposed (12, 2000).
         if raw_data.shape == (12, 2000):
             raw_data = raw_data.T
         elif raw_data.shape == (2000, 12):
             pass
         else:
-            # Try to handle legacy shapes
-            if raw_data.shape == (11, 2000):
-                raw_data = raw_data.T
-                # Pad to 12 channels if legacy 11-channel format
-                raw_data = np.pad(raw_data, ((0, 0), (0, 1)), constant_values=0)
-            elif raw_data.shape == (2000, 11):
-                raw_data = np.pad(raw_data, ((0, 0), (0, 1)), constant_values=0)
-            else:
-                print(f'Unexpected signal shape for {gene}: {raw_data.shape}')
-                continue
+            raise ValueError(
+                f'Unexpected signal shape for gene {gene}: {raw_data.shape}. '
+                f'Expected (2000, 12) or (12, 2000).'
+            )
         
         # Split into signals (0:8) and nucleotides (8:12)
         signals = raw_data[:, :8].astype(np.float32)
@@ -563,9 +524,260 @@ def get_zarr_output_dir(dataset: str, base_dir: Optional[str] = None) -> str:
     """
     if base_dir is None:
         base_dir = DEFAULT_ZARR_BASE
-    # Use canonical cohort name for output directory
-    canonical_name = normalize_cohort_name(dataset)
-    return os.path.join(base_dir, canonical_name, 'zarr_files')
+    return os.path.join(base_dir, dataset, 'zarr_files')
+
+
+def _resolve_tfx(
+    tfx_path: Union[str, float, None],
+    sample: str,
+) -> Tuple[float, Optional[str]]:
+    """Resolve TFX value from None, numeric, or file path.
+
+    Returns (tfx_value, error_reason).  On success error_reason is None.
+    On failure tfx_value is NaN and error_reason describes the problem.
+    """
+    if tfx_path is None:
+        return float('nan'), None
+    if isinstance(tfx_path, (int, float)):
+        return float(tfx_path), None
+    try:
+        tfx_df = pd.read_csv(tfx_path, sep='\t', index_col='sample')
+        if sample in tfx_df.index:
+            return float(tfx_df.at[sample, 'tfx']), None
+        # Try matching by prefix
+        matching = [idx for idx in tfx_df.index if sample in idx or idx in sample]
+        if matching:
+            return float(tfx_df.at[matching[0], 'tfx']), None
+        return float('nan'), 'Not in TFX file'
+    except (FileNotFoundError, KeyError, ValueError, pd.errors.ParserError) as e:
+        return float('nan'), f'TFX read error: {e}'
+
+
+def _validate_genes(
+    tss_signals: Dict[str, np.ndarray],
+    tss_nucleotides: Dict[str, np.ndarray],
+    tss_features: Dict[str, np.ndarray],
+    ref_data: Dict[str, np.ndarray],
+) -> Tuple[List[str], Dict[str, int]]:
+    """Determine valid genes and count exclusions by reason.
+
+    Returns (sorted valid_genes list, excluded_counts dict).
+    """
+    excluded_counts: Dict[str, int] = {
+        'no_signals': 0,
+        'no_features': 0,
+        'high_nan': 0,
+        'no_ref': 0,
+    }
+    valid_genes: List[str] = []
+
+    for gene in tss_signals:
+        if tss_signals[gene].shape != (2000, 9):
+            excluded_counts['no_signals'] += 1
+            continue
+        if gene not in tss_nucleotides or tss_nucleotides[gene].shape != (2000, 4):
+            excluded_counts['no_signals'] += 1
+            continue
+        if gene not in tss_features:
+            excluded_counts['no_features'] += 1
+            continue
+        nan_frac = np.isnan(tss_features[gene]).mean()
+        if nan_frac > MAX_FEATURE_NAN_FRACTION:
+            excluded_counts['high_nan'] += 1
+            continue
+        if gene not in ref_data:
+            excluded_counts['no_ref'] += 1
+            continue
+        valid_genes.append(gene)
+
+    valid_genes.sort()
+    return valid_genes, excluded_counts
+
+
+def _build_flat_arrays(
+    valid_genes: List[str],
+    tss_signals: Dict[str, np.ndarray],
+    tss_nucleotides: Dict[str, np.ndarray],
+    tss_features: Dict[str, np.ndarray],
+    gb_features: Dict[str, np.ndarray],
+    ref_data: Dict[str, np.ndarray],
+    tumor_exp_data: Dict[str, float],
+    background_exp_data: Dict[str, float],
+    tfx: float,
+) -> Dict[str, np.ndarray]:
+    """Build all flat numpy arrays for Zarr storage.
+
+    Returns a dict keyed by Zarr dataset name.
+    """
+    n_genes = len(valid_genes)
+
+    all_tss_signals = np.zeros((n_genes, 2000, 9), dtype=np.float32)
+    all_tss_nucleotides = np.zeros((n_genes, 2000, 4), dtype=np.uint8)
+    all_tss_features = np.zeros((n_genes, len(TSS_FEATURES)), dtype=np.float32)
+    all_gb_features = np.zeros((n_genes, 11), dtype=np.float32)
+    all_ref_scalars = np.zeros((n_genes, 3), dtype=np.float32)
+    all_tfx = np.full((n_genes,), tfx, dtype=np.float32)
+    all_tumor_exp = np.full((n_genes,), np.nan, dtype=np.float32)
+    all_background_exp = np.full((n_genes,), np.nan, dtype=np.float32)
+
+    # Compute GB mean once for imputation
+    gb_mean = None
+    if gb_features:
+        gb_vals = [gb_features[g] for g in gb_features if g in valid_genes]
+        if gb_vals:
+            gb_mean = np.nanmean(gb_vals, axis=0)
+            gb_mean = np.nan_to_num(gb_mean, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+
+    for i, gene in enumerate(valid_genes):
+        all_tss_signals[i] = tss_signals[gene]
+        all_tss_nucleotides[i] = tss_nucleotides[gene]
+        all_tss_features[i] = tss_features[gene]
+
+        if gene in gb_features:
+            all_gb_features[i] = gb_features[gene]
+        elif gb_mean is not None:
+            all_gb_features[i] = gb_mean
+
+        all_ref_scalars[i] = ref_data[gene]
+
+        if gene in tumor_exp_data:
+            all_tumor_exp[i] = tumor_exp_data[gene]
+        if gene in background_exp_data:
+            all_background_exp[i] = background_exp_data[gene]
+
+    # Final NaN/Inf cleanup for training arrays (labels excluded)
+    all_tss_signals = np.nan_to_num(all_tss_signals, nan=0.0, posinf=0.0, neginf=0.0)
+    all_tss_features = np.nan_to_num(all_tss_features, nan=0.0, posinf=0.0, neginf=0.0)
+    all_gb_features = np.nan_to_num(all_gb_features, nan=0.0, posinf=0.0, neginf=0.0)
+    all_ref_scalars = np.nan_to_num(all_ref_scalars, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return {
+        'TSS_signals': all_tss_signals,
+        'TSS_nucleotides': all_tss_nucleotides,
+        'TSS_features': all_tss_features,
+        'GB_features': all_gb_features,
+        'ref_scalars': all_ref_scalars,
+        'TFX_label': all_tfx,
+        'tumor_exp': all_tumor_exp,
+        'background_exp': all_background_exp,
+    }
+
+
+def _write_zarr_store(
+    zarr_path: str,
+    sample: str,
+    valid_genes: List[str],
+    arrays: Dict[str, np.ndarray],
+    tfx: float,
+    n_genes: int,
+) -> None:
+    """Write all arrays to a Zarr store. Raises on error."""
+    os.makedirs(os.path.dirname(zarr_path), exist_ok=True)
+    if os.path.exists(zarr_path):
+        shutil.rmtree(zarr_path)
+
+    root = zarr.open_group(zarr_path, mode='w')
+
+    root.attrs['sample_name'] = sample
+    root.attrs['n_genes'] = n_genes
+    root.attrs['tfx'] = tfx
+
+    root.create_dataset(
+        'gene_names',
+        data=np.array(valid_genes, dtype=object),
+        dtype=object,
+        object_codec=VLenUTF8(),
+        compressor=COMPRESSOR,
+    )
+
+    flat = root.create_group('flat')
+
+    chunk_genes_large = int(min(256, n_genes))
+    chunk_genes_small = int(min(1024, n_genes))
+
+    flat.create_dataset(
+        'TSS_signals',
+        data=arrays['TSS_signals'],
+        chunks=(chunk_genes_large, 2000, 9),
+        compressor=COMPRESSOR,
+    )
+    flat.create_dataset(
+        'TSS_nucleotides',
+        data=arrays['TSS_nucleotides'],
+        chunks=(chunk_genes_large, 2000, 4),
+        compressor=COMPRESSOR,
+    )
+    flat.create_dataset(
+        'TSS_features',
+        data=arrays['TSS_features'],
+        chunks=(chunk_genes_small, len(TSS_FEATURES)),
+        compressor=COMPRESSOR,
+    )
+    flat.create_dataset(
+        'GB_features',
+        data=arrays['GB_features'],
+        chunks=(chunk_genes_small, 11),
+        compressor=COMPRESSOR,
+    )
+    flat.create_dataset(
+        'ref_scalars',
+        data=arrays['ref_scalars'],
+        chunks=(chunk_genes_small, 3),
+        compressor=COMPRESSOR,
+    )
+    flat.create_dataset(
+        'TFX_label',
+        data=arrays['TFX_label'],
+        chunks=(chunk_genes_small,),
+        compressor=COMPRESSOR,
+    )
+    flat.create_dataset(
+        'tumor_exp',
+        data=arrays['tumor_exp'],
+        chunks=(chunk_genes_small,),
+        compressor=COMPRESSOR,
+    )
+    flat.create_dataset(
+        'background_exp',
+        data=arrays['background_exp'],
+        chunks=(chunk_genes_small,),
+        compressor=COMPRESSOR,
+    )
+    flat.create_dataset(
+        'gene_weight',
+        data=np.ones((n_genes,), dtype=np.float32),
+        chunks=(chunk_genes_small,),
+        compressor=COMPRESSOR,
+    )
+
+    zarr.consolidate_metadata(zarr_path)
+
+
+def _verify_zarr_write(zarr_path: str, n_genes: int) -> Optional[str]:
+    """Verify a Zarr store was written correctly.
+
+    Returns an error message string on failure, or None on success.
+    """
+    import subprocess
+    try:
+        verify_store = zarr.open(zarr_path, mode='r')
+        actual_genes = len(verify_store['gene_names']) if 'gene_names' in verify_store else 0
+        if actual_genes != n_genes:
+            shutil.rmtree(zarr_path)
+            return f'Write verification failed: expected {n_genes} genes, found {actual_genes}'
+
+        result = subprocess.run(['du', '-sb', zarr_path], capture_output=True, text=True)
+        if result.returncode == 0:
+            size_bytes = int(result.stdout.split()[0])
+            min_expected_size = n_genes * 1000
+            if size_bytes < min_expected_size:
+                shutil.rmtree(zarr_path)
+                return f'Store too small: {size_bytes} bytes for {n_genes} genes'
+    except (OSError, subprocess.SubprocessError, ValueError, zarr.errors.PathNotFoundError) as e:
+        if os.path.exists(zarr_path):
+            shutil.rmtree(zarr_path)
+        return f'Write verification error: {e}'
+    return None
 
 
 def process_sample_to_zarr(
@@ -607,70 +819,45 @@ def process_sample_to_zarr(
         - If skipped: (None, reason_string, None)
     """
     zarr_path = os.path.join(out_dir, f'{sample}.zarr')
-    
+
+    # --- Early return: valid existing store ---
     if os.path.exists(zarr_path) and not overwrite:
-        # Verify existing store is valid (not empty)
         try:
             existing = zarr.open(zarr_path, mode='r')
             if 'flat' in existing and 'gene_names' in existing:
                 flat = existing['flat']
                 if 'TSS_signals' in flat and flat['TSS_signals'].shape[0] > 0:
-                    return (zarr_path, None, None)  # Valid existing store
+                    return (zarr_path, None, None)
         except (KeyError, OSError, zarr.errors.ContainsGroupError) as e:
-            # Invalid store, will regenerate
             print(f'  Note: Regenerating invalid store for {sample}: {e}')
-    
-    # Construct sample directories
+
+    # --- Verify TSS directory ---
     tss_sample_dir = os.path.join(tss_dir, sample)
     gb_sample_dir = os.path.join(gb_dir, sample)
-    
-    # Verify directories exist
     if not os.path.exists(tss_sample_dir):
-        return (None, f'TSS directory not found', None)
-    
-    # Get TFX value - when no TFX file, assign NaN
-    if tfx_path is None:
-        tfx = float('nan')
-    elif isinstance(tfx_path, (int, float)):
-        tfx = float(tfx_path)
-    else:
-        try:
-            tfx_df = pd.read_csv(tfx_path, sep='\t', index_col='sample')
-            if sample in tfx_df.index:
-                tfx = float(tfx_df.at[sample, 'tfx'])
-            else:
-                # Try matching by prefix
-                matching = [idx for idx in tfx_df.index if sample in idx or idx in sample]
-                if matching:
-                    tfx = float(tfx_df.at[matching[0], 'tfx'])
-                else:
-                    return (None, 'Not in TFX file', None)
-        except Exception as e:
-            return (None, f'TFX read error: {str(e)[:50]}', None)
+        return (None, 'TSS directory not found', None)
+
+    # --- Resolve TFX ---
+    tfx, tfx_err = _resolve_tfx(tfx_path, sample)
+    if tfx_err is not None:
+        return (None, tfx_err, None)
 
     print(f'Processing sample {sample}...')
 
-    # Initialize gene exclusion tracker (collects exclusions from signal loading AND validation)
-    excluded_genes = {
-        'no_signals': 0, 
-        'no_features': 0, 
-        'high_nan': 0, 
+    # --- Load raw data ---
+    excluded_genes: Dict[str, int] = {
+        'no_signals': 0,
+        'no_features': 0,
+        'high_nan': 0,
         'no_ref': 0,
     }
-
-    # Load all data - pass exclusion tracker to capture genes dropped during loading
     tss_signals, tss_nucleotides = _load_signal_profiles(tss_sample_dir, sample, excluded_genes)
-    
-    # Load features with appropriate feature lists
     tss_features_raw = _load_features(tss_sample_dir, sample, TSS_FEATURES)
     gb_features_raw = _load_features(gb_sample_dir, sample, GB_FEATURES) if os.path.exists(gb_sample_dir) else {}
-    
-    # Load reference and labels
     ref_data = _process_ref(ref_path)
     tumor_exp_data = _process_label(tumor_exp_path, sample) if tumor_exp_path else {}
     background_exp_data = _process_label(background_exp_path, sample) if background_exp_path else {}
 
-    # Warn when a label file was provided but returned no data (likely naming mismatch)
     if tumor_exp_path and not tumor_exp_data:
         print(f'  WARNING: tumor_exp file provided but sample "{sample}" not matched '
               f'in {os.path.basename(tumor_exp_path)}')
@@ -678,222 +865,40 @@ def process_sample_to_zarr(
         print(f'  WARNING: background_exp file provided but sample "{sample}" not matched '
               f'in {os.path.basename(background_exp_path)}')
 
-    # Apply feature-specific transforms
+    # --- Transform features ---
     tss_features = _transform_features(tss_features_raw, TSS_FEATURES)
     gb_features = _transform_features(gb_features_raw, GB_FEATURES)
 
-    # Verify we have signal data (TSS is required)
     if not tss_signals:
         return (None, 'No TSS signal data', excluded_genes)
 
-    # Determine valid genes (must have TSS signals, nucleotides, and features)
-    valid_genes = []
-    
-    for gene in tss_signals:
-        # Check signals shape
-        if tss_signals[gene].shape != (2000, 9):
-            excluded_genes['no_signals'] += 1
-            continue
-        # Check nucleotides exist
-        if gene not in tss_nucleotides or tss_nucleotides[gene].shape != (2000, 4):
-            excluded_genes['no_signals'] += 1
-            continue
-        # Check TSS features exist
-        if gene not in tss_features:
-            excluded_genes['no_features'] += 1
-            continue
-        # Check feature NaN fraction (after transforms/imputation, should be low)
-        tss_feat = tss_features[gene]
-        nan_frac = np.isnan(tss_feat).mean()
-        if nan_frac > MAX_FEATURE_NAN_FRACTION:
-            excluded_genes['high_nan'] += 1
-            continue
-        # Check reference exists
-        if gene not in ref_data:
-            excluded_genes['no_ref'] += 1
-            continue
-        
-        valid_genes.append(gene)
-    
-    valid_genes.sort()
+    # --- Validate genes ---
+    valid_genes, validation_excluded = _validate_genes(
+        tss_signals, tss_nucleotides, tss_features, ref_data,
+    )
+    for key in validation_excluded:
+        excluded_genes[key] = excluded_genes.get(key, 0) + validation_excluded[key]
+
     n_genes = len(valid_genes)
-    
-    # Log exclusion summary
     total_excluded = sum(excluded_genes.values())
     if total_excluded > 0:
         print(f'  Excluded {total_excluded} genes: {excluded_genes}')
-    
     if n_genes == 0:
         return (None, f'No valid genes (excluded: {excluded_genes})', excluded_genes)
 
-    # Create Zarr store with explicit DirectoryStore for reliable persistence
+    # --- Build arrays and write Zarr ---
+    arrays = _build_flat_arrays(
+        valid_genes, tss_signals, tss_nucleotides, tss_features,
+        gb_features, ref_data, tumor_exp_data, background_exp_data, tfx,
+    )
     os.makedirs(out_dir, exist_ok=True)
-    if os.path.exists(zarr_path):
-        shutil.rmtree(zarr_path)
-    
-    # ==========================================================================
-    # BUILD ALL ARRAYS FIRST (in memory), then write to Zarr once
-    # This is more reliable than creating empty arrays and filling them
-    # ==========================================================================
-    
-    # Pre-allocate numpy arrays
-    all_tss_signals = np.zeros((n_genes, 2000, 9), dtype=np.float32)
-    all_tss_nucleotides = np.zeros((n_genes, 2000, 4), dtype=np.uint8)
-    all_tss_features = np.zeros((n_genes, len(TSS_FEATURES)), dtype=np.float32)
-    all_gb_features = np.zeros((n_genes, 11), dtype=np.float32)
-    all_ref_scalars = np.zeros((n_genes, 3), dtype=np.float32)
-    all_tfx = np.full((n_genes,), tfx, dtype=np.float32)
-    all_tumor_exp = np.full((n_genes,), np.nan, dtype=np.float32)
-    all_background_exp = np.full((n_genes,), np.nan, dtype=np.float32)
-    
-    # Compute GB mean once if needed (for imputation)
-    gb_mean = None
-    if gb_features:
-        gb_vals = [gb_features[g] for g in gb_features if g in valid_genes]
-        if gb_vals:
-            gb_mean = np.nanmean(gb_vals, axis=0)
-            gb_mean = np.nan_to_num(gb_mean, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-    
-    # Fill arrays
-    for i, gene in enumerate(valid_genes):
-        # TSS signals and nucleotides (required)
-        all_tss_signals[i] = tss_signals[gene]
-        all_tss_nucleotides[i] = tss_nucleotides[gene]
-        all_tss_features[i] = tss_features[gene]
-        
-        # GB data (optional, use mean imputation)
-        if gene in gb_features:
-            all_gb_features[i] = gb_features[gene]
-        elif gb_mean is not None:
-            all_gb_features[i] = gb_mean
-        
-        # Reference scalars (required)
-        all_ref_scalars[i] = ref_data[gene]
-        
-        # Expression labels (NaN is intentional for missing)
-        if gene in tumor_exp_data:
-            all_tumor_exp[i] = tumor_exp_data[gene]
-        if gene in background_exp_data:
-            all_background_exp[i] = background_exp_data[gene]
-    
-    # ==========================================================================
-    # FINAL CLEANUP: Ensure NO NaN/Inf in training arrays (labels excluded)
-    # ==========================================================================
-    all_tss_signals = np.nan_to_num(all_tss_signals, nan=0.0, posinf=0.0, neginf=0.0)
-    all_tss_features = np.nan_to_num(all_tss_features, nan=0.0, posinf=0.0, neginf=0.0)
-    all_gb_features = np.nan_to_num(all_gb_features, nan=0.0, posinf=0.0, neginf=0.0)
-    all_ref_scalars = np.nan_to_num(all_ref_scalars, nan=0.0, posinf=0.0, neginf=0.0)
-    
-    # ==========================================================================
-    # WRITE TO ZARR (flat-only)
-    # ==========================================================================
-    root = zarr.open_group(zarr_path, mode='w')
-    
-    # Sample-level metadata
-    root.attrs['sample_name'] = sample
-    root.attrs['n_genes'] = n_genes
-    root.attrs['tfx'] = tfx
-    # Intentionally do not record schema/version tags in attrs.
-    
-    # Gene name index (for stable alignment across arrays)
-    root.create_dataset(
-        'gene_names',
-        data=np.array(valid_genes, dtype=object),
-        dtype=object,
-        object_codec=VLenUTF8(),
-        compressor=COMPRESSOR,
-    )
+    _write_zarr_store(zarr_path, sample, valid_genes, arrays, tfx, n_genes)
 
-    # Flat arrays (primary access pattern: read whole sample, then shuffle genes in-memory)
-    flat = root.create_group('flat')
+    # --- Verify ---
+    verify_err = _verify_zarr_write(zarr_path, n_genes)
+    if verify_err is not None:
+        return (None, verify_err, excluded_genes)
 
-    # Chunking: never split within-gene dimensions. Only chunk along genes.
-    # For whole-sample reads, chunk size is not critical; keep it moderate.
-    chunk_genes_large = int(min(256, n_genes))
-    chunk_genes_small = int(min(1024, n_genes))
-
-    flat.create_dataset(
-        'TSS_signals',
-        data=all_tss_signals,
-        chunks=(chunk_genes_large, 2000, 9),
-        compressor=COMPRESSOR,
-    )
-    flat.create_dataset(
-        'TSS_nucleotides',
-        data=all_tss_nucleotides,
-        chunks=(chunk_genes_large, 2000, 4),
-        compressor=COMPRESSOR,
-    )
-    flat.create_dataset(
-        'TSS_features',
-        data=all_tss_features,
-        chunks=(chunk_genes_small, len(TSS_FEATURES)),
-        compressor=COMPRESSOR,
-    )
-    flat.create_dataset(
-        'GB_features',
-        data=all_gb_features,
-        chunks=(chunk_genes_small, 11),
-        compressor=COMPRESSOR,
-    )
-    flat.create_dataset(
-        'ref_scalars',
-        data=all_ref_scalars,
-        chunks=(chunk_genes_small, 3),
-        compressor=COMPRESSOR,
-    )
-    flat.create_dataset(
-        'TFX_label',
-        data=all_tfx,
-        chunks=(chunk_genes_small,),
-        compressor=COMPRESSOR,
-    )
-    flat.create_dataset(
-        'tumor_exp',
-        data=all_tumor_exp,
-        chunks=(chunk_genes_small,),
-        compressor=COMPRESSOR,
-    )
-    flat.create_dataset(
-        'background_exp',
-        data=all_background_exp,
-        chunks=(chunk_genes_small,),
-        compressor=COMPRESSOR,
-    )
-
-    # Gene/sample weights (for per-gene weighting in loss; default=1.0)
-    flat.create_dataset(
-        'gene_weight',
-        data=np.ones((n_genes,), dtype=np.float32),
-        chunks=(chunk_genes_small,),
-        compressor=COMPRESSOR,
-    )
-    
-    # Consolidate metadata for faster subsequent opens
-    zarr.consolidate_metadata(zarr_path)
-    
-    # Verify write succeeded - check that store can be reopened and has expected data
-    try:
-        verify_store = zarr.open(zarr_path, mode='r')
-        actual_genes = len(verify_store['gene_names']) if 'gene_names' in verify_store else 0
-        if actual_genes != n_genes:
-            shutil.rmtree(zarr_path)
-            return (None, f'Write verification failed: expected {n_genes} genes, found {actual_genes}', excluded_genes)
-        
-        # Check minimum file size to detect incomplete writes
-        import subprocess
-        result = subprocess.run(['du', '-sb', zarr_path], capture_output=True, text=True)
-        if result.returncode == 0:
-            size_bytes = int(result.stdout.split()[0])
-            min_expected_size = n_genes * 1000  # Conservative estimate: ~1KB per gene minimum
-            if size_bytes < min_expected_size:
-                shutil.rmtree(zarr_path)
-                return (None, f'Store too small: {size_bytes} bytes for {n_genes} genes', excluded_genes)
-    except Exception as e:
-        if os.path.exists(zarr_path):
-            shutil.rmtree(zarr_path)
-        return (None, f'Write verification error: {e}', excluded_genes)
-    
     print(f'  -> {sample}: {n_genes} genes')
     return (zarr_path, None, excluded_genes)
 
@@ -968,7 +973,8 @@ def process_dataset(
             continue
         try:
             label_cols = set(pd.read_csv(label_path, sep='\t', index_col=0, nrows=0).columns)
-        except Exception:
+        except (FileNotFoundError, pd.errors.ParserError) as e:
+            logging.warning('Could not read label file %s for pre-flight check: %s', label_path, e)
             continue
         exact_hits = sum(1 for s in samples if s in label_cols)
         fuzzy_hits = sum(
@@ -1063,10 +1069,8 @@ def process_dataset(
     
     # Save processing manifest with actual paths, skip reasons, and gene exclusion stats
     from datetime import datetime
-    canonical_dataset = normalize_cohort_name(dataset)
     manifest = {
-        'dataset': canonical_dataset,
-        'original_dataset_name': dataset if dataset != canonical_dataset else None,
+        'dataset': dataset,
         'timestamp': datetime.now().isoformat(),
         'paths': {
             'tss_dir': tss_dir,
@@ -1187,7 +1191,7 @@ def verify_zarr_store(zarr_path: str, check_nan_inf: bool = True) -> Dict:
         try:
             result = subprocess.run(['du', '-sh', zarr_path], capture_output=True, text=True)
             size_str = result.stdout.split()[0] if result.stdout else 'unknown'
-        except:
+        except (OSError, subprocess.SubprocessError, IndexError):
             size_str = 'unknown'
         
         return {
@@ -1203,7 +1207,7 @@ def verify_zarr_store(zarr_path: str, check_nan_inf: bool = True) -> Dict:
             'labeled': tumor_nan < n_genes,
             'nan_inf_issues': nan_inf_issues  # Empty dict = clean
         }
-    except Exception as e:
+    except (OSError, KeyError, ValueError, zarr.errors.PathNotFoundError) as e:
         return {
             'valid': False,
             'error': str(e)

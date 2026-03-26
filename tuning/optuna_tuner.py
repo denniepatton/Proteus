@@ -25,7 +25,9 @@ import hashlib
 import json
 import math
 import os
+import sys
 import time
+import traceback
 import warnings
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
@@ -682,7 +684,7 @@ def run_optuna_cv_tuning(
             )
         except optuna.TrialPruned:
             raise  # Let Optuna handle pruning
-        except Exception as exc:
+        except (RuntimeError, ValueError, OSError, KeyError, TypeError) as exc:
             # CUDA hardware failures (driver crash, ECC error, device-side
             # assert, etc.) are infrastructure problems — once CUDA enters
             # this error state, every subsequent .to(device) call in the
@@ -693,12 +695,13 @@ def run_optuna_cv_tuning(
             _err = str(exc).lower()
             if 'cuda' in _err and ('unknown error' in _err or 'device-side assert' in _err):
                 print(f"[Trial {trial.number}] CUDA infrastructure failure — "
-                      f"terminating worker: {exc}")
+                      f"terminating worker: {exc}", file=sys.stderr, flush=True)
                 raise SystemExit(1)
             # Training diverged (NaN, OOM, etc.) — record failure and
             # return worst-case value so the trial completes rather than
             # crashing the entire study.
-            print(f"[Trial {trial.number}] Training failed: {exc}")
+            print(f"[Trial {trial.number}] Training failed: {exc}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
             trial.set_user_attr("error", str(exc))
             return float("inf") if direction == "minimize" else float("-inf")
 
@@ -865,7 +868,7 @@ class _PromotionManager:
                         "trial": source_trial,
                     }
             self._write_and_unlock(data, fh)
-        except Exception:
+        except (OSError, KeyError, TypeError, ValueError):
             self._unlock(fh)
             raise
         return chash
@@ -885,7 +888,7 @@ class _PromotionManager:
                     return chash, entry["params"]
             self._write_and_unlock(data, fh)
             return None
-        except Exception:
+        except (OSError, KeyError, TypeError, ValueError):
             self._unlock(fh)
             raise
 
@@ -902,7 +905,7 @@ class _PromotionManager:
                     "trial_dir": trial_dir,
                 }
             self._write_and_unlock(data, fh)
-        except Exception:
+        except (OSError, KeyError, TypeError, ValueError):
             self._unlock(fh)
             raise
 
@@ -918,7 +921,7 @@ class _PromotionManager:
                     "error": error,
                 }
             self._write_and_unlock(data, fh)
-        except Exception:
+        except (OSError, KeyError, TypeError, ValueError):
             self._unlock(fh)
             raise
 
@@ -927,7 +930,7 @@ class _PromotionManager:
         data, fh = self._lock_and_read()
         try:
             self._write_and_unlock(data, fh)
-        except Exception:
+        except (OSError, TypeError, ValueError):
             self._unlock(fh)
             raise
 
@@ -1137,7 +1140,7 @@ def _run_promotion_phase(
                 f"[Promotion] Fold {fold_num}: config {chash[:8]}… "
                 f"pruned ({exc})"
             )
-        except Exception as exc:
+        except (RuntimeError, ValueError, TypeError, OSError, KeyError, ExperimentSpecError) as exc:
             pm.record_failure(chash, fold_num, str(exc))
             print(
                 f"[Promotion] Fold {fold_num}: config {chash[:8]}… "
@@ -1275,7 +1278,7 @@ def run_optuna_fold_tuning(
             )
         except optuna.TrialPruned:
             raise  # Let Optuna handle it
-        except Exception as exc:
+        except (RuntimeError, ValueError, OSError, KeyError, TypeError) as exc:
             # CUDA hardware failures (driver crash, ECC error, etc.) —
             # once CUDA is broken, every .to(device) in this process will
             # fail.  Terminate the worker immediately instead of burning
@@ -1283,12 +1286,13 @@ def run_optuna_fold_tuning(
             _err = str(exc).lower()
             if 'cuda' in _err and ('unknown error' in _err or 'device-side assert' in _err):
                 print(f"[Trial {trial.number}, Fold {fold_num}] CUDA "
-                      f"infrastructure failure — terminating worker: {exc}")
+                      f"infrastructure failure — terminating worker: {exc}", file=sys.stderr, flush=True)
                 raise SystemExit(1)
             # Training diverged (NaN, OOM, etc.) — record failure and
             # return worst-case value so the trial completes rather than
             # crashing the entire study.
-            print(f"[Trial {trial.number}, Fold {fold_num}] Training failed: {exc}")
+            print(f"[Trial {trial.number}, Fold {fold_num}] Training failed: {exc}", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
             trial.set_user_attr("error", str(exc))
             return float("inf") if direction == "minimize" else float("-inf")
 
@@ -1296,7 +1300,7 @@ def run_optuna_fold_tuning(
         fold_dir = os.path.join(run_dir, f'CV-fold_{int(fold_num)}')
         metrics_path = os.path.join(fold_dir, f'validation-fold_{int(fold_num)}_metrics.json')
         if not os.path.exists(metrics_path):
-            print(f"[Trial {trial.number}, Fold {fold_num}] Metrics file not found: {metrics_path}")
+            print(f"[Trial {trial.number}, Fold {fold_num}] Metrics file not found: {metrics_path}", file=sys.stderr, flush=True)
             trial.set_user_attr("error", f"Metrics file not found: {metrics_path}")
             return float("inf") if direction == "minimize" else float("-inf")
 
@@ -1521,7 +1525,7 @@ def _write_study_report(study: optuna.Study, output_dir: str) -> None:
         imp = optuna_importance.get_param_importances(study)
         imp_path = os.path.join(output_dir, 'param_importance.json')
         _write_json_atomic(imp_path, {k: float(v) for k, v in imp.items()})
-    except Exception:
+    except (ImportError, RuntimeError, ValueError, TypeError, OSError):
         pass
 
     # Fold-stability analysis (fold-parallel studies)

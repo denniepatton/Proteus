@@ -126,7 +126,7 @@ _COHORT_CONFIG = {
     "PC-PDX": {
         "heatmap_gene_sets": ["PC-Phenotyping"],
         "goi": DEFAULT_GOI_PC,
-        "gene_scatter_sets": ["Targets_PC"],
+        "gene_scatter_sets": ["Targets_CRPC"],
         "study_samples": PC_PDX_STUDY,
     },
     "SCLC-PDX": {
@@ -753,7 +753,7 @@ def _run_cv_suite(
     print(f"\n── {label} (plots + outputs) ──")
 
     if heatmap_gene_sets is None:
-        heatmap_gene_sets = ["PC-Phenotyping", "PAM50", "Targets_PC"]
+        heatmap_gene_sets = ["PC-Phenotyping", "PAM50", "Targets_CRPC"]
     if goi is None:
         goi = DEFAULT_GOI_PC
     if var_map is None:
@@ -985,7 +985,7 @@ def _run_holdout_suite(
 
     # Double heatmaps
     _heatmap_sets = heatmap_gene_sets if heatmap_gene_sets is not None else [
-        "PC-Phenotyping", "PAM50", "Targets_PC",
+        "PC-Phenotyping", "PAM50", "Targets_CRPC",
     ]
     for gs_name in _heatmap_sets:
         resolved = STANDARD_GENE_SETS.get(gs_name, gs_name)
@@ -1020,27 +1020,35 @@ def _run_holdout_suite(
 
 
 # ---------------------------------------------------------------------------
-# Analysis group: Patient_Validation (holdout predictions vs biopsy truth)
+# Analysis groups: Patient_Validation_PAN-FT / Patient_Validation_BASE
 # ---------------------------------------------------------------------------
 
-# Cohorts with RNA-Seq truth labels and PAN-FT holdout results.
+# All cohorts with RNA-Seq truth labels and holdout results.
 _VALIDATION_COHORTS = ["CRPC-WCDT", "BLCA-RA", "CRPC-RA", "SCLC"]
+
+# PAN-FT holdout cohorts (NOT in PAN-FT training) — per-cohort analysis safe.
+_PANFT_HOLDOUT_COHORTS = ["CRPC-WCDT", "BLCA-RA"]
+
+# PAN-FT training cohorts — only CV out-of-fold results are leak-free.
+# These cohorts do NOT get per-cohort dirs in PAN-FT mode; they appear
+# in the Collected analysis via PAN-FT CV predictions (marked as circles).
+_PANFT_CV_COHORTS = ["CRPC-RA", "SCLC"]
 
 # Per-cohort gene-set config: heatmap gene sets, scatter gene sets, and GOI.
 _VALIDATION_COHORT_CONFIG: Dict[str, Dict[str, Any]] = {
     "CRPC-WCDT": {
-        "heatmap": ["PC-Phenotyping", "Targets_PC"],
-        "scatter": ["Targets_PC"],
+        "heatmap": ["PC-Phenotyping", "Targets_CRPC"],
+        "scatter": ["Targets_CRPC"],
         "goi": DEFAULT_GOI_PC,
     },
     "BLCA-RA": {
-        "heatmap": ["Targets_BC"],
-        "scatter": ["Targets_BC"],
+        "heatmap": ["Targets_BLCA"],
+        "scatter": ["Targets_BLCA"],
         "goi": DEFAULT_GOI_PC,
     },
     "CRPC-RA": {
-        "heatmap": ["PC-Phenotyping", "Targets_PC"],
-        "scatter": ["Targets_PC"],
+        "heatmap": ["PC-Phenotyping", "Targets_CRPC"],
+        "scatter": ["Targets_CRPC"],
         "goi": DEFAULT_GOI_PC,
     },
     "SCLC": {
@@ -1050,16 +1058,27 @@ _VALIDATION_COHORT_CONFIG: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# Single model: PAN-FT fine-tuned Proteus.
-_VALIDATION_MODEL_PATH = "results_holdout/BioDVN_PAN-FT/{cohort}/predictions_tumor.tsv"
+# Model path templates.
+_PANFT_HOLDOUT_MODEL_PATH = "results_holdout/BioDVN_PAN-FT/{cohort}/predictions_tumor.tsv"
+_BASE_HOLDOUT_MODEL_PATH = "results_holdout/BioDVN/{cohort}/predictions_tumor.tsv"
+
+# PAN-FT CV results directory (for loading leak-free CRPC-RA / SCLC results).
+_PANFT_CV_RESULTS_DIR = "results_training/PAN-FT_cv"
+
+# Composite target gene list for Collected gene scatters (union across cancers).
+_COLLECTED_TARGET_SETS = ["Targets_CRPC", "Targets_BLCA", "Targets_SCLC"]
 
 
 def _run_patient_validation_cohort(
     cohort: str,
+    model_path_template: str,
     out_dir: str,
     args: argparse.Namespace,
 ) -> Optional[Dict[str, Any]]:
-    """Run Patient_Validation analysis for a single cohort (PAN-FT model only).
+    """Run Patient_Validation analysis for a single cohort.
+
+    Loads holdout predictions from ``model_path_template``, runs the full
+    per-cohort suite (metrics + plots), and returns data for Collected.
 
     Returns a dict with cohort-level data for the Collected analysis,
     or None if the cohort is skipped.
@@ -1083,8 +1102,8 @@ def _run_patient_validation_cohort(
         tfx_dict = subtypes_df["tfx"].to_dict()
 
     cohort_cfg = _VALIDATION_COHORT_CONFIG.get(cohort, {
-        "heatmap": ["PC-Phenotyping", "Targets_PC"],
-        "scatter": ["Targets_PC"],
+        "heatmap": ["PC-Phenotyping", "Targets_CRPC"],
+        "scatter": ["Targets_CRPC"],
         "goi": DEFAULT_GOI_PC,
     })
 
@@ -1092,16 +1111,16 @@ def _run_patient_validation_cohort(
     cohort_out = ensure_dir(os.path.join(out_dir, cohort))
     summaries: List[Dict[str, Any]] = []
 
-    path = PROJECT_ROOT / _VALIDATION_MODEL_PATH.format(cohort=cohort)
+    path = PROJECT_ROOT / model_path_template.format(cohort=cohort)
     if not path.exists():
-        print(f"    [skip] PAN-FT predictions not found: {path.name}")
+        print(f"    [skip] Predictions not found: {path.name}")
         return None
 
     pred, ci_lo, ci_hi = load_holdout_predictions_proteus(str(path))
     _apply_prefix_map(pred, pmap)
     _apply_prefix_map(ci_lo, pmap)
     _apply_prefix_map(ci_hi, pmap)
-    label = f"Proteus PAN-FT — {cohort}"
+    label = f"{cohort}"
 
     suite_result = _run_holdout_suite(
         pred, truth_wide, label, cohort_out,
@@ -1134,6 +1153,10 @@ def _run_patient_validation_cohort(
         print_summary_table(summaries)
         _save_summary_tsv(summaries, os.path.join(cohort_out, "summary_metrics.tsv"))
 
+    # IHC correlation analysis (for cohorts with IHC scoring data)
+    _run_ihc_analysis(truth_wide, pred, cohort, cohort_out,
+                      overwrite=args.overwrite)
+
     # Return data for Collected analysis
     return {
         "cohort": cohort,
@@ -1141,22 +1164,238 @@ def _run_patient_validation_cohort(
         "pred_wide": pred,
         "subtypes_df": subtypes_df,
         "tfx_dict": tfx_dict,
+        "status": "holdout",
     }
+
+
+# ---------------------------------------------------------------------------
+# IHC correlation analysis
+# ---------------------------------------------------------------------------
+
+# Cohorts with IHC protein scoring data in reference/.
+_IHC_FILES: Dict[str, str] = {
+    "BLCA-RA": "reference/BLCA-RA_IHC-Scores.tsv",
+    "CRPC-RA": "reference/CRPC-RA_IHC-Scores.tsv",
+}
+
+# Protein → gene name mapping for cases where they differ.
+_IHC_PROTEIN_TO_GENE: Dict[str, str] = {
+    "PSA": "KLK3",
+}
+
+
+def _ihc_scatter(
+    ihc_vals: np.ndarray,
+    expr_vals: np.ndarray,
+    protein: str,
+    gene: str,
+    expr_label: str,
+    name: str,
+) -> None:
+    """Scatter: IHC protein score vs RNA-Seq expression (truth or predicted)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scipy.stats import spearmanr
+
+    rho_val, _ = spearmanr(ihc_vals, expr_vals)
+
+    fig, ax = plt.subplots(figsize=(5, 5))
+    ax.scatter(ihc_vals, expr_vals, s=60, c="#0077BB",
+               edgecolors="black", linewidths=0.5, alpha=0.7)
+
+    if len(ihc_vals) > 2:
+        coeffs = np.polyfit(ihc_vals, expr_vals, 1)
+        x_line = np.linspace(float(ihc_vals.min()), float(ihc_vals.max()), 100)
+        ax.plot(x_line, np.polyval(coeffs, x_line), "k-", lw=1, alpha=0.5)
+
+    ax.set_xlabel(f"IHC Score ({protein})")
+    ax.set_ylabel(f"{expr_label} log\u2082(CPM+1) ({gene})")
+    ax.set_title(f"{protein} IHC vs {expr_label} — {gene}")
+    ax.text(0.05, 0.95, f"\u03c1 = {rho_val:.3f}\nn = {len(ihc_vals)}",
+            transform=ax.transAxes, va="top", fontsize=9)
+    ax.set_box_aspect(1)
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _ihc_heatmap(
+    rho_df: pd.DataFrame,
+    name: str,
+    title: str = "IHC Correlation",
+) -> None:
+    """Heatmap: 3 columns of Spearman rho (truth vs IHC, pred vs IHC, truth vs pred)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import TwoSlopeNorm
+
+    proteins = rho_df["protein"].tolist()
+    data = rho_df[["rho_truth_ihc", "rho_pred_ihc", "rho_truth_pred"]].values
+
+    fig, ax = plt.subplots(figsize=(4, max(3, 0.4 * len(proteins) + 1)))
+
+    norm = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
+    im = ax.imshow(data, cmap="RdBu_r", norm=norm, aspect="auto")
+
+    ax.set_xticks([0, 1, 2])
+    ax.set_xticklabels(["Truth vs IHC", "Pred vs IHC", "Truth vs Pred"],
+                       rotation=45, ha="right", fontsize=9)
+    ax.set_yticks(range(len(proteins)))
+    ax.set_yticklabels(proteins, fontsize=9)
+
+    for i in range(len(proteins)):
+        for j in range(3):
+            val = data[i, j]
+            color = "white" if abs(val) > 0.6 else "black"
+            ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                    fontsize=8, color=color)
+
+    ax.set_title(title, fontsize=11)
+    fig.colorbar(im, ax=ax, label="Spearman \u03c1", shrink=0.8)
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _run_ihc_analysis(
+    truth_wide: pd.DataFrame,
+    pred_wide: pd.DataFrame,
+    cohort: str,
+    out_dir: str,
+    *,
+    overwrite: bool = False,
+) -> None:
+    """IHC correlation analysis for cohorts with IHC protein scoring data.
+
+    For each protein with IHC data that maps to a gene in the truth/prediction
+    set, produces scatter plots (IHC vs truth, IHC vs pred) and a summary
+    heatmap showing three columns of Spearman rho per protein:
+      - Truth RNA-Seq vs IHC score
+      - Predicted expression vs IHC score
+      - Truth RNA-Seq vs predicted expression
+    """
+    from scipy.stats import spearmanr
+
+    ihc_rel = _IHC_FILES.get(cohort)
+    if ihc_rel is None:
+        return
+    ihc_path = PROJECT_ROOT / ihc_rel
+    if not ihc_path.exists():
+        return
+
+    ihc_out = ensure_dir(os.path.join(out_dir, "IHC"))
+    print(f"    ── IHC correlation ({cohort}) ──")
+
+    ihc_df = pd.read_csv(ihc_path, sep="\t")
+    ihc_df = ihc_df.set_index("sample")
+
+    # Parse protein columns: use _mean columns (or _final for PSA).
+    proteins: List[str] = []
+    ihc_col_map: Dict[str, str] = {}
+    for col in ihc_df.columns:
+        if col.endswith("_mean"):
+            protein = col[:-5]
+            proteins.append(protein)
+            ihc_col_map[protein] = col
+        elif col == "PSA_final":
+            proteins.append("PSA")
+            ihc_col_map["PSA"] = col
+
+    # Map bare IHC sample names → prefixed truth/pred column names
+    pmap = _build_prefix_map(truth_wide.columns, cohort)
+
+    rows: List[Dict[str, Any]] = []
+    for protein in proteins:
+        gene = _IHC_PROTEIN_TO_GENE.get(protein, protein)
+        if gene not in truth_wide.index or gene not in pred_wide.index:
+            continue
+
+        col = ihc_col_map[protein]
+        ihc_series = pd.to_numeric(ihc_df[col], errors="coerce")
+
+        # Align samples across IHC, truth, and pred
+        ihc_vals, truth_vals, pred_vals = [], [], []
+        for sample_bare, ihc_val in ihc_series.items():
+            if not np.isfinite(ihc_val):
+                continue
+            prefixed = pmap.get(str(sample_bare), str(sample_bare))
+            if prefixed in truth_wide.columns and prefixed in pred_wide.columns:
+                t_val = float(truth_wide.loc[gene, prefixed])
+                p_val = float(pred_wide.loc[gene, prefixed])
+                if np.isfinite(t_val) and np.isfinite(p_val):
+                    ihc_vals.append(ihc_val)
+                    truth_vals.append(t_val)
+                    pred_vals.append(p_val)
+
+        if len(ihc_vals) < 3:
+            continue
+
+        ihc_arr = np.array(ihc_vals, dtype=np.float64)
+        truth_arr = np.array(truth_vals, dtype=np.float64)
+        pred_arr = np.array(pred_vals, dtype=np.float64)
+
+        rho_truth_ihc = spearmanr(truth_arr, ihc_arr).statistic
+        rho_pred_ihc = spearmanr(pred_arr, ihc_arr).statistic
+        rho_truth_pred = spearmanr(truth_arr, pred_arr).statistic
+
+        rows.append({
+            "protein": protein,
+            "gene": gene,
+            "n": len(ihc_vals),
+            "rho_truth_ihc": rho_truth_ihc,
+            "rho_pred_ihc": rho_pred_ihc,
+            "rho_truth_pred": rho_truth_pred,
+        })
+
+        # Per-protein scatter plots
+        _maybe(_ihc_scatter, overwrite,
+               ihc_arr, truth_arr, protein, gene, "Truth",
+               os.path.join(ihc_out, f"truth_vs_ihc_{protein}"))
+        _maybe(_ihc_scatter, overwrite,
+               ihc_arr, pred_arr, protein, gene, "Predicted",
+               os.path.join(ihc_out, f"pred_vs_ihc_{protein}"))
+
+    if not rows:
+        print("    [skip] No IHC-gene matches found")
+        return
+
+    rho_df = pd.DataFrame(rows)
+    rho_df.to_csv(os.path.join(ihc_out, "ihc_correlations.tsv"),
+                  sep="\t", index=False)
+    print(f"    IHC correlations: {len(rows)} proteins")
+
+    # Summary heatmap
+    _maybe(_ihc_heatmap, overwrite, rho_df,
+           os.path.join(ihc_out, "ihc_correlation_heatmap"),
+           title=f"IHC Correlation — {cohort}")
 
 
 def _run_collected_validation(
     cohort_data: List[Dict[str, Any]],
     out_dir: str,
     args: argparse.Namespace,
+    label: str = "Collected",
 ) -> None:
-    """Run the Collected validation analysis combining all cohorts.
+    """Cross-cohort Collected analysis combining all validation cohorts.
 
-    Produces gene-level scatter plots across all validation cohorts on
-    the intersection of genes available in every cohort.  Summary metrics
-    are computed on the combined pool.
+    Produces:
+      - Summary metrics, gene-level and sample-level metric TSVs
+      - Gene metric distribution plots (Pearson r, Spearman ρ, RMSE)
+      - Gene scatter plots on a composite target gene list (union of
+        Targets_CRPC, Targets_BLCA, Targets_SCLC), colored by cohort
+        (palette) and sized by TFx, with circle (validation/CV) or
+        diamond (holdout) markers based on each cohort entry's status
+      - No per-sample scatters (redundant with per-cohort output)
+
+    Variance is pooled across all cohorts for GVW metrics, reflecting
+    the pan-cancer / cross-cohort evaluation intent of this analysis.
     """
     collected_out = ensure_dir(os.path.join(out_dir, "Collected"))
-    print("\n  ── Collected (all validation cohorts) ──")
+    print(f"\n  ── {label} (all validation cohorts) ──")
 
     # Intersect genes across all cohorts
     all_genes = None
@@ -1187,10 +1426,12 @@ def _run_collected_validation(
     print(f"    Combined: {combined_truth.shape[0]} genes × "
           f"{combined_truth.shape[1]} samples")
 
-    # Compute combined metrics
+    # Pooled variance across all cohorts for pan-cancer GVW weighting.
+    # This gives equal influence per gene across the combined sample pool,
+    # appropriate for cross-cohort performance evaluation.
     var_map = compute_gene_variance(combined_truth)
     summary = cohort_summary_table(
-        combined_truth, combined_pred, label="Collected",
+        combined_truth, combined_pred, label=label,
         n_workers=args.n_workers, var_map=var_map,
     )
     gene_met: pd.DataFrame = summary["_gene_metrics"]
@@ -1215,42 +1456,81 @@ def _run_collected_validation(
 
     _maybe(metric_distribution_by_variance, args.overwrite, gene_met, var_map, "pearson_r",
            os.path.join(collected_out, "gene_pearson_r_dist_by_variance"),
-           xlim=(-1, 1), title="Collected — Pearson r by Variance Group", square=True)
+           xlim=(-1, 1), title=f"{label} — Pearson r by Variance Group", square=True)
     _maybe(metric_distribution_by_variance, args.overwrite, gene_met, var_map, "spearman_rho",
            os.path.join(collected_out, "gene_spearman_rho_dist_by_variance"),
-           xlim=(-1, 1), title="Collected — Spearman ρ by Variance Group", square=True)
+           xlim=(-1, 1), title=f"{label} — Spearman ρ by Variance Group", square=True)
     _maybe(metric_distribution_by_variance, args.overwrite, gene_met, var_map, "rmse",
            os.path.join(collected_out, "gene_rmse_dist_by_variance"),
-           title="Collected — RMSE by Variance Group", square=True)
+           title=f"{label} — RMSE by Variance Group", square=True)
 
-    # Per-sample scatters
-    sample_dir = ensure_dir(os.path.join(collected_out, "sample_scatters"))
-    batch_sample_scatters(
-        combined_truth, combined_pred, sample_dir,
-        goi=DEFAULT_GOI_PC, subtypes_df=None, n_workers=args.n_workers,
-    )
+    # ── Composite gene scatter plots (colored by cohort, sized by TFx) ──
+    # Build synthetic subtypes_df: "subtype" = cohort name for palette coloring,
+    # "status" = "validation" (circle) or "holdout" (diamond).
+    collected_subtypes_rows: List[Dict[str, Any]] = []
+    merged_tfx: Dict[str, float] = {}
+    for cd in cohort_data:
+        status = cd.get("status", "holdout")
+        tfx_dict = cd.get("tfx_dict") or {}
+        for sample in cd["pred_wide"].columns:
+            if sample in combined_pred.columns:
+                collected_subtypes_rows.append({
+                    "sample": sample,
+                    "subtype": cd["cohort"],
+                    "tfx": tfx_dict.get(sample, np.nan),
+                    "status": status,
+                })
+                if sample in tfx_dict:
+                    merged_tfx[sample] = tfx_dict[sample]
+
+    collected_subtypes = pd.DataFrame(collected_subtypes_rows).set_index("sample")
+    collected_tfx = merged_tfx if merged_tfx else None
+
+    # Composite gene list: union of per-cancer target sets (deduped).
+    composite_genes: List[str] = []
+    seen_genes: set = set()
+    for gs_name in _COLLECTED_TARGET_SETS:
+        resolved = STANDARD_GENE_SETS.get(gs_name, gs_name)
+        if not gene_list_available(resolved):
+            continue
+        for g in get_gene_list(resolved):
+            if g not in seen_genes:
+                composite_genes.append(g)
+                seen_genes.add(g)
+
+    if composite_genes:
+        target_dir = ensure_dir(os.path.join(collected_out, "gene_target_scatters"))
+        batch_gene_scatters(
+            combined_truth, combined_pred, composite_genes, target_dir,
+            subtypes_df=collected_subtypes, tfx_dict=collected_tfx,
+            n_workers=args.n_workers,
+        )
 
     # Save summary
     print_summary_table([summary])
     _save_summary_tsv([summary], os.path.join(collected_out, "summary_metrics.tsv"))
 
 
-def run_patient_validation(args: argparse.Namespace) -> None:
-    """Patient validation analysis: PAN-FT model predictions vs biopsy truth.
+def run_patient_validation_panft(args: argparse.Namespace) -> None:
+    """PAN-FT Patient Validation analysis.
 
-    Iterates over all configured cohorts with truth labels and PAN-FT holdout
-    predictions.  Output is flat per cohort (no model subfolders).  A
-    "Collected" subfolder combines all cohorts for cross-cohort analysis.
+    Per-cohort analysis for CRPC-WCDT and BLCA-RA only (true holdout for
+    the PAN-FT model).  CRPC-RA and SCLC were in the PAN-FT training set,
+    so per-cohort holdout analysis would be data leakage.
 
-    Override behaviour: if ``--proteus_holdout`` and ``--truth_cohort`` are
-    given, runs a single custom model/cohort pair instead.
+    The Collected cross-cohort analysis includes ALL four cohorts:
+      - CRPC-WCDT, BLCA-RA: from PAN-FT holdout predictions (diamond markers)
+      - CRPC-RA, SCLC: from PAN-FT CV out-of-fold predictions (circle markers)
+
+    Override: if ``--proteus_holdout`` and ``--truth_cohort`` are given,
+    runs a single custom model/cohort pair instead.
     """
     print("\n" + "=" * 70)
-    print("  ANALYSIS GROUP: Patient_Validation")
+    print("  ANALYSIS GROUP: Patient_Validation_PAN-FT")
     print("=" * 70)
 
     out_dir = ensure_dir(
-        str(PROJECT_ROOT / "analysis" / "results" / "Patient_Validation"))
+        str(PROJECT_ROOT / "analysis" / "results" / "Patient_Validation_PAN-FT"))
 
     # Single-cohort CLI override
     if args.proteus_holdout and args.truth_cohort:
@@ -1286,17 +1566,115 @@ def run_patient_validation(args: argparse.Namespace) -> None:
             print_summary_table(summaries)
         return
 
-    # Default: iterate over all validation cohorts (PAN-FT model only)
+    # Per-cohort analysis: PAN-FT holdout cohorts only (no leakage).
     cohort_data: List[Dict[str, Any]] = []
-    for cohort in _VALIDATION_COHORTS:
-        print(f"\n  ── Cohort: {cohort} ──")
-        result = _run_patient_validation_cohort(cohort, out_dir, args)
+    for cohort in _PANFT_HOLDOUT_COHORTS:
+        print(f"\n  ── Cohort: {cohort} (PAN-FT holdout) ──")
+        result = _run_patient_validation_cohort(
+            cohort, _PANFT_HOLDOUT_MODEL_PATH, out_dir, args,
+        )
         if result is not None:
             cohort_data.append(result)
 
-    # Collected analysis across all validation cohorts
+    # Load PAN-FT CV out-of-fold predictions for leakage cohorts.
+    # These do NOT get per-cohort output dirs — they only contribute
+    # to the Collected analysis, marked as "validation" (circles).
+    cv_dir = str(PROJECT_ROOT / _PANFT_CV_RESULTS_DIR)
+    if os.path.isdir(cv_dir):
+        fold_splits = pd.read_csv(
+            PROJECT_ROOT / "data" / "PAN-FT_sample-splits.tsv", sep="\t",
+        )
+        cohort_map_cv: Dict[str, str] = dict(
+            zip(fold_splits["Sample"], fold_splits["Cohort"])
+        )
+        # Build short→prefixed map for renaming prediction columns
+        prefix_map_cv: Dict[str, str] = {}
+        for _, row in fold_splits.iterrows():
+            prefixed = row["Sample"]
+            short = str(strip_cohort_prefix(
+                pd.Index([prefixed]), row["Cohort"],
+            )[0])
+            prefix_map_cv[short] = prefixed
+
+        cv_pred, _cv_truth, cv_ci_lo, cv_ci_hi = load_cv_predictions_proteus(cv_dir)
+        _apply_prefix_map(cv_pred, prefix_map_cv)
+        _apply_prefix_map(cv_ci_lo, prefix_map_cv)
+        _apply_prefix_map(cv_ci_hi, prefix_map_cv)
+
+        for cohort in _PANFT_CV_COHORTS:
+            print(f"\n  ── Cohort: {cohort} (PAN-FT CV — Collected only) ──")
+            truth_path = PROJECT_ROOT / "labels" / f"{cohort}_Log2CPMplus1.tsv"
+            if not truth_path.exists():
+                print(f"    [skip] Truth not found: {cohort}")
+                continue
+            truth_wide = load_truth(cohort)
+
+            # Extract this cohort's CV samples
+            cohort_samples = [
+                s for s in cv_pred.columns if cohort_map_cv.get(s) == cohort
+            ]
+            if not cohort_samples:
+                print(f"    [skip] No CV samples for {cohort}")
+                continue
+
+            pred_c = cv_pred[cohort_samples]
+            ci_lo_c = cv_ci_lo[[s for s in cohort_samples if s in cv_ci_lo.columns]] if cv_ci_lo is not None else None
+            ci_hi_c = cv_ci_hi[[s for s in cohort_samples if s in cv_ci_hi.columns]] if cv_ci_hi is not None else None
+            print(f"    CV predictions: {pred_c.shape[0]} genes × {pred_c.shape[1]} samples")
+
+            subtypes_df = None
+            sub_path = PROJECT_ROOT / "labels" / f"{cohort}_TFX_Subtype.tsv"
+            if sub_path.exists():
+                subtypes_df = load_subtypes(cohort)
+            tfx_dict = None
+            if subtypes_df is not None and "tfx" in subtypes_df.columns:
+                tfx_dict = subtypes_df["tfx"].to_dict()
+
+            cohort_data.append({
+                "cohort": cohort,
+                "truth_wide": truth_wide,
+                "pred_wide": pred_c,
+                "subtypes_df": subtypes_df,
+                "tfx_dict": tfx_dict,
+                "status": "validation",
+            })
+    else:
+        print(f"  [skip] PAN-FT CV results not found: {_PANFT_CV_RESULTS_DIR}")
+
+    # Collected analysis across all cohorts
     if len(cohort_data) >= 2:
-        _run_collected_validation(cohort_data, out_dir, args)
+        _run_collected_validation(cohort_data, out_dir, args,
+                                  label="Collected (PAN-FT)")
+
+
+def run_patient_validation_base(args: argparse.Namespace) -> None:
+    """BASE model Patient Validation analysis.
+
+    All four cohorts (CRPC-WCDT, BLCA-RA, CRPC-RA, SCLC) are true holdout
+    for the base model — none were in its training set.  Each cohort gets
+    per-cohort analysis with diamond markers (holdout), plus a Collected
+    cross-cohort analysis.
+    """
+    print("\n" + "=" * 70)
+    print("  ANALYSIS GROUP: Patient_Validation_BASE")
+    print("=" * 70)
+
+    out_dir = ensure_dir(
+        str(PROJECT_ROOT / "analysis" / "results" / "Patient_Validation_BASE"))
+
+    cohort_data: List[Dict[str, Any]] = []
+    for cohort in _VALIDATION_COHORTS:
+        print(f"\n  ── Cohort: {cohort} (BASE holdout) ──")
+        result = _run_patient_validation_cohort(
+            cohort, _BASE_HOLDOUT_MODEL_PATH, out_dir, args,
+        )
+        if result is not None:
+            cohort_data.append(result)
+
+    # Collected analysis across all cohorts (all holdout / diamond markers)
+    if len(cohort_data) >= 2:
+        _run_collected_validation(cohort_data, out_dir, args,
+                                  label="Collected (BASE)")
 
 
 # ---------------------------------------------------------------------------
@@ -1347,6 +1725,23 @@ def _run_discovery_cohort(
             continue
 
         pred, ci_lo, ci_hi = load_holdout_predictions_proteus(str(path))
+
+        # CRPC-Pluvicto: restrict to clinical FH samples (not FHL) at cycle 1
+        if cohort == "CRPC-Pluvicto":
+            keep = [
+                s for s in pred.columns
+                if s.startswith("FH") and not s.startswith("FHL")
+                and s.endswith("C1")
+            ]
+            n_before = pred.shape[1]
+            pred = pred[keep]
+            if ci_lo is not None:
+                ci_lo = ci_lo[[s for s in keep if s in ci_lo.columns]]
+            if ci_hi is not None:
+                ci_hi = ci_hi[[s for s in keep if s in ci_hi.columns]]
+            print(f"    Pluvicto filter: {n_before} → {pred.shape[1]} samples "
+                  f"(FH* !FHL*, *C1)")
+
         model_out = ensure_dir(os.path.join(cohort_out, model_name))
         print(f"    {model_name}: {pred.shape[0]} genes × {pred.shape[1]} samples")
 
@@ -1354,7 +1749,7 @@ def _run_discovery_cohort(
                os.path.join(model_out, "expression_profiles"),
                subtypes_df=subtypes_df)
 
-        for gs_name in ["PC-Phenotyping", "Targets_PC", "PAM50"]:
+        for gs_name in ["PC-Phenotyping", "Targets_CRPC", "PAM50"]:
             resolved = STANDARD_GENE_SETS.get(gs_name, gs_name)
             if not gene_list_available(resolved):
                 continue
@@ -1407,9 +1802,9 @@ _PANFT_CV_PATH = "results_training/PAN-FT_cv"
 # Per-cohort analysis config for PAN-FT-CV splits
 _PANFT_CV_COHORT_CONFIG: Dict[str, Dict[str, Any]] = {
     "CRPC-RA": {
-        "heatmap_gene_sets": ["PC-Phenotyping", "Targets_PC"],
+        "heatmap_gene_sets": ["PC-Phenotyping", "Targets_CRPC"],
         "goi": DEFAULT_GOI_PC,
-        "gene_scatter_sets": ["Targets_PC"],
+        "gene_scatter_sets": ["Targets_CRPC"],
         "truth_label": "CRPC-RA",
     },
     "SCLC": {
@@ -2473,7 +2868,8 @@ GROUPS = {
     "PAN-FT-CV": run_panft_cv,
     "CRPC-FT-CV": run_crpc_finetune_cv,
     "XGB-FT-CV": run_xgb_finetune_cv,
-    "Patient_Validation": run_patient_validation,
+    "Patient_Validation_PAN-FT": run_patient_validation_panft,
+    "Patient_Validation_BASE": run_patient_validation_base,
     "Patient_Discovery": run_patient_discovery,
 }
 
