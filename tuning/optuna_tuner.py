@@ -429,22 +429,12 @@ def compute_cv_objective(run_dir: str) -> Dict[str, Any]:
         for r in rows
         if r.get("tumor", {}).get("gvw_crps") is not None
     ]
-    tumor_gvw_mean_r2 = [
-        float(r.get("tumor", {}).get("gvw_mean_r2"))
-        for r in rows
-        if r.get("tumor", {}).get("gvw_mean_r2") is not None
-    ]
     bg_mae = [float(r.get("background", {}).get("mae")) for r in rows if r.get("background", {}).get("mae") is not None]
     bg_r2 = [float(r.get("background", {}).get("r2")) for r in rows if r.get("background", {}).get("r2") is not None]
     bg_gvw_crps = [
         float(r.get("background", {}).get("gvw_crps"))
         for r in rows
         if r.get("background", {}).get("gvw_crps") is not None
-    ]
-    bg_gvw_mean_r2 = [
-        float(r.get("background", {}).get("gvw_mean_r2"))
-        for r in rows
-        if r.get("background", {}).get("gvw_mean_r2") is not None
     ]
 
     obj = {
@@ -455,23 +445,20 @@ def compute_cv_objective(run_dir: str) -> Dict[str, Any]:
         "tumor_r2_std": _nanstd(tumor_r2),
         "tumor_gvw_crps_mean": _nanmean(tumor_gvw_crps),
         "tumor_gvw_crps_std": _nanstd(tumor_gvw_crps),
-        "tumor_gvw_mean_r2_mean": _nanmean(tumor_gvw_mean_r2),
-        "tumor_gvw_mean_r2_std": _nanstd(tumor_gvw_mean_r2),
         "background_mae_mean": _nanmean(bg_mae),
         "background_mae_std": _nanstd(bg_mae),
         "background_r2_mean": _nanmean(bg_r2),
         "background_r2_std": _nanstd(bg_r2),
         "background_gvw_crps_mean": _nanmean(bg_gvw_crps),
         "background_gvw_crps_std": _nanstd(bg_gvw_crps),
-        "background_gvw_mean_r2_mean": _nanmean(bg_gvw_mean_r2),
-        "background_gvw_mean_r2_std": _nanstd(bg_gvw_mean_r2),
         # Combined objective: average of tumor and background MAE
         "val_loss": _nanmean([_nanmean(tumor_mae), _nanmean(bg_mae)]),
     }
 
     # Balanced fine-tuning objective: per-fold balanced_tumor_gvw_crps
-    # (equal-weight average of per-patient-cohort GVW-CRPS, computed in
-    # _save_fold_predictions when sample_to_cohort is provided).
+    # (equal-weight average of per-source GVW-CRPS when source_groups is
+    # active, or per-cohort GVW-CRPS otherwise; computed in
+    # _save_fold_predictions).
     balanced_crps = [
         float(r["balanced_tumor_gvw_crps"])
         for r in rows
@@ -480,6 +467,36 @@ def compute_cv_objective(run_dir: str) -> Dict[str, Any]:
     if balanced_crps:
         obj["balanced_tumor_gvw_crps_mean"] = _nanmean(balanced_crps)
         obj["balanced_tumor_gvw_crps_std"] = _nanstd(balanced_crps)
+
+    # Balanced GVW-r: per-fold balanced_tumor_gvw_r
+    # (equal-weight average of per-source GVW-r when source_groups is
+    # active, or per-cohort GVW-r otherwise).
+    balanced_gvw_r = [
+        float(r["balanced_tumor_gvw_r"])
+        for r in rows
+        if r.get("balanced_tumor_gvw_r") is not None
+    ]
+    if balanced_gvw_r:
+        obj["balanced_tumor_gvw_r_mean"] = _nanmean(balanced_gvw_r)
+        obj["balanced_tumor_gvw_r_std"] = _nanstd(balanced_gvw_r)
+
+    # Per-fold balanced_tumor_gvw_crps_std (stdev across cohorts within each fold)
+    balanced_crps_std = [
+        float(r["balanced_tumor_gvw_crps_std"])
+        for r in rows
+        if r.get("balanced_tumor_gvw_crps_std") is not None
+    ]
+    if balanced_crps_std:
+        obj["balanced_tumor_gvw_crps_std_mean"] = _nanmean(balanced_crps_std)
+
+    # Per-fold balanced_tumor_gvw_r_std (stdev across cohorts within each fold)
+    balanced_gvw_r_std = [
+        float(r["balanced_tumor_gvw_r_std"])
+        for r in rows
+        if r.get("balanced_tumor_gvw_r_std") is not None
+    ]
+    if balanced_gvw_r_std:
+        obj["balanced_tumor_gvw_r_std_mean"] = _nanmean(balanced_gvw_r_std)
 
     out_path = os.path.join(run_dir, "cv_objective.json")
     with open(out_path, "w") as f:
@@ -660,6 +677,8 @@ def run_optuna_cv_tuning(
                 subsample_frac=subsample_frac,
                 train_only_cohorts=exp.data.train_only_cohorts,
                 balance_cohorts=exp.data.balance_cohorts,
+                source_groups=exp.data.source_groups,
+                target_n_per_source=exp.data.target_n_per_source,
             )
         except optuna.TrialPruned:
             raise  # Let Optuna handle pruning
@@ -1069,6 +1088,10 @@ def _run_promotion_phase(
                 shuffle_genes_in_batch=True,
                 seed=exp.data.seed,
                 subsample_frac=exp.data.subsample_frac,
+                train_only_cohorts=exp.data.train_only_cohorts,
+                balance_cohorts=exp.data.balance_cohorts,
+                source_groups=exp.data.source_groups,
+                target_n_per_source=exp.data.target_n_per_source,
             )
 
             # Read fold metric
@@ -1088,12 +1111,17 @@ def _run_promotion_phase(
                 "tumor_mae_mean": tumor.get("mae", float("nan")),
                 "tumor_r2_mean": tumor.get("r2", float("nan")),
                 "tumor_gvw_crps_mean": tumor.get("gvw_crps", float("nan")),
-                "tumor_gvw_mean_r2_mean": tumor.get("gvw_mean_r2", float("nan")),
                 "background_mae_mean": bg.get("mae", float("nan")),
                 "background_r2_mean": bg.get("r2", float("nan")),
                 "background_gvw_crps_mean": bg.get("gvw_crps", float("nan")),
-                "background_gvw_mean_r2_mean": bg.get("gvw_mean_r2", float("nan")),
             }
+            # Balanced metrics (single-fold: mean across non-PHT cohorts)
+            if fold_metrics.get("balanced_tumor_gvw_crps") is not None:
+                obj["balanced_tumor_gvw_crps_mean"] = float(fold_metrics["balanced_tumor_gvw_crps"])
+                obj["balanced_tumor_gvw_crps_std"] = float(fold_metrics.get("balanced_tumor_gvw_crps_std", float("nan")))
+            if fold_metrics.get("balanced_tumor_gvw_r") is not None:
+                obj["balanced_tumor_gvw_r_mean"] = float(fold_metrics["balanced_tumor_gvw_r"])
+                obj["balanced_tumor_gvw_r_std"] = float(fold_metrics.get("balanced_tumor_gvw_r_std", float("nan")))
             score = _objective_value(
                 obj, metric=exp.objective.metric, direction=direction
             )
@@ -1242,6 +1270,8 @@ def run_optuna_fold_tuning(
                 epoch_end_callback=_epoch_end_callback,
                 train_only_cohorts=exp.data.train_only_cohorts,
                 balance_cohorts=exp.data.balance_cohorts,
+                source_groups=exp.data.source_groups,
+                target_n_per_source=exp.data.target_n_per_source,
             )
         except optuna.TrialPruned:
             raise  # Let Optuna handle it
@@ -1280,11 +1310,9 @@ def run_optuna_fold_tuning(
             "tumor_mae_mean": tumor.get("mae", float("nan")),
             "tumor_r2_mean": tumor.get("r2", float("nan")),
             "tumor_gvw_crps_mean": tumor.get("gvw_crps", float("nan")),
-            "tumor_gvw_mean_r2_mean": tumor.get("gvw_mean_r2", float("nan")),
             "background_mae_mean": bg.get("mae", float("nan")),
             "background_r2_mean": bg.get("r2", float("nan")),
             "background_gvw_crps_mean": bg.get("gvw_crps", float("nan")),
-            "background_gvw_mean_r2_mean": bg.get("gvw_mean_r2", float("nan")),
             "val_loss": _nanmean([
                 tumor.get("mae", float("nan")),
                 bg.get("mae", float("nan")),
@@ -1294,6 +1322,11 @@ def run_optuna_fold_tuning(
         balanced_val = fold_metrics.get("balanced_tumor_gvw_crps", None)
         if balanced_val is not None:
             obj["balanced_tumor_gvw_crps_mean"] = float(balanced_val)
+            obj["balanced_tumor_gvw_crps_std"] = float(fold_metrics.get("balanced_tumor_gvw_crps_std", float("nan")))
+        balanced_r = fold_metrics.get("balanced_tumor_gvw_r", None)
+        if balanced_r is not None:
+            obj["balanced_tumor_gvw_r_mean"] = float(balanced_r)
+            obj["balanced_tumor_gvw_r_std"] = float(fold_metrics.get("balanced_tumor_gvw_r_std", float("nan")))
         for k, v in obj.items():
             if isinstance(v, (int, float)) and math.isfinite(float(v)):
                 trial.set_user_attr(k, float(v))

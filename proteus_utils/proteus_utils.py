@@ -260,6 +260,8 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         val_split: bool = False,
         cohort_map: Optional[Dict[str, str]] = None,
         balance_cohorts: Optional[List[str]] = None,
+        source_map: Optional[Dict[str, str]] = None,
+        target_n_per_source: Optional[int] = None,
     ):
         super().__init__()
         self.index_file = str(index_file)
@@ -275,6 +277,8 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         self.val_split = val_split
         self.cohort_map = cohort_map       # zarr_path -> cohort name
         self.balance_cohorts = balance_cohorts  # cohorts to balance
+        self.source_map = source_map       # zarr_path -> source group name
+        self.target_n_per_source = target_n_per_source
         self._balance_iter = 0
 
         if self.genes_per_batch <= 0:
@@ -348,7 +352,36 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         # each balanced cohort.  The bound is tight (within 1-2
         # batches of the actual count) and prevents the PyTorch
         # "more samples fetched than reported" warning.
-        if self.cohort_map and self.balance_cohorts:
+        if self.source_map and self.target_n_per_source:
+            from collections import defaultdict
+            batches_per_sample: Dict[str, int] = {}
+            for path, start, end in self._chunks:
+                batches_per_sample[path] = (
+                    batches_per_sample.get(path, 0)
+                    + (end - start) // self.genes_per_batch
+                )
+            source_paths_map: Dict[str, List[str]] = defaultdict(list)
+            for path in self.sample_paths:
+                src = self.source_map.get(path)
+                if src is not None:
+                    source_paths_map[src].append(path)
+            max_balanced = 0
+            for src_name, paths in source_paths_map.items():
+                per_sample = sorted(
+                    [batches_per_sample.get(p, 0) for p in paths],
+                    reverse=True,
+                )
+                n_target = self.target_n_per_source
+                # Worst case: we pick the samples with highest batch counts
+                if len(per_sample) >= n_target:
+                    max_balanced += sum(per_sample[:n_target])
+                else:
+                    # Oversampling: each sample can appear multiple times
+                    full_copies = n_target // len(per_sample)
+                    remainder = n_target % len(per_sample)
+                    max_balanced += sum(per_sample) * full_copies + sum(per_sample[:remainder])
+            self._balanced_n_batches = max_balanced
+        elif self.cohort_map and self.balance_cohorts:
             from collections import defaultdict
             batches_per_sample: Dict[str, int] = {}
             for path, start, end in self._chunks:
@@ -393,44 +426,74 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         return int(n_batches)
 
     def __len__(self) -> int:
+        if self.source_map and self.target_n_per_source:
+            return self._balanced_n_batches
         if self.cohort_map and self.balance_cohorts:
             return self._balanced_n_batches
         return int(self._n_batches)
 
     def _balanced_chunks(self, epoch: int) -> List[Tuple[str, int, int]]:
-        """Return chunks filtered for cohort-balanced training.
+        """Return chunks filtered for balanced training.
 
-        For each epoch, selects a balanced subset of samples from the
-        cohorts listed in ``balance_cohorts`` (minority count rules).
-        Samples from cohorts NOT in ``balance_cohorts`` (e.g. PDX
-        admixtures) are always included at full count.
+        Two modes:
+
+        1.  **Source-group balancing** (``source_map`` + ``target_n_per_source``):
+            Groups samples by source, then draws exactly
+            ``target_n_per_source`` samples per source per epoch
+            (oversampling small sources with replacement,
+            undersampling large sources without).
+
+        2.  **Legacy cohort balancing** (``balance_cohorts`` only):
+            Undersamples balanced cohorts to the minority count.
+            Non-balanced cohorts are always included at full count.
         """
-        # Group sample paths by cohort.
         from collections import defaultdict
+
+        # ------- Source-group balanced sampling -------
+        if self.source_map and self.target_n_per_source:
+            source_paths: Dict[str, List[str]] = defaultdict(list)
+            for path in self.sample_paths:
+                src = self.source_map.get(path)
+                if src is not None:
+                    source_paths[src].append(path)
+
+            rng = random.Random(self.seed + epoch * 997)
+            selected_paths: set = set()
+            for src_name, paths in source_paths.items():
+                n_avail = len(paths)
+                n_target = self.target_n_per_source
+                if n_avail == 0:
+                    continue
+                if n_avail >= n_target:
+                    chosen = rng.sample(paths, n_target)
+                else:
+                    # Oversample: full copy + random remainder
+                    full_copies = n_target // n_avail
+                    remainder = n_target % n_avail
+                    chosen = paths * full_copies + rng.sample(paths, remainder)
+                selected_paths.update(chosen)
+            return [c for c in self._chunks if c[0] in selected_paths]
+
+        # ------- Legacy cohort-balanced sampling -------
         cohort_paths: Dict[str, List[str]] = defaultdict(list)
-        all_paths = set()
         for path in self.sample_paths:
             coh = self.cohort_map.get(path, None)
             if coh is not None:
                 cohort_paths[coh].append(path)
-            all_paths.add(path)
 
-        # Find minority count among balance cohorts.
         counts = {c: len(cohort_paths[c]) for c in self.balance_cohorts
                   if c in cohort_paths}
         if not counts:
             return self._chunks
         n_min = min(counts.values())
 
-        # Select balanced subset with epoch-varying seed.
         rng = random.Random(self.seed + epoch * 997)
-        selected_paths: set = set()
+        selected_paths = set()
         for coh in self.balance_cohorts:
             paths = cohort_paths.get(coh, [])
             chosen = rng.sample(paths, min(n_min, len(paths)))
             selected_paths.update(chosen)
 
-        # Always include paths from non-balanced cohorts.
         for coh, paths in cohort_paths.items():
             if coh not in self.balance_cohorts:
                 selected_paths.update(paths)
@@ -481,11 +544,14 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
             worker_id = int(worker_info.id)
             num_workers = int(worker_info.num_workers)
 
-        # Per-epoch cohort-balanced filtering.  _balance_iter increments
-        # on every __iter__() call so each worker (persistent or not)
-        # deterministically varies the selected majority-cohort samples.
+        # Per-epoch balanced filtering (source-group or cohort-level).
+        # _balance_iter increments on every __iter__() call so each
+        # worker deterministically varies the selected samples.
         active_chunks = self._chunks
-        if self.cohort_map and self.balance_cohorts:
+        if self.source_map and self.target_n_per_source:
+            self._balance_iter += 1
+            active_chunks = self._balanced_chunks(self._balance_iter)
+        elif self.cohort_map and self.balance_cohorts:
             self._balance_iter += 1
             active_chunks = self._balanced_chunks(self._balance_iter)
 
@@ -669,6 +735,8 @@ def create_data_loader(
     val_split: bool = False,
     cohort_map: Optional[Dict[str, str]] = None,
     balance_cohorts: Optional[List[str]] = None,
+    source_map: Optional[Dict[str, str]] = None,
+    target_n_per_source: Optional[int] = None,
 ) -> Tuple[DataLoader, int]:
     """
     Create a DataLoader for Proteus training/validation.
@@ -722,6 +790,8 @@ def create_data_loader(
             val_split=val_split,
             cohort_map=cohort_map,
             balance_cohorts=balance_cohorts,
+            source_map=source_map,
+            target_n_per_source=target_n_per_source,
         )
 
         # IterableDataset already yields fixed-size training batches.
@@ -809,6 +879,8 @@ def build_loaders_from_splits(
     gene_weights: Optional[Dict[str, float]] = None,
     train_only_cohorts: Optional[List[str]] = None,
     balance_cohorts: Optional[List[str]] = None,
+    source_groups: Optional[Dict[str, List[str]]] = None,
+    target_n_per_source: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader, int, int]:
     """Build train/val DataLoaders from a deterministic splits TSV file.
 
@@ -838,6 +910,14 @@ def build_loaders_from_splits(
                          of the majority cohort(s) to the minority count.
                          E.g. ``['CRPC-RA', 'SCLC']``.  Cohorts not
                          listed are always included at full count.
+        source_groups: Source-level batch balancing.  Maps source name to
+                       list of cohort names.  PHT samples are automatically
+                       assigned to the source whose PDX cohort they derive
+                       from (parsed from the embedded PDX name in the
+                       sample name: ``PHT-Fold-X_<PDX_NAME>-BP...``).
+                       Mutually exclusive with ``balance_cohorts``.
+        target_n_per_source: Target samples per source group per epoch.
+                             Only used when ``source_groups`` is set.
 
     Returns:
         (train_loader, val_loader, train_steps, val_steps)
@@ -906,6 +986,67 @@ def build_loaders_from_splits(
     rng = np.random.RandomState(seed)
     rng.shuffle(train_paths)
 
+    # Build source_map: zarr_path -> source group name.
+    # For PHT samples, parse the embedded PDX name from the sample name
+    # (format: PHT-Fold-X_<PDX_NAME>-BP...) and match against known
+    # PDX sample names to determine which source group they belong to.
+    zarr_path_to_source: Optional[Dict[str, str]] = None
+    if source_groups:
+        import re
+        # Invert source_groups: cohort -> source name
+        cohort_to_source: Dict[str, str] = {}
+        for src_name, cohorts in source_groups.items():
+            for coh in cohorts:
+                cohort_to_source[coh] = src_name
+
+        # Collect known PDX sample names per cohort (for matching PHT names).
+        pdx_sample_to_cohort: Dict[str, str] = {}
+        with open(training_set_tsv, 'r', newline='') as f2:
+            reader2 = csv.DictReader(f2, delimiter='\t')
+            for row in reader2:
+                coh = row['Cohort'].strip()
+                samp = row['Sample'].strip()
+                if samp.startswith(f"{coh}_"):
+                    samp = samp[len(coh) + 1:]
+                # Only index non-PHT cohorts that appear in source groups
+                if coh in cohort_to_source:
+                    pdx_sample_to_cohort[samp] = coh
+
+        # Build the source map for all training paths.
+        zarr_path_to_source = {}
+        pht_re = re.compile(r'^PHT-Fold-\d+_(.+)-BP\d+')
+        for zpath, coh in zarr_path_to_cohort.items():
+            if zpath not in train_paths:
+                continue
+            if coh in cohort_to_source:
+                zarr_path_to_source[zpath] = cohort_to_source[coh]
+            elif coh == 'PHT':
+                # Extract PDX name from the zarr filename.
+                basename = os.path.basename(zpath).replace('.zarr', '')
+                m = pht_re.match(basename)
+                if m:
+                    pdx_name = m.group(1)
+                    pdx_coh = pdx_sample_to_cohort.get(pdx_name)
+                    if pdx_coh is not None:
+                        zarr_path_to_source[zpath] = cohort_to_source[pdx_coh]
+                    else:
+                        raise ValueError(
+                            f"PHT sample '{basename}' has PDX name '{pdx_name}' "
+                            f"that does not match any known PDX sample. "
+                            f"Known: {sorted(pdx_sample_to_cohort.keys())}"
+                        )
+                else:
+                    raise ValueError(
+                        f"Could not parse PDX name from PHT sample: '{basename}'. "
+                        f"Expected format: PHT-Fold-X_<PDX_NAME>-BP..."
+                    )
+
+        # Report source group assignments.
+        from collections import Counter
+        src_counts = Counter(zarr_path_to_source.values())
+        print(f"  [Source groups] {dict(src_counts)}, "
+              f"target_n_per_source={target_n_per_source}")
+
     # Write temp index files (required by chunk loader)
     import tempfile
     temp_dir = tempfile.mkdtemp(prefix='proteus_splits_')
@@ -938,6 +1079,8 @@ def build_loaders_from_splits(
         gene_weights=gene_weights,
         cohort_map=zarr_path_to_cohort if balance_cohorts else None,
         balance_cohorts=balance_cohorts,
+        source_map=zarr_path_to_source,
+        target_n_per_source=target_n_per_source,
     )
 
     val_loader, val_steps = create_data_loader(

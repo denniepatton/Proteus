@@ -364,6 +364,19 @@ class DataSpec:
         Fraction of each fold to use during training.  Used by phased
         tuning to run cheap screening passes on 10% or 50% of data.
         None means use 100% of the data (default for production runs).
+
+    source_groups (optional, Dict[str, List[str]]):
+        Source-level batch balancing.  Maps a source name to the list
+        of cohort names that belong to that source.  PHT samples are
+        automatically assigned to the source whose PDX cohort they
+        derive from (parsed from sample name).  When set, each epoch
+        draws ``target_n_per_source`` samples from every source group
+        (oversampling small sources, undersampling large ones).
+        Mutually exclusive with ``balance_cohorts``.
+
+    target_n_per_source (optional, int):
+        Target number of samples per source group per training epoch.
+        Only used when ``source_groups`` is set.
     """
     training_set: str
     zarr_base: str
@@ -371,13 +384,16 @@ class DataSpec:
     subsample_frac: Optional[float]
     train_only_cohorts: Optional[List[str]]
     balance_cohorts: Optional[List[str]]
+    source_groups: Optional[Dict[str, List[str]]]
+    target_n_per_source: Optional[int]
 
     @staticmethod
     def from_yaml(x: Any) -> "DataSpec":
         d = _expect_dict(x, "data")
         allowed = ["training_set", "zarr_base", "seed",
                     "subsample_frac", "train_only_cohorts",
-                    "balance_cohorts"]
+                    "balance_cohorts", "source_groups",
+                    "target_n_per_source"]
         _check_no_unknown_keys(d, allowed=allowed, ctx="data")
         subsample_raw = d.get("subsample_frac", None)
         subsample_frac: Optional[float] = None
@@ -401,6 +417,27 @@ class DataSpec:
                 _fail("data.balance_cohorts must be a list of strings")
             balance = [str(c).strip() for c in balance_raw]
 
+        source_groups_raw = d.get("source_groups", None)
+        source_groups: Optional[Dict[str, List[str]]] = None
+        if source_groups_raw is not None:
+            if not isinstance(source_groups_raw, dict):
+                _fail("data.source_groups must be a mapping of source_name -> [cohort_names]")
+            source_groups = {
+                str(k).strip(): [str(c).strip() for c in v]
+                for k, v in source_groups_raw.items()
+            }
+
+        target_n_raw = d.get("target_n_per_source", None)
+        target_n: Optional[int] = None
+        if target_n_raw is not None:
+            target_n = _as_int(target_n_raw, "data.target_n_per_source")
+            if target_n <= 0:
+                _fail(f"data.target_n_per_source must be > 0, got {target_n}")
+
+        if source_groups is not None and balance is not None:
+            _fail("data.source_groups and data.balance_cohorts are "
+                  "mutually exclusive — use one or the other")
+
         return DataSpec(
             training_set=_as_str(d["training_set"], "data.training_set"),
             zarr_base=_as_str(
@@ -411,6 +448,8 @@ class DataSpec:
             subsample_frac=subsample_frac,
             train_only_cohorts=train_only,
             balance_cohorts=balance,
+            source_groups=source_groups,
+            target_n_per_source=target_n,
         )
 
 

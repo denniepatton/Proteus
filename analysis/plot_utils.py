@@ -190,11 +190,15 @@ def gene_target_scatter(
     tfx_dict: Optional[Dict[str, float]] = None,
     ci_lo_wide: Optional[pd.DataFrame] = None,
     ci_hi_wide: Optional[pd.DataFrame] = None,
+    bg_truth_wide: Optional[pd.DataFrame] = None,
+    bg_pred_wide: Optional[pd.DataFrame] = None,
 ) -> None:
     """Scatter: samples as dots for one gene, truth vs pred.
 
     Colored by subtype, sized by TFx.  Fit line + 95% CI band.
     Vertical error bars show per-sample model CIs when available.
+    When ``bg_truth_wide`` / ``bg_pred_wide`` are provided, HD-L
+    background predictions are overlaid as gray diamonds.
     """
     _ensure_dir(name)
     if gene not in truth_wide.index or gene not in pred_wide.index:
@@ -220,6 +224,19 @@ def gene_target_scatter(
         lo_ci_vals = ci_lo_wide.loc[gene, common].reindex(t.index).dropna().values
         hi_ci_vals = ci_hi_wide.loc[gene, common].reindex(t.index).dropna().values
         all_vals = np.concatenate([all_vals, lo_ci_vals, hi_ci_vals])
+
+    # Background overlay data
+    bg_t: Optional[pd.Series] = None
+    bg_p: Optional[pd.Series] = None
+    if (bg_truth_wide is not None and bg_pred_wide is not None
+            and gene in bg_truth_wide.index and gene in bg_pred_wide.index):
+        bg_common = bg_truth_wide.columns.intersection(bg_pred_wide.columns)
+        _bt = bg_truth_wide.loc[gene, bg_common].astype(np.float64)
+        _bp = bg_pred_wide.loc[gene, bg_common].astype(np.float64)
+        bg_mask = np.isfinite(_bt) & np.isfinite(_bp)
+        if bg_mask.sum() >= 1:
+            bg_t, bg_p = _bt[bg_mask], _bp[bg_mask]
+            all_vals = np.concatenate([all_vals, bg_t.values, bg_p.values])
     data_min = max(float(np.nanmin(all_vals)) - 0.5, 0.0)
     data_max = float(np.nanmax(all_vals)) + 0.5
     axis_lo = np.floor(data_min)
@@ -333,6 +350,13 @@ def gene_target_scatter(
         ax.scatter(
             t.values, p.values, s=sizes,
             edgecolors="black", linewidths=0.5, alpha=0.75, zorder=3,
+        )
+
+    # HD-L background overlay (gray diamonds, behind tumor legend)
+    if bg_t is not None and bg_p is not None:
+        ax.scatter(
+            bg_t.values, bg_p.values, s=80, c="#AAAAAA", marker="D",
+            edgecolors="black", linewidths=0.5, alpha=0.6, zorder=2, label="HD-L",
         )
 
     ax.set_xlabel(r"RNA-Seq log$_2$(CPM+1)")
@@ -1134,11 +1158,12 @@ def batch_sample_scatters(
 
 def _render_gene_scatter(args: Tuple) -> str:
     """Worker for parallel gene target scatters."""
-    truth_wide, pred_wide, gene, out_path, subtypes_df, tfx_dict, ci_lo_wide, ci_hi_wide = args
+    truth_wide, pred_wide, gene, out_path, subtypes_df, tfx_dict, ci_lo_wide, ci_hi_wide, bg_truth_wide, bg_pred_wide = args
     gene_target_scatter(
         truth_wide, pred_wide, gene, out_path,
         subtypes_df=subtypes_df, tfx_dict=tfx_dict,
         ci_lo_wide=ci_lo_wide, ci_hi_wide=ci_hi_wide,
+        bg_truth_wide=bg_truth_wide, bg_pred_wide=bg_pred_wide,
     )
     return gene
 
@@ -1153,6 +1178,8 @@ def batch_gene_scatters(
     tfx_dict: Optional[Dict[str, float]] = None,
     ci_lo_wide: Optional[pd.DataFrame] = None,
     ci_hi_wide: Optional[pd.DataFrame] = None,
+    bg_truth_wide: Optional[pd.DataFrame] = None,
+    bg_pred_wide: Optional[pd.DataFrame] = None,
     n_workers: Optional[int] = None,
 ) -> None:
     """Generate per-gene target scatter plots in parallel."""
@@ -1161,7 +1188,9 @@ def batch_gene_scatters(
         n_workers = max(1, (os.cpu_count() or 1))
 
     args_list = [
-        (truth_wide, pred_wide, gene, os.path.join(out_dir, gene), subtypes_df, tfx_dict, ci_lo_wide, ci_hi_wide)
+        (truth_wide, pred_wide, gene, os.path.join(out_dir, gene),
+         subtypes_df, tfx_dict, ci_lo_wide, ci_hi_wide,
+         bg_truth_wide, bg_pred_wide)
         for gene in genes
         if gene in truth_wide.index and gene in pred_wide.index
     ]
@@ -1182,16 +1211,25 @@ def batch_gene_scatters(
 # Benchmarking grid plots
 # ---------------------------------------------------------------------------
 
-# Consistent model palette for all benchmark figures
-_BENCH_COLORS = [
+# Palette-based model colours for all benchmark figures.
+# Falls back to grey cycle if a model is absent from the palette.
+_BENCH_FALLBACK_COLORS = [
     "#0077BB", "#EE7733", "#33BBEE", "#EE3377", "#009988", "#CC3311",
     "#332288", "#DDCC77", "#882255", "#44AA99", "#88CCEE", "#AA4499",
-    "#BBBBBB",
 ]
 
 
 def _bench_color_map(model_names: Sequence[str]) -> Dict[str, str]:
-    return {m: _BENCH_COLORS[i % len(_BENCH_COLORS)] for i, m in enumerate(model_names)}
+    pal = _palette()
+    cmap: Dict[str, str] = {}
+    fb_idx = 0
+    for m in model_names:
+        if m in pal:
+            cmap[m] = pal[m]
+        else:
+            cmap[m] = _BENCH_FALLBACK_COLORS[fb_idx % len(_BENCH_FALLBACK_COLORS)]
+            fb_idx += 1
+    return cmap
 
 
 def benchmark_grid_boxplots(
@@ -1204,12 +1242,12 @@ def benchmark_grid_boxplots(
     tfx_order: Sequence[str],
     depth_order: Sequence[str],
     model_order: Sequence[str],
-    null_model: str = "Null",
+    naive_model: str = "Na\u00efve",
 ) -> None:
     """TFx x Depth grid of box plots, one box per model/score.
 
     ``metrics_table`` must have columns: tfx, depth, model, and ``metric_col``.
-    A dashed gray horizontal line is drawn at the Null model's mean value
+    A dashed gray horizontal line is drawn at the Na\u00efve model's mean value
     (or single value) in each panel for reference.
     """
     _ensure_dir(name)
@@ -1232,11 +1270,11 @@ def benchmark_grid_boxplots(
                 ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
                         ha="center", va="center", fontsize=9, color="gray")
             else:
-                # Null reference line — dashed gray spanning full x-extent
-                null_vals = sub.loc[sub["model"] == null_model, metric_col].dropna().values
-                if len(null_vals) > 0:
-                    null_ref = float(np.mean(null_vals))
-                    ax.axhline(null_ref, color="#BBBBBB", ls="--", lw=1.2, zorder=0)
+                # Naïve reference line — dashed gray spanning full x-extent
+                naive_vals = sub.loc[sub["model"] == naive_model, metric_col].dropna().values
+                if len(naive_vals) > 0:
+                    naive_ref = float(np.mean(naive_vals))
+                    ax.axhline(naive_ref, color="#BBBBBB", ls="--", lw=1.2, zorder=0)
 
                 plot_data = []
                 labels = []
@@ -1246,13 +1284,13 @@ def benchmark_grid_boxplots(
                     if len(vals) > 0:
                         plot_data.append(vals)
                         labels.append(model)
-                        colors.append("#BBBBBB" if model == "Null" else cmap[model])
+                        colors.append(cmap.get(model, "#BBBBBB"))
                 if plot_data:
                     # If every model has exactly 1 value, use dot plot
                     all_scalar = all(len(v) == 1 for v in plot_data)
                     if all_scalar:
                         for i, (vals, c) in enumerate(zip(plot_data, colors), start=1):
-                            ax.plot(i, vals[0], "o", color=c, markersize=8, zorder=3)
+                            ax.plot(i, vals[0], "o", color=c, markersize=24, zorder=3)
                         ax.set_xticks(range(1, len(labels) + 1))
                         ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=6)
                     else:
@@ -1264,6 +1302,9 @@ def benchmark_grid_boxplots(
                         for patch, c in zip(bp["boxes"], colors):
                             patch.set_facecolor(c)
                             patch.set_alpha(0.7)
+                        # Increase outlier dot size
+                        for flier in bp.get("fliers", []):
+                            flier.set_markersize(4)
                         ax.set_xticks(range(1, len(labels) + 1))
                         ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=6)
 
@@ -1318,7 +1359,7 @@ def benchmark_grid_histograms(
                     if len(vals) < 3:
                         continue
                     n_good = int((vals >= 0.70).sum())
-                    color = "#BBBBBB" if model == "Null" else cmap[model]
+                    color = cmap.get(model, "#BBBBBB")
                     sns.kdeplot(
                         vals, ax=ax, color=color, linewidth=1.5,
                         fill=False, clip=(-1, 1),
@@ -1357,12 +1398,12 @@ def benchmark_ecdna_lines(
     cmap = _bench_color_map(model_order)
 
     metric_defs = [
-        ("sample_rho_mean", "Mean Sample Spearman \u03c1"),
-        ("mean_gene_rho", "Mean Gene Spearman \u03c1"),
-        ("median_gene_rho", "Median Gene Spearman \u03c1"),
         ("gvw_rho", "GVW Spearman \u03c1"),
-        ("rmse", "Mean Gene RMSE"),
         ("mean_top10pct_gene_rho", "Mean \u03c1 (Top 10% Var.)"),
+        ("median_gene_rho", "Median Gene Spearman \u03c1"),
+        ("mean_gene_rho", "Mean Gene Spearman \u03c1"),
+        ("sample_rho_mean", "Mean Sample Spearman \u03c1"),
+        ("rmse", "Mean Gene RMSE"),
     ]
 
     n_rows, n_cols = 3, 2
@@ -1376,9 +1417,9 @@ def benchmark_ecdna_lines(
             sub = ecdna_table[ecdna_table["model"] == model].sort_values("ecdna")
             if sub.empty or col not in sub.columns or sub[col].isna().all():
                 continue
-            color = "#BBBBBB" if model == "Null" else cmap[model]
+            color = cmap.get(model, "#BBBBBB")
             line, = ax.plot(sub["ecdna"], sub[col], "o-",
-                            color=color, markersize=4, linewidth=1.2)
+                            color=color, markersize=16, linewidth=1.4)
             # Collect legend entries from first panel only
             if idx == 0:
                 legend_handles.append((line, model))
@@ -1396,6 +1437,205 @@ def benchmark_ecdna_lines(
                    framealpha=0.8, bbox_to_anchor=(0.5, -0.02))
 
     fig.suptitle("Benchmark Metrics vs Effective ctDNA",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.04, 1, 0.97])
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Benchmarking cohort-panel plots (Benchmarking_PAN-FT)
+# ---------------------------------------------------------------------------
+
+def benchmark_cohort_boxplots(
+    metrics_table: pd.DataFrame,
+    name: str,
+    *,
+    metric_col: str,
+    ylabel: str,
+    title: str,
+    cohort_order: Sequence[str],
+    model_order: Sequence[str],
+    naive_model: str = "Naïve",
+) -> None:
+    """Side-by-side cohort panels of box/dot plots, one box per model.
+
+    ``metrics_table`` must have columns: cohort, model, and ``metric_col``.
+    Each cohort gets its own panel.  A dashed gray line marks the Naïve
+    model's mean value for reference.
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+    n_panels = len(cohort_order)
+
+    fig, axes = plt.subplots(
+        1, n_panels, figsize=(6 * n_panels + 1, 5),
+        sharey=True, squeeze=False,
+    )
+
+    for ci, cohort in enumerate(cohort_order):
+        ax = axes[0, ci]
+        sub = metrics_table[metrics_table["cohort"] == cohort]
+        if sub.empty:
+            ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=9, color="gray")
+        else:
+            naive_vals = sub.loc[sub["model"] == naive_model, metric_col].dropna().values
+            if len(naive_vals) > 0:
+                ax.axhline(float(np.mean(naive_vals)), color="#BBBBBB",
+                           ls="--", lw=1.2, zorder=0)
+
+            plot_data, labels, colors = [], [], []
+            for model in model_order:
+                vals = sub.loc[sub["model"] == model, metric_col].dropna().values
+                if len(vals) > 0:
+                    plot_data.append(vals)
+                    labels.append(model)
+                    colors.append(cmap.get(model, "#BBBBBB"))
+
+            if plot_data:
+                all_scalar = all(len(v) == 1 for v in plot_data)
+                if all_scalar:
+                    for i, (vals, c) in enumerate(zip(plot_data, colors), start=1):
+                        ax.plot(i, vals[0], "o", color=c, markersize=24, zorder=3)
+                    ax.set_xticks(range(1, len(labels) + 1))
+                    ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=6)
+                else:
+                    bp = ax.boxplot(
+                        plot_data, patch_artist=True, widths=0.6,
+                        medianprops=dict(color="black", linewidth=1.2),
+                        flierprops=dict(markersize=2),
+                    )
+                    for patch, c in zip(bp["boxes"], colors):
+                        patch.set_facecolor(c)
+                        patch.set_alpha(0.7)
+                    for flier in bp.get("fliers", []):
+                        flier.set_markersize(4)
+                    ax.set_xticks(range(1, len(labels) + 1))
+                    ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=6)
+
+        ax.set_title(cohort, fontsize=10, fontweight="bold")
+        if ci == 0:
+            ax.set_ylabel(ylabel, fontsize=9)
+
+    fig.suptitle(title, fontsize=13, fontweight="bold", y=1.01)
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def benchmark_cohort_histograms(
+    gene_rho_table: pd.DataFrame,
+    name: str,
+    *,
+    cohort_order: Sequence[str],
+    model_order: Sequence[str],
+    title: Optional[str] = None,
+) -> None:
+    """Side-by-side cohort panels of overlaid per-gene Spearman rho KDEs.
+
+    ``gene_rho_table`` has columns: cohort, model, spearman_rho.
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+    n_panels = len(cohort_order)
+
+    fig, axes = plt.subplots(
+        1, n_panels, figsize=(5 * n_panels + 1, 5),
+        sharex=True, sharey=False, squeeze=False,
+    )
+
+    for ci, cohort in enumerate(cohort_order):
+        ax = axes[0, ci]
+        sub = gene_rho_table[gene_rho_table["cohort"] == cohort]
+        if sub.empty:
+            ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                    ha="center", va="center", fontsize=9, color="gray")
+        else:
+            legend_entries = []
+            for model in model_order:
+                vals = sub.loc[sub["model"] == model, "spearman_rho"].dropna().values
+                if len(vals) < 3:
+                    continue
+                n_good = int((vals >= 0.70).sum())
+                color = cmap.get(model, "#BBBBBB")
+                sns.kdeplot(vals, ax=ax, color=color, linewidth=1.5,
+                            fill=False, clip=(-1, 1))
+                legend_entries.append(f"{model} (n≥0.7={n_good})")
+            if legend_entries:
+                ax.legend(legend_entries, fontsize=5, loc="upper left",
+                          framealpha=0.6)
+        ax.set_xlim(-1, 1)
+        ax.set_title(cohort, fontsize=10, fontweight="bold")
+        if ci == 0:
+            ax.set_ylabel("Density", fontsize=9)
+        ax.set_xlabel("Spearman ρ", fontsize=8)
+
+    fig.suptitle(title or "Per-Gene Spearman ρ Distribution",
+                 fontsize=13, fontweight="bold", y=1.01)
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def benchmark_cohort_metrics_lines(
+    metrics_table: pd.DataFrame,
+    name: str,
+    *,
+    cohort_order: Sequence[str],
+    model_order: Sequence[str],
+) -> None:
+    """Multi-metric panel (2×3) showing scalar metrics per model per cohort.
+
+    Similar to ``benchmark_ecdna_lines`` but the x-axis is the cohort
+    (categorical) rather than eCDNA.  One dot per (model, cohort).
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+
+    metric_defs = [
+        ("gvw_rho", "GVW Spearman ρ"),
+        ("mean_top10pct_gene_rho", "Mean ρ (Top 10% Var.)"),
+        ("median_gene_rho", "Median Gene Spearman ρ"),
+        ("mean_gene_rho", "Mean Gene Spearman ρ"),
+        ("sample_rho_mean", "Mean Sample Spearman ρ"),
+        ("rmse", "Mean Gene RMSE"),
+    ]
+
+    n_rows, n_cols = 3, 2
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 12), squeeze=False)
+
+    legend_handles = []
+    x_positions = list(range(len(cohort_order)))
+    for idx, (col, label) in enumerate(metric_defs):
+        ri, ci = divmod(idx, n_cols)
+        ax = axes[ri, ci]
+        for model in model_order:
+            sub = metrics_table[metrics_table["model"] == model]
+            if sub.empty or col not in sub.columns or sub[col].isna().all():
+                continue
+            color = cmap.get(model, "#BBBBBB")
+            y_vals = []
+            for cohort in cohort_order:
+                v = sub.loc[sub["cohort"] == cohort, col].values
+                y_vals.append(float(v[0]) if len(v) > 0 else np.nan)
+            line, = ax.plot(x_positions, y_vals, "o-",
+                            color=color, markersize=16, linewidth=1.4)
+            if idx == 0:
+                legend_handles.append((line, model))
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(cohort_order, fontsize=9)
+        ax.set_ylabel(label, fontsize=9)
+        ax.set_title(label, fontsize=10, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+
+    if legend_handles:
+        handles, labels = zip(*legend_handles)
+        fig.legend(handles, labels, loc="lower center",
+                   ncol=min(len(labels), 6), fontsize=8,
+                   framealpha=0.8, bbox_to_anchor=(0.5, -0.02))
+
+    fig.suptitle("Benchmark Metrics by Cohort",
                  fontsize=13, fontweight="bold")
     fig.tight_layout(rect=[0, 0.04, 1, 0.97])
     fig.savefig(f"{name}.pdf", bbox_inches="tight")

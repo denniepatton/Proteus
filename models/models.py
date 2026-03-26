@@ -80,6 +80,7 @@ def get_model_instance(model_name: str = 'BioDVN') -> nn.Module:
         'BioDVN': BioDVN,
         'BioDVN_NoSeq': BioDVN_NoSeq,
         'BioDVN_OnlySeq': BioDVN_OnlySeq,
+        'BioDVN_PAN-FT': BioDVN,
     }
     
     if model_name not in models:

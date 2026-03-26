@@ -795,10 +795,6 @@ class Trainer:
         metrics_tracker = MetricsTracker()
         self.tumor_r2.reset()
 
-        # GVW-weighted R² accumulators
-        tumor_gvw_r2 = MaskedR2Metric()
-        bg_gvw_r2 = MaskedR2Metric()
-
         # GVW CRPS accumulators (weighted by gene variance weights).
         tumor_crps_sum = torch.tensor(0.0)
         tumor_crps_denom = torch.tensor(0.0)
@@ -985,14 +981,9 @@ class Trainer:
             # Update R² metrics
             # Aggregate R² (unweighted, pooled across all genes/samples)
             self.tumor_r2.update(predictions['tumor_exp'], labels['tumor_exp'])
-            # GVW R² (weighted by gene variance weights)
-            tumor_gvw_r2.update(predictions['tumor_exp'], labels['tumor_exp'], sample_weight=w_val)
-            bg_gvw_r2.update(predictions['background_exp'], labels['background_exp'], sample_weight=w_bg)
         
         metrics = metrics_tracker.compute()
         metrics['val_tumor_aggregate_r2'] = self.tumor_r2.compute()
-        metrics['val_tumor_gvw_r2'] = tumor_gvw_r2.compute()
-        metrics['val_background_gvw_r2'] = bg_gvw_r2.compute()
 
         if float(tumor_crps_denom.item()) > 0:
             metrics['val_tumor_gvw_crps'] = float((tumor_crps_sum / tumor_crps_denom).item())
@@ -1070,7 +1061,6 @@ class Trainer:
             'val_loss': [],
             'val_tumor_gvw_crps': [],
             'val_tumor_aggregate_r2': [],
-            'val_tumor_gvw_r2': [],
             'learning_rate': [],
         }
 
@@ -1117,7 +1107,6 @@ class Trainer:
                 history['val_loss'].append(val_metrics['val_loss'])
                 history['val_tumor_gvw_crps'].append(val_metrics.get('val_tumor_gvw_crps', float('nan')))
                 history['val_tumor_aggregate_r2'].append(val_metrics.get('val_tumor_aggregate_r2', 0))
-                history['val_tumor_gvw_r2'].append(val_metrics.get('val_tumor_gvw_r2', 0))
                 if 'val_balanced_tumor_gvw_crps' in val_metrics:
                     history.setdefault('val_balanced_tumor_gvw_crps', []).append(
                         val_metrics['val_balanced_tumor_gvw_crps'])
@@ -1130,8 +1119,7 @@ class Trainer:
                     f'  Val Loss: {val_metrics["val_loss"]:.4f} '
                     f'| {crps_label}: {crps_value:.4f} '
                     f'| GVW-CRPS: {val_metrics.get("val_tumor_gvw_crps", float("nan")):.4f} '
-                    f'| Agg R²: {val_metrics.get("val_tumor_aggregate_r2", 0):.4f} '
-                    f'| GVW R²: {val_metrics.get("val_tumor_gvw_r2", 0):.4f}'
+                    f'| Agg R²: {val_metrics.get("val_tumor_aggregate_r2", 0):.4f}'
                 )
 
                 # Model selection / early stopping metric.

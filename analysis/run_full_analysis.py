@@ -5,10 +5,11 @@ Proteus analysis framework — main orchestrator.
 
 Usage examples:
     python analysis/run_full_analysis.py --group BTS-CV
-    python analysis/run_full_analysis.py --group Patient-HO
-    python analysis/run_full_analysis.py --group Patient-HO \
+    python analysis/run_full_analysis.py --group Patient_Validation
+    python analysis/run_full_analysis.py --group Patient_Validation \
         --proteus_holdout results_holdout/BioDVN/CRPC-WCDT \
         --truth_cohort CRPC-WCDT
+    python analysis/run_full_analysis.py --group Patient_Discovery
     python analysis/run_full_analysis.py --group all
 
 Run ``--help`` for full CLI reference.
@@ -35,7 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from analysis.analysis_utils import (
     _flatten_wide_pair,
     build_study_truth_pool,
-    build_study_var_map,
+    clean_epicseq_sample_names,
     cohort_summary_table,
     compute_coverage_curve,
     compute_gene_variance,
@@ -49,6 +50,7 @@ from analysis.analysis_utils import (
     GENE_SET_BREAKS,
     load_cv_predictions_proteus,
     load_cv_predictions_proteus_full,
+    load_cv_predictions_background,
     load_cv_predictions_xgboost,
     load_fold_splits,
     load_holdout_predictions_epicseq,
@@ -65,6 +67,7 @@ from analysis.analysis_utils import (
     sample_level_metrics,
     SCLC_PDX_STUDY,
     STANDARD_GENE_SETS,
+    strip_cohort_prefix,
     variance_group_metrics,
 )
 from analysis.calibration import (
@@ -80,6 +83,9 @@ from analysis.reliability import (
 from analysis.plot_utils import (
     batch_gene_scatters,
     batch_sample_scatters,
+    benchmark_cohort_boxplots,
+    benchmark_cohort_histograms,
+    benchmark_cohort_metrics_lines,
     benchmark_ecdna_lines,
     benchmark_grid_boxplots,
     benchmark_grid_histograms,
@@ -174,20 +180,6 @@ def run_bts_cv(args: argparse.Namespace) -> None:
     subtypes_df = _build_bts_subtypes()
     canonical_truth = _build_bts_truth()
     print(f"  Canonical truth: {canonical_truth.shape[0]} genes × {canonical_truth.shape[1]} samples")
-
-    # Build the single study-wide variance map (25+25 PDX tumor only)
-    study_var_map = build_study_var_map()
-    print(f"  Study variance map: {len(study_var_map)} genes")
-
-    # Per-cohort variance maps using study tumor samples only
-    cohort_var_maps: Dict[str, Dict[str, float]] = {}
-    for cohort_name, cfg in _COHORT_CONFIG.items():
-        cohort_samples = [s for s in cfg["study_samples"] if s in canonical_truth.columns]
-        if cohort_samples:
-            cohort_var_maps[cohort_name] = compute_gene_variance(canonical_truth[cohort_samples])
-            print(f"  Variance map for {cohort_name}: {len(cohort_samples)} samples")
-        else:
-            cohort_var_maps[cohort_name] = study_var_map
 
     def _split_by_cohort(
         pred: pd.DataFrame,
@@ -405,12 +397,10 @@ def run_bts_cv(args: argparse.Namespace) -> None:
                                                   columns=combined_pred.columns)
 
         # ── Report metrics separately: CV / HO / Combined ──
-        var_map = cohort_var_maps[cohort_name]
-
         print(f"\n  ── Metrics: {cohort_name} (CV only, {len(cv_samples)} samples) ──")
         cv_truth = canonical_truth.reindex(index=cp.index, columns=cp.columns)
         cv_summary = cohort_summary_table(cv_truth, cp, label=f"CV ({cohort_name})",
-                                          n_workers=n_workers, var_map=var_map)
+                                          n_workers=n_workers)
         summaries.append(cv_summary)
 
         if ho_pred_w is not None and len(ho_samples) >= 2:
@@ -419,13 +409,13 @@ def run_bts_cv(args: argparse.Namespace) -> None:
                                                columns=ho_pred_w.columns)
             ho_summary = cohort_summary_table(ho_truth, ho_pred_w,
                                               label=f"HO ({cohort_name})",
-                                              n_workers=n_workers, var_map=var_map)
+                                              n_workers=n_workers)
             summaries.append(ho_summary)
 
         print(f"  ── Metrics: {cohort_name} (Combined, {combined_pred.shape[1]} samples) ──")
         comb_summary = cohort_summary_table(combined_truth, combined_pred,
                                             label=f"Combined ({cohort_name})",
-                                            n_workers=n_workers, var_map=var_map)
+                                            n_workers=n_workers)
         summaries.append(comb_summary)
 
         # ── Generate plots and outputs using combined data ──
@@ -435,7 +425,6 @@ def run_bts_cv(args: argparse.Namespace) -> None:
             goi=cfg["goi"], subtypes_df=subtypes_with_status,
             heatmap_gene_sets=cfg["heatmap_gene_sets"],
             gene_scatter_sets=cfg.get("gene_scatter_sets", []),
-            var_map=var_map,
             gene_met=comb_summary["_gene_metrics"],
             sample_met=comb_summary["_sample_metrics"],
             n_workers=n_workers, overwrite=args.overwrite,
@@ -455,6 +444,28 @@ def run_bts_cv(args: argparse.Namespace) -> None:
         _maybe(sample_expression_kde, args.overwrite, combined_pred,
                os.path.join(cohort_out, "expression_profiles"),
                subtypes_df=subtypes_with_status)
+
+    # ── HD-L background prediction analysis ──
+    print("\n  ── HD-L (background predictions) ──")
+    bg_pred, bg_truth = load_cv_predictions_background(cv_dir)
+    if bg_pred.empty:
+        print("  [skip] No background prediction files found")
+    else:
+        hdl_out = ensure_dir(os.path.join(out_dir, "HD-L"))
+        print(f"  Background preds: {bg_pred.shape[0]} genes × {bg_pred.shape[1]} donors")
+
+        hdl_summary = cohort_summary_table(
+            bg_truth, bg_pred, label="HD-L (background)",
+            n_workers=n_workers,
+        )
+        summaries.append(hdl_summary)
+
+        _run_cv_suite_hdl(
+            bg_pred, bg_truth, "BTS (HD-L)", hdl_out,
+            gene_met=hdl_summary["_gene_metrics"],
+            sample_met=hdl_summary["_sample_metrics"],
+            n_workers=n_workers, overwrite=args.overwrite,
+        )
 
     # ── Print summary ──
     if summaries:
@@ -797,14 +808,14 @@ def _run_cv_suite(
                os.path.join(out_dir, f"double_heatmap_{gs_name}"),
                subtypes=subtypes_df, breaks=breaks)
 
-    # Per-gene target scatters for GOI sets
+    # Per-gene target scatters for GOI sets (tumor only)
     if gene_scatter_sets:
         for gs_name in gene_scatter_sets:
             resolved = STANDARD_GENE_SETS.get(gs_name, gs_name)
             if not gene_list_available(resolved):
                 continue
             genes = get_gene_list(resolved)
-            gs_dir = ensure_dir(os.path.join(out_dir, f"gene_scatters_{gs_name}"))
+            gs_dir = ensure_dir(os.path.join(out_dir, f"gene_tumor_scatters_{gs_name}"))
             _ci_lo_gs = ci_lo if scatter_ci else None
             _ci_hi_gs = ci_hi if scatter_ci else None
             batch_gene_scatters(
@@ -835,8 +846,73 @@ def _run_cv_suite(
     print(f"  Done ({elapsed:.1f}s)")
 
 
+def _run_cv_suite_hdl(
+    pred_wide: pd.DataFrame,
+    truth_wide: pd.DataFrame,
+    label: str,
+    out_dir: str,
+    *,
+    var_map: Optional[Dict[str, float]] = None,
+    gene_met: Optional[pd.DataFrame] = None,
+    sample_met: Optional[pd.DataFrame] = None,
+    n_workers: int = 1,
+    overwrite: bool = False,
+) -> None:
+    """Simplified plot/output suite for HD-L background predictions.
+
+    Produces metric distributions and sample scatters only (no gene
+    scatters, heatmaps, or reliability).
+    """
+    t0 = time.time()
+    print(f"\n── {label} (plots + outputs) ──")
+
+    if var_map is None:
+        var_map = compute_gene_variance(truth_wide)
+
+    if gene_met is None:
+        gene_met = gene_level_metrics(truth_wide, pred_wide, n_workers=n_workers)
+    if sample_met is None:
+        sample_met = sample_level_metrics(truth_wide, pred_wide, n_workers=n_workers)
+
+    gene_met.to_csv(os.path.join(out_dir, "gene_metrics.tsv"), sep="\t")
+    sample_met.to_csv(os.path.join(out_dir, "sample_metrics.tsv"), sep="\t")
+
+    vg = variance_group_metrics(truth_wide, pred_wide, var_map, gene_met=gene_met)
+    vg.to_csv(os.path.join(out_dir, "variance_group_metrics.tsv"), sep="\t", index=False)
+    print(f"  Variance groups:\n{vg.to_string(index=False)}")
+
+    # Gene metric distributions
+    _maybe(metric_distribution, overwrite, gene_met["pearson_r"], "pearson_r",
+           os.path.join(out_dir, "gene_pearson_r_dist"), xlim=(-1, 1), square=True)
+    _maybe(metric_distribution, overwrite, gene_met["spearman_rho"], "spearman_rho",
+           os.path.join(out_dir, "gene_spearman_rho_dist"), xlim=(-1, 1), square=True)
+    _maybe(metric_distribution, overwrite, gene_met["rmse"], "gene_rmse",
+           os.path.join(out_dir, "gene_rmse_dist"), square=True)
+
+    # Variance-colored distributions
+    _maybe(metric_distribution_by_variance, overwrite, gene_met, var_map, "pearson_r",
+           os.path.join(out_dir, "gene_pearson_r_dist_by_variance"), xlim=(-1, 1),
+           title=f"{label} — Pearson r by Variance Group", square=True)
+    _maybe(metric_distribution_by_variance, overwrite, gene_met, var_map, "spearman_rho",
+           os.path.join(out_dir, "gene_spearman_rho_dist_by_variance"), xlim=(-1, 1),
+           title=f"{label} — Spearman ρ by Variance Group", square=True)
+    _maybe(metric_distribution_by_variance, overwrite, gene_met, var_map, "rmse",
+           os.path.join(out_dir, "gene_rmse_dist_by_variance"),
+           title=f"{label} — RMSE by Variance Group", square=True)
+
+    # Sample scatters
+    sample_dir = ensure_dir(os.path.join(out_dir, "sample_scatters"))
+    batch_sample_scatters(
+        truth_wide, pred_wide, sample_dir,
+        goi=None, subtypes_df=None, n_workers=n_workers,
+    )
+
+    elapsed = time.time() - t0
+    print(f"  Done ({elapsed:.1f}s)")
+
+
 # ---------------------------------------------------------------------------
-# Analysis group: Patient-HO (Holdout — Patient Biopsies)
+# Analysis group: Patient_Validation (Holdout — Patient Biopsies)
 # ---------------------------------------------------------------------------
 
 
@@ -849,6 +925,8 @@ def _run_holdout_suite(
     ci_lo: Optional[pd.DataFrame] = None,
     ci_hi: Optional[pd.DataFrame] = None,
     subtypes_df: Optional[pd.DataFrame] = None,
+    heatmap_gene_sets: Optional[List[str]] = None,
+    goi: Optional[Dict[str, List[str]]] = None,
     n_workers: int = 1,
     overwrite: bool = False,
     summaries: Optional[List[Dict]] = None,
@@ -906,7 +984,10 @@ def _run_holdout_suite(
            os.path.join(out_dir, "gene_rmse_dist_by_variance"), square=True)
 
     # Double heatmaps
-    for gs_name in ["PC-Phenotyping", "PAM50", "Targets_PC"]:
+    _heatmap_sets = heatmap_gene_sets if heatmap_gene_sets is not None else [
+        "PC-Phenotyping", "PAM50", "Targets_PC",
+    ]
+    for gs_name in _heatmap_sets:
         resolved = STANDARD_GENE_SETS.get(gs_name, gs_name)
         if not gene_list_available(resolved):
             continue
@@ -926,10 +1007,11 @@ def _run_holdout_suite(
         ci_lo_aligned = None
         ci_hi_aligned = None
 
+    _goi = goi if goi is not None else DEFAULT_GOI_PC
     batch_sample_scatters(
         tw, pw, sample_dir,
         ci_lo_wide=ci_lo_aligned, ci_hi_wide=ci_hi_aligned,
-        goi=DEFAULT_GOI_PC, subtypes_df=subtypes_df, n_workers=n_workers,
+        goi=_goi, subtypes_df=subtypes_df, n_workers=n_workers,
     )
 
     elapsed = time.time() - t0
@@ -938,214 +1020,660 @@ def _run_holdout_suite(
 
 
 # ---------------------------------------------------------------------------
-# Analysis group: Patient-HO (patient holdout with biopsy truth)
+# Analysis group: Patient_Validation (holdout predictions vs biopsy truth)
 # ---------------------------------------------------------------------------
 
-# Default patient holdout cohorts: (truth_cohort, holdout_predictions_dir)
-# Uses base model (BioDVN) results by default.
-_PATIENT_HO_DEFAULTS = [
-    ("CRPC-WCDT", "results_holdout/BioDVN/CRPC-WCDT"),
-    ("BLCA-RA",   "results_holdout/BioDVN/BLCA-RA"),
-]
+# Cohorts with RNA-Seq truth labels and PAN-FT holdout results.
+_VALIDATION_COHORTS = ["CRPC-WCDT", "BLCA-RA", "CRPC-RA", "SCLC"]
+
+# Per-cohort gene-set config: heatmap gene sets, scatter gene sets, and GOI.
+_VALIDATION_COHORT_CONFIG: Dict[str, Dict[str, Any]] = {
+    "CRPC-WCDT": {
+        "heatmap": ["PC-Phenotyping", "Targets_PC"],
+        "scatter": ["Targets_PC"],
+        "goi": DEFAULT_GOI_PC,
+    },
+    "BLCA-RA": {
+        "heatmap": ["Targets_BC"],
+        "scatter": ["Targets_BC"],
+        "goi": DEFAULT_GOI_PC,
+    },
+    "CRPC-RA": {
+        "heatmap": ["PC-Phenotyping", "Targets_PC"],
+        "scatter": ["Targets_PC"],
+        "goi": DEFAULT_GOI_PC,
+    },
+    "SCLC": {
+        "heatmap": ["Targets_SCLC"],
+        "scatter": ["Targets_SCLC"],
+        "goi": DEFAULT_GOI_SCLC,
+    },
+}
+
+# Single model: PAN-FT fine-tuned Proteus.
+_VALIDATION_MODEL_PATH = "results_holdout/BioDVN_PAN-FT/{cohort}/predictions_tumor.tsv"
 
 
-def _run_patient_ho_cohort(
-    truth_cohort: str,
-    ho_dir: str,
+def _run_patient_validation_cohort(
+    cohort: str,
     out_dir: str,
     args: argparse.Namespace,
-    summaries: List[Dict[str, Any]],
-) -> None:
-    """Run Patient-HO analysis for a single cohort."""
-    truth_path = PROJECT_ROOT / "labels" / f"{truth_cohort}_Log2CPMplus1.tsv"
+) -> Optional[Dict[str, Any]]:
+    """Run Patient_Validation analysis for a single cohort (PAN-FT model only).
+
+    Returns a dict with cohort-level data for the Collected analysis,
+    or None if the cohort is skipped.
+    """
+    truth_path = PROJECT_ROOT / "labels" / f"{cohort}_Log2CPMplus1.tsv"
     if not truth_path.exists():
-        print(f"  [skip] Truth not found: {truth_cohort}")
-        return
-    truth_wide = load_truth(truth_cohort)
+        print(f"  [skip] Truth not found: {cohort}")
+        return None
+    truth_wide = load_truth(cohort)
+
+    # Build short→prefixed map and add prefixes to prediction columns
+    pmap = _build_prefix_map(truth_wide.columns, cohort)
 
     subtypes_df = None
-    sub_path = PROJECT_ROOT / "labels" / f"{truth_cohort}_TFX_Subtype.tsv"
+    sub_path = PROJECT_ROOT / "labels" / f"{cohort}_TFX_Subtype.tsv"
     if sub_path.exists():
-        subtypes_df = load_subtypes(truth_cohort)
+        subtypes_df = load_subtypes(cohort)
 
     tfx_dict = None
     if subtypes_df is not None and "tfx" in subtypes_df.columns:
         tfx_dict = subtypes_df["tfx"].to_dict()
 
-    ho_path = os.path.join(_resolve(ho_dir), "predictions_tumor.tsv")
-    if not os.path.exists(ho_path):
-        print(f"  [skip] Predictions not found: {ho_path}")
-        return
+    cohort_cfg = _VALIDATION_COHORT_CONFIG.get(cohort, {
+        "heatmap": ["PC-Phenotyping", "Targets_PC"],
+        "scatter": ["Targets_PC"],
+        "goi": DEFAULT_GOI_PC,
+    })
 
-    proteus_pred, ci_lo, ci_hi = load_holdout_predictions_proteus(ho_path)
-    cohort_tag = truth_cohort.replace("/", "_")
-    p_out = ensure_dir(os.path.join(out_dir, cohort_tag, "Proteus"))
+    # Output directly into cohort folder (no model subfolder)
+    cohort_out = ensure_dir(os.path.join(out_dir, cohort))
+    summaries: List[Dict[str, Any]] = []
 
-    _run_holdout_suite(
-        proteus_pred, truth_wide, f"Proteus-{cohort_tag}", p_out,
+    path = PROJECT_ROOT / _VALIDATION_MODEL_PATH.format(cohort=cohort)
+    if not path.exists():
+        print(f"    [skip] PAN-FT predictions not found: {path.name}")
+        return None
+
+    pred, ci_lo, ci_hi = load_holdout_predictions_proteus(str(path))
+    _apply_prefix_map(pred, pmap)
+    _apply_prefix_map(ci_lo, pmap)
+    _apply_prefix_map(ci_hi, pmap)
+    label = f"Proteus PAN-FT — {cohort}"
+
+    suite_result = _run_holdout_suite(
+        pred, truth_wide, label, cohort_out,
         ci_lo=ci_lo, ci_hi=ci_hi, subtypes_df=subtypes_df,
-        n_workers=args.n_workers, overwrite=args.overwrite, summaries=summaries,
-        scatter_ci=args.scatter_ci,
+        heatmap_gene_sets=cohort_cfg["heatmap"],
+        goi=cohort_cfg["goi"],
+        n_workers=args.n_workers, overwrite=args.overwrite,
+        summaries=summaries, scatter_ci=args.scatter_ci,
     )
 
     # Gene target scatters
     _ci_lo_tgt = ci_lo if args.scatter_ci else None
     _ci_hi_tgt = ci_hi if args.scatter_ci else None
-    for gs_name in ["Targets_PC", "Targets_SCLC", "Targets_BC"]:
+    for gs_name in cohort_cfg.get("scatter", []):
         resolved = STANDARD_GENE_SETS.get(gs_name, gs_name)
         if not gene_list_available(resolved):
             continue
         genes = get_gene_list(resolved)
-        target_dir = ensure_dir(os.path.join(p_out, f"target_scatters_{gs_name}"))
+        target_dir = ensure_dir(
+            os.path.join(cohort_out, f"target_scatters_{gs_name}"))
         batch_gene_scatters(
-            truth_wide, proteus_pred, genes, target_dir,
+            truth_wide, pred, genes, target_dir,
             subtypes_df=subtypes_df, tfx_dict=tfx_dict,
             ci_lo_wide=_ci_lo_tgt, ci_hi_wide=_ci_hi_tgt,
             n_workers=args.n_workers,
         )
 
-    # XGBoost holdout (optional)
-    if args.xgb_holdout:
-        xgb_ho_path = os.path.join(_resolve(args.xgb_holdout), "predictions_tumor.tsv")
-        if os.path.exists(xgb_ho_path):
-            xgb_pred = load_holdout_predictions_xgboost(xgb_ho_path)
-            x_out = ensure_dir(os.path.join(out_dir, cohort_tag, "XGBoost"))
-            _run_holdout_suite(
-                xgb_pred, truth_wide, f"XGBoost-{cohort_tag}", x_out,
-                n_workers=args.n_workers, overwrite=args.overwrite, summaries=summaries,
-            )
-
     if summaries:
-        print("\n" + "─" * 70)
+        print(f"\n  ── {cohort} Summary ──")
         print_summary_table(summaries)
-        _save_summary_tsv(summaries, os.path.join(out_dir, cohort_tag, "summary_metrics.tsv"))
+        _save_summary_tsv(summaries, os.path.join(cohort_out, "summary_metrics.tsv"))
+
+    # Return data for Collected analysis
+    return {
+        "cohort": cohort,
+        "truth_wide": truth_wide,
+        "pred_wide": pred,
+        "subtypes_df": subtypes_df,
+        "tfx_dict": tfx_dict,
+    }
 
 
-def run_patient_ho(args: argparse.Namespace) -> None:
-    """Patient holdout analysis: predictions vs biopsy truth.
+def _run_collected_validation(
+    cohort_data: List[Dict[str, Any]],
+    out_dir: str,
+    args: argparse.Namespace,
+) -> None:
+    """Run the Collected validation analysis combining all cohorts.
 
-    If --proteus_holdout and --truth_cohort are given, runs for that single
-    cohort.  Otherwise, defaults to CRPC-WCDT and BLCA-RA using the base
-    model (BioDVN) holdout predictions.
+    Produces gene-level scatter plots across all validation cohorts on
+    the intersection of genes available in every cohort.  Summary metrics
+    are computed on the combined pool.
+    """
+    collected_out = ensure_dir(os.path.join(out_dir, "Collected"))
+    print("\n  ── Collected (all validation cohorts) ──")
+
+    # Intersect genes across all cohorts
+    all_genes = None
+    for cd in cohort_data:
+        idx = cd["truth_wide"].index.intersection(cd["pred_wide"].index)
+        all_genes = idx if all_genes is None else all_genes.intersection(idx)
+
+    if all_genes is None or len(all_genes) < 10:
+        print("    [skip] Too few common genes across cohorts")
+        return
+
+    # Build combined truth and pred on the common gene index
+    truth_parts, pred_parts = [], []
+    for cd in cohort_data:
+        tw = cd["truth_wide"].loc[all_genes]
+        pw = cd["pred_wide"].loc[all_genes]
+        common_samples = tw.columns.intersection(pw.columns)
+        if len(common_samples) > 0:
+            truth_parts.append(tw[common_samples])
+            pred_parts.append(pw[common_samples])
+
+    if not truth_parts:
+        print("    [skip] No overlapping samples")
+        return
+
+    combined_truth = pd.concat(truth_parts, axis=1)
+    combined_pred = pd.concat(pred_parts, axis=1)
+    print(f"    Combined: {combined_truth.shape[0]} genes × "
+          f"{combined_truth.shape[1]} samples")
+
+    # Compute combined metrics
+    var_map = compute_gene_variance(combined_truth)
+    summary = cohort_summary_table(
+        combined_truth, combined_pred, label="Collected",
+        n_workers=args.n_workers, var_map=var_map,
+    )
+    gene_met: pd.DataFrame = summary["_gene_metrics"]
+    sample_met: pd.DataFrame = summary["_sample_metrics"]
+
+    gene_met.to_csv(os.path.join(collected_out, "gene_metrics.tsv"), sep="\t")
+    sample_met.to_csv(os.path.join(collected_out, "sample_metrics.tsv"), sep="\t")
+
+    vg = variance_group_metrics(combined_truth, combined_pred, var_map,
+                                gene_met=gene_met)
+    vg.to_csv(os.path.join(collected_out, "variance_group_metrics.tsv"),
+              sep="\t", index=False)
+    print(f"    Variance groups:\n{vg.to_string(index=False)}")
+
+    # Gene metric distributions
+    _maybe(metric_distribution, args.overwrite, gene_met["pearson_r"], "pearson_r",
+           os.path.join(collected_out, "gene_pearson_r_dist"), xlim=(-1, 1), square=True)
+    _maybe(metric_distribution, args.overwrite, gene_met["spearman_rho"], "spearman_rho",
+           os.path.join(collected_out, "gene_spearman_rho_dist"), xlim=(-1, 1), square=True)
+    _maybe(metric_distribution, args.overwrite, gene_met["rmse"], "gene_rmse",
+           os.path.join(collected_out, "gene_rmse_dist"), square=True)
+
+    _maybe(metric_distribution_by_variance, args.overwrite, gene_met, var_map, "pearson_r",
+           os.path.join(collected_out, "gene_pearson_r_dist_by_variance"),
+           xlim=(-1, 1), title="Collected — Pearson r by Variance Group", square=True)
+    _maybe(metric_distribution_by_variance, args.overwrite, gene_met, var_map, "spearman_rho",
+           os.path.join(collected_out, "gene_spearman_rho_dist_by_variance"),
+           xlim=(-1, 1), title="Collected — Spearman ρ by Variance Group", square=True)
+    _maybe(metric_distribution_by_variance, args.overwrite, gene_met, var_map, "rmse",
+           os.path.join(collected_out, "gene_rmse_dist_by_variance"),
+           title="Collected — RMSE by Variance Group", square=True)
+
+    # Per-sample scatters
+    sample_dir = ensure_dir(os.path.join(collected_out, "sample_scatters"))
+    batch_sample_scatters(
+        combined_truth, combined_pred, sample_dir,
+        goi=DEFAULT_GOI_PC, subtypes_df=None, n_workers=args.n_workers,
+    )
+
+    # Save summary
+    print_summary_table([summary])
+    _save_summary_tsv([summary], os.path.join(collected_out, "summary_metrics.tsv"))
+
+
+def run_patient_validation(args: argparse.Namespace) -> None:
+    """Patient validation analysis: PAN-FT model predictions vs biopsy truth.
+
+    Iterates over all configured cohorts with truth labels and PAN-FT holdout
+    predictions.  Output is flat per cohort (no model subfolders).  A
+    "Collected" subfolder combines all cohorts for cross-cohort analysis.
+
+    Override behaviour: if ``--proteus_holdout`` and ``--truth_cohort`` are
+    given, runs a single custom model/cohort pair instead.
     """
     print("\n" + "=" * 70)
-    print("  ANALYSIS GROUP: Patient-HO")
+    print("  ANALYSIS GROUP: Patient_Validation")
     print("=" * 70)
 
-    out_dir = ensure_dir(str(PROJECT_ROOT / "analysis" / "results" / "Patient-HO"))
+    out_dir = ensure_dir(
+        str(PROJECT_ROOT / "analysis" / "results" / "Patient_Validation"))
 
-    # Explicit single-cohort mode
+    # Single-cohort CLI override
     if args.proteus_holdout and args.truth_cohort:
+        cohort = args.truth_cohort
+        truth_path = PROJECT_ROOT / "labels" / f"{cohort}_Log2CPMplus1.tsv"
+        if not truth_path.exists():
+            print(f"  [skip] Truth not found: {cohort}")
+            return
+        truth_wide = load_truth(cohort)
+        pmap = _build_prefix_map(truth_wide.columns, cohort)
+        subtypes_df = None
+        sub_path = PROJECT_ROOT / "labels" / f"{cohort}_TFX_Subtype.tsv"
+        if sub_path.exists():
+            subtypes_df = load_subtypes(cohort)
+        ho_path = os.path.join(_resolve(args.proteus_holdout),
+                               "predictions_tumor.tsv")
+        if not os.path.exists(ho_path):
+            print(f"  [skip] {ho_path} not found")
+            return
+        pred, ci_lo, ci_hi = load_holdout_predictions_proteus(ho_path)
+        _apply_prefix_map(pred, pmap)
+        _apply_prefix_map(ci_lo, pmap)
+        _apply_prefix_map(ci_hi, pmap)
+        custom_out = ensure_dir(os.path.join(out_dir, cohort))
         summaries: List[Dict[str, Any]] = []
-        _run_patient_ho_cohort(
-            args.truth_cohort, args.proteus_holdout, out_dir, args, summaries,
+        _run_holdout_suite(
+            pred, truth_wide, f"Custom — {cohort}", custom_out,
+            ci_lo=ci_lo, ci_hi=ci_hi, subtypes_df=subtypes_df,
+            n_workers=args.n_workers, overwrite=args.overwrite,
+            summaries=summaries, scatter_ci=args.scatter_ci,
         )
+        if summaries:
+            print_summary_table(summaries)
         return
 
-    # Default: iterate over standard patient holdout cohorts
-    for truth_cohort, ho_dir in _PATIENT_HO_DEFAULTS:
-        resolved = str(PROJECT_ROOT / ho_dir)
-        if not os.path.isdir(resolved):
-            print(f"  [skip] Holdout dir not found: {ho_dir}")
-            continue
-        print(f"\n  ── {truth_cohort} (base model) ──")
-        summaries = []
-        _run_patient_ho_cohort(truth_cohort, ho_dir, out_dir, args, summaries)
+    # Default: iterate over all validation cohorts (PAN-FT model only)
+    cohort_data: List[Dict[str, Any]] = []
+    for cohort in _VALIDATION_COHORTS:
+        print(f"\n  ── Cohort: {cohort} ──")
+        result = _run_patient_validation_cohort(cohort, out_dir, args)
+        if result is not None:
+            cohort_data.append(result)
+
+    # Collected analysis across all validation cohorts
+    if len(cohort_data) >= 2:
+        _run_collected_validation(cohort_data, out_dir, args)
 
 
 # ---------------------------------------------------------------------------
-# Analysis group: Patient-Discovery (no truth)
+# Analysis group: Patient_Discovery (predictions only — no truth)
 # ---------------------------------------------------------------------------
 
-def run_patient_discovery(args: argparse.Namespace) -> None:
-    """Discovery cohort analysis: predictions only (no biopsy truth)."""
-    print("\n" + "=" * 70)
-    print("  ANALYSIS GROUP: Patient-Discovery")
-    print("=" * 70)
+# Discovery cohorts: predictions available but no RNA-Seq truth labels.
+# Format: (cohort_predictions_dir_name, subtype_label_name_or_None).
+# subtype_label_name maps to labels/{name}_TFX_Subtype.tsv for annotation.
+_DISCOVERY_COHORTS: List[Tuple[str, Optional[str]]] = [
+    ("CRPC-Pluvicto", "Pluvicto"),
+    ("CRPC-UW", "UW"),
+    ("BC-Ghana", None),
+]
 
-    out_dir = ensure_dir(str(PROJECT_ROOT / "analysis" / "results" / "Patient-Discovery"))
+# Models to check for each discovery cohort (ordered by priority).
+_DISCOVERY_MODELS = [
+    ("Proteus_Tuned", "results_holdout/BioDVN_PAN-FT/{cohort}/predictions_tumor.tsv"),
+    ("Proteus_Base", "results_holdout/BioDVN/{cohort}/predictions_tumor.tsv"),
+]
 
-    if not args.proteus_holdout:
-        print("  [skip] --proteus_holdout required")
-        return
 
-    ho_path = os.path.join(_resolve(args.proteus_holdout), "predictions_tumor.tsv")
-    if not os.path.exists(ho_path):
-        print(f"  [skip] {ho_path} not found")
-        return
+def _run_discovery_cohort(
+    cohort: str,
+    subtype_label: Optional[str],
+    out_dir: str,
+    args: argparse.Namespace,
+) -> None:
+    """Run Patient_Discovery analysis for a single cohort (no truth)."""
+    cohort_out = ensure_dir(os.path.join(out_dir, cohort))
 
-    cohort_tag = args.truth_cohort or Path(args.proteus_holdout).name
-    p_out = ensure_dir(os.path.join(out_dir, cohort_tag))
-
-    pred, ci_lo, ci_hi = load_holdout_predictions_proteus(ho_path)
-    print(f"  Predictions: {pred.shape[0]} genes × {pred.shape[1]} samples")
-
-    # Heatmaps for key gene sets
     subtypes_df = None
     tfx_dict = None
     sub_dict = None
-    sub_path = PROJECT_ROOT / "labels" / f"{cohort_tag}_TFX_Subtype.tsv"
+    label_name = subtype_label or cohort
+    sub_path = PROJECT_ROOT / "labels" / f"{label_name}_TFX_Subtype.tsv"
     if sub_path.exists():
-        subtypes_df = load_subtypes(cohort_tag)
-        tfx_dict = subtypes_df["tfx"].to_dict()
+        subtypes_df = load_subtypes(label_name)
+        if "tfx" in subtypes_df.columns:
+            tfx_dict = subtypes_df["tfx"].to_dict()
         if "subtype" in subtypes_df.columns:
             sub_dict = subtypes_df["subtype"].to_dict()
 
-    # Expression profiles (colored by subtype)
-    _maybe(sample_expression_kde, args.overwrite, pred,
-           os.path.join(p_out, "expression_profiles"), subtypes_df=subtypes_df)
-
-    for gs_name in ["PC-Phenotyping", "Targets_PC", "PAM50"]:
-        resolved = STANDARD_GENE_SETS.get(gs_name, gs_name)
-        if not gene_list_available(resolved):
+    for model_name, path_pattern in _DISCOVERY_MODELS:
+        path = PROJECT_ROOT / path_pattern.format(cohort=cohort)
+        if not path.exists():
+            print(f"    [skip] {model_name}: not found")
             continue
-        genes = get_gene_list(resolved)
-        _maybe(
-            single_heatmap, args.overwrite, pred, genes,
-            os.path.join(p_out, f"heatmap_{gs_name}"),
-            tfx_dict=tfx_dict, sub_dict=sub_dict,
-        )
 
-    pred.to_csv(os.path.join(p_out, "predictions_wide.tsv"), sep="\t")
-    print("  Done")
+        pred, ci_lo, ci_hi = load_holdout_predictions_proteus(str(path))
+        model_out = ensure_dir(os.path.join(cohort_out, model_name))
+        print(f"    {model_name}: {pred.shape[0]} genes × {pred.shape[1]} samples")
+
+        _maybe(sample_expression_kde, args.overwrite, pred,
+               os.path.join(model_out, "expression_profiles"),
+               subtypes_df=subtypes_df)
+
+        for gs_name in ["PC-Phenotyping", "Targets_PC", "PAM50"]:
+            resolved = STANDARD_GENE_SETS.get(gs_name, gs_name)
+            if not gene_list_available(resolved):
+                continue
+            genes = get_gene_list(resolved)
+            _maybe(
+                single_heatmap, args.overwrite, pred, genes,
+                os.path.join(model_out, f"heatmap_{gs_name}"),
+                tfx_dict=tfx_dict, sub_dict=sub_dict,
+            )
+
+        pred.to_csv(os.path.join(model_out, "predictions_wide.tsv"), sep="\t")
+
+
+def run_patient_discovery(args: argparse.Namespace) -> None:
+    """Discovery cohort analysis: predictions only (no biopsy truth).
+
+    Iterates over all configured discovery cohorts and generates heatmaps,
+    expression profiles, and prediction exports for each available model.
+
+    Override: if ``--proteus_holdout`` is given, runs only that path.
+    """
+    print("\n" + "=" * 70)
+    print("  ANALYSIS GROUP: Patient_Discovery")
+    print("=" * 70)
+
+    out_dir = ensure_dir(
+        str(PROJECT_ROOT / "analysis" / "results" / "Patient_Discovery"))
+
+    # CLI override: single path
+    if args.proteus_holdout:
+        cohort_tag = args.truth_cohort or Path(args.proteus_holdout).name
+        _run_discovery_cohort(cohort_tag, None, out_dir, args)
+        print("  Done")
+        return
+
+    # Default: iterate over all discovery cohorts
+    for cohort, subtype_label in _DISCOVERY_COHORTS:
+        print(f"\n  ── Cohort: {cohort} ──")
+        _run_discovery_cohort(cohort, subtype_label, out_dir, args)
+
+    print("\n  Done")
 
 
 # ---------------------------------------------------------------------------
-# Group: PAN-FT-CV / CRPC-FT-CV (fine-tune CV)
+# Group: PAN-FT-CV (fine-tune cross-validation, mirrors BTS-CV pipeline)
 # ---------------------------------------------------------------------------
 
-_FINETUNE_CV_PATHS: Dict[str, str] = {
-    "PAN-FT-CV": "results_training/proteus_pan-finetune_cv",
-    "CRPC-FT-CV": "results_training/proteus_crpc-finetune_cv",
+_PANFT_CV_PATH = "results_training/PAN-FT_cv"
+
+# Per-cohort analysis config for PAN-FT-CV splits
+_PANFT_CV_COHORT_CONFIG: Dict[str, Dict[str, Any]] = {
+    "CRPC-RA": {
+        "heatmap_gene_sets": ["PC-Phenotyping", "Targets_PC"],
+        "goi": DEFAULT_GOI_PC,
+        "gene_scatter_sets": ["Targets_PC"],
+        "truth_label": "CRPC-RA",
+    },
+    "SCLC": {
+        "heatmap_gene_sets": ["Targets_SCLC"],
+        "goi": DEFAULT_GOI_SCLC,
+        "gene_scatter_sets": ["Targets_SCLC"],
+        "truth_label": "SCLC",
+    },
 }
 
 
-def run_finetune_cv(args: argparse.Namespace, group_name: str) -> None:
-    """Fine-tune CV analysis (PAN-FT-CV or CRPC-FT-CV)."""
+def _load_panft_fold_splits() -> pd.DataFrame:
+    """Load data/PAN-FT_sample-splits.tsv → DataFrame with Cohort, Sample, Fold."""
+    path = PROJECT_ROOT / "data" / "PAN-FT_sample-splits.tsv"
+    return pd.read_csv(path, sep="\t")
+
+
+def _build_panft_truth() -> pd.DataFrame:
+    """Build canonical truth for PAN-FT CV cohorts (CRPC-RA + SCLC).
+
+    Loads Log2CPMplus1 labels for both cohorts, keeps only samples present
+    in the PAN-FT sample-splits table, and concatenates on a common gene index.
+    Column names retain their native form (e.g. ``CRPC-RA_15-023``).
+    """
+    splits = _load_panft_fold_splits()
+    split_samples = set(splits["Sample"])
+
+    parts = []
+    for cohort in ("CRPC-RA", "SCLC"):
+        truth_path = PROJECT_ROOT / "labels" / f"{cohort}_Log2CPMplus1.tsv"
+        if not truth_path.exists():
+            continue
+        tw = load_truth(cohort)
+        # Keep only samples that are in the PAN-FT splits
+        keep = [s for s in tw.columns if s in split_samples]
+        if keep:
+            parts.append(tw[keep])
+
+    if not parts:
+        return pd.DataFrame()
+
+    common_genes = parts[0].index
+    for p in parts[1:]:
+        common_genes = common_genes.intersection(p.index)
+    return pd.concat([p.loc[common_genes] for p in parts], axis=1)
+
+
+def _build_panft_subtypes() -> Optional[pd.DataFrame]:
+    """Build a subtypes DataFrame for PAN-FT CV samples (CRPC-RA + SCLC).
+
+    Index retains the native prefixed sample names from the label files.
+    """
+    parts = []
+    for cohort in ("CRPC-RA", "SCLC"):
+        path = PROJECT_ROOT / "labels" / f"{cohort}_TFX_Subtype.tsv"
+        if path.exists():
+            parts.append(load_subtypes(cohort))
+    if not parts:
+        return None
+    return pd.concat(parts, axis=0)
+
+
+def run_panft_cv(args: argparse.Namespace) -> None:
+    """PAN-FT cross-validation analysis (mirrors BTS-CV pipeline).
+
+    Loads full MDN predictions from PAN-FT 5-fold CV, splits by cohort
+    (CRPC-RA, SCLC), and runs the full analysis suite per cohort including:
+      1. CQR regime-based calibration on all OOF samples.
+      2. Gene-level reliability model fitted on OOF features.
+      3. Per-cohort evaluation + plots with cohort-specific gene sets.
+    """
+    print("\n" + "=" * 70)
+    print("  ANALYSIS GROUP: PAN-FT-CV (Cross-Validation)")
+    print("=" * 70)
+
+    cv_dir = str(PROJECT_ROOT / _PANFT_CV_PATH)
+    if not os.path.isdir(cv_dir):
+        print(f"  [skip] CV results not found: {_PANFT_CV_PATH}")
+        return
+
+    out_dir = ensure_dir(str(PROJECT_ROOT / "analysis" / "results" / "PAN-FT-CV"))
+    summaries: List[Dict[str, Any]] = []
+    n_workers = args.n_workers
+
+    # Load fold-split table to map samples → cohort (prefixed names).
+    fold_splits = _load_panft_fold_splits()
+    cohort_map: Dict[str, str] = dict(
+        zip(fold_splits["Sample"], fold_splits["Cohort"])
+    )
+
+    # Build short→prefixed map for renaming prediction columns.
+    _prefix_map: Dict[str, str] = {}
+    for _, row in fold_splits.iterrows():
+        prefixed = row["Sample"]
+        short = str(strip_cohort_prefix(
+            pd.Index([prefixed]), row["Cohort"],
+        )[0])
+        _prefix_map[short] = prefixed
+
+    subtypes_df = _build_panft_subtypes()
+    canonical_truth = _build_panft_truth()
+    if canonical_truth.empty:
+        print("  [skip] No canonical truth could be built for PAN-FT")
+        return
+    print(f"  Canonical truth: {canonical_truth.shape[0]} genes × "
+          f"{canonical_truth.shape[1]} samples")
+
+    def _split_by_cohort(
+        pred: pd.DataFrame,
+        truth: pd.DataFrame,
+        ci_lo: Optional[pd.DataFrame],
+        ci_hi: Optional[pd.DataFrame],
+        cohort: str,
+    ) -> Tuple:
+        """Extract only samples matching ``cohort``."""
+        samples = sorted(s for s in pred.columns if cohort_map.get(s) == cohort)
+        if not samples:
+            return None, None, None, None
+        p = pred[[s for s in samples if s in pred.columns]]
+        t = truth[[s for s in samples if s in truth.columns]]
+        cl = ci_lo[[s for s in samples if s in ci_lo.columns]] if ci_lo is not None else None
+        ch = ci_hi[[s for s in samples if s in ci_hi.columns]] if ci_hi is not None else None
+        return p, t, cl, ch
+
+    # ── Load Proteus CV predictions (full: includes p0, per-fold data) ──
+    print(f"\n  Loading Proteus CV (full) from: {cv_dir}")
+    cv_full = load_cv_predictions_proteus_full(cv_dir)
+
+    # Rename prediction columns from short IDs to prefixed canonical names
+    # (e.g. '15-023' → 'CRPC-RA_15-023'; 'L-0141' → 'L-0141').
+    for key in ("pred_wide", "truth_wide", "ci_lo_wide", "ci_hi_wide",
+                "p0_wide", "pi_gamma_wide", "pi_normal_wide",
+                "gamma_beta_wide", "normal_mean_wide", "normal_stdev_wide"):
+        cv_full[key] = _apply_prefix_map(cv_full.get(key), _prefix_map)
+    for fold_id, fd in cv_full.get("fold_data", {}).items():
+        for fk in list(fd.keys()):
+            if isinstance(fd[fk], pd.DataFrame):
+                fd[fk] = _apply_prefix_map(fd[fk], _prefix_map)
+    cv_full["sample_fold"] = {
+        _prefix_map.get(s, s): f for s, f in cv_full["sample_fold"].items()
+    }
+
+    proteus_pred = cv_full["pred_wide"]
+    _pred_truth = cv_full["truth_wide"]
+    proteus_ci_lo = cv_full["ci_lo_wide"]
+    proteus_ci_hi = cv_full["ci_hi_wide"]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # CQR regime-based calibration on ALL OOF samples
+    # ──────────────────────────────────────────────────────────────────────
+    calibrator: Optional[RegimeCalibrator] = None
+    regime_df: Optional[pd.DataFrame] = None
+    if proteus_ci_lo is not None and proteus_ci_hi is not None:
+        cal_truth = _pred_truth.reindex(
+            index=proteus_ci_lo.index, columns=proteus_ci_lo.columns,
+        )
+        regime_df = compute_gene_regimes(canonical_truth)
+        print(f"  Gene regimes: {regime_df['regime'].nunique()} unique regimes "
+              f"from {len(regime_df)} genes")
+
+        calibrator = RegimeCalibrator.fit(
+            cal_truth, proteus_ci_lo, proteus_ci_hi, regime_df, alpha=0.05,
+        )
+        print(f"  {calibrator.summary()}")
+
+        _maybe(plot_regime_qhat_heatmap, args.overwrite,
+               calibrator.q_hats,
+               os.path.join(out_dir, "regime_qhat_heatmap"),
+               title="CQR Normalised q̂ by Gene Regime (PAN-FT)")
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Gene-level reliability model fitted on OOF features
+    # ──────────────────────────────────────────────────────────────────────
+    reliability_model: Optional[ReliabilityModel] = None
+    if proteus_ci_lo is not None and cv_full.get("fold_data"):
+        print("\n  ── Fitting reliability model (per-fold) ──")
+        reliability_model = ReliabilityModel.fit(
+            cv_full["fold_data"], canonical_truth, ridge_alpha=1.0,
+        )
+        print(f"    {reliability_model.summary()}")
+
+        _maybe(plot_reliability_weights, args.overwrite,
+               reliability_model.feature_columns, reliability_model.weights,
+               os.path.join(out_dir, "reliability_feature_weights"),
+               title="Reliability Model Feature Weights (PAN-FT OOF)")
+
+    # Apply CQR calibration to CV OOF intervals
+    if calibrator is not None and proteus_ci_lo is not None:
+        proteus_ci_lo, proteus_ci_hi = calibrator.apply(
+            proteus_ci_lo, proteus_ci_hi,
+        )
+        print(f"  Applied CQR calibration to {proteus_ci_lo.shape[1]} CV OOF intervals")
+
+    # ── Run per-cohort analyses ──
+    for cohort_name, cfg in _PANFT_CV_COHORT_CONFIG.items():
+        cp, ct, ccl, cch = _split_by_cohort(
+            proteus_pred, canonical_truth, proteus_ci_lo, proteus_ci_hi, cohort_name,
+        )
+        if cp is None or cp.shape[1] < 2:
+            print(f"  [skip] Too few {cohort_name} samples for PAN-FT CV")
+            continue
+
+        cohort_out = ensure_dir(os.path.join(out_dir, cohort_name))
+
+        print(f"\n  ── Metrics: {cohort_name} ({cp.shape[1]} samples) ──")
+        cv_truth = canonical_truth.reindex(index=cp.index, columns=cp.columns)
+        cv_summary = cohort_summary_table(cv_truth, cp, label=f"PAN-FT CV ({cohort_name})",
+                                          n_workers=n_workers)
+        summaries.append(cv_summary)
+
+        # Build subtypes for this cohort's samples
+        cohort_subtypes = None
+        if subtypes_df is not None:
+            cohort_samples_sub = [s for s in cp.columns if s in subtypes_df.index]
+            if cohort_samples_sub:
+                cohort_subtypes = subtypes_df.loc[cohort_samples_sub]
+
+        _run_cv_suite(
+            cp, cv_truth, f"PAN-FT CV ({cohort_name})", cohort_out,
+            ci_lo=ccl, ci_hi=cch,
+            goi=cfg["goi"], subtypes_df=cohort_subtypes,
+            heatmap_gene_sets=cfg["heatmap_gene_sets"],
+            gene_scatter_sets=cfg.get("gene_scatter_sets", []),
+            gene_met=cv_summary["_gene_metrics"],
+            sample_met=cv_summary["_sample_metrics"],
+            n_workers=n_workers, overwrite=args.overwrite,
+            scatter_ci=args.scatter_ci,
+        )
+
+    # ── Print summary ──
+    if summaries:
+        print("\n" + "─" * 70)
+        print_summary_table(summaries)
+        _save_summary_tsv(summaries, os.path.join(out_dir, "summary_metrics.tsv"))
+
+
+# ---------------------------------------------------------------------------
+# Group: CRPC-FT-CV (legacy fine-tune CV — simple version)
+# ---------------------------------------------------------------------------
+
+_CRPC_FT_CV_PATH = "results_training/proteus_crpc-finetune_cv"
+
+
+def run_crpc_finetune_cv(args: argparse.Namespace) -> None:
+    """CRPC-FT-CV analysis (simple version without calibration/reliability)."""
+    group_name = "CRPC-FT-CV"
     print(f"\n{'='*70}")
     print(f"  ANALYSIS GROUP: {group_name}")
     print("=" * 70)
 
-    cv_rel = _FINETUNE_CV_PATHS.get(group_name)
-    if cv_rel is None:
-        raise ValueError(f"Unknown finetune CV group: {group_name}")
-    cv_dir = str(PROJECT_ROOT / cv_rel)
+    cv_dir = str(PROJECT_ROOT / _CRPC_FT_CV_PATH)
     if not os.path.isdir(cv_dir):
-        print(f"  [skip] CV results not found: {cv_rel}")
+        print(f"  [skip] CV results not found: {_CRPC_FT_CV_PATH}")
         return
 
     out_dir = ensure_dir(str(PROJECT_ROOT / "analysis" / "results" / group_name))
-    summaries: List[Dict[str, Any]] = []
     n_workers = args.n_workers
 
     print(f"  Loading Proteus CV from: {cv_dir}")
     pred, truth, ci_lo, ci_hi = load_cv_predictions_proteus(cv_dir)
-    # Exclude PHT admix samples from CV analyses
     pred, truth, ci_lo, ci_hi = _exclude_pht(pred, truth, ci_lo, ci_hi)
 
     ft_out = ensure_dir(os.path.join(out_dir, "Proteus"))
     summary = cohort_summary_table(truth, pred, label=group_name, n_workers=n_workers)
-    summaries.append(summary)
 
     _run_cv_suite(
         pred, truth, group_name, ft_out,
@@ -1156,10 +1684,9 @@ def run_finetune_cv(args: argparse.Namespace, group_name: str) -> None:
         scatter_ci=args.scatter_ci,
     )
 
-    if summaries:
-        print("\n" + "─" * 70)
-        print_summary_table(summaries)
-        _save_summary_tsv(summaries, os.path.join(out_dir, "summary_metrics.tsv"))
+    print("\n" + "─" * 70)
+    print_summary_table([summary])
+    _save_summary_tsv([summary], os.path.join(out_dir, "summary_metrics.tsv"))
 
 
 # ---------------------------------------------------------------------------
@@ -1208,6 +1735,28 @@ def run_xgb_finetune_cv(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _build_prefix_map(truth_columns: pd.Index, cohort: str) -> Dict[str, str]:
+    """Map short (prefix-stripped) sample names → canonical truth column names.
+
+    For cohorts using prefixed names (e.g. ``CRPC-RA_15-023``), this maps
+    ``'15-023' → 'CRPC-RA_15-023'``.  For cohorts whose truth labels are
+    already short (e.g. SCLC ``'L-0141'``), the map is identity.
+    """
+    stripped = strip_cohort_prefix(truth_columns, cohort)
+    return dict(zip(stripped, truth_columns))
+
+
+def _apply_prefix_map(
+    df: Optional[pd.DataFrame], pmap: Dict[str, str],
+) -> Optional[pd.DataFrame]:
+    """Rename DataFrame columns using a short→prefixed mapping (in-place)."""
+    if df is None:
+        return None
+    df.columns = pd.Index([pmap.get(str(s), str(s)) for s in df.columns])
+    return df
+
 
 def _exclude_pht(
     pred: pd.DataFrame,
@@ -1277,13 +1826,18 @@ _BENCH_EXCLUDED_DEPTHS = {"1x", "30x", "50x"}
 
 # Model directories under results_holdout/
 _BENCH_PROTEUS_MODELS: Dict[str, str] = {
-    "Proteus-Base": "results_holdout/BioDVN/PHS/predictions_tumor.tsv",
-    "Proteus-NoSeq": "results_holdout/BioDVN_NoSeq/PHS/predictions_tumor.tsv",
-    "Proteus-OnlySeq": "results_holdout/BioDVN_OnlySeq/PHS/predictions_tumor.tsv",
+    "Proteus_Base": "results_holdout/BioDVN/PHS/predictions_tumor.tsv",
+    "Proteus_NoSeq": "results_holdout/BioDVN_NoSeq/PHS/predictions_tumor.tsv",
+    "Proteus_OnlySeq": "results_holdout/BioDVN_OnlySeq/PHS/predictions_tumor.tsv",
 }
 _BENCH_XGB_PATH = "results_holdout/XGBoost/PHS/predictions_tumor.tsv"
 _EPIC_SEQ_PATH = "results_holdout/EPIC-Seq/PHS/EPICSeqInferredExpressionValues.txt"
-_EPIC_SCORE_COLS = ["inferredGEP", "PFE", "NDR_relative_2k", "Gini", "Shannon", "OCF_Ratio"]
+_EPIC_SCORE_COLS = ["inferredGEP", "PFE", "NDR_relative_2k"]
+_EPIC_DISPLAY_NAMES = {
+    "inferredGEP": "EPIC_GEP",
+    "PFE": "EPIC_PFE",
+    "NDR_relative_2k": "EPIC_NDR",
+}
 
 
 def _bench_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1299,11 +1853,221 @@ def _bench_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _generate_null_example(
+# ---------------------------------------------------------------------------
+# Analysis group: Benchmarking_PAN-FT (real patient cohorts)
+# ---------------------------------------------------------------------------
+
+_PANFT_COHORTS = ["CRPC-WCDT", "BLCA-RA"]
+
+_PANFT_MODEL_ORDER = [
+    "Proteus_Tuned", "Proteus_Base", "XGBoost",
+    "EPIC_GEP", "EPIC_PFE", "EPIC_NDR", "Naïve",
+]
+
+# Per-cohort model paths (relative to PROJECT_ROOT).
+_PANFT_PROTEUS_PATHS: Dict[str, Dict[str, str]] = {
+    "CRPC-WCDT": {
+        "Proteus_Tuned": "results_holdout/BioDVN_PAN-FT/CRPC-WCDT/predictions_tumor.tsv",
+        "Proteus_Base": "results_holdout/BioDVN/CRPC-WCDT/predictions_tumor.tsv",
+    },
+    "BLCA-RA": {
+        "Proteus_Tuned": "results_holdout/BioDVN_PAN-FT/BLCA-RA/predictions_tumor.tsv",
+        "Proteus_Base": "results_holdout/BioDVN/BLCA-RA/predictions_tumor.tsv",
+    },
+}
+
+_PANFT_XGB_PATHS: Dict[str, str] = {
+    "CRPC-WCDT": "results_holdout/XGBoost/CRPC-WCDT/predictions_tumor.tsv",
+    "BLCA-RA": "results_holdout/XGBoost/BLCA-RA/predictions_tumor.tsv",
+}
+
+# EPIC-Seq paths — only BLCA-RA has EPIC-Seq results.
+_PANFT_EPIC_PATHS: Dict[str, str] = {
+    "BLCA-RA": "results_holdout/EPIC-Seq/BLCA-RA/EPICSeqInferredExpressionValues.txt",
+}
+
+
+def run_benchmarking_panft(args: argparse.Namespace) -> None:
+    """Benchmarking on real patient cohorts (CRPC-WCDT, BLCA-RA).
+
+    Compares models on actual patient biopsies.  Metrics are computed per
+    cohort and presented side-by-side in twin-panel plots (one panel per
+    cohort).  Output is flat — no per-cohort subfolders.
+    """
+    print("\n" + "=" * 70)
+    print("  ANALYSIS GROUP: Benchmarking_PAN-FT")
+    print("=" * 70)
+
+    out_dir = ensure_dir(str(PROJECT_ROOT / "analysis" / "results" / "Benchmarking_PAN-FT"))
+
+    # Accumulate metrics, per-gene rho, and per-sample rho across cohorts
+    all_metrics_rows: List[Dict[str, Any]] = []
+    all_gene_rho_rows: List[Dict[str, Any]] = []
+    all_sample_rho_rows: List[Dict[str, Any]] = []
+
+    for cohort in _PANFT_COHORTS:
+        print(f"\n  ── Cohort: {cohort} ──")
+
+        # Load truth
+        truth_path = PROJECT_ROOT / "labels" / f"{cohort}_Log2CPMplus1.tsv"
+        if not truth_path.exists():
+            print(f"  [skip] Truth not found: {truth_path.name}")
+            continue
+        truth_wide = load_truth(cohort)
+        print(f"  Truth: {truth_wide.shape[0]} genes × {truth_wide.shape[1]} samples")
+
+        # Build short→prefixed map from truth column names for this cohort
+        pmap = _build_prefix_map(truth_wide.columns, cohort)
+
+        # Collect model predictions for this cohort
+        model_preds: Dict[str, pd.DataFrame] = {}
+
+        # Proteus models
+        proteus_paths = _PANFT_PROTEUS_PATHS.get(cohort, {})
+        for model_name, rel_path in proteus_paths.items():
+            path = PROJECT_ROOT / rel_path
+            if path.exists():
+                pred, _, _ = load_holdout_predictions_proteus(str(path))
+                _apply_prefix_map(pred, pmap)
+                model_preds[model_name] = pred
+                print(f"    Loaded {model_name}: {pred.shape[1]} samples")
+            else:
+                print(f"    [skip] {model_name}: {rel_path} not found")
+
+        # XGBoost
+        xgb_rel = _PANFT_XGB_PATHS.get(cohort)
+        if xgb_rel:
+            xgb_path = PROJECT_ROOT / xgb_rel
+            if xgb_path.exists():
+                xgb_pred = load_holdout_predictions_xgboost(str(xgb_path))
+                _apply_prefix_map(xgb_pred, pmap)
+                model_preds["XGBoost"] = xgb_pred
+                print(f"    Loaded XGBoost: {xgb_pred.shape[1]} samples")
+            else:
+                print(f"    [skip] XGBoost: {xgb_rel} not found")
+
+        # EPIC-Seq
+        epic_rel = _PANFT_EPIC_PATHS.get(cohort)
+        if epic_rel:
+            epic_path = PROJECT_ROOT / epic_rel
+            if epic_path.exists():
+                epic_preds = load_holdout_predictions_epicseq(
+                    str(epic_path), _EPIC_SCORE_COLS,
+                )
+                for score_name, epw in epic_preds.items():
+                    display = _EPIC_DISPLAY_NAMES.get(score_name, f"EPIC_{score_name}")
+                    epw.columns = clean_epicseq_sample_names(epw.columns)
+                    _apply_prefix_map(epw, pmap)
+                    model_preds[display] = epw
+                    print(f"    Loaded {display}: {epw.shape[1]} samples")
+            else:
+                print(f"    [skip] EPIC-Seq: {epic_rel} not found")
+
+        if not model_preds:
+            print(f"  [skip] No model predictions for {cohort}")
+            continue
+
+        # Naïve baseline (row-shuffled truth)
+        naive_pred = generate_null_predictions(truth_wide, seed=42)
+        model_preds["Naïve"] = naive_pred
+
+        # Canonical order for this cohort
+        model_order = [m for m in _PANFT_MODEL_ORDER if m in model_preds]
+
+        # Compute per-model metrics
+        for model_name in model_order:
+            pw = model_preds[model_name]
+            m = compute_subset_metrics(truth_wide, pw)
+            all_metrics_rows.append({
+                "cohort": cohort,
+                "model": model_name,
+                "sample_rho_mean": float(np.nanmean(m["sample_rho"])) if len(m["sample_rho"]) else np.nan,
+                "mean_gene_rho": m["mean_gene_rho"],
+                "median_gene_rho": m["median_gene_rho"],
+                "gvw_rho": m["gvw_rho"],
+                "rmse": m["rmse"],
+                "mean_top10pct_gene_rho": m["mean_top10pct_gene_rho"],
+                "n_genes_rho_ge070": m["n_genes_rho_ge070"],
+                "n_samples": len(m["sample_rho"]),
+            })
+
+            # Per-gene Spearman rho
+            gene_names = m.get("gene_rho_genes", np.array([], dtype=object))
+            for gi, rho_val in enumerate(m["gene_rho_array"]):
+                all_gene_rho_rows.append({
+                    "cohort": cohort, "model": model_name,
+                    "gene": gene_names[gi] if gi < len(gene_names) else "",
+                    "spearman_rho": rho_val,
+                })
+
+            # Per-sample Spearman rho
+            for rho_val in m["sample_rho"]:
+                all_sample_rho_rows.append({
+                    "cohort": cohort, "model": model_name,
+                    "spearman_rho": rho_val,
+                })
+
+    metrics_table = pd.DataFrame(all_metrics_rows)
+    gene_rho_table = pd.DataFrame(all_gene_rho_rows)
+    sample_rho_table = pd.DataFrame(all_sample_rho_rows)
+
+    if metrics_table.empty:
+        print("  [skip] No metrics computed")
+        return
+
+    # Save summary TSV
+    metrics_table.to_csv(
+        os.path.join(out_dir, "summary_benchmarking.tsv"), sep="\t", index=False,
+    )
+    print(f"\n  Summary: {len(metrics_table)} rows")
+    print(metrics_table.to_string(index=False))
+
+    # Resolve global model order (models that appear in at least one cohort)
+    model_order = [m for m in _PANFT_MODEL_ORDER if m in set(metrics_table["model"])]
+
+    # ── Twin-panel cohort boxplots for key scalar metrics ──
+    for metric_col, ylabel in [
+        ("gvw_rho", "GVW-ρ"),
+        ("mean_gene_rho", "Mean Gene ρ"),
+        ("rmse", "Mean Gene RMSE"),
+        ("mean_top10pct_gene_rho", "Mean ρ (Top 10%)"),
+        ("n_genes_rho_ge070", "Genes with ρ≥0.70"),
+    ]:
+        _maybe(benchmark_cohort_boxplots, args.overwrite,
+               metrics_table, os.path.join(out_dir, f"benchmark_cohort_{metric_col}"),
+               metric_col=metric_col, ylabel=ylabel,
+               title=f"Benchmarking PAN-FT — {ylabel}",
+               cohort_order=_PANFT_COHORTS, model_order=model_order)
+
+    # Per-sample Spearman rho boxplots
+    if not sample_rho_table.empty:
+        _maybe(benchmark_cohort_boxplots, args.overwrite,
+               sample_rho_table,
+               os.path.join(out_dir, "benchmark_cohort_sample_rho"),
+               metric_col="spearman_rho", ylabel="Sample ρ",
+               title="Benchmarking PAN-FT — Per-Sample Spearman ρ",
+               cohort_order=_PANFT_COHORTS, model_order=model_order)
+
+    # ── Twin-panel cohort histograms of per-gene Spearman rho ──
+    if not gene_rho_table.empty:
+        _maybe(benchmark_cohort_histograms, args.overwrite,
+               gene_rho_table,
+               os.path.join(out_dir, "benchmark_cohort_gene_rho_hist"),
+               cohort_order=_PANFT_COHORTS, model_order=model_order)
+
+    # ── Multi-metric line plots (cohort on x-axis) ──
+    _maybe(benchmark_cohort_metrics_lines, args.overwrite,
+           metrics_table, os.path.join(out_dir, "benchmark_cohort_metrics"),
+           cohort_order=_PANFT_COHORTS, model_order=model_order)
+
+    print("\n  Done")
+
+
+def _generate_naive_example(
     out_dir: str,
     overwrite: bool,
 ) -> None:
-    """Produce NullExample illustrative plots.
+    """Produce NaiveExample illustrative plots.
 
     Uses all 25 LuCaP PC-PDX truth profiles to illustrate two baselines
     at both the single-transcriptome (scatter) and per-gene (distribution)
@@ -1312,11 +2076,12 @@ def _generate_null_example(
     1. Scatter: LuCaP_136 vs 136CR (biological replicate pair)
     2. Scatter: LuCaP_136 vs population-mean expression (regression to mean)
     3. Distribution: per-gene Pearson r, truth vs row-shuffled truth
-       across all 25 LuCaP samples (null baseline, same as benchmarking)
-    4. Distribution: per-gene Pearson r, truth vs truth + faint noise
-       across all 25 LuCaP samples (near-replicate baseline)
+       across all 25 LuCaP samples (na\u00efve shuffle baseline)
+    4. Distribution: per-gene Pearson r, truth vs truth + strong noise
+       across all 25 LuCaP samples (synthetic replicate baseline)
     """
-    ne_dir = ensure_dir(os.path.join(out_dir, "NullExample"))
+    ne_dir = ensure_dir(os.path.join(out_dir, "NaiveExample"))
+    N_RESAMPLES = 200  # re-draws for smoother distributions
 
     # Load all 25 PC-PDX truth profiles
     pc_truth = pd.read_csv(
@@ -1324,7 +2089,7 @@ def _generate_null_example(
     )
     keep = [s for s in PC_PDX_STUDY if s in pc_truth.columns]
     if len(keep) < 3:
-        print("  [skip] NullExample: fewer than 3 LuCaP samples in truth")
+        print("  [skip] NaiveExample: fewer than 3 LuCaP samples in truth")
         return
     T = pc_truth[keep]  # genes × 25 samples
     T_arr = T.values.astype(np.float64)
@@ -1342,7 +2107,7 @@ def _generate_null_example(
                 "LuCaP_136 vs 136CR", path_a, goi=None,
             )
     else:
-        print("  [skip] NullExample: LuCaP_136 or 136CR not in labels")
+        print("  [skip] NaiveExample: LuCaP_136 or 136CR not in labels")
 
     # --- (2) LuCaP_136 vs population-mean expression ---
     if "LuCaP_136" in T.columns:
@@ -1356,73 +2121,67 @@ def _generate_null_example(
                 "LuCaP_136 vs Population Mean", path_b, goi=None,
             )
 
-    # --- (3) Null per-gene Pearson r (row-shuffled baseline) ---
-    # Same approach as generate_null_predictions: shuffle within each row
-    # (gene) to break per-gene correlations, then compute per-gene r.
-    null_pred = generate_null_predictions(T, seed=42)
-    N_arr = null_pred.values.astype(np.float64)
-
-    # Per-gene Pearson r between truth and null (vectorised across axis=1)
-    finite = np.isfinite(T_arr) & np.isfinite(N_arr)
-    n_valid = finite.sum(axis=1)
-    null_gene_r = np.full(n_genes, np.nan)
-    ok = n_valid >= 5
-    if ok.any():
-        Tc = np.where(finite, T_arr, 0.0)
-        Nc = np.where(finite, N_arr, 0.0)
+    # Helper: vectorised gene-level Pearson r across genes × samples
+    def _gene_pearson_r(truth_arr, pred_arr):
+        finite = np.isfinite(truth_arr) & np.isfinite(pred_arr)
+        n_valid = finite.sum(axis=1)
+        n_g = truth_arr.shape[0]
+        result = np.full(n_g, np.nan)
+        ok = n_valid >= 5
+        if not ok.any():
+            return result
+        Tc = np.where(finite, truth_arr, 0.0)
+        Pc = np.where(finite, pred_arr, 0.0)
         nv = n_valid[ok].astype(np.float64)
         st = Tc[ok].sum(axis=1)
-        sn = Nc[ok].sum(axis=1)
+        sp = Pc[ok].sum(axis=1)
         stt = (Tc[ok] ** 2).sum(axis=1)
-        snn = (Nc[ok] ** 2).sum(axis=1)
-        stn = (Tc[ok] * Nc[ok]).sum(axis=1)
-        num = nv * stn - st * sn
+        spp = (Pc[ok] ** 2).sum(axis=1)
+        stp = (Tc[ok] * Pc[ok]).sum(axis=1)
+        num = nv * stp - st * sp
         with np.errstate(invalid="ignore"):
-            den = np.sqrt((nv * stt - st ** 2) * (nv * snn - sn ** 2))
+            den = np.sqrt((nv * stt - st ** 2) * (nv * spp - sp ** 2))
         with np.errstate(divide="ignore", invalid="ignore"):
-            null_gene_r[ok] = np.where(den > 0, num / den, np.nan)
+            result[ok] = np.where(den > 0, num / den, np.nan)
+        return result
 
-    null_r_series = pd.Series(null_gene_r[np.isfinite(null_gene_r)], name="pearson_r")
-    path_c = os.path.join(ne_dir, "null_gene_pearson_r_distribution")
+    # --- (3) Na\u00efve per-gene Pearson r (row-shuffled baseline) ---
+    # Average over N_RESAMPLES shuffles for a smoother distribution.
+    all_naive_r = []
+    for seed_i in range(N_RESAMPLES):
+        naive_pred = generate_null_predictions(T, seed=seed_i)
+        r_vals = _gene_pearson_r(T_arr, naive_pred.values.astype(np.float64))
+        all_naive_r.append(r_vals[np.isfinite(r_vals)])
+    naive_r_concat = np.concatenate(all_naive_r)
+    naive_r_series = pd.Series(naive_r_concat, name="pearson_r")
+    path_c = os.path.join(ne_dir, "naive_gene_pearson_r_distribution")
     if overwrite or not os.path.exists(f"{path_c}.pdf"):
         metric_distribution(
-            null_r_series, "Per-Gene Pearson r (Null)", path_c,
+            naive_r_series, "Per-Gene Pearson r (Na\u00efve)", path_c,
             xlim=(-1.0, 1.0), square=True,
         )
 
-    # --- (4) Near-replicate per-gene Pearson r ---
-    # pred = truth + Gaussian noise (sigma = 50% of per-gene std)
-    rng = np.random.default_rng(42)
-    gene_std = np.nanstd(T_arr, axis=1, keepdims=True)  # (G, 1)
-    noise = rng.normal(0, 1.0, size=T_arr.shape) * (0.50 * gene_std)
-    noisy_pred = T_arr + noise
-    noisy_pred[~np.isfinite(T_arr)] = np.nan
-
-    # Per-gene Pearson r between truth and near-replicate (axis=1)
-    finite_n = np.isfinite(T_arr) & np.isfinite(noisy_pred)
-    nv_n = finite_n.sum(axis=1)
-    noisy_gene_r = np.full(n_genes, np.nan)
-    ok_n = nv_n >= 5
-    if ok_n.any():
-        Tc_n = np.where(finite_n, T_arr, 0.0)
-        Pc_n = np.where(finite_n, noisy_pred, 0.0)
-        nvn = nv_n[ok_n].astype(np.float64)
-        st_n = Tc_n[ok_n].sum(axis=1)
-        sp_n = Pc_n[ok_n].sum(axis=1)
-        stt_n = (Tc_n[ok_n] ** 2).sum(axis=1)
-        spp_n = (Pc_n[ok_n] ** 2).sum(axis=1)
-        stp_n = (Tc_n[ok_n] * Pc_n[ok_n]).sum(axis=1)
-        num_n = nvn * stp_n - st_n * sp_n
-        with np.errstate(invalid="ignore"):
-            den_n = np.sqrt((nvn * stt_n - st_n ** 2) * (nvn * spp_n - sp_n ** 2))
-        with np.errstate(divide="ignore", invalid="ignore"):
-            noisy_gene_r[ok_n] = np.where(den_n > 0, num_n / den_n, np.nan)
-
-    noisy_r_series = pd.Series(noisy_gene_r[np.isfinite(noisy_gene_r)], name="pearson_r")
-    path_d = os.path.join(ne_dir, "near_replicate_gene_pearson_r_distribution")
+    # --- (4) Synthetic replicate per-gene Pearson r ---
+    # pred = truth + Gaussian noise sized so the mean per-gene Pearson r
+    # approximates real technical replicates.  The relationship between
+    # noise fraction f and E[r] ≈ 1/sqrt(1+f²) at large n; f≈0.48
+    # gives r ~ 0.90, representative of replicate concordance.
+    NOISE_FRAC = 0.48
+    all_noisy_r = []
+    for seed_i in range(N_RESAMPLES):
+        rng = np.random.default_rng(42 + seed_i)
+        gene_std = np.nanstd(T_arr, axis=1, keepdims=True)
+        noise = rng.normal(0, 1.0, size=T_arr.shape) * (NOISE_FRAC * gene_std)
+        noisy_pred = T_arr + noise
+        noisy_pred[~np.isfinite(T_arr)] = np.nan
+        r_vals = _gene_pearson_r(T_arr, noisy_pred)
+        all_noisy_r.append(r_vals[np.isfinite(r_vals)])
+    noisy_r_concat = np.concatenate(all_noisy_r)
+    noisy_r_series = pd.Series(noisy_r_concat, name="pearson_r")
+    path_d = os.path.join(ne_dir, "synthetic_replicate_gene_pearson_r_distribution")
     if overwrite or not os.path.exists(f"{path_d}.pdf"):
         metric_distribution(
-            noisy_r_series, "Per-Gene Pearson r (Near Replicate)", path_d,
+            noisy_r_series, "Per-Gene Pearson r (Synthetic Replicate)", path_d,
             xlim=(-1.0, 1.0), square=True,
         )
 
@@ -1430,16 +2189,16 @@ def _generate_null_example(
 def run_benchmarking(args: argparse.Namespace) -> None:
     """Benchmarking analysis: compare models on PHS holdout across TFx/depth grid.
 
-    Loads PHS predictions for Proteus-Base, NoSeq, OnlySeq, XGBoost,
-    EPIC-Seq scores, and a Null (column-shuffled truth) baseline.
+    Loads PHS predictions for Proteus_Base, NoSeq, OnlySeq, XGBoost,
+    EPIC-Seq scores, and a Naïve (row-shuffled truth) baseline.
     Computes metrics per (TFx, depth, model) cell and produces grid
     boxplots, histograms, and eCDNA line plots.
     """
     print("\n" + "=" * 70)
-    print("  ANALYSIS GROUP: Benchmarking")
+    print("  ANALYSIS GROUP: Benchmarking_Base")
     print("=" * 70)
 
-    out_dir = ensure_dir(str(PROJECT_ROOT / "analysis" / "results" / "Benchmarking"))
+    out_dir = ensure_dir(str(PROJECT_ROOT / "analysis" / "results" / "Benchmarking_Base"))
     n_workers = args.n_workers
 
     # ── Load model predictions and build truth ──────────────────────────
@@ -1491,9 +2250,9 @@ def run_benchmarking(args: argparse.Namespace) -> None:
     var_map = compute_gene_variance(unique_truth)
     print(f"  Variance map: {len(var_map)} genes from {len(unique_pdx_names)} unique PDX profiles")
 
-    # Null model: column-wise shuffled truth
-    null_pred = generate_null_predictions(truth_wide, seed=42)
-    model_preds["Null"] = null_pred
+    # Na\u00efve model: column-wise shuffled truth
+    naive_pred = generate_null_predictions(truth_wide, seed=42)
+    model_preds["Na\u00efve"] = naive_pred
 
     # ── Load EPIC-Seq scores ───────────────────────────────────────────
     epic_path = PROJECT_ROOT / _EPIC_SEQ_PATH
@@ -1503,8 +2262,9 @@ def run_benchmarking(args: argparse.Namespace) -> None:
             str(epic_path), _EPIC_SCORE_COLS,
         )
         for score_name, epw in epic_preds.items():
-            model_preds[f"EPIC-{score_name}"] = epw
-            print(f"  Loaded EPIC-{score_name}: {epw.shape[0]} genes × {epw.shape[1]} samples")
+            display = _EPIC_DISPLAY_NAMES.get(score_name, f"EPIC_{score_name}")
+            model_preds[display] = epw
+            print(f"  Loaded {display}: {epw.shape[0]} genes × {epw.shape[1]} samples")
     else:
         print(f"  [skip] EPIC-Seq: {_EPIC_SEQ_PATH} not found")
 
@@ -1526,13 +2286,12 @@ def run_benchmarking(args: argparse.Namespace) -> None:
     print(f"  Grid samples (after depth filter): {len(grid_samples)}")
 
     # ── Compute metrics per (TFx, depth, model) ────────────────────────
-    model_order = [m for m in list(_BENCH_PROTEUS_MODELS.keys()) + ["XGBoost"] if m in model_preds]
-    # Add EPIC-Seq score models
-    for score_name in _EPIC_SCORE_COLS:
-        epic_key = f"EPIC-{score_name}"
-        if epic_key in model_preds:
-            model_order.append(epic_key)
-    model_order.append("Null")
+    # Canonical model order for Benchmarking_Base (excludes Proteus_Tuned)
+    _BASE_MODEL_ORDER = [
+        "Proteus_Base", "Proteus_NoSeq", "Proteus_OnlySeq",
+        "XGBoost", "EPIC_GEP", "EPIC_PFE", "EPIC_NDR", "Na\u00efve",
+    ]
+    model_order = [m for m in _BASE_MODEL_ORDER if m in model_preds]
 
     metrics_rows = []     # one row per (tfx, depth, model) with scalar metrics
     gene_rho_rows = []    # one row per (tfx, depth, model, gene) with gene rho
@@ -1697,8 +2456,8 @@ def run_benchmarking(args: argparse.Namespace) -> None:
                ecdna_table, os.path.join(out_dir, "benchmark_ecdna_lines"),
                model_order=model_order)
 
-    # ── NullExample: illustrative scatter / distribution baseline plots ──
-    _generate_null_example(out_dir, args.overwrite)
+    # ── NaiveExample: illustrative scatter / distribution baseline plots ──
+    _generate_naive_example(out_dir, args.overwrite)
 
     print("  Done")
 
@@ -1709,12 +2468,13 @@ def run_benchmarking(args: argparse.Namespace) -> None:
 
 GROUPS = {
     "BTS-CV": run_bts_cv,
-    "Benchmarking": run_benchmarking,
-    "PAN-FT-CV": lambda args: run_finetune_cv(args, "PAN-FT-CV"),
-    "CRPC-FT-CV": lambda args: run_finetune_cv(args, "CRPC-FT-CV"),
+    "Benchmarking_Base": run_benchmarking,
+    "Benchmarking_PAN-FT": run_benchmarking_panft,
+    "PAN-FT-CV": run_panft_cv,
+    "CRPC-FT-CV": run_crpc_finetune_cv,
     "XGB-FT-CV": run_xgb_finetune_cv,
-    "Patient-HO": run_patient_ho,
-    "Patient-Discovery": run_patient_discovery,
+    "Patient_Validation": run_patient_validation,
+    "Patient_Discovery": run_patient_discovery,
 }
 
 

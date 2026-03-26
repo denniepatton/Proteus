@@ -64,7 +64,7 @@ def load_gene_list(name: str) -> List[str]:
 def load_palette() -> Dict[str, str]:
     """Load reference/palette.tsv → {subtype: hex_color}."""
     path = PROJECT_ROOT / "reference" / "palette.tsv"
-    df = pd.read_csv(path, sep="\t", header=None)
+    df = pd.read_csv(path, sep="\t", header=None, encoding="mac_roman").dropna()
     return dict(zip(df[0], df[1]))
 
 
@@ -121,6 +121,34 @@ GENE_SET_BREAKS: Dict[str, List[int]] = {
 
 
 # ---------------------------------------------------------------------------
+# Sample name alignment helpers
+# ---------------------------------------------------------------------------
+
+
+def strip_cohort_prefix(columns: pd.Index, cohort: str) -> pd.Index:
+    """Strip '{cohort}_' prefix from column names when present.
+
+    Truth label files use prefixed sample names (e.g. 'BLCA-RA_15-109')
+    while prediction files use bare IDs (e.g. '15-109').  Stripping the
+    prefix allows ``pd.Index.intersection`` to find the overlap.
+    """
+    prefix = f"{cohort}_"
+    plen = len(prefix)
+    return pd.Index(
+        [col[plen:] if col.startswith(prefix) else col for col in columns]
+    )
+
+
+def clean_epicseq_sample_names(columns: pd.Index) -> pd.Index:
+    """Normalise EPIC-Seq sample IDs by stripping '_<digits>.cram' suffix.
+
+    EPIC-Seq pivot columns look like '15-109_1107.cram'; Proteus/XGBoost
+    predictions (and stripped truth columns) use '15-109'.
+    """
+    return pd.Index([re.sub(r'_\d+\.cram$', '', str(c)) for c in columns])
+
+
+# ---------------------------------------------------------------------------
 # Prediction loading — long → wide
 # ---------------------------------------------------------------------------
 
@@ -170,6 +198,65 @@ def load_cv_predictions_proteus(
     ci_hi_wide = _merge_wide_folds(ci_hi_parts) if ci_hi_parts else None
 
     return pred_wide, truth_wide, ci_lo_wide, ci_hi_wide
+
+
+def _extract_donor_id(pht_sample: str) -> Optional[str]:
+    """Extract the HD-L donor ID (e.g. 'BP1124576_S78') from a PHT sample name.
+
+    PHT sample names look like 'PHT-Fold-1_LuCaP_96-BP1124576_S78'.
+    The donor ID is the portion after the last hyphen-separated PDX name,
+    matching the pattern ``BP\\d+_S\\d+``.
+    """
+    m = re.search(r"(BP\d+_S\d+)$", pht_sample)
+    return m.group(1) if m else None
+
+
+def load_cv_predictions_background(
+    trial_dir: str,
+    folds: Sequence[int] = (1, 2, 3, 4, 5),
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Load background (HD-L) predictions from CV folds, averaged per donor.
+
+    Each fold's ``predictions_background.tsv`` contains the model's
+    background-head predictions for every PHT admixture sample.  Multiple
+    PHT admixtures share the same HD-L donor within a fold, so we
+    average prediction_mean across all PHT samples that share a donor
+    to produce a single predicted profile per donor.
+
+    Returns (pred_wide, truth_wide) — both genes × HD-L donors.
+    """
+    pred_parts: List[pd.DataFrame] = []
+    truth_parts: List[pd.DataFrame] = []
+
+    for fold in folds:
+        fold_dir = os.path.join(trial_dir, f"CV-fold_{fold}")
+        path = os.path.join(fold_dir, f"validation-fold_{fold}_predictions_background.tsv")
+        if not os.path.exists(path):
+            continue
+
+        df = pd.read_csv(path, sep="\t", index_col=0)
+        df["donor"] = df["sample"].map(_extract_donor_id)
+        df = df.dropna(subset=["donor"])
+
+        # Average across PHT admixtures sharing the same donor
+        df.index.name = "gene"
+        df = df.reset_index()
+        pred_avg = df.groupby(["gene", "donor"])["prediction_mean"].mean().reset_index()
+        pred_avg = pred_avg.pivot(index="gene", columns="donor", values="prediction_mean")
+
+        truth_avg = df.groupby(["gene", "donor"])["truth"].mean().reset_index()
+        truth_avg = truth_avg.pivot(index="gene", columns="donor", values="truth")
+
+        pred_parts.append(pred_avg)
+        truth_parts.append(truth_avg)
+
+    if not pred_parts:
+        return pd.DataFrame(), pd.DataFrame()
+
+    pred_wide = _merge_wide_folds(pred_parts)
+    truth_wide = _merge_wide_folds(truth_parts)
+
+    return pred_wide, truth_wide
 
 
 def load_cv_predictions_proteus_full(
@@ -852,18 +939,17 @@ def cohort_summary_table(
     Parameters
     ----------
     var_map : optional pre-computed gene variance dict.  When supplied the
-        GVW metrics and variance-group breakdowns use these values instead
-        of recomputing from *truth_wide* (which may only be a subset of
-        the full cohort).  Callers should obtain this from the full
-        canonical RNA-Seq truth labels.
+        GVW metrics and variance-group breakdowns use these weights.
+        When *None*, variance is computed from the truth–prediction
+        intersection (only samples visible to the model contribute).
     """
-    if var_map is None:
-        var_map = compute_gene_variance(truth_wide)
-
     common_genes = truth_wide.index.intersection(pred_wide.index)
     common_samples = truth_wide.columns.intersection(pred_wide.columns)
     tw = truth_wide.loc[common_genes, common_samples]
     pw = pred_wide.loc[common_genes, common_samples]
+
+    if var_map is None:
+        var_map = compute_gene_variance(tw)
 
     # GVW metrics via wide-format vectorised helpers (no flattening)
     T_arr = tw.values.astype(np.float64)
@@ -1070,9 +1156,10 @@ def compute_subset_metrics(
 
     Parameters
     ----------
-    var_map : optional pre-computed gene variance dict from the full truth
-        cohort.  When supplied, GVW metrics use these weights instead of
-        recomputing from the (potentially tiny) truth subset.
+    var_map : optional pre-computed gene variance dict.  When supplied,
+        GVW metrics use these weights.  When *None*, variance is computed
+        from the truth–prediction intersection (only samples visible to
+        the model contribute).
 
     Returns dict with:
       sample_rho  : np.ndarray of per-sample transcriptome-wide Spearman rho

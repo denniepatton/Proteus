@@ -1715,13 +1715,15 @@ def latent_space_umap(
     n_samples: int = 10_000,
     seed: int = 200,
 ) -> None:
-    """Generate UMAP plots of the tumor latent space.
+    """Generate UMAP plots of the tumor and background latent spaces.
 
-    Extracts ``z_tumor_mean`` via a forward hook on the tumor VAE encoder,
-    then projects to 2D with UMAP.  Produces:
+    Extracts ``z_tumor_mean`` and ``z_background_mean`` via forward hooks
+    on the respective VAE encoders, then projects each to 2D with UMAP.
 
-    1. Predicted tumor expression (continuous).
-    2. Ground-truth tumor expression (from labels).
+    For each branch (tumor / background) produces:
+
+    1. Predicted expression (continuous).
+    2. Ground-truth expression (from labels).
     3. Cancer subtype (ARPC / NEPC / ASCL1 / etc.).
     4. Tumor fraction (TFx, continuous).
     5. Prediction residuals (signed error).
@@ -1740,7 +1742,9 @@ def latent_space_umap(
     features = _tensors_to_feature_dict(tensors)
 
     z_tumor_mean_parts: List[np.ndarray] = []
+    z_bg_mean_parts: List[np.ndarray] = []
     tumor_exp_parts: List[np.ndarray] = []
+    bg_exp_parts: List[np.ndarray] = []
 
     fwd_batch = 32
     n_total = tensors[0].shape[0]
@@ -1748,37 +1752,45 @@ def latent_space_umap(
         end = min(start + fwd_batch, n_total)
         batch_feat = {k: v[start:end] for k, v in features.items()}
 
-        z_chunk: Optional[np.ndarray] = None
+        z_tumor_chunk: Optional[np.ndarray] = None
+        z_bg_chunk: Optional[np.ndarray] = None
 
         def _tumor_hook(module: nn.Module, inp: Any,
                         out: Tuple[torch.Tensor, torch.Tensor]) -> None:
-            nonlocal z_chunk
-            z_chunk = out[0].detach().cpu().numpy()
+            nonlocal z_tumor_chunk
+            z_tumor_chunk = out[0].detach().cpu().numpy()
 
-        h = model.tumor_encoder.register_forward_hook(_tumor_hook)
+        def _bg_hook(module: nn.Module, inp: Any,
+                     out: Tuple[torch.Tensor, torch.Tensor]) -> None:
+            nonlocal z_bg_chunk
+            z_bg_chunk = out[0].detach().cpu().numpy()
+
+        h_t = model.tumor_encoder.register_forward_hook(_tumor_hook)
+        h_b = model.background_encoder.register_forward_hook(_bg_hook)
         with torch.no_grad():
             preds, _ = model(batch_feat, return_internal_loss=False)
-        h.remove()
+        h_t.remove()
+        h_b.remove()
 
-        z_tumor_mean_parts.append(z_chunk)
+        z_tumor_mean_parts.append(z_tumor_chunk)
+        z_bg_mean_parts.append(z_bg_chunk)
         tumor_exp_parts.append(preds['tumor_exp'].cpu().numpy().squeeze(-1))
+        bg_exp_parts.append(preds['background_exp'].cpu().numpy().squeeze(-1))
 
     del tensors, features
     torch.cuda.empty_cache()
 
     z_tumor_mean = np.concatenate(z_tumor_mean_parts, axis=0)
+    z_bg_mean = np.concatenate(z_bg_mean_parts, axis=0)
     tumor_pred = np.concatenate(tumor_exp_parts, axis=0)
+    bg_pred = np.concatenate(bg_exp_parts, axis=0)
     tumor_truth = sub['tumor_exp']
+    bg_truth = sub['background_exp']
     sample_names = np.array(sub['sample_names'])
-
-    # Derive error metrics
-    residuals = tumor_pred - tumor_truth          # signed error
-    abs_error = np.abs(residuals)
 
     # Build sample-level metadata lookup
     meta = _build_sample_metadata()
 
-    # Map per-gene metadata from sample names
     cohorts = np.array([
         meta.loc[s, 'cohort'] if s in meta.index else 'Unknown'
         for s in sample_names
@@ -1792,130 +1804,141 @@ def latent_space_umap(
         for s in sample_names
     ], dtype=np.float32)
 
-    # UMAP projection
-    reducer = umap.UMAP(
-        n_components=2, random_state=seed,
-        n_neighbors=30, min_dist=0.3, metric='cosine',
-    )
-    embedding = reducer.fit_transform(z_tumor_mean)
+    # ── Run UMAP + plots for each branch ──
+    for branch, z_latent, pred_arr, truth_arr in [
+        ('tumor', z_tumor_mean, tumor_pred, tumor_truth),
+        ('background', z_bg_mean, bg_pred, bg_truth),
+    ]:
+        branch_label = branch.capitalize()
 
-    # ── Helper for continuous-colour UMAPs ──
-    def _plot_continuous(values: np.ndarray, cmap: str, label: str,
-                         title: str, fname: str, *,
-                         vcenter: Optional[float] = None) -> None:
-        fig, ax = plt.subplots(figsize=(7, 7), constrained_layout=True)
-        ax.set_aspect('equal')
-        if vcenter is not None:
-            vmin, vmax = np.nanpercentile(values, [2, 98])
-            norm = TwoSlopeNorm(vcenter=vcenter, vmin=vmin, vmax=vmax)
-        else:
-            norm = None
-        sc = ax.scatter(
-            embedding[:, 0], embedding[:, 1],
-            c=values, cmap=cmap, norm=norm,
-            s=2, alpha=0.5, rasterized=True,
+        reducer = umap.UMAP(
+            n_components=2, random_state=seed,
+            n_neighbors=30, min_dist=0.3, metric='cosine',
         )
-        ax.set_xlabel('UMAP 1', fontsize=10)
-        ax.set_ylabel('UMAP 2', fontsize=10)
-        ax.set_title(title, fontsize=12)
-        fig.colorbar(sc, ax=ax, label=label)
-        _save_or_show(fig, folder_path, fname)
+        embedding = reducer.fit_transform(z_latent)
 
-    # ── Helper for categorical UMAPs ──
-    def _plot_categorical(labels: np.ndarray, title: str, fname: str,
-                          *, max_legend: int = 20,
-                          palette: Optional[str] = None) -> None:
-        fig, ax = plt.subplots(figsize=(7, 7), constrained_layout=True)
-        ax.set_aspect('equal')
-        unique = sorted(set(labels))
-        n_cats = len(unique)
-        cmap_name = palette or ('tab10' if n_cats <= 10 else 'tab20')
-        cmap_c = plt.cm.get_cmap(cmap_name, max(n_cats, 1))
+        residuals = pred_arr - truth_arr
+        abs_error = np.abs(residuals)
 
-        if n_cats <= max_legend:
-            for i, cat in enumerate(unique):
-                mask = labels == cat
-                ax.scatter(embedding[mask, 0], embedding[mask, 1],
-                           c=[cmap_c(i)], s=2, alpha=0.4,
-                           label=cat, rasterized=True)
-        else:
-            counts = Counter(labels.tolist())
-            top_cats = [c for c, _ in counts.most_common(max_legend - 1)]
-            cmap_c = plt.cm.get_cmap(cmap_name, max_legend)
-            for i, cat in enumerate(top_cats):
-                mask = labels == cat
-                ax.scatter(embedding[mask, 0], embedding[mask, 1],
-                           c=[cmap_c(i)], s=2, alpha=0.4,
-                           label=cat, rasterized=True)
-            other_mask = ~np.isin(labels, top_cats)
-            if other_mask.any():
-                ax.scatter(embedding[other_mask, 0], embedding[other_mask, 1],
-                           c='grey', s=1, alpha=0.2,
-                           label=f'Other ({other_mask.sum():,})',
-                           rasterized=True)
-        ax.legend(fontsize=6, markerscale=4, ncol=1,
-                  loc='center left', bbox_to_anchor=(1.02, 0.5))
-        ax.set_xlabel('UMAP 1', fontsize=10)
-        ax.set_ylabel('UMAP 2', fontsize=10)
-        ax.set_title(title, fontsize=12)
-        _save_or_show(fig, folder_path, fname)
+        # ── Helper for continuous-colour UMAPs ──
+        def _plot_continuous(values: np.ndarray, cmap: str, label: str,
+                             title: str, fname: str, *,
+                             vcenter: Optional[float] = None,
+                             _emb=embedding) -> None:
+            fig, ax = plt.subplots(figsize=(7, 7), constrained_layout=True)
+            ax.set_aspect('equal')
+            if vcenter is not None:
+                vmin, vmax = np.nanpercentile(values, [2, 98])
+                norm = TwoSlopeNorm(vcenter=vcenter, vmin=vmin, vmax=vmax)
+            else:
+                norm = None
+            sc = ax.scatter(
+                _emb[:, 0], _emb[:, 1],
+                c=values, cmap=cmap, norm=norm,
+                s=2, alpha=0.5, rasterized=True,
+            )
+            ax.set_xlabel('UMAP 1', fontsize=10)
+            ax.set_ylabel('UMAP 2', fontsize=10)
+            ax.set_title(title, fontsize=12)
+            fig.colorbar(sc, ax=ax, label=label)
+            _save_or_show(fig, folder_path, fname)
 
-    # 1. Predicted tumor expression (continuous)
-    _plot_continuous(
-        tumor_pred, 'viridis', 'Predicted Log\u2082(CPM+1)',
-        'Tumor Latent Space — Predicted Expression',
-        'umap_tumor_predicted.png',
-    )
+        # ── Helper for categorical UMAPs ──
+        def _plot_categorical(labels: np.ndarray, title: str, fname: str,
+                              *, max_legend: int = 20,
+                              palette: Optional[str] = None,
+                              _emb=embedding) -> None:
+            fig, ax = plt.subplots(figsize=(7, 7), constrained_layout=True)
+            ax.set_aspect('equal')
+            unique = sorted(set(labels))
+            n_cats = len(unique)
+            cmap_name = palette or ('tab10' if n_cats <= 10 else 'tab20')
+            cmap_c = plt.cm.get_cmap(cmap_name, max(n_cats, 1))
 
-    # 2. Ground-truth tumor expression (continuous)
-    _plot_continuous(
-        tumor_truth, 'viridis', 'True Log\u2082(CPM+1)',
-        'Tumor Latent Space — True Expression',
-        'umap_tumor_truth.png',
-    )
+            if n_cats <= max_legend:
+                for i, cat in enumerate(unique):
+                    mask = labels == cat
+                    ax.scatter(_emb[mask, 0], _emb[mask, 1],
+                               c=[cmap_c(i)], s=2, alpha=0.4,
+                               label=cat, rasterized=True)
+            else:
+                counts = Counter(labels.tolist())
+                top_cats = [c for c, _ in counts.most_common(max_legend - 1)]
+                cmap_c = plt.cm.get_cmap(cmap_name, max_legend)
+                for i, cat in enumerate(top_cats):
+                    mask = labels == cat
+                    ax.scatter(_emb[mask, 0], _emb[mask, 1],
+                               c=[cmap_c(i)], s=2, alpha=0.4,
+                               label=cat, rasterized=True)
+                other_mask = ~np.isin(labels, top_cats)
+                if other_mask.any():
+                    ax.scatter(_emb[other_mask, 0], _emb[other_mask, 1],
+                               c='grey', s=1, alpha=0.2,
+                               label=f'Other ({other_mask.sum():,})',
+                               rasterized=True)
+            ax.legend(fontsize=6, markerscale=4, ncol=1,
+                      loc='center left', bbox_to_anchor=(1.02, 0.5))
+            ax.set_xlabel('UMAP 1', fontsize=10)
+            ax.set_ylabel('UMAP 2', fontsize=10)
+            ax.set_title(title, fontsize=12)
+            _save_or_show(fig, folder_path, fname)
 
-    # 3. Cancer subtype
-    _plot_categorical(
-        subtypes,
-        'Tumor Latent Space — Cancer Subtype',
-        'umap_cancer_subtype.png',
-    )
+        # 1. Predicted expression (continuous)
+        _plot_continuous(
+            pred_arr, 'viridis', 'Predicted Log\u2082(CPM+1)',
+            f'{branch_label} Latent Space \u2014 Predicted Expression',
+            f'umap_{branch}_predicted.png',
+        )
 
-    # 4. Tumor fraction (TFx)
-    _plot_continuous(
-        tfx_values, 'magma', 'Tumor Fraction',
-        'Tumor Latent Space — TFx',
-        'umap_tfx.png',
-    )
+        # 2. Ground-truth expression (continuous)
+        _plot_continuous(
+            truth_arr, 'viridis', 'True Log\u2082(CPM+1)',
+            f'{branch_label} Latent Space \u2014 True Expression',
+            f'umap_{branch}_truth.png',
+        )
 
-    # 5. Prediction residuals (signed, centred at 0)
-    _plot_continuous(
-        residuals, 'RdBu_r', 'Residual (pred \u2212 truth)',
-        'Tumor Latent Space — Prediction Residuals',
-        'umap_residuals.png', vcenter=0.0,
-    )
+        # 3. Cancer subtype
+        _plot_categorical(
+            subtypes,
+            f'{branch_label} Latent Space \u2014 Cancer Subtype',
+            f'umap_{branch}_cancer_subtype.png',
+        )
 
-    # 6. Absolute error
-    _plot_continuous(
-        abs_error, 'hot_r', '|Prediction Error|',
-        'Tumor Latent Space — Absolute Error',
-        'umap_abs_error.png',
-    )
+        # 4. Tumor fraction (TFx)
+        _plot_continuous(
+            tfx_values, 'magma', 'Tumor Fraction',
+            f'{branch_label} Latent Space \u2014 TFx',
+            f'umap_{branch}_tfx.png',
+        )
 
-    # 7. Cohort identity
-    _plot_categorical(
-        cohorts,
-        'Tumor Latent Space — Cohort',
-        'umap_cohort.png',
-    )
+        # 5. Prediction residuals (signed, centred at 0)
+        _plot_continuous(
+            residuals, 'RdBu_r', 'Residual (pred \u2212 truth)',
+            f'{branch_label} Latent Space \u2014 Prediction Residuals',
+            f'umap_{branch}_residuals.png', vcenter=0.0,
+        )
 
-    # 8. Sample identity (top 15 + Other)
-    _plot_categorical(
-        sample_names,
-        'Tumor Latent Space — Sample Identity',
-        'umap_tumor_samples.png',
-        max_legend=16,
-    )
+        # 6. Absolute error
+        _plot_continuous(
+            abs_error, 'hot_r', '|Prediction Error|',
+            f'{branch_label} Latent Space \u2014 Absolute Error',
+            f'umap_{branch}_abs_error.png',
+        )
+
+        # 7. Cohort identity
+        _plot_categorical(
+            cohorts,
+            f'{branch_label} Latent Space \u2014 Cohort',
+            f'umap_{branch}_cohort.png',
+        )
+
+        # 8. Sample identity (top 15 + Other)
+        _plot_categorical(
+            sample_names,
+            f'{branch_label} Latent Space \u2014 Sample Identity',
+            f'umap_{branch}_samples.png',
+            max_legend=16,
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════

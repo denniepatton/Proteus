@@ -1,0 +1,97 @@
+# BioDVN PLCA Phase 1.0 – HP Screening (10% data, source-group balanced)
+#
+# Train from scratch on PLCA (CRPC-RA + SCLC + PC-PDX + SCLC-PDX + PHT).
+# Source-group balanced sampling: 40 samples/source/epoch (160 total).
+# PHT samples assigned to their parent PDX source group automatically.
+#
+# Fixed values are held constant; any parameter with a "suggest" block
+# is searched by Optuna.
+
+name: biodvn_tune-plca_phase1-0
+output_dir: results_training/biodvn_plca_phase1_0_training
+
+transfer: ~
+
+objective:
+  metric: balanced_tumor_gvw_crps_mean
+  direction: minimize
+
+tuning:
+  phase: "1.0"
+  n_trials_per_fold: 100
+  prev_study: ~
+  top_fraction: 0.1
+  enqueue_top_k: 3
+
+data:
+  training_set: data/PLCA_sample-splits.tsv
+  zarr_base: /hpc/temp/ha_g/user/rpatton/ProteusZarrs
+  subsample_frac: 1.00
+  seed: 23
+  source_groups:
+    CRPC-RA: [CRPC-RA]
+    SCLC: [SCLC]
+    Prostate-Synthetic: [PC-PDX]
+    SCLC-Synthetic: [SCLC-PDX]
+  target_n_per_source: 40
+
+
+# =========================================================================
+# GROUP 1: Structural HPs  (loss weights — opened for PLCA rebalancing)
+# =========================================================================
+# Base model converged values noted in comments.
+structural:
+  beta_point_mse:                                    # base: 0.30
+    suggest: {type: float, low: 0.05, high: 1.0}
+  beta_background:                                   # base: 2.0
+    suggest: {type: float, low: 0.5, high: 5.0}
+  beta_tcvae:                                        # base: 2.0
+    suggest: {type: float, low: 0.5, high: 8.0, log: true}
+  beta_contrastive:                                  # base: 1.0
+    suggest: {type: float, low: 0.1, high: 3.0, log: true}
+  beta_grl:                                          # base: 0.15
+    suggest: {type: float, low: 0.01, high: 0.50, log: true}
+  beta_reconstruction:                               # base: 0.50
+    suggest: {type: float, low: 0.1, high: 2.0}
+  cl_margin:                                         # base: 1.0
+    suggest: {type: float, low: 0.3, high: 2.0}
+  internal_weight:                                   # base: 1.0
+    suggest: {type: float, low: 0.3, high: 3.0}
+
+
+# =========================================================================
+# GROUP 2: Training HPs  (optimizer, schedule, regularisation)
+# =========================================================================
+training:
+  epochs: 30
+  patience: 3
+  use_amp: true
+  min_lr_ratio: 5.0e-4
+  warmup_start_lr: 2.5e-4
+  warmup_frac: 0.10
+  schedule_frac: 0.90
+  max_grad_norm: 18.0
+  max_lr:
+    suggest: {type: float, low: 5.0e-4, high: 5.0e-3, log: true}
+  weight_decay:
+    suggest: {type: float, low: 1.0e-6, high: 1.0e-3, log: true}
+
+
+# =========================================================================
+# GROUP 3: Scale HPs  (fixed at base model convergence)
+# =========================================================================
+scale:
+  signal_ksize: 6
+  interaction_ksize: 3
+  n_reductions: 3
+  reduction_dilation: 3
+  signal_encoder_width: 256
+  encoder_start: 128
+  latent_size: 64
+  decoder_start: 64
+  mdn_hidden: 64
+  mdn_final: 32
+  signal_filters: 16
+  initial_reduction_channels: 64
+  dropout_rate:
+    suggest: {type: float, low: 0.05, high: 0.30, step: 0.05}

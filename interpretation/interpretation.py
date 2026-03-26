@@ -39,40 +39,49 @@ from proteus_utils.compile_sample_data import (
     get_zarr_output_dir,
 )
 
-# BTS training-set TSV that maps Cohort/Sample/Fold
-_BTS_SPLITS_TSV = str(_PROJECT_ROOT / 'data' / 'BTS_sample-splits.tsv')
+def _resolve_zarr_paths_from_tsv(
+    splits_tsv: str, zarr_base: str, label: str,
+) -> List[str]:
+    """Read a sample-splits TSV and return existing .zarr store paths."""
+    paths: List[str] = []
+    seen: set = set()
+    with open(splits_tsv, 'r', newline='') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            cohort = row['Cohort'].strip()
+            sample = row['Sample'].strip()
+            sample_name = sample
+            if sample.startswith(f'{cohort}_'):
+                sample_name = sample[len(cohort) + 1:]
+            zarr_path = os.path.join(
+                zarr_base, cohort, 'zarr_files', f'{sample_name}.zarr',
+            )
+            if zarr_path not in seen and os.path.isdir(zarr_path):
+                paths.append(zarr_path)
+                seen.add(zarr_path)
+    if not paths:
+        raise FileNotFoundError(
+            f'No zarr stores found for {label} in {zarr_base}.  '
+            f'Run --process_data first or check PROTEUS_ZARR_BASE.'
+        )
+    return paths
 
 
 def _resolve_zarr_paths(use_set: str, zarr_base: str) -> List[str]:
     """Resolve a dataset name to a list of existing .zarr store paths.
 
     Supports two modes:
-    - **BTS** (or BTS-CV): reads the BTS_sample-splits.tsv to gather zarr
-      paths from *all* cohorts used in training (HD-L, PC-PDX, PHT, SCLC-PDX).
-    - **Single cohort** (e.g. PC-PDX, PHT): globs ``*.zarr`` from the
-      cohort's zarr directory.
+    - **Composite dataset** (e.g. BTS, PAN-FT): if a matching
+      ``data/{use_set}_sample-splits.tsv`` exists, reads it to gather
+      zarr paths from all cohorts listed in the TSV.
+    - **Single cohort** (e.g. PC-PDX, CRPC-RA): globs ``*.zarr`` from
+      the cohort's zarr directory.
     """
-    if use_set.upper() in ('BTS', 'BTS-CV'):
-        paths: List[str] = []
-        with open(_BTS_SPLITS_TSV, 'r', newline='') as f:
-            reader = csv.DictReader(f, delimiter='\t')
-            for row in reader:
-                cohort = row['Cohort'].strip()
-                sample = row['Sample'].strip()
-                sample_name = sample
-                if sample.startswith(f'{cohort}_'):
-                    sample_name = sample[len(cohort) + 1:]
-                zarr_path = os.path.join(
-                    zarr_base, cohort, 'zarr_files', f'{sample_name}.zarr',
-                )
-                if os.path.isdir(zarr_path) and zarr_path not in paths:
-                    paths.append(zarr_path)
-        if not paths:
-            raise FileNotFoundError(
-                f'No zarr stores found for BTS in {zarr_base}.  '
-                f'Run --process_data first or check PROTEUS_ZARR_BASE.'
-            )
-        return paths
+    # Check for a sample-splits TSV (covers BTS, PAN-FT, and any future
+    # composite datasets).
+    splits_tsv = _PROJECT_ROOT / 'data' / f'{use_set}_sample-splits.tsv'
+    if splits_tsv.exists():
+        return _resolve_zarr_paths_from_tsv(str(splits_tsv), zarr_base, use_set)
 
     # Single-cohort: glob the dataset's zarr directory
     zarr_dir = get_zarr_output_dir(use_set, zarr_base)

@@ -318,6 +318,7 @@ def _collect_zarr_paths(
     training_set_tsv: str,
     zarr_base: str,
     exclude_fold: Optional[int] = None,
+    exclude_cohorts: Optional[set] = None,
 ) -> List[str]:
     """Collect Zarr paths from a training-set TSV.
 
@@ -326,6 +327,7 @@ def _collect_zarr_paths(
         zarr_base: Root directory for Zarr stores.
         exclude_fold: If set, skip samples whose Fold == this value.
             If None, include ALL samples (no fold filter).
+        exclude_cohorts: If set, skip samples whose Cohort is in this set.
 
     Path construction mirrors build_loaders_from_splits (cohort prefix
     stripping, zarr_files/ subdirectory) so that gene weights are computed
@@ -338,6 +340,8 @@ def _collect_zarr_paths(
             if exclude_fold is not None and int(row['Fold']) == exclude_fold:
                 continue
             cohort = row['Cohort'].strip()
+            if exclude_cohorts and cohort in exclude_cohorts:
+                continue
             sample = row['Sample'].strip()
             sample_name = sample
             if sample.startswith(f"{cohort}_"):
@@ -365,6 +369,8 @@ def train_model_cv(
     external_stop_check: Optional[Callable[..., bool]] = None,
     train_only_cohorts: Optional[List[str]] = None,
     balance_cohorts: Optional[List[str]] = None,
+    source_groups: Optional[Dict[str, List[str]]] = None,
+    target_n_per_source: Optional[int] = None,
 ):
     """Train a model using cross-validation with deterministic fold assignment.
 
@@ -416,19 +422,23 @@ def train_model_cv(
 
     # Compute full-dataset (all folds) gene variance once for GVW evaluation.
     # This gives validation metrics a stable, unbiased variance estimate.
+    # PHT samples are excluded: their truth labels duplicate their parent PDX
+    # samples, so including them would inflate sample counts and bias variance.
     from proteus_utils.proteus_utils import compute_gene_weights_from_zarr, compute_gene_variances_unclipped
-    print('Computing full-dataset gene variance for GVW evaluation...')
-    all_zarr_paths = _collect_zarr_paths(training_set_tsv, zarr_base)
+    print('Computing full-dataset gene variance for GVW evaluation (excluding PHT)...')
+    all_zarr_paths = _collect_zarr_paths(training_set_tsv, zarr_base, exclude_cohorts={'PHT'})
     full_tumor_variance = compute_gene_variances_unclipped(
         all_zarr_paths, label_key='flat/tumor_exp',
     )
     full_background_variance = compute_gene_variances_unclipped(
         all_zarr_paths, label_key='flat/background_exp',
     )
-    print(f'  Full-dataset tumor variance: {len(full_tumor_variance)} genes '
-          f'(range [{min(full_tumor_variance.values()):.3f}, {max(full_tumor_variance.values()):.3f}])')
-    print(f'  Full-dataset background variance: {len(full_background_variance)} genes '
-          f'(range [{min(full_background_variance.values()):.3f}, {max(full_background_variance.values()):.3f}])')
+    print(f'  Full-dataset tumor variance: {len(full_tumor_variance)} genes, '
+          f'n={len(all_zarr_paths)} samples, '
+          f'range [{min(full_tumor_variance.values()):.3f}, {max(full_tumor_variance.values()):.3f}]')
+    print(f'  Full-dataset background variance: {len(full_background_variance)} genes, '
+          f'n={len(all_zarr_paths)} samples, '
+          f'range [{min(full_background_variance.values()):.3f}, {max(full_background_variance.values()):.3f}]')
 
     # Build sample-name → cohort mapping for per-cohort validation metrics.
     # Uses the same cohort-prefix stripping as build_loaders_from_splits.
@@ -442,6 +452,97 @@ def train_model_cv(
             if sample.startswith(f"{cohort}_"):
                 sample_name = sample[len(cohort) + 1:]
             sample_to_cohort[sample_name] = cohort
+
+    # When source_groups is set, build sample→source mapping and compute
+    # per-source gene variance for GVW-CRPS / GVW-r evaluation.
+    # PHT samples are assigned to their parent PDX source using the same
+    # regex logic as build_loaders_from_splits.
+    sample_to_source: Optional[Dict[str, str]] = None
+    source_tumor_variance: Optional[Dict[str, Dict[str, float]]] = None
+    if source_groups:
+        import re
+        # Invert source_groups: cohort → source name.
+        _cohort_to_source: Dict[str, str] = {}
+        for src_name, cohorts in source_groups.items():
+            for coh in cohorts:
+                _cohort_to_source[coh] = src_name
+
+        # Collect known PDX sample names per cohort (for matching PHT names).
+        _pdx_sample_to_cohort: Dict[str, str] = {}
+        with open(training_set_tsv, 'r', newline='') as f:
+            reader = csv.DictReader(f, delimiter='\t')
+            for row in reader:
+                coh = row['Cohort'].strip()
+                samp = row['Sample'].strip()
+                if samp.startswith(f"{coh}_"):
+                    samp = samp[len(coh) + 1:]
+                if coh in _cohort_to_source:
+                    _pdx_sample_to_cohort[samp] = coh
+
+        _pht_re = re.compile(r'^PHT-Fold-\d+_(.+)-BP\d+')
+        sample_to_source = {}
+        _source_zarr_paths: Dict[str, List[str]] = {src: [] for src in source_groups}
+
+        with open(training_set_tsv, 'r', newline='') as f:
+            reader = csv.DictReader(f, delimiter='\t')
+            for row in reader:
+                cohort = row['Cohort'].strip()
+                sample = row['Sample'].strip()
+                sample_name = sample
+                if sample.startswith(f"{cohort}_"):
+                    sample_name = sample[len(cohort) + 1:]
+
+                if cohort in _cohort_to_source:
+                    source = _cohort_to_source[cohort]
+                elif cohort == 'PHT':
+                    m = _pht_re.match(sample_name)
+                    if m:
+                        pdx_name = m.group(1)
+                        pdx_coh = _pdx_sample_to_cohort.get(pdx_name)
+                        if pdx_coh is not None:
+                            source = _cohort_to_source[pdx_coh]
+                        else:
+                            raise ValueError(
+                                f"PHT sample '{sample_name}' has PDX name '{pdx_name}' "
+                                f"that does not match any known PDX sample. "
+                                f"Known: {sorted(_pdx_sample_to_cohort.keys())}"
+                            )
+                    else:
+                        raise ValueError(
+                            f"Could not parse PDX name from PHT sample: '{sample_name}'. "
+                            f"Expected format: PHT-Fold-X_<PDX_NAME>-BP..."
+                        )
+                else:
+                    continue  # cohort not in any source group
+
+                sample_to_source[sample_name] = source
+                zarr_path = os.path.join(
+                    zarr_base, cohort, 'zarr_files', f"{sample_name}.zarr",
+                )
+                if os.path.isdir(zarr_path):
+                    # Only non-PHT samples contribute to per-source variance.
+                    # PHT truth labels duplicate their parent PDX, so
+                    # including them would double-count and bias variance.
+                    if cohort != 'PHT':
+                        _source_zarr_paths[source].append(zarr_path)
+
+        # Compute per-source unclipped tumor variance (all 5 folds).
+        print('Computing per-source gene variance for GVW evaluation...')
+        source_tumor_variance = {}
+        for src_name in sorted(source_groups):
+            src_paths = _source_zarr_paths[src_name]
+            if src_paths:
+                source_tumor_variance[src_name] = compute_gene_variances_unclipped(
+                    src_paths, label_key='flat/tumor_exp',
+                )
+                vals = list(source_tumor_variance[src_name].values())
+                print(
+                    f'  Source "{src_name}": {len(vals)} genes, '
+                    f'variance range [{min(vals):.3f}, {max(vals):.3f}], '
+                    f'{len(src_paths)} samples'
+                )
+            else:
+                print(f'  Source "{src_name}": no zarr paths found — skipping')
 
     for fold_num in fold_list:
         if test_fold is not None and fold_num != test_fold:
@@ -461,9 +562,10 @@ def train_model_cv(
         # Compute per-gene variance weights from the K-1 training folds
         # (excluding the held-out validation fold).  Clipped variance weights
         # scale the CRPS loss so high-variance genes contribute more.
-        print(f'Computing gene variance weights from training folds (excluding fold {fold_num})...')
+        print(f'Computing gene variance weights from training folds (excluding fold {fold_num}, excluding PHT)...')
         train_zarr_paths = _collect_zarr_paths(
             training_set_tsv, zarr_base, exclude_fold=fold_num,
+            exclude_cohorts={'PHT'},
         )
         _raw_var = compute_gene_variances_unclipped(train_zarr_paths, label_key='flat/tumor_exp')
         gene_weights = compute_gene_weights_from_zarr(
@@ -471,7 +573,7 @@ def train_model_cv(
             label_key='flat/tumor_exp',
         )
         _raw_vals = list(_raw_var.values())
-        print(f'  {len(gene_weights)} genes — '
+        print(f'  {len(gene_weights)} genes, n={len(train_zarr_paths)} samples — '
               f'raw variance [{min(_raw_vals):.4f}, {max(_raw_vals):.4f}], '
               f'clipped to [0.100, 10.000]')
 
@@ -491,6 +593,8 @@ def train_model_cv(
             gene_weights=gene_weights,
             train_only_cohorts=train_only_cohorts,
             balance_cohorts=balance_cohorts,
+            source_groups=source_groups,
+            target_n_per_source=target_n_per_source,
         )
         print(f'Training batches: {train_steps}, Validation batches: {val_steps}')
         
@@ -514,6 +618,9 @@ def train_model_cv(
         trainer = Trainer(model, fold_training_config, model_config, device)
         trainer.val_gene_weight_map = full_tumor_variance
         trainer.val_background_gene_weight_map = full_background_variance
+        # Enable epoch-level per-group CRPS monitoring.  When source_groups
+        # is active, group by source (4 groups); otherwise by cohort.
+        trainer.val_sample_cohort_map = sample_to_source or sample_to_cohort or None
         history = trainer.fit(
             train_loader,
             val_loader,
@@ -546,6 +653,8 @@ def train_model_cv(
             full_tumor_variance=full_tumor_variance,
             full_background_variance=full_background_variance,
             sample_to_cohort=sample_to_cohort if sample_to_cohort else None,
+            sample_to_source=sample_to_source,
+            source_tumor_variance=source_tumor_variance,
         )
 
         # Per-fold plots
@@ -670,7 +779,6 @@ def _summarize_cv_results(out_dir: str) -> None:
             # Primary selection metric
             'score': float(t_metrics.get('gvw_crps', float('nan'))),
             'tumor_gvw_crps': float(t_metrics.get('gvw_crps', float('nan'))),
-            'tumor_gvw_mean_r2': float(t_metrics.get('gvw_mean_r2', float('nan'))),
 
             # Tumor regression summary
             'tumor_n': int(t_metrics.get('n', 0)),
@@ -688,7 +796,6 @@ def _summarize_cv_results(out_dir: str) -> None:
             'background_rmse': float(b_metrics.get('rmse', float('nan'))),
             'background_r2': float(b_metrics.get('r2', float('nan'))),
             'background_gvw_crps': float(b_metrics.get('gvw_crps', float('nan'))),
-            'background_gvw_mean_r2': float(b_metrics.get('gvw_mean_r2', float('nan'))),
         }
         fold_metrics.append(row)
 
@@ -733,6 +840,8 @@ def _save_fold_predictions(
     full_tumor_variance: Optional[Dict[str, float]] = None,
     full_background_variance: Optional[Dict[str, float]] = None,
     sample_to_cohort: Optional[Dict[str, str]] = None,
+    sample_to_source: Optional[Dict[str, str]] = None,
+    source_tumor_variance: Optional[Dict[str, Dict[str, float]]] = None,
 ):
     """Save MDN predictions, full distribution params, and quantile CIs for a validation fold.
 
@@ -786,6 +895,10 @@ def _save_fold_predictions(
 
     # Per-cohort CRPS accumulators (for balanced fine-tuning objective)
     _cohort_crps: Dict[str, List[torch.Tensor]] = {}  # cohort -> [t_sum, t_den]
+
+    # Per-source CRPS accumulators (when source_groups is active).
+    # Each source uses its own per-source variance as CRPS weights.
+    _source_crps: Dict[str, List[torch.Tensor]] = {}  # source -> [t_sum, t_den]
 
     with torch.no_grad():
         for features, labels in val_loader:
@@ -894,6 +1007,36 @@ def _save_fold_predictions(
                     _cohort_crps[coh][0] += cs.cpu()
                     _cohort_crps[coh][1] += cd.cpu()
 
+            # ---- Per-source GVW-CRPS (tumor, per-source variance weights) ----
+            if sample_to_source and source_tumor_variance and 'sample_name' in features:
+                batch_samples = features['sample_name']
+                if not isinstance(batch_samples, (list, tuple)):
+                    batch_samples = [batch_samples]
+                src_label = sample_to_source.get(str(batch_samples[0]))
+                if src_label is not None and src_label in source_tumor_variance:
+                    src_var = source_tumor_variance[src_label]
+                    gnames = features['gene_name']
+                    if isinstance(gnames, (list, tuple)):
+                        w_src = torch.tensor(
+                            [float(src_var.get(str(g), 1.0)) for g in gnames],
+                            dtype=torch.float32, device=device,
+                        ).unsqueeze(-1)
+                    else:
+                        w_src = torch.tensor(
+                            [[float(src_var.get(str(gnames), 1.0))]],
+                            dtype=torch.float32, device=device,
+                        )
+                    src_cs, src_cd = mixture_crps(
+                        t_mdn, labels_device['tumor_exp'],
+                        sample_weight=w_src,
+                    )
+                    if src_label not in _source_crps:
+                        _source_crps[src_label] = [
+                            torch.tensor(0.0), torch.tensor(0.0),
+                        ]
+                    _source_crps[src_label][0] += src_cs.cpu()
+                    _source_crps[src_label][1] += src_cd.cpu()
+
             # Metadata
             sample_names = features['sample_name']
             gene_names = features['gene_name']
@@ -956,32 +1099,6 @@ def _save_fold_predictions(
     # GVW-CRPS
     t_metrics['gvw_crps'] = float((tumor_crps_sum / tumor_crps_denom).item()) if float(tumor_crps_denom.item()) > 0 else float('nan')
     b_metrics['gvw_crps'] = float((bg_crps_sum / bg_crps_denom).item()) if float(bg_crps_denom.item()) > 0 else float('nan')
-
-    # GVW-R² (mean-based) for both heads
-    def _weighted_r2(y: np.ndarray, yhat: np.ndarray, genes: list, weight_map: Optional[Dict[str, float]]) -> float:
-        mask = np.isfinite(y) & np.isfinite(yhat)
-        if mask.sum() < 2:
-            return float('nan')
-        y_m = y[mask]
-        yhat_m = yhat[mask]
-        if weight_map is not None:
-            genes_arr = np.asarray(genes)
-            w = np.array(
-                [float(weight_map.get(str(g), 1.0)) for g in genes_arr[mask]],
-                dtype=np.float64,
-            )
-        else:
-            w = np.ones(int(mask.sum()), dtype=np.float64)
-        ss_res = float(np.sum(w * (y_m - yhat_m) ** 2))
-        w_sum = float(np.sum(w))
-        w_mean_y = float(np.sum(w * y_m)) / w_sum
-        ss_tot = float(np.sum(w * (y_m - w_mean_y) ** 2))
-        if ss_tot < 1e-12:
-            return float('nan')
-        return 1.0 - ss_res / ss_tot
-
-    t_metrics['gvw_mean_r2'] = _weighted_r2(truth_t, pred_mean_t, all_genes, full_tumor_variance)
-    b_metrics['gvw_mean_r2'] = _weighted_r2(truth_b, pred_mean_b, all_genes, full_background_variance)
 
     # Gene-level and sample-level correlation summaries
     def _rankdata(x: np.ndarray) -> np.ndarray:
@@ -1052,7 +1169,7 @@ def _save_fold_predictions(
     t_metrics['quantile_coverage'] = _coverage(truth_t, q5_t, q95_t)
     b_metrics['quantile_coverage'] = _coverage(truth_b, q5_b, q95_b)
 
-    # ---- Per-cohort metrics (for balanced fine-tuning objective) ----
+    # ---- Per-cohort metrics (for balanced tuning objectives) ----
     per_cohort: Dict[str, Dict[str, Any]] = {}
     if sample_to_cohort:
         samples_arr = np.asarray(all_samples, dtype=object)
@@ -1070,16 +1187,53 @@ def _save_fold_predictions(
             c_bg = _compute_regression_metrics(
                 truth_b[mask_c], pred_mean_b[mask_c],
             )
-            c_tumor['gvw_mean_r2'] = _weighted_r2(
-                truth_t[mask_c], pred_mean_t[mask_c],
-                [g for g, m in zip(all_genes, mask_c) if m],
-                full_tumor_variance,
-            )
-            c_bg['gvw_mean_r2'] = _weighted_r2(
-                truth_b[mask_c], pred_mean_b[mask_c],
-                [g for g, m in zip(all_genes, mask_c) if m],
-                full_background_variance,
-            )
+
+            # Per-cohort GVW-r: per-gene Pearson r, variance-weighted
+            # average using per-cohort truth variance (computed from
+            # the genes present in this cohort's validation data).
+            c_genes = [g for g, m in zip(all_genes, mask_c) if m]
+            c_truth_t = truth_t[mask_c]
+            c_pred_t = pred_mean_t[mask_c]
+            c_truth_b = truth_b[mask_c]
+            c_pred_b = pred_mean_b[mask_c]
+
+            def _gvw_r(truth_vec, pred_vec, genes_vec, external_var=None):
+                """Per-gene Pearson r, variance-weighted average.
+
+                If *external_var* (gene-name → variance dict) is given, use
+                those variances as weights; otherwise compute variance from
+                the truth values for each gene within this group.
+                """
+                df_tmp = pd.DataFrame({
+                    'truth': truth_vec,
+                    'pred': pred_vec,
+                    'gene': genes_vec,
+                })
+                gene_r_vals = []
+                gene_var_vals = []
+                for gname, sub in df_tmp.groupby('gene'):
+                    y = sub['truth'].to_numpy(dtype=np.float64)
+                    yhat = sub['pred'].to_numpy(dtype=np.float64)
+                    m = np.isfinite(y) & np.isfinite(yhat)
+                    if int(m.sum()) < 3:
+                        continue
+                    r = _pearson_r(y[m], yhat[m])
+                    if external_var is not None:
+                        v = external_var.get(str(gname), 0.0)
+                    else:
+                        v = float(np.var(y[m]))
+                    if np.isfinite(r) and v > 0:
+                        gene_r_vals.append(r)
+                        gene_var_vals.append(v)
+                if not gene_r_vals:
+                    return float('nan')
+                r_arr = np.asarray(gene_r_vals, dtype=np.float64)
+                v_arr = np.asarray(gene_var_vals, dtype=np.float64)
+                return float(np.average(r_arr, weights=v_arr))
+
+            c_tumor['gvw_r'] = _gvw_r(c_truth_t, c_pred_t, c_genes)
+            c_bg['gvw_r'] = _gvw_r(c_truth_b, c_pred_b, c_genes)
+
             # Per-cohort GVW-CRPS from streaming accumulators
             if cohort_name in _cohort_crps:
                 s, d = _cohort_crps[cohort_name]
@@ -1092,6 +1246,52 @@ def _save_fold_predictions(
                 'background': c_bg,
             }
 
+    # ---- Per-source metrics (when source_groups active) ----
+    per_source: Dict[str, Dict[str, Any]] = {}
+    if sample_to_source and source_tumor_variance:
+        samples_arr = np.asarray(all_samples, dtype=object)
+        source_arr = np.array(
+            [sample_to_source.get(str(s), 'unknown') for s in samples_arr],
+            dtype=object,
+        )
+        for source_name in sorted(set(source_arr)):
+            if source_name == 'unknown':
+                continue
+            mask_s = source_arr == source_name
+            if mask_s.sum() == 0:
+                continue
+            s_tumor = _compute_regression_metrics(
+                truth_t[mask_s], pred_mean_t[mask_s],
+            )
+            s_bg = _compute_regression_metrics(
+                truth_b[mask_s], pred_mean_b[mask_s],
+            )
+
+            s_genes = [g for g, m in zip(all_genes, mask_s) if m]
+            s_truth_t = truth_t[mask_s]
+            s_pred_t = pred_mean_t[mask_s]
+            s_truth_b = truth_b[mask_s]
+            s_pred_b = pred_mean_b[mask_s]
+
+            # Per-source GVW-r: variance weights from all 5 folds for
+            # this source (precomputed in source_tumor_variance).
+            src_var = source_tumor_variance.get(source_name)
+            s_tumor['gvw_r'] = _gvw_r(s_truth_t, s_pred_t, s_genes, external_var=src_var)
+            s_bg['gvw_r'] = _gvw_r(s_truth_b, s_pred_b, s_genes)
+
+            # Per-source GVW-CRPS from streaming accumulators
+            # (accumulated with per-source variance weights).
+            if source_name in _source_crps:
+                s_sum, s_den = _source_crps[source_name]
+                s_tumor['gvw_crps'] = (
+                    float((s_sum / s_den).item()) if float(s_den.item()) > 0
+                    else float('nan')
+                )
+            per_source[source_name] = {
+                'tumor': s_tumor,
+                'background': s_bg,
+            }
+
     metrics = {
         'fold': int(fold_num),
         'tumor': t_metrics,
@@ -1099,30 +1299,84 @@ def _save_fold_predictions(
     }
     if per_cohort:
         metrics['per_cohort'] = per_cohort
-        # Balanced tumor metric: equal-weight average of per-cohort GVW-CRPS
-        # across patient cohorts (excludes PDX admixtures whose cohort
-        # typically starts with 'PH').
+    if per_source:
+        metrics['per_source'] = per_source
+
+    # Balanced metrics: when source mode is active, average across sources
+    # (all sources count, including those containing PHT samples).
+    # Otherwise, fall back to cohort-level averaging with PH* exclusion.
+    if per_source:
+        source_gvw_crps = [
+            v['tumor'].get('gvw_crps', float('nan'))
+            for v in per_source.values()
+        ]
+        source_gvw_r = [
+            v['tumor'].get('gvw_r', float('nan'))
+            for v in per_source.values()
+        ]
+        finite_crps = [x for x in source_gvw_crps if np.isfinite(x)]
+        finite_r = [x for x in source_gvw_r if np.isfinite(x)]
+        metrics['balanced_tumor_gvw_crps'] = (
+            float(np.mean(finite_crps)) if finite_crps else float('nan')
+        )
+        metrics['balanced_tumor_gvw_crps_std'] = (
+            float(np.std(finite_crps)) if len(finite_crps) > 1 else float('nan')
+        )
+        metrics['balanced_tumor_gvw_r'] = (
+            float(np.mean(finite_r)) if finite_r else float('nan')
+        )
+        metrics['balanced_tumor_gvw_r_std'] = (
+            float(np.std(finite_r)) if len(finite_r) > 1 else float('nan')
+        )
+    elif per_cohort:
         patient_gvw_crps = [
             v['tumor'].get('gvw_crps', float('nan'))
             for k, v in per_cohort.items()
             if not k.startswith('PH')
         ]
-        finite_vals = [x for x in patient_gvw_crps if np.isfinite(x)]
+        patient_gvw_r = [
+            v['tumor'].get('gvw_r', float('nan'))
+            for k, v in per_cohort.items()
+            if not k.startswith('PH')
+        ]
+        finite_crps = [x for x in patient_gvw_crps if np.isfinite(x)]
+        finite_r = [x for x in patient_gvw_r if np.isfinite(x)]
         metrics['balanced_tumor_gvw_crps'] = (
-            float(np.mean(finite_vals)) if finite_vals else float('nan')
+            float(np.mean(finite_crps)) if finite_crps else float('nan')
         )
+        metrics['balanced_tumor_gvw_crps_std'] = (
+            float(np.std(finite_crps)) if len(finite_crps) > 1 else float('nan')
+        )
+        metrics['balanced_tumor_gvw_r'] = (
+            float(np.mean(finite_r)) if finite_r else float('nan')
+        )
+        metrics['balanced_tumor_gvw_r_std'] = (
+            float(np.std(finite_r)) if len(finite_r) > 1 else float('nan')
+        )
+
     with open(os.path.join(fold_dir, f'validation-fold_{fold_num}_metrics.json'), 'w') as f:
         json.dump(metrics, f, indent=2)
 
     print(
         f'Fold {fold_num} tumor metrics: '
         f'gvw_crps={t_metrics.get("gvw_crps", float("nan")):.4f} '
-        f'gvw_mean_r2={t_metrics.get("gvw_mean_r2", float("nan")):.4f} '
         f'gene_r2(mean/med)={t_metrics.get("gene_r2_mean", float("nan")):.4f}/'
         f'{t_metrics.get("gene_r2_median", float("nan")):.4f} '
         f'sample_r2(mean/med)={t_metrics.get("sample_r2_mean", float("nan")):.4f}/'
         f'{t_metrics.get("sample_r2_median", float("nan")):.4f}'
     )
+    if per_source:
+        for src_name, src_data in sorted(per_source.items()):
+            crps_str = f'{src_data["tumor"].get("gvw_crps", float("nan")):.4f}'
+            r_str = f'{src_data["tumor"].get("gvw_r", float("nan")):.4f}'
+            print(f'  source {src_name}: gvw_crps={crps_str} gvw_r={r_str}')
+        balanced_crps_str = f'{metrics.get("balanced_tumor_gvw_crps", float("nan")):.4f}'
+        balanced_r_str = f'{metrics.get("balanced_tumor_gvw_r", float("nan")):.4f}'
+        print(f'  balanced_gvw_crps={balanced_crps_str} balanced_gvw_r={balanced_r_str}')
+    elif per_cohort:
+        balanced_crps_str = f'{metrics.get("balanced_tumor_gvw_crps", float("nan")):.4f}'
+        balanced_r_str = f'{metrics.get("balanced_tumor_gvw_r", float("nan")):.4f}'
+        print(f'  balanced_gvw_crps={balanced_crps_str} balanced_gvw_r={balanced_r_str}')
 
     # ---- Plots (per fold) ----
     try:
@@ -1909,6 +2163,7 @@ def main():
                 'BioDVN':        'proteus_base-model',
                 'BioDVN_NoSeq':  'proteus_base-model_no-seq',
                 'BioDVN_OnlySeq':'proteus_base-model_only-seq',
+                'BioDVN_PAN-FT': 'proteus_PAN-FT',
             }
             dir_name = _MODEL_DIR_MAP.get(args.model_name)
             if dir_name is None:
