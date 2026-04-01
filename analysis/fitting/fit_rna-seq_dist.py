@@ -289,9 +289,9 @@ def main():
     pdf_norm_comp = pi_norm * norm.pdf(xvals, loc=mu, scale=sigma)
     pdf_continuous = pdf_gam_comp + pdf_norm_comp
 
-    fig, axes = plt.subplots(2, 1, figsize=(10, 10), gridspec_kw={'height_ratios': [3, 1]})
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7.5))
 
-    # --- Top panel: PDF overlay ---
+    # --- Left panel: PDF overlay (log-scale density) ---
     ax = axes[0]
     hist_counts, hist_edges = np.histogram(data_pos, bins=100, density=True)
     hist_density = hist_counts * (1.0 - pi_delta)
@@ -305,7 +305,7 @@ def main():
     ax.annotate(f'δ(0)\nπ={pi_delta:.3f}',
                 xy=(0, pdf_continuous.max() * 0.85),
                 xytext=(0.8, pdf_continuous.max() * 0.9),
-                fontsize=10, color='red',
+                fontsize=13, color='red',
                 arrowprops=dict(arrowstyle='->', color='red'))
 
     ax.plot(xvals, pdf_continuous, 'k-', lw=2.5, label='Fitted continuous mixture')
@@ -314,14 +314,16 @@ def main():
     ax.plot(xvals, pdf_norm_comp, '--', color='green', lw=1.5,
             label=f'N(μ={mu:.2f}, σ={sigma:.2f})  π={pi_norm:.3f}')
 
-    ax.set_xlabel('log₂(CPM + 1)')
-    ax.set_ylabel('Density')
-    ax.set_title('Mixture Fit: δ(0) + Gamma(k,β) + Normal')
-    ax.legend(fontsize=9)
+    ax.set_ylim(0, 1.0)
+    ax.set_xlabel('log₂(CPM + 1)', fontsize=14)
+    ax.set_ylabel('Density', fontsize=14)
+    ax.set_title('Mixture Fit: δ(0) + Gamma(k,β) + Normal', fontsize=15)
+    ax.legend(fontsize=12)
     ax.set_xlim(0, x_max)
-    ax.set_ylim(bottom=0)
+    ax.tick_params(labelsize=12)
+    ax.set_aspect(1.0 / ax.get_data_ratio(), adjustable='box')
 
-    # --- Bottom panel: CDF comparison ---
+    # --- Right panel: CDF comparison ---
     ax2 = axes[1]
     sorted_data = np.sort(raw_data)
     ecdf = np.arange(1, len(sorted_data) + 1) / len(sorted_data)
@@ -333,10 +335,13 @@ def main():
 
     ax2.plot(sorted_data, ecdf, 'steelblue', lw=1.5, label='Empirical CDF')
     ax2.plot(sorted_data, fitted_cdf, 'k--', lw=1.5, label='Fitted CDF')
-    ax2.set_xlabel('log₂(CPM + 1)')
-    ax2.set_ylabel('CDF')
-    ax2.legend()
+    ax2.set_xlabel('log₂(CPM + 1)', fontsize=14)
+    ax2.set_ylabel('CDF', fontsize=14)
+    ax2.set_title('CDF Comparison', fontsize=15)
+    ax2.legend(fontsize=12)
     ax2.set_xlim(0, x_max)
+    ax2.tick_params(labelsize=12)
+    ax2.set_aspect(1.0 / ax2.get_data_ratio(), adjustable='box')
 
     plt.tight_layout()
     plt.savefig("MDN_Mixture_Fit.pdf", dpi=150)

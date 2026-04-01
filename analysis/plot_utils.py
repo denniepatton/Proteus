@@ -597,11 +597,13 @@ def metric_distribution(
     *,
     xlim: Optional[Tuple[float, float]] = None,
     square: bool = False,
+    log_y: bool = False,
 ) -> None:
     """Histogram + KDE of a per-gene or per-sample metric.
 
     If ``square`` is True, figure uses equal aspect and a dashed gray
     vertical line is drawn at x=0.
+    If ``log_y`` is True, the y-axis uses a log scale.
     """
     _ensure_dir(name)
     vals = values.dropna()
@@ -620,6 +622,8 @@ def metric_distribution(
     ax.legend(fontsize=9)
     if xlim:
         ax.set_xlim(xlim)
+    if log_y:
+        ax.set_yscale("log")
     if square:
         ax.set_box_aspect(1)
     ax.set_title(f"Distribution of {metric_name} (n={len(vals):,})")
@@ -1638,6 +1642,222 @@ def benchmark_cohort_metrics_lines(
     fig.suptitle("Benchmark Metrics by Cohort",
                  fontsize=13, fontweight="bold")
     fig.tight_layout(rect=[0, 0.04, 1, 0.97])
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Volcano plot (limma DE results)
+# ---------------------------------------------------------------------------
+
+def volcano_plot(
+    de_results: pd.DataFrame,
+    name: str,
+    padj_thresh: float = 0.05,
+    lfc_thresh: float = 1.0,
+    contrast_name: str = "NEPC-ARPC",
+    n_label: int = 20,
+) -> None:
+    """Volcano plot from limma topTable results.
+
+    Args:
+        de_results: DataFrame with logFC, adj.P.Val columns (gene names as index).
+        name: Output file stem (saves {name}.pdf).
+        padj_thresh: Adjusted p-value significance threshold.
+        lfc_thresh: Absolute log2 fold-change threshold.
+        contrast_name: Contrast string (group2-group1) for axis label.
+        n_label: Number of top genes to label.
+    """
+    _ensure_dir(os.path.dirname(name))
+    pal = _palette()
+
+    # Parse contrast for colors: "NEPC-ARPC" → up_group=NEPC, down_group=ARPC
+    parts = contrast_name.split("-", 1)
+    up_group = parts[0]          # positive logFC direction
+    down_group = parts[1] if len(parts) > 1 else "Down"
+    up_color = pal.get(up_group, "#EE7733")
+    down_color = pal.get(down_group, "#0077BB")
+    ns_color = "#BBBBBB"
+
+    logfc = de_results["logFC"].values
+    neg_log_p = -np.log10(de_results["adj.P.Val"].clip(lower=1e-300).values)
+    genes = de_results.index.astype(str).values
+
+    sig_up = (logfc > lfc_thresh) & (de_results["adj.P.Val"].values < padj_thresh)
+    sig_down = (logfc < -lfc_thresh) & (de_results["adj.P.Val"].values < padj_thresh)
+    ns = ~(sig_up | sig_down)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+
+    ax.scatter(logfc[ns], neg_log_p[ns], c=ns_color, s=6, alpha=0.4,
+               linewidths=0, rasterized=True, label="NS")
+    ax.scatter(logfc[sig_down], neg_log_p[sig_down], c=down_color, s=14,
+               alpha=0.7, linewidths=0, label=f"{down_group}-up ({sig_down.sum()})")
+    ax.scatter(logfc[sig_up], neg_log_p[sig_up], c=up_color, s=14,
+               alpha=0.7, linewidths=0, label=f"{up_group}-up ({sig_up.sum()})")
+
+    # Threshold lines
+    ax.axhline(-np.log10(padj_thresh), ls="--", lw=0.7, color="grey", alpha=0.6)
+    ax.axvline(lfc_thresh, ls="--", lw=0.7, color="grey", alpha=0.6)
+    ax.axvline(-lfc_thresh, ls="--", lw=0.7, color="grey", alpha=0.6)
+
+    # Label top genes by adjusted p-value among significant
+    sig_mask = sig_up | sig_down
+    if sig_mask.any():
+        sig_idx = np.where(sig_mask)[0]
+        top_idx = sig_idx[np.argsort(de_results["adj.P.Val"].values[sig_idx])[:n_label]]
+        for i in top_idx:
+            ax.annotate(
+                genes[i], (logfc[i], neg_log_p[i]),
+                fontsize=6, alpha=0.85,
+                textcoords="offset points", xytext=(4, 4),
+                path_effects=[
+                    PathEffects.withStroke(linewidth=2, foreground="white"),
+                ],
+            )
+
+    ax.set_xlabel(f"log$_2$ FC ({contrast_name})", fontsize=12)
+    ax.set_ylabel(r"$-\log_{10}$(adj. p-value)", fontsize=12)
+    ax.set_title(f"Differential Expression: {contrast_name}", fontsize=13,
+                 fontweight="bold")
+    ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+    ax.grid(True, alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Enrichment dot plot (GSEA results)
+# ---------------------------------------------------------------------------
+
+def enrichment_dot_plot(
+    gsea_df: pd.DataFrame,
+    name: str,
+    contrast_name: str = "NEPC-ARPC",
+    fdr_thresh: float = 0.25,
+    n_top: int = 30,
+    title: Optional[str] = None,
+) -> None:
+    """Dot plot of GSEA pathway enrichment results.
+
+    Args:
+        gsea_df: DataFrame with columns: Term, NES, FDR q-val (or fdr),
+            and optionally FWER p-val.  One row per gene set.
+        name: Output file stem (saves {name}.pdf).
+        contrast_name: Contrast string for color assignment (e.g. "NEPC-ARPC").
+        fdr_thresh: FDR threshold for significance annotation line.
+        n_top: Max pathways to show (by FDR).
+        title: Plot title (default: "GSEA: {contrast_name}").
+    """
+    _ensure_dir(os.path.dirname(name))
+    pal = _palette()
+
+    # Standardise column names (gseapy uses different names across versions)
+    df = gsea_df.copy()
+
+    # Find the first matching column for each required field
+    _term_candidates = ["Term", "term", "Name"]
+    _nes_candidates = ["NES", "nes"]
+    _fdr_candidates = ["FDR q-val", "fdr", "FDR"]
+
+    def _pick(cols: Sequence[str], candidates: list) -> Optional[str]:
+        for c in candidates:
+            if c in cols:
+                return c
+        return None
+
+    orig_cols = list(df.columns)
+    term_col = _pick(orig_cols, _term_candidates)
+    nes_col = _pick(orig_cols, _nes_candidates)
+    fdr_col = _pick(orig_cols, _fdr_candidates)
+
+    if not all([term_col, nes_col, fdr_col]):
+        warnings.warn(f"enrichment_dot_plot: missing required columns in {orig_cols}")
+        return
+
+    df = df.rename(columns={term_col: "term", nes_col: "nes", fdr_col: "fdr"})
+    # Drop any remaining duplicate columns from the rename
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    df["fdr"] = pd.to_numeric(df["fdr"], errors="coerce")
+    df["nes"] = pd.to_numeric(df["nes"], errors="coerce")
+    df = df.dropna(subset=["fdr", "nes"])
+    if df.empty:
+        return
+
+    # Sort by FDR, take top n
+    df = df.sort_values("fdr").head(n_top).copy()
+
+    # Clean pathway names: strip HALLMARK_ prefix, replace _ with space
+    df["label"] = (
+        df["term"]
+        .str.replace("^HALLMARK_", "", regex=True)
+        .str.replace("_", " ")
+    )
+    # Sort by NES for visual grouping
+    df = df.sort_values("nes")
+
+    # Colors based on direction
+    parts = contrast_name.split("-", 1)
+    up_group = parts[0]
+    down_group = parts[1] if len(parts) > 1 else "Down"
+    up_color = pal.get(up_group, "#EE7733")
+    down_color = pal.get(down_group, "#0077BB")
+
+    colors = [up_color if nes > 0 else down_color for nes in df["nes"].values]
+
+    # Dot size: -log10(FDR), clamped
+    neg_log_fdr = -np.log10(df["fdr"].clip(lower=1e-10).values)
+    # Scale to reasonable point sizes
+    size_min, size_max = 30, 250
+    if neg_log_fdr.max() > neg_log_fdr.min():
+        sizes = size_min + (size_max - size_min) * (
+            (neg_log_fdr - neg_log_fdr.min()) / (neg_log_fdr.max() - neg_log_fdr.min())
+        )
+    else:
+        sizes = np.full_like(neg_log_fdr, (size_min + size_max) / 2)
+
+    fig_height = max(4, 0.35 * len(df))
+    fig, ax = plt.subplots(figsize=(7, fig_height))
+
+    y_pos = np.arange(len(df))
+    ax.scatter(df["nes"].values, y_pos, c=colors, s=sizes,
+               alpha=0.8, edgecolors="white", linewidths=0.5)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(df["label"].values, fontsize=8)
+    ax.axvline(0, color="grey", ls="-", lw=0.6, alpha=0.5)
+
+    # FDR threshold annotation
+    sig_count = int((df["fdr"] < fdr_thresh).sum())
+    ax.set_xlabel("Normalized Enrichment Score (NES)", fontsize=11)
+    ax.set_title(title or f"GSEA: {contrast_name}", fontsize=13, fontweight="bold")
+
+    # Legend for direction
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=up_color,
+               markersize=8, label=f"{up_group}-enriched"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=down_color,
+               markersize=8, label=f"{down_group}-enriched"),
+    ]
+    # Size legend (small / large)
+    for fdr_val, lbl in [(0.05, "FDR=0.05"), (0.001, "FDR=0.001")]:
+        sz = size_min + (size_max - size_min) * (
+            (-np.log10(fdr_val) - neg_log_fdr.min())
+            / max(neg_log_fdr.max() - neg_log_fdr.min(), 1e-6)
+        )
+        sz = np.clip(sz, size_min, size_max)
+        legend_elements.append(
+            Line2D([0], [0], marker="o", color="w", markerfacecolor="#888888",
+                   markersize=np.sqrt(sz) * 0.6, label=lbl),
+        )
+    ax.legend(handles=legend_elements, loc="lower right", fontsize=7,
+              framealpha=0.8, handletextpad=0.5)
+
+    ax.grid(True, axis="x", alpha=0.2)
+    fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
 

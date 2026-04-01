@@ -35,6 +35,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from analysis.analysis_utils import (
     _flatten_wide_pair,
+    _gvw_r_from_wide,
+    _gvw_rho_from_wide,
     build_study_truth_pool,
     clean_epicseq_sample_names,
     cohort_summary_table,
@@ -103,6 +105,8 @@ from analysis.plot_utils import (
     sample_expression_kde,
     sample_scatter,
     single_heatmap,
+    volcano_plot,
+    enrichment_dot_plot,
 )
 
 # ---------------------------------------------------------------------------
@@ -1291,6 +1295,8 @@ def _run_ihc_analysis(
     print(f"    ── IHC correlation ({cohort}) ──")
 
     ihc_df = pd.read_csv(ihc_path, sep="\t")
+    # Strip whitespace from sample names (some IHC files have trailing spaces)
+    ihc_df["sample"] = ihc_df["sample"].str.strip()
     ihc_df = ihc_df.set_index("sample")
 
     # Parse protein columns: use _mean columns (or _final for PSA).
@@ -1685,8 +1691,8 @@ def run_patient_validation_base(args: argparse.Namespace) -> None:
 # Format: (cohort_predictions_dir_name, subtype_label_name_or_None).
 # subtype_label_name maps to labels/{name}_TFX_Subtype.tsv for annotation.
 _DISCOVERY_COHORTS: List[Tuple[str, Optional[str]]] = [
-    ("CRPC-Pluvicto", "Pluvicto"),
-    ("CRPC-UW", "UW"),
+    ("CRPC-Pluvicto", "CRPC-Pluvicto"),
+    ("CRPC-UW", "CRPC-UW"),
     ("BC-Ghana", None),
 ]
 
@@ -1695,6 +1701,273 @@ _DISCOVERY_MODELS = [
     ("Proteus_Tuned", "results_holdout/BioDVN_PAN-FT/{cohort}/predictions_tumor.tsv"),
     ("Proteus_Base", "results_holdout/BioDVN/{cohort}/predictions_tumor.tsv"),
 ]
+
+# GMT files for GSEA
+_GSEA_HALLMARK_GMT = PROJECT_ROOT / "reference" / "h.all.v2026.1.Hs.symbols.gmt"
+_GSEA_SHORTLIST_GMT = PROJECT_ROOT / "reference" / "gsva_genesets_shortlist.gmt"
+_GSEA_SHORTLIST_SETS = {"ARG.10", "NE.10", "CCP.31"}
+
+
+def _load_gmt(path: Path) -> Dict[str, List[str]]:
+    """Parse a GMT file → {set_name: [gene_symbols]}."""
+    genesets: Dict[str, List[str]] = {}
+    with open(path) as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                continue
+            name = parts[0]
+            # parts[1] is description/URL, parts[2:] are genes
+            genesets[name] = [g for g in parts[2:] if g]
+    return genesets
+
+
+def _build_entrez_to_symbol() -> Dict[str, str]:
+    """Build Entrez ID → gene symbol map from MANE reference."""
+    ref_path = PROJECT_ROOT / "reference" / "MANE.GRCh38.v1.3.UniversalReference.tsv"
+    mapping: Dict[str, str] = {}
+    with open(ref_path) as fh:
+        header = fh.readline()
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 4:
+                continue
+            # Column 0: "GeneID:123", Column 3: symbol
+            gene_id_raw = parts[0]  # e.g. "GeneID:354"
+            symbol = parts[3]
+            entrez = gene_id_raw.replace("GeneID:", "")
+            if entrez and symbol:
+                mapping[entrez] = symbol
+    return mapping
+
+
+def _convert_entrez_gmt(
+    genesets: Dict[str, List[str]],
+) -> Dict[str, List[str]]:
+    """Convert Entrez-ID gene sets to gene symbols via MANE reference."""
+    e2s = _build_entrez_to_symbol()
+    converted: Dict[str, List[str]] = {}
+    for name, entrez_ids in genesets.items():
+        symbols = []
+        unmapped = []
+        for eid in entrez_ids:
+            sym = e2s.get(eid)
+            if sym:
+                symbols.append(sym)
+            else:
+                unmapped.append(eid)
+        if unmapped:
+            print(f"    GSEA: {name}: {len(unmapped)} unmapped Entrez IDs: "
+                  f"{unmapped[:5]}{'...' if len(unmapped) > 5 else ''}")
+        converted[name] = symbols
+    return converted
+
+
+def _run_gsea(
+    de_results: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+    contrast: str = "NEPC-ARPC",
+) -> None:
+    """Run GSEA (prerank) on limma DE results using gseapy.
+
+    Runs against Hallmark pathways and the CRPC shortlist gene sets
+    (ARG.10, NE.10, CCP.31).  Saves results TSVs and enrichment dot plots.
+    """
+    import gseapy as gp
+
+    # Build ranked gene list: gene → limma t-statistic (better ranking than logFC
+    # because it accounts for variance, recommended for GSEA prerank)
+    if "t" in de_results.columns:
+        rank_col = "t"
+    else:
+        rank_col = "logFC"
+    rank_series = de_results[rank_col].dropna()
+    rank_series = rank_series[~rank_series.index.duplicated(keep="first")]
+    rank_series = rank_series.sort_values(ascending=False)
+
+    gsea_out = ensure_dir(os.path.join(out_dir, "GSEA"))
+
+    # --- (1) Hallmark pathways ---
+    if _GSEA_HALLMARK_GMT.exists():
+        hallmark_sets = _load_gmt(_GSEA_HALLMARK_GMT)
+        print(f"    GSEA Hallmark: {len(hallmark_sets)} gene sets, "
+              f"{len(rank_series)} ranked genes")
+
+        hallmark_out = ensure_dir(os.path.join(gsea_out, "Hallmark"))
+        hallmark_tsv = os.path.join(hallmark_out, "gsea_hallmark_results.tsv")
+
+        if overwrite or not os.path.exists(hallmark_tsv):
+            res_h = gp.prerank(
+                rnk=rank_series,
+                gene_sets=hallmark_sets,
+                outdir=hallmark_out,
+                min_size=10,
+                max_size=500,
+                permutation_num=1000,
+                seed=42,
+                no_plot=True,
+                verbose=False,
+            )
+            res_h_df = res_h.res2d
+            res_h_df.to_csv(hallmark_tsv, sep="\t", index=False)
+            print(f"    Saved: {hallmark_tsv}")
+        else:
+            res_h_df = pd.read_csv(hallmark_tsv, sep="\t")
+
+        # Enrichment dot plot
+        _maybe(enrichment_dot_plot, overwrite, res_h_df,
+               os.path.join(hallmark_out, "enrichment_dotplot_hallmark"),
+               contrast_name=contrast, title="GSEA Hallmark Pathways")
+
+        sig_h = res_h_df[pd.to_numeric(res_h_df.get("FDR q-val", res_h_df.get("fdr", pd.Series())),
+                                       errors="coerce") < 0.25]
+        print(f"    Hallmark: {len(sig_h)} sets at FDR<0.25")
+    else:
+        print(f"    [skip] Hallmark GMT not found: {_GSEA_HALLMARK_GMT}")
+
+    # --- (2) CRPC shortlist (Entrez → Symbol) ---
+    if _GSEA_SHORTLIST_GMT.exists():
+        raw_sets = _load_gmt(_GSEA_SHORTLIST_GMT)
+        # Filter to requested sets
+        raw_sets = {k: v for k, v in raw_sets.items() if k in _GSEA_SHORTLIST_SETS}
+        if raw_sets:
+            converted_sets = _convert_entrez_gmt(raw_sets)
+            for name, genes in converted_sets.items():
+                print(f"    GSEA shortlist: {name} → {len(genes)} genes "
+                      f"(e.g. {', '.join(genes[:4])})")
+
+            shortlist_out = ensure_dir(os.path.join(gsea_out, "Shortlist"))
+            shortlist_tsv = os.path.join(shortlist_out, "gsea_shortlist_results.tsv")
+
+            if overwrite or not os.path.exists(shortlist_tsv):
+                res_s = gp.prerank(
+                    rnk=rank_series,
+                    gene_sets=converted_sets,
+                    outdir=shortlist_out,
+                    min_size=3,
+                    max_size=500,
+                    permutation_num=1000,
+                    seed=42,
+                    no_plot=True,
+                    verbose=False,
+                )
+                res_s_df = res_s.res2d
+                res_s_df.to_csv(shortlist_tsv, sep="\t", index=False)
+                print(f"    Saved: {shortlist_tsv}")
+            else:
+                res_s_df = pd.read_csv(shortlist_tsv, sep="\t")
+
+            # Enrichment dot plot
+            _maybe(enrichment_dot_plot, overwrite, res_s_df,
+                   os.path.join(shortlist_out, "enrichment_dotplot_shortlist"),
+                   contrast_name=contrast,
+                   title="GSEA: ARG.10 / NE.10 / CCP.31")
+
+            # Print per-set summary
+            for _, row in res_s_df.iterrows():
+                fdr_col = "FDR q-val" if "FDR q-val" in res_s_df.columns else "fdr"
+                nes_col = "NES" if "NES" in res_s_df.columns else "nes"
+                term_col = "Term" if "Term" in res_s_df.columns else "Name"
+                print(f"      {row.get(term_col, '?')}: "
+                      f"NES={float(row.get(nes_col, float('nan'))):.3f}, "
+                      f"FDR={float(row.get(fdr_col, float('nan'))):.3g}")
+    else:
+        print(f"    [skip] Shortlist GMT not found: {_GSEA_SHORTLIST_GMT}")
+
+
+def _run_limma_de(
+    pred_wide: pd.DataFrame,
+    subtypes_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+    contrast: str = "NEPC-ARPC",
+    padj_thresh: float = 0.05,
+    lfc_thresh: float = 1.0,
+) -> Optional[pd.DataFrame]:
+    """Run limma DE on predicted expression between two subtypes via rpy2.
+
+    Returns the full topTable DataFrame, or None if skipped.
+    """
+    # Parse contrast to get the two groups
+    groups_in_contrast = contrast.replace(" ", "").split("-")
+    if len(groups_in_contrast) != 2:
+        raise ValueError(f"Contrast must be 'GroupA-GroupB', got: {contrast}")
+    required_groups = set(groups_in_contrast)
+
+    # Filter to samples with a subtype in the contrast
+    valid = subtypes_df[subtypes_df["subtype"].isin(required_groups)]
+    common = [s for s in pred_wide.columns if s in valid.index]
+
+    if len(common) < 3:
+        print(f"    [skip] limma DE: only {len(common)} samples in {required_groups}")
+        return None
+
+    expr = pred_wide[common]
+
+    # Gene filtering before limma
+    n_total = expr.shape[0]
+
+    # (1) Drop genes with any NA
+    na_mask = expr.isna().any(axis=1)
+    n_na = int(na_mask.sum())
+    expr = expr[~na_mask]
+
+    # (2) Keep genes with log2(CPM+1) > 1.0 in at least 3 samples
+    expressed_mask = (expr > 1.0).sum(axis=1) >= 3
+    n_low = int((~expressed_mask).sum())
+    expr = expr[expressed_mask]
+
+    print(f"    Gene filter: {n_total} total → dropped {n_na} NA, "
+          f"{n_low} low-expression → {expr.shape[0]} genes retained")
+
+    if expr.shape[0] == 0:
+        print("    [skip] limma DE: no genes passed filtering")
+        return None
+
+    groups = valid.loc[common, "subtype"].values
+    counts = {g: int((groups == g).sum()) for g in groups_in_contrast}
+    print(f"    limma-trend DE: {' vs '.join(f'{counts[g]} {g}' for g in groups_in_contrast)} "
+          f"({expr.shape[0]} genes)")
+
+    # rpy2 bridge
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+
+    r_script = str(PROJECT_ROOT / "analysis" / "limma_de.R")
+    ro.r.source(r_script)
+
+    converter = ro.default_converter + pandas2ri.converter
+    with localconverter(converter):
+        r_expr = ro.conversion.get_conversion().py2rpy(expr)
+        r_groups = ro.StrVector(list(groups))
+        de_r = ro.globalenv["run_limma_de"](r_expr, r_groups, contrast)
+        de_results = ro.conversion.get_conversion().rpy2py(de_r)
+
+    # Save TSV
+    de_path = os.path.join(out_dir, f"limma_DE_{contrast.replace('-', '_vs_')}.tsv")
+    de_results.to_csv(de_path, sep="\t")
+    print(f"    Saved DE results: {de_path}")
+
+    # Volcano plot
+    _maybe(volcano_plot, overwrite, de_results,
+           os.path.join(out_dir, f"volcano_{contrast.replace('-', '_vs_')}"),
+           padj_thresh=padj_thresh, lfc_thresh=lfc_thresh,
+           contrast_name=contrast)
+
+    # Summary
+    sig = de_results[
+        (de_results["adj.P.Val"] < padj_thresh)
+        & (de_results["logFC"].abs() > lfc_thresh)
+    ]
+    n_up = int((sig["logFC"] > 0).sum())
+    n_down = int((sig["logFC"] < 0).sum())
+    print(f"    DE summary: {len(sig)} significant genes "
+          f"({n_up} {groups_in_contrast[0]}-up, {n_down} {groups_in_contrast[1]}-up) "
+          f"at padj<{padj_thresh}, |logFC|>{lfc_thresh}")
+
+    return de_results
 
 
 def _run_discovery_cohort(
@@ -1761,6 +2034,12 @@ def _run_discovery_cohort(
             )
 
         pred.to_csv(os.path.join(model_out, "predictions_wide.tsv"), sep="\t")
+
+        # Limma DE: ARPC vs NEPC for CRPC-UW
+        if cohort == "CRPC-UW" and sub_dict is not None and subtypes_df is not None:
+            de_results = _run_limma_de(pred, subtypes_df, model_out, args.overwrite)
+            if de_results is not None:
+                _run_gsea(de_results, model_out, args.overwrite)
 
 
 def run_patient_discovery(args: argparse.Namespace) -> None:
@@ -2464,19 +2743,23 @@ def _generate_naive_example(
 ) -> None:
     """Produce NaiveExample illustrative plots.
 
-    Uses all 25 LuCaP PC-PDX truth profiles to illustrate two baselines
-    at both the single-transcriptome (scatter) and per-gene (distribution)
-    levels:
+    Uses all 25 PC-PDX (LuCaP) truth profiles to contrast "near replicate"
+    performance against "naïve/guessing" at both the single-transcriptome
+    (scatter) and per-gene (distribution) levels:
 
-    1. Scatter: LuCaP_136 vs 136CR (biological replicate pair)
-    2. Scatter: LuCaP_136 vs population-mean expression (regression to mean)
-    3. Distribution: per-gene Pearson r, truth vs row-shuffled truth
-       across all 25 LuCaP samples (na\u00efve shuffle baseline)
-    4. Distribution: per-gene Pearson r, truth vs truth + strong noise
-       across all 25 LuCaP samples (synthetic replicate baseline)
+    1. Replicate scatter: LuCaP_136 vs LuCaP_136CR.
+    2. Naïve scatter: LuCaP_136 truth vs a randomly chosen other sample's
+       truth value per gene (destroys sample identity).
+    3. Replicate distribution: PCA of all 25 truth profiles; for each
+       sample, the nearest neighbor in PCA space serves as its
+       "prediction".  Per-gene Pearson r across 25 (truth, NN-pred) pairs.
+    4. Lineage-derivative distribution: pseudo-paired CR / non-CR lines
+       (e.g. LuCaP_136 vs 136CR).  Per-gene Pearson r across 6 pairs.
+    5. Naïve distribution: per-gene Pearson r from row-shuffled truth
+       (shuffle sample labels independently per gene).  One shuffle gives
+       n=25 points per gene → one r per gene, distributed ≈ N(0, σ).
     """
     ne_dir = ensure_dir(os.path.join(out_dir, "NaiveExample"))
-    N_RESAMPLES = 200  # re-draws for smoother distributions
 
     # Load all 25 PC-PDX truth profiles
     pc_truth = pd.read_csv(
@@ -2489,32 +2772,6 @@ def _generate_naive_example(
     T = pc_truth[keep]  # genes × 25 samples
     T_arr = T.values.astype(np.float64)
     n_genes, n_samp = T_arr.shape
-
-    # --- (1) LuCaP_136 vs LuCaP_136CR scatter (biological replicate) ---
-    if "LuCaP_136" in T.columns and "LuCaP_136CR" in T.columns:
-        s136 = T["LuCaP_136"]
-        s136cr = T["LuCaP_136CR"]
-        common = s136.dropna().index.intersection(s136cr.dropna().index)
-        path_a = os.path.join(ne_dir, "LuCaP_136_vs_136CR")
-        if overwrite or not os.path.exists(f"{path_a}.pdf"):
-            sample_scatter(
-                s136cr.loc[common], s136.loc[common],
-                "LuCaP_136 vs 136CR", path_a, goi=None,
-            )
-    else:
-        print("  [skip] NaiveExample: LuCaP_136 or 136CR not in labels")
-
-    # --- (2) LuCaP_136 vs population-mean expression ---
-    if "LuCaP_136" in T.columns:
-        s136 = T["LuCaP_136"]
-        pop_mean = T.mean(axis=1)  # mean across all 25 samples per gene
-        common = s136.dropna().index.intersection(pop_mean.dropna().index)
-        path_b = os.path.join(ne_dir, "LuCaP_136_vs_population_mean")
-        if overwrite or not os.path.exists(f"{path_b}.pdf"):
-            sample_scatter(
-                s136.loc[common], pop_mean.loc[common],
-                "LuCaP_136 vs Population Mean", path_b, goi=None,
-            )
 
     # Helper: vectorised gene-level Pearson r across genes × samples
     def _gene_pearson_r(truth_arr, pred_arr):
@@ -2540,45 +2797,176 @@ def _generate_naive_example(
             result[ok] = np.where(den > 0, num / den, np.nan)
         return result
 
-    # --- (3) Na\u00efve per-gene Pearson r (row-shuffled baseline) ---
-    # Average over N_RESAMPLES shuffles for a smoother distribution.
-    all_naive_r = []
-    for seed_i in range(N_RESAMPLES):
-        naive_pred = generate_null_predictions(T, seed=seed_i)
-        r_vals = _gene_pearson_r(T_arr, naive_pred.values.astype(np.float64))
-        all_naive_r.append(r_vals[np.isfinite(r_vals)])
-    naive_r_concat = np.concatenate(all_naive_r)
-    naive_r_series = pd.Series(naive_r_concat, name="pearson_r")
-    path_c = os.path.join(ne_dir, "naive_gene_pearson_r_distribution")
+    # --- (1) Replicate scatter: LuCaP_136 vs LuCaP_136CR ---
+    if "LuCaP_136" in T.columns and "LuCaP_136CR" in T.columns:
+        s136 = T["LuCaP_136"]
+        s136cr = T["LuCaP_136CR"]
+        common = s136.dropna().index.intersection(s136cr.dropna().index)
+        path_a = os.path.join(ne_dir, "replicate_scatter_136_vs_136CR")
+        if overwrite or not os.path.exists(f"{path_a}.pdf"):
+            sample_scatter(
+                s136cr.loc[common], s136.loc[common],
+                "LuCaP_136 vs 136CR", path_a, goi=None,
+            )
+    else:
+        print("  [skip] NaiveExample: LuCaP_136 or 136CR not in labels")
+
+    # --- (2) Naïve scatter: LuCaP_136 vs random other sample per gene ---
+    if "LuCaP_136" in T.columns:
+        rng_scatter = np.random.default_rng(42)
+        idx_136 = T.columns.get_loc("LuCaP_136")
+        other_indices = [j for j in range(n_samp) if j != idx_136]
+        # For each gene, pick a random other sample
+        chosen = rng_scatter.choice(other_indices, size=n_genes)
+        naive_vals = T_arr[np.arange(n_genes), chosen]
+        naive_series = pd.Series(naive_vals, index=T.index, name="random_other")
+        s136 = T["LuCaP_136"]
+        common = s136.dropna().index.intersection(naive_series.dropna().index)
+        path_b = os.path.join(ne_dir, "naive_scatter_136_vs_random_other")
+        if overwrite or not os.path.exists(f"{path_b}.pdf"):
+            sample_scatter(
+                s136.loc[common], naive_series.loc[common],
+                "LuCaP_136 vs Random Other", path_b, goi=None,
+            )
+
+    # --- (3) Replicate distribution: PCA nearest-sample Pearson r ---
+    # For each sample, find its nearest neighbor in PCA space (across all
+    # genes) and use that neighbor's expression profile as the "prediction".
+    # This gives 25 (truth, pred) pairs per gene → one Pearson r per gene.
+    from sklearn.decomposition import PCA
+
+    # Transpose to (samples × genes), drop genes with any NaN for PCA
+    T_T = T.T  # (25, G)
+    finite_genes = T_T.columns[T_T.notna().all()]
+    T_pca_input = T_T[finite_genes].values  # (25, G')
+
+    pca = PCA(n_components=min(10, T_pca_input.shape[0] - 1))
+    scores = pca.fit_transform(T_pca_input)  # (25, k)
+
+    # Pairwise Euclidean distances in PCA space
+    from scipy.spatial.distance import cdist
+    dists = cdist(scores, scores, metric="euclidean")  # (25, 25)
+    np.fill_diagonal(dists, np.inf)  # exclude self
+    nn_idx = np.argmin(dists, axis=1)  # nearest neighbor per sample
+
+    # Build prediction matrix: for each sample j, pred[:,j] = truth[:,nn[j]]
+    nn_pred = T_arr[:, nn_idx]  # (G, 25)
+
+    replicate_r = _gene_pearson_r(T_arr, nn_pred)
+    replicate_r_series = pd.Series(
+        replicate_r[np.isfinite(replicate_r)], name="pearson_r",
+    )
+    path_c = os.path.join(ne_dir, "replicate_pca_nearest_sample_pearson_r_distribution")
     if overwrite or not os.path.exists(f"{path_c}.pdf"):
         metric_distribution(
-            naive_r_series, "Per-Gene Pearson r (Na\u00efve)", path_c,
+            replicate_r_series,
+            "Per-Gene Pearson r (PCA Nearest Sample)",
+            path_c,
             xlim=(-1.0, 1.0), square=True,
         )
+    # Report NN pairs
+    nn_pairs = [(T.columns[j], T.columns[nn_idx[j]]) for j in range(n_samp)]
+    print(f"  PCA nearest-sample dist: {len(replicate_r_series)} genes, "
+          f"median r={float(replicate_r_series.median()):.4f}")
+    print(f"    NN pairs: {', '.join(f'{a}→{b}' for a, b in nn_pairs[:5])}...")
 
-    # --- (4) Synthetic replicate per-gene Pearson r ---
-    # pred = truth + Gaussian noise sized so the mean per-gene Pearson r
-    # approximates real technical replicates.  The relationship between
-    # noise fraction f and E[r] ≈ 1/sqrt(1+f²) at large n; f≈0.48
-    # gives r ~ 0.90, representative of replicate concordance.
-    NOISE_FRAC = 0.48
-    all_noisy_r = []
-    for seed_i in range(N_RESAMPLES):
-        rng = np.random.default_rng(42 + seed_i)
-        gene_std = np.nanstd(T_arr, axis=1, keepdims=True)
-        noise = rng.normal(0, 1.0, size=T_arr.shape) * (NOISE_FRAC * gene_std)
-        noisy_pred = T_arr + noise
-        noisy_pred[~np.isfinite(T_arr)] = np.nan
-        r_vals = _gene_pearson_r(T_arr, noisy_pred)
-        all_noisy_r.append(r_vals[np.isfinite(r_vals)])
-    noisy_r_concat = np.concatenate(all_noisy_r)
-    noisy_r_series = pd.Series(noisy_r_concat, name="pearson_r")
-    path_d = os.path.join(ne_dir, "synthetic_replicate_gene_pearson_r_distribution")
+    # --- (4) Lineage-derivative distribution: CR / non-CR pairs ---
+    # Pseudo-paired: non-CR sample expression vs its CR derivative.
+    # 6 pairs within the 25-sample study set.
+    _cr_pairs = [
+        ("LuCaP_35", "LuCaP_35CR"),
+        ("LuCaP_70", "LuCaP_70CR"),
+        ("LuCaP_96", "LuCaP_96CR"),
+        ("LuCaP_136", "LuCaP_136CR"),
+        ("LuCaP_167", "LuCaP_167CR"),
+        ("LuCaP_176", "LuCaP_176CR"),
+    ]
+    valid_pairs = [(a, b) for a, b in _cr_pairs
+                   if a in T.columns and b in T.columns]
+    if len(valid_pairs) >= 2:
+        nonCR_arr = T[[a for a, _ in valid_pairs]].values.astype(np.float64)
+        CR_arr = T[[b for _, b in valid_pairs]].values.astype(np.float64)
+        lineage_r = _gene_pearson_r(nonCR_arr, CR_arr)
+        lineage_r_series = pd.Series(
+            lineage_r[np.isfinite(lineage_r)], name="pearson_r",
+        )
+        path_lin = os.path.join(
+            ne_dir, "lineage_derivative_pearson_r_distribution",
+        )
+        if overwrite or not os.path.exists(f"{path_lin}.pdf"):
+            metric_distribution(
+                lineage_r_series,
+                "Per-Gene Pearson r (CR / non-CR Pairs)",
+                path_lin,
+                xlim=(-1.0, 1.0), square=True,
+            )
+        print(f"  Lineage-derivative dist: {len(lineage_r_series)} genes, "
+              f"median r={float(lineage_r_series.median()):.4f}  "
+              f"(n={len(valid_pairs)} pairs: "
+              f"{', '.join(a.replace('LuCaP_','') + '/' + b.replace('LuCaP_','') for a, b in valid_pairs)})")
+    else:
+        lineage_r_series = None
+        print(f"  [skip] Lineage-derivative: only {len(valid_pairs)} "
+              f"CR/non-CR pairs found")
+
+    # --- (5) Naïve distribution: per-gene row-shuffled Pearson r ---
+    # Shuffle truth values across 25 samples independently per gene,
+    # then compute Pearson r per gene (one r per gene per shuffle).
+    # Single shuffle: n=25 samples per gene → one r per gene.
+    naive_pred = generate_null_predictions(T, seed=42)
+    naive_r = _gene_pearson_r(T_arr, naive_pred.values.astype(np.float64))
+    naive_r_series = pd.Series(
+        naive_r[np.isfinite(naive_r)], name="pearson_r",
+    )
+    path_d = os.path.join(ne_dir, "naive_gene_pearson_r_distribution")
     if overwrite or not os.path.exists(f"{path_d}.pdf"):
         metric_distribution(
-            noisy_r_series, "Per-Gene Pearson r (Synthetic Replicate)", path_d,
+            naive_r_series,
+            "Per-Gene Pearson r (Na\u00efve)",
+            path_d,
             xlim=(-1.0, 1.0), square=True,
         )
+    print(f"  Naïve dist: {len(naive_r_series)} genes, "
+          f"median r={float(naive_r_series.median()):.4f}")
+
+    # --- GVW summary: variance-weighted Pearson r and Spearman rho ---
+    var_map = compute_gene_variance(T)
+    gene_names = T.index.astype(str).values
+    w_gene = np.array([var_map.get(g, 0.0) for g in gene_names], dtype=np.float64)
+
+    gvw_r_rep = _gvw_r_from_wide(T_arr, nn_pred, w_gene)
+    gvw_rho_rep = _gvw_rho_from_wide(T_arr, nn_pred, w_gene)
+    gvw_r_naive = _gvw_r_from_wide(T_arr, naive_pred.values.astype(np.float64), w_gene)
+    gvw_rho_naive = _gvw_rho_from_wide(T_arr, naive_pred.values.astype(np.float64), w_gene)
+
+    rows = [
+        {"method": "PCA_Nearest_Sample",
+         "GVW_r": gvw_r_rep, "GVW_rho": gvw_rho_rep,
+         "median_gene_r": float(replicate_r_series.median()),
+         "n_genes": len(replicate_r_series), "n_samples": n_samp},
+    ]
+    if lineage_r_series is not None:
+        w_lin = np.array([var_map.get(g, 0.0) for g in T[[a for a, _ in valid_pairs]].index.astype(str)], dtype=np.float64)
+        gvw_r_lin = _gvw_r_from_wide(nonCR_arr, CR_arr, w_lin)
+        gvw_rho_lin = _gvw_rho_from_wide(nonCR_arr, CR_arr, w_lin)
+        rows.append({"method": "Lineage_Derivative",
+                     "GVW_r": gvw_r_lin, "GVW_rho": gvw_rho_lin,
+                     "median_gene_r": float(lineage_r_series.median()),
+                     "n_genes": len(lineage_r_series),
+                     "n_samples": len(valid_pairs)})
+        print(f"    Lineage:     GVW-r={gvw_r_lin:.4f}, GVW-ρ={gvw_rho_lin:.4f}")
+    rows.append(
+        {"method": "Naive_Shuffle",
+         "GVW_r": gvw_r_naive, "GVW_rho": gvw_rho_naive,
+         "median_gene_r": float(naive_r_series.median()),
+         "n_genes": len(naive_r_series), "n_samples": n_samp},
+    )
+    summary_df = pd.DataFrame(rows)
+    summary_path = os.path.join(ne_dir, "naive_example_gvw_summary.tsv")
+    summary_df.to_csv(summary_path, sep="\t", index=False)
+    print(f"  GVW summary saved: {summary_path}")
+    print(f"    PCA Nearest: GVW-r={gvw_r_rep:.4f}, GVW-ρ={gvw_rho_rep:.4f}")
+    print(f"    Naïve:       GVW-r={gvw_r_naive:.4f}, GVW-ρ={gvw_rho_naive:.4f}")
 
 
 def run_benchmarking(args: argparse.Namespace) -> None:

@@ -2,20 +2,20 @@
 set -euo pipefail
 
 # =====================================================================
-# PLCA Phase 1.0 — Fold-parallel HP screening
+# PLCA Phase 1.3 — Min-source GVW-r objective, narrowed LR, tunable epochs
 #
 # 4 workers per fold × 5 folds = 20 SLURM jobs.
 # All share the same Optuna study via SQLite storage.
-# Each worker runs 25 trials; 4 workers × 25 = 100 trials per fold.
+# Each worker runs 50 trials; 4 workers × 50 = 200 trials per fold.
 # Workers for the same fold get different sampler seeds so each
 # explores a distinct region of HP space.
 # =====================================================================
-EXPERIMENT="PLCA_tuning/biodvn_tune-plca_phase1-0"
-TAG="PLCA_1-0"
+EXPERIMENT="PLCA_tuning/biodvn_tune-plca_phase1-3"
+TAG="PLCA_1-3"
 YAML="config/experiments/${EXPERIMENT}.yaml"
 ENV_NAME="proteus"
 N_WORKERS_PER_FOLD=4
-TRIALS_PER_WORKER=25          # 4 workers × 25 = 100 trials/fold
+TRIALS_PER_WORKER=50
 BASE_SAMPLER_SEED=42
 POLL_INTERVAL=15
 MONITOR_INTERVAL=120
@@ -89,7 +89,7 @@ _blacklist_node() {
 }
 
 TOTAL_WORKERS=$((N_WORKERS_PER_FOLD * 5))
-echo "=== PLCA Phase 1.0: ${N_WORKERS_PER_FOLD} workers/fold × 5 folds = ${TOTAL_WORKERS} workers, ${TRIALS_PER_WORKER} trials/worker ==="
+echo "=== PLCA Phase 1.2: ${N_WORKERS_PER_FOLD} workers/fold × 5 folds = ${TOTAL_WORKERS} workers, ${TRIALS_PER_WORKER} trials/worker ==="
 
 # =====================================================================
 # Phase 1: Submit first worker for Fold 1 to initialize the Optuna study
@@ -196,7 +196,6 @@ while true; do
         echo "=== All workers have finished. ==="
         break
     fi
-    echo "  [$(date '+%H:%M:%S')] ${alive}/${n_slots} workers still active."
 done
 
 echo "=== PLCA Phase 1.0 tuning complete. ==="

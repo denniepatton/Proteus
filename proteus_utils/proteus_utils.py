@@ -795,6 +795,7 @@ def create_data_loader(
             worker_init_fn=_seed_worker if num_workers > 0 else None,
             generator=base_generator,
             drop_last=False,
+            pin_memory=True,
         )
     else:
         # Default: per-gene items
@@ -818,6 +819,7 @@ def create_data_loader(
             worker_init_fn=_seed_worker if num_workers > 0 else None,
             generator=base_generator,
             drop_last=bool(drop_last),
+            pin_memory=True,
         )
 
     n_batches = len(dataset) if mode == 'chunk' else len(loader)
@@ -847,6 +849,7 @@ def create_inference_loader(
         shuffle=False,  # Keep gene order for output
         num_workers=num_workers,
         collate_fn=collate_inference,
+        pin_memory=True,
     )
     
     return loader, dataset.gene_names

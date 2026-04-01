@@ -1228,6 +1228,9 @@ def _save_fold_predictions(
         metrics['balanced_tumor_gvw_r_std'] = (
             float(np.std(finite_r)) if len(finite_r) > 1 else float('nan')
         )
+        metrics['min_tumor_gvw_r'] = (
+            float(np.min(finite_r)) if finite_r else float('nan')
+        )
     elif per_cohort:
         patient_gvw_crps = [
             v['tumor'].get('gvw_crps', float('nan'))
@@ -1252,6 +1255,9 @@ def _save_fold_predictions(
         )
         metrics['balanced_tumor_gvw_r_std'] = (
             float(np.std(finite_r)) if len(finite_r) > 1 else float('nan')
+        )
+        metrics['min_tumor_gvw_r'] = (
+            float(np.min(finite_r)) if finite_r else float('nan')
         )
 
     with open(os.path.join(fold_dir, f'validation-fold_{fold_num}_metrics.json'), 'w') as f:

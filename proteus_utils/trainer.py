@@ -57,15 +57,20 @@ class TrainingConfig:
     # Training settings
     epochs: int = 15
     max_grad_norm: float = 18.0  # Gradient clipping threshold (prevents explosion)
+
+    # Gradient accumulation: effective batch = genes_per_batch × accum_steps.
+    # Set >1 to trade per-step noise for fewer optimizer steps per epoch.
+    grad_accum_steps: int = 1
     
     # Mixed precision
     use_amp: bool = True
     
     # torch.compile (PyTorch 2.0+)
-    # NOTE: Disabled by default - can cause significant slowdown on first epoch
-    # and may have graph-break issues with complex models. Enable only after
-    # confirming model correctness.
-    use_compile: bool = False  # Disabled for v1 parity testing
+    # Disabled: with 92K tiny 32-gene batches, CUDA graph recording/replay
+    # overhead in 'reduce-overhead' mode exceeds kernel-fusion savings,
+    # inflating epoch time from ~5-10 min to 4-6 hours on RTX 2080 Ti.
+    # Re-evaluate if batch size increases substantially (>256 genes).
+    use_compile: bool = False
     compile_mode: str = 'reduce-overhead'  # 'default', 'reduce-overhead', 'max-autotune'
     
     # Early stopping
@@ -555,6 +560,9 @@ class Trainer:
         # Reset timing origin now that we've accounted for first-batch wait.
         last_iter_end = time.time()
 
+        accum_steps = self.config.grad_accum_steps
+        self.optimizer.zero_grad(set_to_none=True)
+
         for batch_idx, (features, labels) in _iter_batches():
             if self.config.track_batch_timing:
                 data_time = time.time() - last_iter_end
@@ -563,9 +571,6 @@ class Trainer:
             if batch_idx == 0:
                 self._print_runtime_device_banner(features)
             step_start = time.time()
-            
-            # Zero gradients
-            self.optimizer.zero_grad(set_to_none=True)
             
             # Forward pass with AMP
             amp_ctx = autocast(device_type=self.device.type, enabled=self.use_amp)
@@ -668,24 +673,27 @@ class Trainer:
             else:
                 _consecutive_nan = 0
             
-            # Backward pass with gradient scaling
+            # Backward pass — scale loss for gradient accumulation
+            scaled_loss = total_loss / accum_steps
             if self.use_amp:
-                self.scaler.scale(total_loss).backward()
-                # Unscale gradients before clipping
-                self.scaler.unscale_(self.optimizer)
-                # Gradient clipping to prevent explosion
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                self.scaler.scale(scaled_loss).backward()
             else:
-                total_loss.backward()
-                # Gradient clipping to prevent explosion
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
-                self.optimizer.step()
-            
-            # Update LR scheduler
-            if self.scheduler is not None:
-                self.scheduler.step()
+                scaled_loss.backward()
+
+            # Optimizer step at accumulation boundary
+            is_accum_boundary = ((batch_idx + 1) % accum_steps == 0) or (batch_idx == n_batches - 1)
+            if is_accum_boundary:
+                if self.use_amp:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                    self.optimizer.step()
+                if self.scheduler is not None:
+                    self.scheduler.step()
+                self.optimizer.zero_grad(set_to_none=True)
 
             if self.config.track_batch_timing:
                 step_time = time.time() - step_start
@@ -1080,6 +1088,7 @@ class Trainer:
                 per_src_r.append(source_gvw_r[src_key])
             if per_src_r:
                 metrics['val_balanced_tumor_gvw_r'] = sum(per_src_r) / len(per_src_r)
+                metrics['val_min_tumor_gvw_r'] = min(per_src_r)
 
         if rich_progress is not None:
             rich_progress.stop()
@@ -1113,11 +1122,15 @@ class Trainer:
         self._prepare_for_fit()
         print(f'Preflight complete in {(time.time() - preflight_start):.2f}s')
         
-        # Initialize scheduler – derive step counts from epoch budget
+        # Initialize scheduler – derive step counts from epoch budget.
+        # With gradient accumulation, each optimizer step spans multiple
+        # micro-batches, so the scheduler total is in optimizer steps.
+        accum = self.config.grad_accum_steps
         steps_per_epoch = len(train_loader)
-        total_training_steps = epochs * steps_per_epoch
+        optimizer_steps_per_epoch = -(-steps_per_epoch // accum)  # ceil division
+        total_training_steps = epochs * optimizer_steps_per_epoch
         total_sched_steps = int(self.config.schedule_frac * total_training_steps)
-        total_sched_steps = max(total_sched_steps, steps_per_epoch)  # at least 1 epoch
+        total_sched_steps = max(total_sched_steps, optimizer_steps_per_epoch)  # at least 1 epoch
         warmup_steps = int(self.config.warmup_frac * total_sched_steps)
         eta_min = self.config.min_lr_ratio * self.config.max_lr
 
@@ -1145,7 +1158,7 @@ class Trainer:
         print(f'Device: {self.device}')
         print(f'AMP: {self.use_amp}')
         print(f'LR schedule: cosine  max_lr={self.config.max_lr:.2e}  eta_min={eta_min:.2e} (ratio={self.config.min_lr_ratio:.1e})  sched_steps={total_sched_steps} ({self.config.schedule_frac:.0%} of {total_training_steps})  warmup={warmup_steps}steps ({self.config.warmup_frac:.1%})  warmup_start_lr={self.config.warmup_start_lr:.2e}')
-        print(f'Train batches: {len(train_loader)}, Val batches: {len(val_loader) if val_loader else 0}')
+        print(f'Train batches: {steps_per_epoch} (accum={accum}, optimizer_steps/epoch={optimizer_steps_per_epoch}), Val batches: {len(val_loader) if val_loader else 0}')
         
         for epoch in range(1, epochs + 1):
             print(f'\nEpoch {epoch}/{epochs}')

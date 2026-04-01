@@ -74,6 +74,24 @@ HYPERBAND_MIN_RESOURCE = 3
 HYPERBAND_REDUCTION_FACTOR = 3
 
 
+def _min_patience_from_spec(spec: ParamSpec, default: int = 3) -> int:
+    """Extract the minimum patience value from a ParamSpec.
+
+    Used to set pruner warmup floors so Optuna never prunes a trial
+    before it has run for at least ``patience`` epochs.
+    """
+    if spec.fixed is not None:
+        return int(spec.fixed)
+    if spec.suggest is not None:
+        s = dict(spec.suggest)
+        stype = str(s.get("type", "")).strip().lower()
+        if stype == "int" and s.get("low") is not None:
+            return int(s["low"])
+        if stype == "categorical" and isinstance(s.get("choices"), list) and s["choices"]:
+            return int(min(s["choices"]))
+    return default
+
+
 def _infer_hyperband_max_resource(exp: ExperimentSpec) -> int:
     """Infer max_resource for Hyperband from experiment.training.epochs."""
     epochs_spec = exp.training.epochs
@@ -81,8 +99,11 @@ def _infer_hyperband_max_resource(exp: ExperimentSpec) -> int:
         return int(epochs_spec.fixed)  # type: ignore[arg-type]
     if epochs_spec.suggest is not None:
         s = dict(epochs_spec.suggest)
-        if str(s.get('type', '')).strip().lower() == 'int' and s.get('high', None) is not None:
+        stype = str(s.get('type', '')).strip().lower()
+        if stype == 'int' and s.get('high', None) is not None:
             return int(s['high'])
+        if stype == 'categorical' and isinstance(s.get('choices'), list) and s['choices']:
+            return int(max(s['choices']))
     return 30
 
 
@@ -500,6 +521,30 @@ def compute_cv_objective(run_dir: str) -> Dict[str, Any]:
     if balanced_gvw_r_std:
         obj["balanced_tumor_gvw_r_std_mean"] = _nanmean(balanced_gvw_r_std)
 
+    # Composite lower-bound / upper-bound objectives
+    # GVW-r lower bound: mean − std (maximize to raise worst-source floor)
+    _r_m = obj.get("balanced_tumor_gvw_r_mean")
+    _r_s = obj.get("balanced_tumor_gvw_r_std")
+    if (_r_m is not None and _r_s is not None
+            and math.isfinite(float(_r_m)) and math.isfinite(float(_r_s))):
+        obj["balanced_tumor_gvw_r_lower_bound"] = float(_r_m) - float(_r_s)
+    # GVW-CRPS upper bound: mean + std (minimize to lower worst-source ceiling)
+    _c_m = obj.get("balanced_tumor_gvw_crps_mean")
+    _c_s = obj.get("balanced_tumor_gvw_crps_std")
+    if (_c_m is not None and _c_s is not None
+            and math.isfinite(float(_c_m)) and math.isfinite(float(_c_s))):
+        obj["balanced_tumor_gvw_crps_upper_bound"] = float(_c_m) + float(_c_s)
+
+    # Min-source GVW-r: per-fold minimum across sources, averaged over folds.
+    min_r_per_fold = [
+        float(r["min_tumor_gvw_r"])
+        for r in rows
+        if r.get("min_tumor_gvw_r") is not None
+           and math.isfinite(float(r["min_tumor_gvw_r"]))
+    ]
+    if min_r_per_fold:
+        obj["min_tumor_gvw_r"] = _nanmean(min_r_per_fold)
+
     out_path = os.path.join(run_dir, "cv_objective.json")
     with open(out_path, "w") as f:
         json.dump(obj, f, indent=2)
@@ -625,6 +670,9 @@ def run_optuna_cv_tuning(
     # Resolve pruner: explicit argument > experiment YAML > default
     effective_pruner_type = pruner_type if pruner_type is not None else exp.tuning.pruner_type
 
+    # Minimum epochs before pruning: respect patience from experiment spec
+    min_patience = _min_patience_from_spec(exp.training.patience)
+
     sampler = optuna.samplers.TPESampler(
         seed=int(sampler_seed),
         multivariate=True,
@@ -634,12 +682,12 @@ def run_optuna_cv_tuning(
 
     if effective_pruner_type == "hyperband":
         pruner = optuna.pruners.HyperbandPruner(
-            min_resource=HYPERBAND_MIN_RESOURCE,
+            min_resource=max(HYPERBAND_MIN_RESOURCE, min_patience),
             max_resource=_infer_hyperband_max_resource(exp),
             reduction_factor=HYPERBAND_REDUCTION_FACTOR,
         )
     elif effective_pruner_type == "median":
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3)
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=min_patience)
     else:
         pruner = optuna.pruners.NopPruner()
 
@@ -651,6 +699,22 @@ def run_optuna_cv_tuning(
         sampler=sampler,
         pruner=pruner,
     )
+
+    # Phase-transition seeding: enqueue top configs from previous study
+    if (exp.tuning.prev_study is not None
+            and not study.user_attrs.get("_prev_study_seeded")):
+        study.set_user_attr("_prev_study_seeded", True)
+        _, top_params = narrow_search_space_from_study(
+            prev_study_name=exp.tuning.prev_study,
+            storage=storage,
+            top_fraction=exp.tuning.top_fraction,
+            enqueue_top_k=exp.tuning.enqueue_top_k,
+        )
+        for params in top_params:
+            study.enqueue_trial(params)
+        if top_params:
+            print(f"[Tuning] Seeded {len(top_params)} top configs from "
+                  f"'{exp.tuning.prev_study}'", file=sys.stderr, flush=True)
 
     from Proteus import train_model_cv  # local import to avoid circulars
 
@@ -1203,6 +1267,9 @@ def run_optuna_fold_tuning(
     # Resolve pruner: explicit argument > experiment YAML > default
     effective_pruner_type = pruner_type if pruner_type is not None else exp.tuning.pruner_type
 
+    # Minimum epochs before pruning: respect patience from experiment spec
+    min_patience = _min_patience_from_spec(exp.training.patience)
+
     # Seed varies per fold so each worker explores different regions
     fold_seed = int(sampler_seed) + int(fold_num)
     sampler = optuna.samplers.TPESampler(
@@ -1214,12 +1281,12 @@ def run_optuna_fold_tuning(
 
     if effective_pruner_type == 'hyperband':
         pruner = optuna.pruners.HyperbandPruner(
-            min_resource=HYPERBAND_MIN_RESOURCE,
+            min_resource=max(HYPERBAND_MIN_RESOURCE, min_patience),
             max_resource=_infer_hyperband_max_resource(exp),
             reduction_factor=HYPERBAND_REDUCTION_FACTOR,
         )
     elif effective_pruner_type == 'median':
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3)
+        pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=min_patience)
     else:
         pruner = optuna.pruners.NopPruner()
 
@@ -1231,6 +1298,22 @@ def run_optuna_fold_tuning(
         sampler=sampler,
         pruner=pruner,
     )
+
+    # Phase-transition seeding: enqueue top configs from previous study
+    if (exp.tuning.prev_study is not None
+            and not study.user_attrs.get("_prev_study_seeded")):
+        study.set_user_attr("_prev_study_seeded", True)
+        _, top_params = narrow_search_space_from_study(
+            prev_study_name=exp.tuning.prev_study,
+            storage=storage,
+            top_fraction=exp.tuning.top_fraction,
+            enqueue_top_k=exp.tuning.enqueue_top_k,
+        )
+        for params in top_params:
+            study.enqueue_trial(params)
+        if top_params:
+            print(f"[Tuning] Seeded {len(top_params)} top configs from "
+                  f"'{exp.tuning.prev_study}'", file=sys.stderr, flush=True)
 
     from Proteus import train_model_cv  # local import to avoid circulars
 
@@ -1249,11 +1332,31 @@ def run_optuna_fold_tuning(
         def _epoch_end_callback(
             epoch: int, val_metrics: Dict[str, float], val_score: float
         ) -> None:
-            """Report intermediate metric for Hyperband pruning."""
-            metric_val = val_metrics.get('val_tumor_gvw_crps', val_score)
+            """Report intermediate metric for Hyperband pruning.
+
+            The reported metric must align with the study direction:
+            - maximize → report a metric where higher = better
+            - minimize → report a metric where lower = better
+
+            For maximize: prefer val_min_tumor_gvw_r (min across sources,
+            higher = better), fall back to val_balanced_tumor_gvw_r, then
+            val_score.  For minimize: val_tumor_gvw_crps.
+
+            Pruning is suppressed for the first ``patience`` epochs so the
+            model has time to complete warmup and stabilize.
+            """
+            if direction == 'maximize':
+                # Prefer min-source GVW-r when available (direct proxy
+                # for min_tumor_gvw_r objective); fall back to balanced.
+                metric_val = val_metrics.get(
+                    'val_min_tumor_gvw_r',
+                    val_metrics.get('val_balanced_tumor_gvw_r', val_score),
+                )
+            else:
+                metric_val = val_metrics.get('val_tumor_gvw_crps', val_score)
             if metric_val is not None and isinstance(metric_val, (int, float)):
                 trial.report(float(metric_val), step=int(epoch))
-                if trial.should_prune():
+                if epoch >= int(train_cfg.patience) and trial.should_prune():
                     raise optuna.TrialPruned(f'Pruned at epoch {epoch}')
 
         try:
@@ -1331,6 +1434,33 @@ def run_optuna_fold_tuning(
         if balanced_r is not None:
             obj["balanced_tumor_gvw_r_mean"] = float(balanced_r)
             obj["balanced_tumor_gvw_r_std"] = float(fold_metrics.get("balanced_tumor_gvw_r_std", float("nan")))
+
+        # Composite lower-bound / upper-bound objectives
+        _r_m = obj.get("balanced_tumor_gvw_r_mean")
+        _r_s = obj.get("balanced_tumor_gvw_r_std")
+        if (_r_m is not None and _r_s is not None
+                and math.isfinite(float(_r_m)) and math.isfinite(float(_r_s))):
+            obj["balanced_tumor_gvw_r_lower_bound"] = float(_r_m) - float(_r_s)
+        _c_m = obj.get("balanced_tumor_gvw_crps_mean")
+        _c_s = obj.get("balanced_tumor_gvw_crps_std")
+        if (_c_m is not None and _c_s is not None
+                and math.isfinite(float(_c_m)) and math.isfinite(float(_c_s))):
+            obj["balanced_tumor_gvw_crps_upper_bound"] = float(_c_m) + float(_c_s)
+
+        # Min-source GVW-r: minimum per-source GVW-r from fold metrics.
+        per_source = fold_metrics.get("per_source", {})
+        if per_source:
+            src_r_vals = [
+                float(v["tumor"]["gvw_r"])
+                for v in per_source.values()
+                if "tumor" in v and "gvw_r" in v["tumor"]
+                   and math.isfinite(float(v["tumor"]["gvw_r"]))
+            ]
+            if src_r_vals:
+                obj["min_tumor_gvw_r"] = min(src_r_vals)
+        elif fold_metrics.get("min_tumor_gvw_r") is not None:
+            obj["min_tumor_gvw_r"] = float(fold_metrics["min_tumor_gvw_r"])
+
         for k, v in obj.items():
             if isinstance(v, (int, float)) and math.isfinite(float(v)):
                 trial.set_user_attr(k, float(v))
