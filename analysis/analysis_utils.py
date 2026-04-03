@@ -148,6 +148,25 @@ def clean_epicseq_sample_names(columns: pd.Index) -> pd.Index:
     return pd.Index([re.sub(r'_\d+\.cram$', '', str(c)) for c in columns])
 
 
+def clean_epicseq_sample_names_wcdt(columns: pd.Index) -> pd.Index:
+    """Normalise CRPC-WCDT EPIC-Seq sample IDs to match truth column names.
+
+    EPIC-Seq names look like ``DTB-097-Progression-cfDNA_recalibrated``;
+    truth labels use ``DTB-097-PRO``.  Mapping:
+      - Strip ``(-cfDNA)?_recalibrated`` suffix
+      - ``Baseline`` → ``BL``
+      - ``Progression`` → ``PRO``
+    """
+    _TIMEPOINT_MAP = {"Baseline": "BL", "Progression": "PRO"}
+    cleaned = []
+    for c in columns:
+        s = re.sub(r'(-cfDNA)?_recalibrated$', '', str(c))
+        for long, short in _TIMEPOINT_MAP.items():
+            s = s.replace(f'-{long}', f'-{short}')
+        cleaned.append(s)
+    return pd.Index(cleaned)
+
+
 # ---------------------------------------------------------------------------
 # Prediction loading — long → wide
 # ---------------------------------------------------------------------------

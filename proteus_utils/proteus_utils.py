@@ -657,6 +657,386 @@ class ProteusInferenceDataset(Dataset):
         }
 
 
+class ProteusMultiSourceBatchDataset(IterableDataset):
+    """Multi-source gene-conditioned batch loader.
+
+    Each batch contains ``genes_per_batch × n_sources × samples_per_source``
+    items, where different sources contribute observations of the same genes.
+    Default geometry: 2 genes × 4 sources × 4 samples/source = 32 items.
+
+    Gene sampling uses a mixture distribution:
+        P(gene_i) = frac × (var_i / Σvar) + (1 − frac) × (1/n)
+    where *frac* controls the variance-priority weight (default 0.70).
+
+    Source balancing builds an exposure list of ``n_eff_per_source`` sample
+    slots per source per epoch.  Small sources are oversampled via
+    repeat-plus-shuffle to reach ``n_eff_per_source``.  The list is cycled
+    and reshuffled when exhausted so that every active sample sees a
+    statistically representative gene set.
+
+    Loss weights per gene are compressed: ``sqrt(variance) / median_stdev``,
+    clamped to ``[gene_weight_min, gene_weight_max]``.
+
+    All training samples are preloaded into RAM at init time to eliminate
+    Zarr chunk-decompression overhead on the hot path.  TSS_signals are
+    stored as float16 and TSS_nucleotides as uint8 to fit within typical
+    HPC node memory budgets (~114 GB for 144 samples × 18K genes).
+    DataLoader workers share the preloaded arrays via fork copy-on-write.
+    """
+
+    def __init__(
+        self,
+        sample_paths_by_source: Dict[str, List[str]],
+        gene_variance: Dict[str, float],
+        n_eff_per_source: int = 24,
+        genes_per_batch: int = 2,
+        samples_per_source: int = 4,
+        variance_sample_frac: float = 0.70,
+        gene_weight_min: float = 0.5,
+        gene_weight_max: float = 2.0,
+        seed: int = 42,
+        labeled: bool = True,
+        sample_name_map: Optional[Dict[str, str]] = None,
+        include_metadata: bool = False,
+        subsample_frac: Optional[float] = None,
+    ):
+        super().__init__()
+        self.sample_paths_by_source = dict(sample_paths_by_source)
+        self.source_names = sorted(self.sample_paths_by_source.keys())
+        self.n_sources = len(self.source_names)
+        self.n_eff_per_source = n_eff_per_source
+        self.genes_per_batch = genes_per_batch
+        self.samples_per_source = samples_per_source
+        self.variance_sample_frac = variance_sample_frac
+        self.gene_weight_min = gene_weight_min
+        self.gene_weight_max = gene_weight_max
+        self.seed = seed
+        self.labeled = labeled
+        self.sample_name_map = sample_name_map
+        self.include_metadata = include_metadata
+        self.batch_size = genes_per_batch * self.n_sources * samples_per_source
+        self._epoch_counter = 0
+
+        # Build gene universe: intersection of all samples' gene sets.
+        all_paths = [p for paths in self.sample_paths_by_source.values()
+                     for p in paths]
+        if not all_paths:
+            raise ValueError("No sample paths provided to "
+                             "ProteusMultiSourceBatchDataset")
+
+        gene_sets: List[set] = []
+        for zpath in all_paths:
+            store = zarr.open(zpath, mode='r')
+            names = [str(g) for g in store['gene_names'][:]]
+            gene_sets.append(set(names))
+        common = set.intersection(*gene_sets)
+        if not common:
+            raise ValueError("No common genes found across all samples")
+        self._common_genes: List[str] = sorted(common)
+        n_genes = len(self._common_genes)
+
+        # Preload all samples into RAM (eliminates Zarr chunk decompression
+        # from the hot path).  Must happen before workers are forked so they
+        # share the arrays via OS copy-on-write pages.
+        self._preloaded: Dict[str, Dict[str, np.ndarray]] = {}
+        self._preload_all_samples(all_paths)
+
+        # Gene sampling distribution (mixture of variance-priority + uniform).
+        variance_arr = np.array(
+            [gene_variance.get(g, 0.0) for g in self._common_genes],
+            dtype=np.float64,
+        )
+        variance_arr = np.maximum(variance_arr, 0.0)
+        sum_var = variance_arr.sum()
+        if sum_var > 0:
+            var_probs = variance_arr / sum_var
+        else:
+            var_probs = np.ones(n_genes, dtype=np.float64) / n_genes
+        uniform_probs = np.ones(n_genes, dtype=np.float64) / n_genes
+        self._gene_probs = (
+            self.variance_sample_frac * var_probs
+            + (1.0 - self.variance_sample_frac) * uniform_probs
+        )
+        self._gene_probs /= self._gene_probs.sum()
+
+        # Per-gene loss weights: sqrt(variance) / median(stdev), clamped.
+        stdevs = np.sqrt(variance_arr)
+        positive_stdevs = stdevs[stdevs > 0]
+        median_std = float(np.median(positive_stdevs)) if len(positive_stdevs) > 0 else 1.0
+        if median_std <= 0:
+            median_std = 1.0
+        raw_weights = stdevs / median_std
+        self._gene_loss_weights: np.ndarray = np.clip(
+            raw_weights, gene_weight_min, gene_weight_max,
+        ).astype(np.float32)
+
+        # Epoch length: each of n_eff samples per source sees ~all genes once.
+        slots_per_source_per_batch = self.genes_per_batch * self.samples_per_source
+        total_source_slots = self.n_eff_per_source * n_genes
+        self._n_batches = max(1, total_source_slots // slots_per_source_per_batch)
+
+        if subsample_frac is not None and 0.0 < subsample_frac < 1.0:
+            self._n_batches = max(1, int(self._n_batches * subsample_frac))
+
+        print(f"  [MultiSource] {n_genes} common genes, "
+              f"{self.n_sources} sources × {self.n_eff_per_source} eff/source, "
+              f"batch={self.batch_size} ({self.genes_per_batch}g × "
+              f"{self.n_sources}s × {self.samples_per_source}sps), "
+              f"{self._n_batches} batches/epoch")
+
+    def __len__(self) -> int:
+        return self._n_batches
+
+    # -- RAM preloading --
+
+    def _preload_all_samples(self, all_paths: List[str]) -> None:
+        """Preload all training samples' common-gene arrays into RAM.
+
+        Each sample's arrays are reindexed to common-gene canonical order
+        so that ``__iter__`` can use a direct integer index into the
+        preloaded arrays without per-sample gene name → index lookup.
+
+        Compact dtypes minimise memory footprint:
+        - TSS_signals: float16 (~648 MB / sample for 18K genes)
+        - TSS_nucleotides: uint8 (~144 MB / sample)
+        - All other arrays: float32 (negligible)
+
+        Decompression is parallelised across threads (zstd releases the
+        GIL) to keep init time short (~30-60 s for 144 samples).
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        common_gene_set = set(self._common_genes)
+        n_common = len(self._common_genes)
+        common_gene_order = {g: i for i, g in enumerate(self._common_genes)}
+
+        def _load_one(zarr_path: str) -> tuple:
+            store = zarr.open(zarr_path, mode='r')
+            gene_names = [str(g) for g in store['gene_names'][:]]
+
+            # Build index array: position i in common_genes → local index.
+            local_indices = np.empty(n_common, dtype=np.intp)
+            gene_to_local = {g: i for i, g in enumerate(gene_names)}
+            for g, common_pos in common_gene_order.items():
+                local_indices[common_pos] = gene_to_local[g]
+
+            flat = store['flat']
+
+            # Read full arrays and reindex to common gene order.
+            signals = flat['TSS_signals'][:][local_indices].astype(np.float16)
+            nucleotides = flat['TSS_nucleotides'][:][local_indices]  # uint8
+            tss_features = flat['TSS_features'][:][local_indices].astype(np.float32)
+            gb_features = flat['GB_features'][:][local_indices].astype(np.float32)
+            ref_scalars = flat['ref_scalars'][:][local_indices].astype(np.float32)
+            tumor_exp = flat['tumor_exp'][:][local_indices].astype(np.float32)
+            bg_exp = flat['background_exp'][:][local_indices].astype(np.float32)
+            tfx_label = flat['TFX_label'][:][local_indices].astype(np.float32)
+
+            # Resolve sample display name at load time (avoids keeping
+            # Zarr stores open after init).
+            if isinstance(self.sample_name_map, dict) and zarr_path in self.sample_name_map:
+                sample_display = self.sample_name_map[zarr_path]
+            else:
+                name = store.attrs.get('sample_name')
+                if name is None:
+                    name = Path(zarr_path).stem.replace('.zarr', '')
+                sample_display = str(name)
+
+            return zarr_path, {
+                'TSS_signals': signals,
+                'TSS_nucleotides': nucleotides,
+                'TSS_features': tss_features,
+                'GB_features': gb_features,
+                'ref_scalars': ref_scalars,
+                'tumor_exp': tumor_exp,
+                'background_exp': bg_exp,
+                'TFX_label': tfx_label,
+            }, sample_display
+
+        unique_paths = sorted(set(all_paths))
+        n_samples = len(unique_paths)
+
+        # Estimate memory requirement.
+        per_sample_mb = (
+            n_common * 2000 * 9 * 2     # TSS_signals float16
+            + n_common * 2000 * 4 * 1   # TSS_nucleotides uint8
+            + n_common * (11 + 11 + 3 + 1 + 1 + 1) * 4  # small float32
+        ) / (1024 ** 2)
+        total_gb = per_sample_mb * n_samples / 1024
+        print(f"  [MultiSource] Preloading {n_samples} samples "
+              f"({n_common} common genes) into RAM — "
+              f"estimated {total_gb:.1f} GB...")
+
+        self._sample_display_names: Dict[str, str] = {}
+
+        # Use 4 threads: limits transient peak memory (~5 GB) while still
+        # saturating zstd decompression throughput.
+        max_threads = min(4, n_samples)
+        with ThreadPoolExecutor(max_workers=max_threads) as executor:
+            futures = {executor.submit(_load_one, p): p for p in unique_paths}
+            done = 0
+            for future in as_completed(futures):
+                zarr_path, arrays, display_name = future.result()
+                self._preloaded[zarr_path] = arrays
+                self._sample_display_names[zarr_path] = display_name
+                done += 1
+                if done % 20 == 0 or done == n_samples:
+                    print(f"    ... loaded {done}/{n_samples} samples")
+
+        print(f"  [MultiSource] Preload complete ({total_gb:.1f} GB in RAM)")
+
+    def _get_sample_name(self, zarr_path: str) -> str:
+        return self._sample_display_names.get(
+            zarr_path,
+            Path(zarr_path).stem.replace('.zarr', ''),
+        )
+
+    # -- Exposure list management --
+
+    def _build_exposure_lists(
+        self, rng: random.Random,
+    ) -> Dict[str, List[str]]:
+        exposure: Dict[str, List[str]] = {}
+        for src in self.source_names:
+            paths = self.sample_paths_by_source[src]
+            n_avail = len(paths)
+            n_eff = self.n_eff_per_source
+            if n_avail >= n_eff:
+                chosen = rng.sample(paths, n_eff)
+            else:
+                full_copies = n_eff // n_avail
+                remainder = n_eff % n_avail
+                chosen = paths * full_copies + rng.sample(paths, remainder)
+            rng.shuffle(chosen)
+            exposure[src] = chosen
+        return exposure
+
+    # -- Core iteration --
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = int(worker_info.id)
+            num_workers = int(worker_info.num_workers)
+
+        self._epoch_counter += 1
+        epoch_seed = self.seed + self._epoch_counter * 997 + worker_id * 31
+        rng = random.Random(epoch_seed)
+        np_rng = np.random.RandomState(epoch_seed % (2**31))
+
+        # Build initial exposure lists and position cursors.
+        exposure = self._build_exposure_lists(rng)
+        positions: Dict[str, int] = {src: 0 for src in self.source_names}
+
+        # Divide batches across workers.
+        total_batches = self._n_batches
+        worker_batches = total_batches // num_workers
+        if worker_id < (total_batches % num_workers):
+            worker_batches += 1
+
+        n_genes = len(self._common_genes)
+        sps = self.samples_per_source
+
+        for _batch_idx in range(worker_batches):
+            # Sample genes from mixture distribution (without replacement
+            # within a single batch to maximise gene diversity).
+            gene_indices = np_rng.choice(
+                n_genes, size=self.genes_per_batch,
+                replace=False, p=self._gene_probs,
+            )
+
+            # Collect items: genes_per_batch × n_sources × sps.
+            feat_signals = []
+            feat_nt = []
+            feat_tss = []
+            feat_gb = []
+            feat_ref = []
+            lab_tumor = []
+            lab_bg = []
+            lab_weight = []
+            lab_tfx = []
+            meta_samples: List[str] = []
+            meta_genes: List[str] = []
+
+            for g_idx in gene_indices:
+                gene_name = self._common_genes[g_idx]
+                gene_weight = float(self._gene_loss_weights[g_idx])
+
+                for src in self.source_names:
+                    for _ in range(sps):
+                        pos = positions[src]
+                        if pos >= len(exposure[src]):
+                            rng.shuffle(exposure[src])
+                            pos = 0
+                        zarr_path = exposure[src][pos]
+                        positions[src] = pos + 1
+
+                        sd = self._preloaded[zarr_path]
+
+                        # Preloaded arrays are in common-gene order,
+                        # so g_idx indexes directly (no name lookup).
+                        feat_signals.append(
+                            torch.from_numpy(
+                                sd['TSS_signals'][g_idx].astype(np.float32)))
+                        feat_nt.append(
+                            torch.from_numpy(
+                                sd['TSS_nucleotides'][g_idx]
+                                .astype(np.float32)))
+                        feat_tss.append(
+                            torch.from_numpy(sd['TSS_features'][g_idx]))
+                        feat_gb.append(
+                            torch.from_numpy(sd['GB_features'][g_idx]))
+                        feat_ref.append(
+                            torch.from_numpy(sd['ref_scalars'][g_idx]))
+                        lab_tfx.append(float(sd['TFX_label'][g_idx]))
+                        lab_weight.append(gene_weight)
+
+                        if self.labeled:
+                            lab_tumor.append(float(sd['tumor_exp'][g_idx]))
+                            lab_bg.append(
+                                float(sd['background_exp'][g_idx]))
+
+                        if self.include_metadata:
+                            meta_samples.append(
+                                self._get_sample_name(zarr_path))
+                            meta_genes.append(gene_name)
+
+            # Stack into batch tensors.
+            features: Dict[str, Any] = {
+                'TSS_signals': torch.stack(feat_signals),
+                'TSS_nucleotides': torch.stack(feat_nt),
+                'TSS_features': torch.stack(feat_tss),
+                'GB_features': torch.stack(feat_gb),
+                'ref_scalars': torch.stack(feat_ref),
+            }
+            if self.include_metadata:
+                features['sample_name'] = meta_samples
+                features['gene_name'] = meta_genes
+
+            w_t = torch.tensor(lab_weight, dtype=torch.float32)
+            t_t = torch.tensor(lab_tfx, dtype=torch.float32)
+
+            if self.labeled:
+                labels: Dict[str, torch.Tensor] = {
+                    'tumor_exp': torch.tensor(
+                        lab_tumor, dtype=torch.float32).unsqueeze(-1),
+                    'background_exp': torch.tensor(
+                        lab_bg, dtype=torch.float32).unsqueeze(-1),
+                    'sample_weight': w_t.unsqueeze(-1),
+                    'TFX_label': t_t.unsqueeze(-1),
+                }
+            else:
+                labels = {
+                    'sample_weight': w_t.unsqueeze(-1),
+                    'TFX_label': t_t.unsqueeze(-1),
+                }
+
+            yield features, labels
+
+
 def collate_proteus_genes(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
     """Collate gene-level items (each item is one gene)."""
     features_list, labels_list = zip(*batch)
@@ -1088,6 +1468,232 @@ def build_loaders_from_splits(
         loader_mode=loader_mode,
         chunk_size=chunk_size,
         genes_per_batch=genes_per_batch,
+        shuffle_genes_in_batch=False,
+        seed=seed,
+        include_metadata=True,
+        drop_last=False,
+        subsample_frac=subsample_frac,
+        gene_weights=gene_weights,
+        sample_name_map=zarr_path_to_sample_name,
+    )
+
+    return train_loader, val_loader, train_steps, val_steps
+
+
+def build_multisource_loaders_from_splits(
+    training_set_tsv: str,
+    zarr_base: str,
+    val_fold: int,
+    source_groups: Dict[str, List[str]],
+    gene_variance: Dict[str, float],
+    n_eff_per_source: int = 24,
+    genes_per_batch: int = 2,
+    samples_per_source: int = 4,
+    variance_sample_frac: float = 0.70,
+    gene_weight_min: float = 0.5,
+    gene_weight_max: float = 2.0,
+    num_workers: int = 4,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+    seed: int = 42,
+    train_only_cohorts: Optional[List[str]] = None,
+    gene_weights: Optional[Dict[str, float]] = None,
+    subsample_frac: Optional[float] = None,
+) -> Tuple[DataLoader, DataLoader, int, int]:
+    """Build multi-source train loader + chunk-based val loader from splits TSV.
+
+    Training uses :class:`ProteusMultiSourceBatchDataset` (gene-conditioned
+    batches drawn from all source groups simultaneously).  Validation uses the
+    standard chunk-based exhaustive loader so every gene × sample is evaluated.
+
+    Args:
+        training_set_tsv: Path to TSV with Cohort/Sample/Fold columns.
+        zarr_base: Base directory for Zarr stores.
+        val_fold: Fold number held out for validation.
+        source_groups: Mapping of source name → list of cohort names.
+        gene_variance: Per-gene raw variance (for mixture sampler + loss weights).
+        n_eff_per_source: Effective samples per source per epoch.
+        genes_per_batch: Unique genes drawn per batch (default 2).
+        samples_per_source: Samples drawn per source per gene (default 4).
+        variance_sample_frac: Weight for variance-priority sampling (default 0.70).
+        gene_weight_min: Minimum compressed loss weight (default 0.5).
+        gene_weight_max: Maximum compressed loss weight (default 2.0).
+        num_workers: DataLoader workers.
+        persistent_workers: Keep workers alive between epochs.
+        prefetch_factor: Batches to prefetch per worker.
+        seed: Random seed.
+        train_only_cohorts: Cohorts always routed to training (e.g. ``['PHT']``).
+        gene_weights: Clipped variance weights for the validation loader.
+        subsample_frac: Optional epoch-length fraction (for fast sanity checks).
+
+    Returns:
+        (train_loader, val_loader, train_steps, val_steps)
+    """
+    import csv
+    import re
+
+    if not os.path.exists(training_set_tsv):
+        raise FileNotFoundError(f"Training set TSV not found: {training_set_tsv}")
+
+    train_paths: List[str] = []
+    val_paths: List[str] = []
+    missing_samples: List[str] = []
+    zarr_path_to_cohort: Dict[str, str] = {}
+    zarr_path_to_sample_name: Dict[str, str] = {}
+    _train_only = set(train_only_cohorts or [])
+
+    with open(training_set_tsv, 'r', newline='') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        required = {'Cohort', 'Sample', 'Fold'}
+        if reader.fieldnames is None or not required.issubset(set(reader.fieldnames)):
+            raise ValueError(
+                f"TSV must have columns: {sorted(required)}. "
+                f"Found: {reader.fieldnames}"
+            )
+        for row in reader:
+            cohort = row['Cohort'].strip()
+            sample = row['Sample'].strip()
+            fold = int(row['Fold'])
+
+            zarr_name = sample
+            if sample.startswith(f"{cohort}_"):
+                zarr_name = sample[len(cohort) + 1:]
+
+            zarr_path = os.path.join(
+                zarr_base, cohort, 'zarr_files', f"{zarr_name}.zarr")
+            if not os.path.isdir(zarr_path):
+                missing_samples.append(
+                    f"  {cohort}/zarr_files/{zarr_name}.zarr  "
+                    f"(Fold={fold}, TSV sample={sample})")
+                continue
+
+            zarr_path_to_cohort[zarr_path] = cohort
+            zarr_path_to_sample_name[zarr_path] = sample
+
+            if cohort in _train_only:
+                train_paths.append(zarr_path)
+            elif fold == val_fold:
+                val_paths.append(zarr_path)
+            else:
+                train_paths.append(zarr_path)
+
+    if missing_samples:
+        raise FileNotFoundError(
+            f"Missing {len(missing_samples)} Zarr store(s) under {zarr_base}:\n"
+            + "\n".join(missing_samples))
+    if not train_paths:
+        raise ValueError(f"No training samples found (all in fold {val_fold}?)")
+    if not val_paths:
+        raise ValueError(f"No validation samples found for fold {val_fold}")
+
+    # -- Assign training paths to source groups (including PHT → parent PDX) --
+    cohort_to_source: Dict[str, str] = {}
+    for src_name, cohorts in source_groups.items():
+        for coh in cohorts:
+            cohort_to_source[coh] = src_name
+
+    # Collect known PDX sample names per cohort for PHT matching.
+    pdx_sample_to_cohort: Dict[str, str] = {}
+    with open(training_set_tsv, 'r', newline='') as f2:
+        reader2 = csv.DictReader(f2, delimiter='\t')
+        for row in reader2:
+            coh = row['Cohort'].strip()
+            samp = row['Sample'].strip()
+            if samp.startswith(f"{coh}_"):
+                samp = samp[len(coh) + 1:]
+            if coh in cohort_to_source:
+                pdx_sample_to_cohort[samp] = coh
+
+    pht_re = re.compile(r'^PHT-Fold-\d+_(.+)-BP\d+')
+    sample_paths_by_source: Dict[str, List[str]] = {
+        src: [] for src in source_groups
+    }
+
+    for zpath in train_paths:
+        coh = zarr_path_to_cohort[zpath]
+        if coh in cohort_to_source:
+            sample_paths_by_source[cohort_to_source[coh]].append(zpath)
+        elif coh == 'PHT':
+            basename = os.path.basename(zpath).replace('.zarr', '')
+            m = pht_re.match(basename)
+            if m:
+                pdx_name = m.group(1)
+                pdx_coh = pdx_sample_to_cohort.get(pdx_name)
+                if pdx_coh is not None:
+                    sample_paths_by_source[cohort_to_source[pdx_coh]].append(zpath)
+                else:
+                    raise ValueError(
+                        f"PHT sample '{basename}' has PDX name '{pdx_name}' "
+                        f"that does not match any known PDX sample. "
+                        f"Known: {sorted(pdx_sample_to_cohort.keys())}")
+            else:
+                raise ValueError(
+                    f"Could not parse PDX name from PHT sample: '{basename}'. "
+                    f"Expected format: PHT-Fold-X_<PDX_NAME>-BP...")
+
+    # Report source assignments.
+    for src_name in sorted(sample_paths_by_source):
+        print(f"  [MultiSource] source '{src_name}': "
+              f"{len(sample_paths_by_source[src_name])} training samples")
+
+    # -- Training loader (multi-source) --
+    train_dataset = ProteusMultiSourceBatchDataset(
+        sample_paths_by_source=sample_paths_by_source,
+        gene_variance=gene_variance,
+        n_eff_per_source=n_eff_per_source,
+        genes_per_batch=genes_per_batch,
+        samples_per_source=samples_per_source,
+        variance_sample_frac=variance_sample_frac,
+        gene_weight_min=gene_weight_min,
+        gene_weight_max=gene_weight_max,
+        seed=seed,
+        labeled=True,
+        sample_name_map=zarr_path_to_sample_name,
+        include_metadata=False,
+        subsample_frac=subsample_frac,
+    )
+
+    base_generator = torch.Generator()
+    base_generator.manual_seed(seed)
+
+    def _seed_worker(worker_id: int) -> None:
+        worker_seed = torch.initial_seed() % (2**32)
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=_collate_identity,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        worker_init_fn=_seed_worker if num_workers > 0 else None,
+        generator=base_generator,
+        drop_last=False,
+        pin_memory=True,
+    )
+    train_steps = len(train_dataset)
+
+    # -- Validation loader (chunk-based, exhaustive) --
+    import tempfile
+    temp_dir = tempfile.mkdtemp(prefix='proteus_msplits_')
+    val_index = os.path.join(temp_dir, f'val_fold{val_fold}.json')
+    with open(val_index, 'w') as f:
+        json.dump(val_paths, f)
+
+    val_loader, val_steps = create_data_loader(
+        index_file=val_index,
+        num_workers=num_workers,
+        shuffle=False,
+        labeled=True,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
+        loader_mode='chunk',
+        chunk_size=256,
+        genes_per_batch=32,
         shuffle_genes_in_batch=False,
         seed=seed,
         include_metadata=True,

@@ -64,6 +64,11 @@ class TrainingConfig:
     
     # Mixed precision
     use_amp: bool = True
+
+    # Exponential moving average of model parameters.
+    # 0.0 = disabled; >0 (e.g. 0.999) = active.  When enabled, validation
+    # and checkpoints use the EMA shadow weights.
+    ema_decay: float = 0.0
     
     # torch.compile (PyTorch 2.0+)
     # Disabled: with 92K tiny 32-gene batches, CUDA graph recording/replay
@@ -198,6 +203,52 @@ class EarlyStopping:
         return False
 
 
+class _EMAState:
+    """Exponential moving average of model parameters.
+
+    Maintains a shadow copy of all trainable parameters.  After each
+    optimizer step, call ``update()`` to blend the shadow toward the
+    current model weights:  shadow = decay * shadow + (1-decay) * param.
+
+    ``apply()`` / ``restore()`` swap the model weights with the shadow
+    so that validation and checkpointing operate on the EMA model.
+    """
+
+    def __init__(self, model: nn.Module, decay: float):
+        self.decay = decay
+        self.shadow: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    @torch.no_grad()
+    def update(self, model: nn.Module) -> None:
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(
+                    param.data, alpha=1.0 - self.decay)
+
+    def apply(self, model: nn.Module) -> Dict[str, torch.Tensor]:
+        """Replace model params with EMA shadow.  Returns a backup."""
+        backup: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+        return backup
+
+    def restore(
+        self, model: nn.Module, backup: Dict[str, torch.Tensor],
+    ) -> None:
+        """Restore original params from backup."""
+        for name, param in model.named_parameters():
+            if name in backup:
+                param.data.copy_(backup[name])
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        return {k: v.clone() for k, v in self.shadow.items()}
+
+
 class Trainer:
     """
     Training loop for BioDVN with mixed precision support.
@@ -282,6 +333,9 @@ class Trainer:
         # Scheduler will be initialized when training starts
         self.scheduler = None
 
+        # EMA state (created lazily in _prepare_for_fit if ema_decay > 0).
+        self._ema: Optional[_EMAState] = None
+
         # One-time runtime banner to confirm GPU execution during actual training.
         self._printed_runtime_device_banner = False
 
@@ -351,6 +405,14 @@ class Trainer:
 
         self.model.train()
         self.optimizer = self._create_optimizer()
+
+        # Initialize EMA shadow after optimizer so the initial shadow
+        # matches the (possibly weight-loaded / frozen) model state.
+        ema_decay = getattr(self.config, 'ema_decay', 0.0)
+        if ema_decay > 0.0:
+            self._ema = _EMAState(self.model, ema_decay)
+            print(f'  EMA enabled (decay={ema_decay})')
+
         self._prepared_for_fit = True
 
     def _print_runtime_device_banner(self, features: Optional[Dict[str, torch.Tensor]] = None) -> None:
@@ -694,6 +756,10 @@ class Trainer:
                 if self.scheduler is not None:
                     self.scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
+
+                # EMA shadow update (after optimizer step).
+                if self._ema is not None:
+                    self._ema.update(self.model)
 
             if self.config.track_batch_timing:
                 step_time = time.time() - step_start
@@ -1190,6 +1256,12 @@ class Trainer:
             
             # Validation
             if val_loader is not None:
+                # When EMA is active, swap to shadow weights for validation
+                # and checkpointing so both reflect the averaged model.
+                _ema_backup: Optional[Dict[str, torch.Tensor]] = None
+                if self._ema is not None:
+                    _ema_backup = self._ema.apply(self.model)
+
                 val_metrics = self.validate(val_loader)
                 
                 history['val_loss'].append(val_metrics['val_loss'])
@@ -1262,7 +1334,14 @@ class Trainer:
                 if self.early_stopping(val_score, epoch):
                     print(f'\nEarly stopping triggered at epoch {epoch}')
                     print(f'Best epoch: {self.early_stopping.best_epoch}')
+                    # Restore raw model weights before break.
+                    if _ema_backup is not None:
+                        self._ema.restore(self.model, _ema_backup)
                     break
+
+                # Restore raw model weights for next training epoch.
+                if _ema_backup is not None:
+                    self._ema.restore(self.model, _ema_backup)
         
         metric_label = 'Balanced-CRPS' if 'val_balanced_tumor_gvw_crps' in (history or {}) else 'GVW-CRPS'
         print(f'\nTraining complete. Best validation score ({metric_label}): {best_val_score:.4f}')
@@ -1282,6 +1361,12 @@ class Trainer:
             'config': self.config,
             'model_config': self.model_config,
         }
+        # When EMA is active and _save_checkpoint is called while the EMA
+        # shadow is applied (inside the EMA context in fit()), the current
+        # model_state_dict already IS the EMA state.  We also store the
+        # shadow explicitly so downstream consumers can detect EMA usage.
+        if self._ema is not None:
+            checkpoint['ema_state_dict'] = self._ema.state_dict()
         
         if is_best:
             path = os.path.join(self.config.checkpoint_dir, 'best_model.pt')

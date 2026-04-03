@@ -24,10 +24,12 @@ from .compile_sample_data import (
 
 from .proteus_utils import (
     ProteusInferenceDataset,
+    ProteusMultiSourceBatchDataset,
     collate_inference,
     create_data_loader,
     create_inference_loader,
     build_loaders_from_splits,
+    build_multisource_loaders_from_splits,
     extract_gene_depths,
 )
 
@@ -59,9 +61,11 @@ __all__ = [
     'MAX_FEATURE_NAN_FRACTION',
     # proteus_utils
     'ProteusInferenceDataset',
+    'ProteusMultiSourceBatchDataset',
     'collate_inference',
     'create_data_loader', 'create_inference_loader',
-    'build_loaders_from_splits', 'extract_gene_depths',
+    'build_loaders_from_splits', 'build_multisource_loaders_from_splits',
+    'extract_gene_depths',
     # trainer
     'TrainingConfig', 'Trainer',
     # metrics

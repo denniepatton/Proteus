@@ -199,6 +199,7 @@ class TrainingSpec:
     epochs: ParamSpec
     patience: ParamSpec
     use_amp: ParamSpec
+    ema_decay: ParamSpec
 
     @staticmethod
     def from_yaml(x: Any) -> "TrainingSpec":
@@ -208,6 +209,7 @@ class TrainingSpec:
             "weight_decay", "max_grad_norm",
             "warmup_frac", "schedule_frac",
             "epochs", "patience", "use_amp",
+            "ema_decay",
         ]
         _check_no_unknown_keys(d, allowed=allowed, ctx="training")
 
@@ -225,6 +227,7 @@ class TrainingSpec:
             epochs=p("epochs", 15),
             patience=p("patience", 3),
             use_amp=p("use_amp", True),
+            ema_decay=p("ema_decay", 0.0),
         )
 
 
@@ -376,7 +379,14 @@ class DataSpec:
 
     target_n_per_source (optional, int):
         Target number of samples per source group per training epoch.
-        Only used when ``source_groups`` is set.
+        Only used when ``source_groups`` is set.  In ``multi_source``
+        batch mode this controls the effective pool size (N_eff).
+
+    batch_mode (optional, str: 'chunk' | 'multi_source'):
+        Batch construction strategy.  ``'chunk'`` (default) uses the
+        existing per-sample contiguous-chunk loader.  ``'multi_source'``
+        uses multi-source gene-conditioned batches (2 genes × N sources
+        × 4 samples/source = 32 items per batch).
     """
     training_set: str
     zarr_base: str
@@ -386,6 +396,7 @@ class DataSpec:
     balance_cohorts: Optional[List[str]]
     source_groups: Optional[Dict[str, List[str]]]
     target_n_per_source: Optional[int]
+    batch_mode: str
 
     @staticmethod
     def from_yaml(x: Any) -> "DataSpec":
@@ -393,7 +404,7 @@ class DataSpec:
         allowed = ["training_set", "zarr_base", "seed",
                     "subsample_frac", "train_only_cohorts",
                     "balance_cohorts", "source_groups",
-                    "target_n_per_source"]
+                    "target_n_per_source", "batch_mode"]
         _check_no_unknown_keys(d, allowed=allowed, ctx="data")
         subsample_raw = d.get("subsample_frac", None)
         subsample_frac: Optional[float] = None
@@ -438,6 +449,17 @@ class DataSpec:
             _fail("data.source_groups and data.balance_cohorts are "
                   "mutually exclusive — use one or the other")
 
+        batch_mode_raw = _as_str(
+            d.get("batch_mode", "chunk"), "data.batch_mode"
+        ).lower()
+        if batch_mode_raw not in ("chunk", "multi_source"):
+            _fail(f"data.batch_mode must be 'chunk' or 'multi_source', "
+                  f"got '{batch_mode_raw}'")
+
+        if batch_mode_raw == "multi_source" and source_groups is None:
+            _fail("data.batch_mode='multi_source' requires "
+                  "data.source_groups to be set")
+
         return DataSpec(
             training_set=_as_str(d["training_set"], "data.training_set"),
             zarr_base=_as_str(
@@ -450,6 +472,7 @@ class DataSpec:
             balance_cohorts=balance,
             source_groups=source_groups,
             target_n_per_source=target_n,
+            batch_mode=batch_mode_raw,
         )
 
 

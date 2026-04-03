@@ -52,6 +52,12 @@ def _color(subtype: str) -> str:
     return _palette().get(subtype, "#999999")
 
 
+def _darken(hex_color: str, factor: float = 0.6) -> str:
+    """Return a darker shade of *hex_color* by scaling RGB toward black."""
+    c = mpl.colors.to_rgb(hex_color)
+    return mpl.colors.to_hex(tuple(ch * factor for ch in c))
+
+
 def _ensure_dir(path: str) -> None:
     d = os.path.dirname(path)
     if d:
@@ -1294,7 +1300,9 @@ def benchmark_grid_boxplots(
                     all_scalar = all(len(v) == 1 for v in plot_data)
                     if all_scalar:
                         for i, (vals, c) in enumerate(zip(plot_data, colors), start=1):
-                            ax.plot(i, vals[0], "o", color=c, markersize=24, zorder=3)
+                            ax.plot(i, vals[0], "o", color=c, markersize=24,
+                                    markeredgecolor=_darken(c), markeredgewidth=1.5,
+                                    zorder=3)
                         ax.set_xticks(range(1, len(labels) + 1))
                         ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=6)
                     else:
@@ -1423,7 +1431,9 @@ def benchmark_ecdna_lines(
                 continue
             color = cmap.get(model, "#BBBBBB")
             line, = ax.plot(sub["ecdna"], sub[col], "o-",
-                            color=color, markersize=16, linewidth=1.4)
+                            color=color, markersize=16, linewidth=1.4,
+                            markeredgecolor=_darken(color),
+                            markeredgewidth=1.2)
             # Collect legend entries from first panel only
             if idx == 0:
                 legend_handles.append((line, model))
@@ -1462,66 +1472,153 @@ def benchmark_cohort_boxplots(
     model_order: Sequence[str],
     naive_model: str = "Naïve",
 ) -> None:
-    """Side-by-side cohort panels of box/dot plots, one box per model.
+    """Single-panel cohort-paired box/dot plots, one group per model.
 
     ``metrics_table`` must have columns: cohort, model, and ``metric_col``.
-    Each cohort gets its own panel.  A dashed gray line marks the Naïve
-    model's mean value for reference.
+    Both cohorts are shown side-by-side within each model group.  For
+    scalar data (one value per model per cohort), different marker symbols
+    distinguish cohorts (square / triangle).  A dashed gray line marks the
+    Naïve model's grand mean for reference.
     """
     _ensure_dir(name)
     cmap = _bench_color_map(model_order)
-    n_panels = len(cohort_order)
+    n_cohorts = len(cohort_order)
 
-    fig, axes = plt.subplots(
-        1, n_panels, figsize=(6 * n_panels + 1, 5),
-        sharey=True, squeeze=False,
-    )
+    # Marker symbols per cohort for scalar dot plots
+    _COHORT_MARKERS = ["s", "^", "D", "P"]  # square, triangle, diamond, plus
+    cohort_markers = {c: _COHORT_MARKERS[i % len(_COHORT_MARKERS)]
+                      for i, c in enumerate(cohort_order)}
 
-    for ci, cohort in enumerate(cohort_order):
-        ax = axes[0, ci]
-        sub = metrics_table[metrics_table["cohort"] == cohort]
-        if sub.empty:
-            ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
-                    ha="center", va="center", fontsize=9, color="gray")
-        else:
-            naive_vals = sub.loc[sub["model"] == naive_model, metric_col].dropna().values
-            if len(naive_vals) > 0:
-                ax.axhline(float(np.mean(naive_vals)), color="#BBBBBB",
-                           ls="--", lw=1.2, zorder=0)
+    # Filter to models present in the data
+    present_models = [m for m in model_order
+                      if m in set(metrics_table["model"])]
+    n_models = len(present_models)
+    if n_models == 0:
+        return
 
-            plot_data, labels, colors = [], [], []
-            for model in model_order:
-                vals = sub.loc[sub["model"] == model, metric_col].dropna().values
-                if len(vals) > 0:
-                    plot_data.append(vals)
-                    labels.append(model)
-                    colors.append(cmap.get(model, "#BBBBBB"))
+    # Determine if data is scalar (1 value per model×cohort) or distributional
+    all_scalar = True
+    for model in present_models:
+        for cohort in cohort_order:
+            vals = metrics_table.loc[
+                (metrics_table["model"] == model) &
+                (metrics_table["cohort"] == cohort), metric_col
+            ].dropna().values
+            if len(vals) > 1:
+                all_scalar = False
+                break
+        if not all_scalar:
+            break
 
-            if plot_data:
-                all_scalar = all(len(v) == 1 for v in plot_data)
-                if all_scalar:
-                    for i, (vals, c) in enumerate(zip(plot_data, colors), start=1):
-                        ax.plot(i, vals[0], "o", color=c, markersize=24, zorder=3)
-                    ax.set_xticks(range(1, len(labels) + 1))
-                    ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=6)
-                else:
-                    bp = ax.boxplot(
-                        plot_data, patch_artist=True, widths=0.6,
-                        medianprops=dict(color="black", linewidth=1.2),
-                        flierprops=dict(markersize=2),
-                    )
-                    for patch, c in zip(bp["boxes"], colors):
-                        patch.set_facecolor(c)
-                        patch.set_alpha(0.7)
-                    for flier in bp.get("fliers", []):
-                        flier.set_markersize(4)
-                    ax.set_xticks(range(1, len(labels) + 1))
-                    ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=6)
+    fig_width = max(8, 1.4 * n_models * n_cohorts + 2)
+    fig, ax = plt.subplots(figsize=(fig_width, 5))
 
-        ax.set_title(cohort, fontsize=10, fontweight="bold")
-        if ci == 0:
-            ax.set_ylabel(ylabel, fontsize=9)
+    # Naïve reference line
+    naive_vals = metrics_table.loc[
+        metrics_table["model"] == naive_model, metric_col
+    ].dropna().values
+    if len(naive_vals) > 0:
+        ax.axhline(float(np.mean(naive_vals)), color="#BBBBBB",
+                   ls="--", lw=1.2, zorder=0)
 
+    if all_scalar:
+        # Dot plot: one marker per (model, cohort); different symbols per cohort
+        group_width = 0.6
+        offsets = np.linspace(-group_width / 2, group_width / 2, n_cohorts)
+        legend_handles = []
+        for ci_idx, cohort in enumerate(cohort_order):
+            marker = cohort_markers[cohort]
+            first_handle = None
+            for mi, model in enumerate(present_models):
+                vals = metrics_table.loc[
+                    (metrics_table["model"] == model) &
+                    (metrics_table["cohort"] == cohort), metric_col
+                ].dropna().values
+                if len(vals) == 0:
+                    continue
+                color = cmap.get(model, "#BBBBBB")
+                x = mi + 1 + offsets[ci_idx]
+                h = ax.plot(x, vals[0], marker=marker, color=color,
+                            markersize=18,
+                            markeredgecolor=_darken(color),
+                            markeredgewidth=1.5, zorder=3,
+                            linestyle="none")
+                if first_handle is None:
+                    first_handle = h[0]
+            if first_handle is not None:
+                legend_handles.append((first_handle, cohort))
+
+        ax.set_xticks(range(1, n_models + 1))
+        ax.set_xticklabels(present_models, rotation=55, ha="right", fontsize=7)
+        if legend_handles:
+            handles, labels = zip(*legend_handles)
+            ax.legend(handles, labels, fontsize=8, loc="best", framealpha=0.8)
+
+    else:
+        # Paired boxplots: for each model, n_cohorts side-by-side boxes
+        box_width = 0.35
+        group_gap = 0.15
+        total_group = n_cohorts * box_width + (n_cohorts - 1) * group_gap
+        all_positions = []
+        all_data = []
+        all_colors = []
+        cohort_color_alpha = {c: 0.55 + 0.15 * i for i, c in enumerate(cohort_order)}
+        tick_positions = []
+        tick_labels = []
+
+        for mi, model in enumerate(present_models):
+            group_center = mi * (total_group + 0.6)
+            tick_positions.append(group_center)
+            tick_labels.append(model)
+            for ci_idx, cohort in enumerate(cohort_order):
+                vals = metrics_table.loc[
+                    (metrics_table["model"] == model) &
+                    (metrics_table["cohort"] == cohort), metric_col
+                ].dropna().values
+                if len(vals) == 0:
+                    vals = np.array([np.nan])
+                pos = (group_center
+                       - total_group / 2
+                       + ci_idx * (box_width + group_gap)
+                       + box_width / 2)
+                all_positions.append(pos)
+                all_data.append(vals)
+                all_colors.append(cmap.get(model, "#BBBBBB"))
+
+        if all_data:
+            bp = ax.boxplot(
+                all_data, positions=all_positions, widths=box_width,
+                patch_artist=True,
+                medianprops=dict(color="black", linewidth=1.2),
+                flierprops=dict(markersize=2),
+            )
+            for pi, (patch, c) in enumerate(zip(bp["boxes"], all_colors)):
+                ci_idx = pi % n_cohorts
+                alpha = cohort_color_alpha.get(cohort_order[ci_idx], 0.7)
+                patch.set_facecolor(c)
+                patch.set_alpha(alpha)
+                # Hatch second cohort for visual distinction
+                if ci_idx > 0:
+                    patch.set_hatch("//")
+            for flier in bp.get("fliers", []):
+                flier.set_markersize(4)
+
+            ax.set_xticks(tick_positions)
+            ax.set_xticklabels(tick_labels, rotation=55, ha="right", fontsize=7)
+
+            # Legend for cohorts (using proxy patches)
+            from matplotlib.patches import Patch
+            legend_patches = []
+            for ci_idx, cohort in enumerate(cohort_order):
+                p = Patch(facecolor="#888888",
+                          alpha=cohort_color_alpha.get(cohort, 0.7),
+                          hatch="//" if ci_idx > 0 else "",
+                          label=cohort)
+                legend_patches.append(p)
+            ax.legend(handles=legend_patches, fontsize=8, loc="best",
+                      framealpha=0.8)
+
+    ax.set_ylabel(ylabel, fontsize=9)
     fig.suptitle(title, fontsize=13, fontweight="bold", y=1.01)
     fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
@@ -1624,7 +1721,9 @@ def benchmark_cohort_metrics_lines(
                 v = sub.loc[sub["cohort"] == cohort, col].values
                 y_vals.append(float(v[0]) if len(v) > 0 else np.nan)
             line, = ax.plot(x_positions, y_vals, "o-",
-                            color=color, markersize=16, linewidth=1.4)
+                            color=color, markersize=16, linewidth=1.4,
+                            markeredgecolor=_darken(color),
+                            markeredgewidth=1.2)
             if idx == 0:
                 legend_handles.append((line, model))
         ax.set_xticks(x_positions)

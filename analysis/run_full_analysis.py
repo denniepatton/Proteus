@@ -39,6 +39,7 @@ from analysis.analysis_utils import (
     _gvw_rho_from_wide,
     build_study_truth_pool,
     clean_epicseq_sample_names,
+    clean_epicseq_sample_names_wcdt,
     cohort_summary_table,
     compute_coverage_curve,
     compute_gene_variance,
@@ -2534,7 +2535,7 @@ def _bench_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
 _PANFT_COHORTS = ["CRPC-WCDT", "BLCA-RA"]
 
 _PANFT_MODEL_ORDER = [
-    "Proteus_Tuned", "Proteus_Base", "XGBoost",
+    "Proteus_Tuned", "Proteus_Base", "Proteus_NoSeq", "XGBoost",
     "EPIC_GEP", "EPIC_PFE", "EPIC_NDR", "Naïve",
 ]
 
@@ -2543,10 +2544,12 @@ _PANFT_PROTEUS_PATHS: Dict[str, Dict[str, str]] = {
     "CRPC-WCDT": {
         "Proteus_Tuned": "results_holdout/BioDVN_PAN-FT/CRPC-WCDT/predictions_tumor.tsv",
         "Proteus_Base": "results_holdout/BioDVN/CRPC-WCDT/predictions_tumor.tsv",
+        "Proteus_NoSeq": "results_holdout/BioDVN_NoSeq/CRPC-WCDT/predictions_tumor.tsv",
     },
     "BLCA-RA": {
         "Proteus_Tuned": "results_holdout/BioDVN_PAN-FT/BLCA-RA/predictions_tumor.tsv",
         "Proteus_Base": "results_holdout/BioDVN/BLCA-RA/predictions_tumor.tsv",
+        "Proteus_NoSeq": "results_holdout/BioDVN_NoSeq/BLCA-RA/predictions_tumor.tsv",
     },
 }
 
@@ -2555,9 +2558,18 @@ _PANFT_XGB_PATHS: Dict[str, str] = {
     "BLCA-RA": "results_holdout/XGBoost/BLCA-RA/predictions_tumor.tsv",
 }
 
-# EPIC-Seq paths — only BLCA-RA has EPIC-Seq results.
+# EPIC-Seq paths — both cohorts now have results.
 _PANFT_EPIC_PATHS: Dict[str, str] = {
+    "CRPC-WCDT": "results_holdout/EPIC-Seq/CRPC-WCDT/EPICSeqInferredExpressionValues.txt",
     "BLCA-RA": "results_holdout/EPIC-Seq/BLCA-RA/EPICSeqInferredExpressionValues.txt",
+}
+
+# EPIC-Seq sample name cleaners per cohort.  CRPC-WCDT uses long-form
+# names (e.g. DTB-097-Progression-cfDNA_recalibrated) while BLCA-RA uses
+# the standard cram suffix form (e.g. 15-109_1107.cram).
+_PANFT_EPIC_CLEANERS = {
+    "CRPC-WCDT": clean_epicseq_sample_names_wcdt,
+    "BLCA-RA": clean_epicseq_sample_names,
 }
 
 
@@ -2628,9 +2640,10 @@ def run_benchmarking_panft(args: argparse.Namespace) -> None:
                 epic_preds = load_holdout_predictions_epicseq(
                     str(epic_path), _EPIC_SCORE_COLS,
                 )
+                cleaner = _PANFT_EPIC_CLEANERS.get(cohort, clean_epicseq_sample_names)
                 for score_name, epw in epic_preds.items():
                     display = _EPIC_DISPLAY_NAMES.get(score_name, f"EPIC_{score_name}")
-                    epw.columns = clean_epicseq_sample_names(epw.columns)
+                    epw.columns = cleaner(epw.columns)
                     _apply_prefix_map(epw, pmap)
                     model_preds[display] = epw
                     print(f"    Loaded {display}: {epw.shape[1]} samples")
@@ -2729,10 +2742,7 @@ def run_benchmarking_panft(args: argparse.Namespace) -> None:
                os.path.join(out_dir, "benchmark_cohort_gene_rho_hist"),
                cohort_order=_PANFT_COHORTS, model_order=model_order)
 
-    # ── Multi-metric line plots (cohort on x-axis) ──
-    _maybe(benchmark_cohort_metrics_lines, args.overwrite,
-           metrics_table, os.path.join(out_dir, "benchmark_cohort_metrics"),
-           cohort_order=_PANFT_COHORTS, model_order=model_order)
+    # benchmark_cohort_metrics_lines omitted for PAN-FT (kept in Base only)
 
     print("\n  Done")
 

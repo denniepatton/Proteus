@@ -377,6 +377,7 @@ def train_model_cv(
     balance_cohorts: Optional[List[str]] = None,
     source_groups: Optional[Dict[str, List[str]]] = None,
     target_n_per_source: Optional[int] = None,
+    batch_mode: str = 'chunk',
 ):
     """Train a model using cross-validation with deterministic fold assignment.
 
@@ -600,23 +601,42 @@ def train_model_cv(
 
         # Build data loaders from TSV
         print('Building data loaders...')
-        train_loader, val_loader, train_steps, val_steps = build_loaders_from_splits(
-            training_set_tsv=training_set_tsv,
-            zarr_base=zarr_base,
-            val_fold=fold_num,
-            num_workers=_loader_workers(),
-            loader_mode='chunk',
-            chunk_size=chunk_size,
-            genes_per_batch=genes_per_batch,
-            shuffle_genes_in_batch=shuffle_genes_in_batch,
-            seed=seed,
-            subsample_frac=subsample_frac,
-            gene_weights=gene_weights,
-            train_only_cohorts=train_only_cohorts,
-            balance_cohorts=balance_cohorts,
-            source_groups=source_groups,
-            target_n_per_source=target_n_per_source,
-        )
+        if batch_mode == 'multi_source':
+            from proteus_utils.proteus_utils import build_multisource_loaders_from_splits
+            if source_groups is None:
+                raise ValueError(
+                    "batch_mode='multi_source' requires source_groups")
+            train_loader, val_loader, train_steps, val_steps = build_multisource_loaders_from_splits(
+                training_set_tsv=training_set_tsv,
+                zarr_base=zarr_base,
+                val_fold=fold_num,
+                source_groups=source_groups,
+                gene_variance=train_fold_variance_raw,
+                n_eff_per_source=target_n_per_source or 24,
+                num_workers=_loader_workers(),
+                seed=seed,
+                train_only_cohorts=train_only_cohorts,
+                gene_weights=gene_weights,
+                subsample_frac=subsample_frac,
+            )
+        else:
+            train_loader, val_loader, train_steps, val_steps = build_loaders_from_splits(
+                training_set_tsv=training_set_tsv,
+                zarr_base=zarr_base,
+                val_fold=fold_num,
+                num_workers=_loader_workers(),
+                loader_mode='chunk',
+                chunk_size=chunk_size,
+                genes_per_batch=genes_per_batch,
+                shuffle_genes_in_batch=shuffle_genes_in_batch,
+                seed=seed,
+                subsample_frac=subsample_frac,
+                gene_weights=gene_weights,
+                train_only_cohorts=train_only_cohorts,
+                balance_cohorts=balance_cohorts,
+                source_groups=source_groups,
+                target_n_per_source=target_n_per_source,
+            )
         print(f'Training batches: {train_steps}, Validation batches: {val_steps}')
         
         # Create model

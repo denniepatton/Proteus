@@ -244,6 +244,7 @@ def _resolve_trial_configs(
     epochs = t("epochs", exp.training.epochs)
     patience = t("patience", exp.training.patience)
     use_amp = t("use_amp", exp.training.use_amp)
+    ema_decay = t("ema_decay", exp.training.ema_decay)
 
     # =====================================================================
     # Scale group
@@ -339,6 +340,7 @@ def _resolve_trial_configs(
         epochs=int(epochs),
         patience=int(patience),
         use_amp=bool(use_amp),
+        ema_decay=float(ema_decay),
         base_weights=exp.transfer.base_weights,
         freeze_level=exp.transfer.freeze_level,
         freeze_mode=str(freeze_mode) if freeze_mode is not None else None,
@@ -373,6 +375,7 @@ def _resolve_trial_configs(
             "epochs": int(epochs),
             "patience": int(patience),
             "use_amp": bool(use_amp),
+            "ema_decay": float(ema_decay),
         },
         "scale": {
             "encoder_start": int(encoder_start),
@@ -745,6 +748,7 @@ def run_optuna_cv_tuning(
                 balance_cohorts=exp.data.balance_cohorts,
                 source_groups=exp.data.source_groups,
                 target_n_per_source=exp.data.target_n_per_source,
+                batch_mode=exp.data.batch_mode,
             )
         except optuna.TrialPruned:
             raise  # Let Optuna handle pruning
@@ -1378,6 +1382,7 @@ def run_optuna_fold_tuning(
                 balance_cohorts=exp.data.balance_cohorts,
                 source_groups=exp.data.source_groups,
                 target_n_per_source=exp.data.target_n_per_source,
+                batch_mode=exp.data.batch_mode,
             )
         except optuna.TrialPruned:
             raise  # Let Optuna handle it

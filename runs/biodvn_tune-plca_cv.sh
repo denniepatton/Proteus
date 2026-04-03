@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # =====================================================================
-# PLCA Phase 1.3 — Min-source GVW-r objective, narrowed LR, tunable epochs
+# PLCA Phase 1.6 — Min-source GVW-r objective, narrowed LR, tunable epochs
 #
 # 4 workers per fold × 5 folds = 20 SLURM jobs.
 # All share the same Optuna study via SQLite storage.
@@ -10,8 +10,8 @@ set -euo pipefail
 # Workers for the same fold get different sampler seeds so each
 # explores a distinct region of HP space.
 # =====================================================================
-EXPERIMENT="PLCA_tuning/biodvn_tune-plca_phase1-3"
-TAG="PLCA_1-3"
+EXPERIMENT="PLCA_tuning/biodvn_tune-plca_phase1-6"
+TAG="PLCA_1-6"
 YAML="config/experiments/${EXPERIMENT}.yaml"
 ENV_NAME="proteus"
 N_WORKERS_PER_FOLD=4
@@ -53,6 +53,7 @@ submit_fold_worker() {
 #SBATCH --error=logs/${job_name}_%j.err
 #SBATCH --partition=${partition}
 #SBATCH --cpus-per-task=8
+#SBATCH --mem=200G
 #SBATCH --gpus=${gpu_spec}
 #SBATCH --time=${time_limit}
 #SBATCH -A nelson_p
@@ -89,7 +90,7 @@ _blacklist_node() {
 }
 
 TOTAL_WORKERS=$((N_WORKERS_PER_FOLD * 5))
-echo "=== PLCA Phase 1.2: ${N_WORKERS_PER_FOLD} workers/fold × 5 folds = ${TOTAL_WORKERS} workers, ${TRIALS_PER_WORKER} trials/worker ==="
+echo "=== PLCA Phase 1.6: ${N_WORKERS_PER_FOLD} workers/fold × 5 folds = ${TOTAL_WORKERS} workers, ${TRIALS_PER_WORKER} trials/worker ==="
 
 # =====================================================================
 # Phase 1: Submit first worker for Fold 1 to initialize the Optuna study
@@ -198,4 +199,4 @@ while true; do
     fi
 done
 
-echo "=== PLCA Phase 1.0 tuning complete. ==="
+echo "=== PLCA Phase 1.6 tuning complete. ==="
