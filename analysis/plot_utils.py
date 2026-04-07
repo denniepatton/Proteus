@@ -1510,7 +1510,7 @@ def benchmark_cohort_boxplots(
         if not all_scalar:
             break
 
-    fig_width = max(8, 1.4 * n_models * n_cohorts + 2)
+    fig_width = max(5, 0.7 * n_models + 2)
     fig, ax = plt.subplots(figsize=(fig_width, 5))
 
     # Naïve reference line
@@ -1523,7 +1523,7 @@ def benchmark_cohort_boxplots(
 
     if all_scalar:
         # Dot plot: one marker per (model, cohort); different symbols per cohort
-        group_width = 0.6
+        group_width = 0.3
         offsets = np.linspace(-group_width / 2, group_width / 2, n_cohorts)
         legend_handles = []
         for ci_idx, cohort in enumerate(cohort_order):
@@ -1539,9 +1539,9 @@ def benchmark_cohort_boxplots(
                 color = cmap.get(model, "#BBBBBB")
                 x = mi + 1 + offsets[ci_idx]
                 h = ax.plot(x, vals[0], marker=marker, color=color,
-                            markersize=18,
+                            markersize=12,
                             markeredgecolor=_darken(color),
-                            markeredgewidth=1.5, zorder=3,
+                            markeredgewidth=1.2, zorder=3,
                             linestyle="none")
                 if first_handle is None:
                     first_handle = h[0]
@@ -1556,8 +1556,8 @@ def benchmark_cohort_boxplots(
 
     else:
         # Paired boxplots: for each model, n_cohorts side-by-side boxes
-        box_width = 0.35
-        group_gap = 0.15
+        box_width = 0.25
+        group_gap = 0.05
         total_group = n_cohorts * box_width + (n_cohorts - 1) * group_gap
         all_positions = []
         all_data = []
@@ -1567,7 +1567,7 @@ def benchmark_cohort_boxplots(
         tick_labels = []
 
         for mi, model in enumerate(present_models):
-            group_center = mi * (total_group + 0.6)
+            group_center = mi * (total_group + 0.3)
             tick_positions.append(group_center)
             tick_labels.append(model)
             for ci_idx, cohort in enumerate(cohort_order):

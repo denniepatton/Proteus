@@ -255,7 +255,6 @@ def _resolve_trial_configs(
     mdn_hidden = sc("mdn_hidden", exp.scale.mdn_hidden)
     mdn_final = sc("mdn_final", exp.scale.mdn_final)
     signal_filters = sc("signal_filters", exp.scale.signal_filters)
-    signal_encoder_width = sc("signal_encoder_width", exp.scale.signal_encoder_width)
     signal_ksize = sc("signal_ksize", exp.scale.signal_ksize)
     interaction_ksize = sc("interaction_ksize", exp.scale.interaction_ksize)
     initial_reduction_channels = sc("initial_reduction_channels", exp.scale.initial_reduction_channels)
@@ -306,7 +305,6 @@ def _resolve_trial_configs(
         mdn_hidden=int(mdn_hidden),
         mdn_final=int(mdn_final),
         signal_filters=int(signal_filters),
-        signal_encoder_width=int(signal_encoder_width),
         signal_ksize=int(signal_ksize),
         interaction_ksize=int(interaction_ksize),
         initial_reduction_channels=int(initial_reduction_channels),
@@ -384,7 +382,6 @@ def _resolve_trial_configs(
             "mdn_hidden": int(mdn_hidden),
             "mdn_final": int(mdn_final),
             "signal_filters": int(signal_filters),
-            "signal_encoder_width": int(signal_encoder_width),
             "signal_ksize": int(signal_ksize),
             "interaction_ksize": int(interaction_ksize),
             "initial_reduction_channels": int(initial_reduction_channels),
@@ -1665,3 +1662,305 @@ def _write_study_report(study: optuna.Study, output_dir: str) -> None:
 
     # Fold-stability analysis (fold-parallel studies)
     _compute_fold_stability(study, output_dir, direction)
+
+
+# =============================================================================
+# Coordinated Fold-Parallel Tuning (ask/tell + fold workers)
+# =============================================================================
+# Each "round" the coordinator asks Optuna for N configs, writes them to
+# disk, then the SLURM script launches 5 fold workers per config.  After
+# all folds finish, the coordinator reads fold metrics and tells Optuna
+# the cross-fold objective.  This gives fold-level parallelism with a
+# proper cross-fold objective.
+# =============================================================================
+
+
+def coordinated_ask(
+    experiment_path: str,
+    n_configs: int,
+    storage: str,
+    study_name: Optional[str] = None,
+    sampler_seed: int = 42,
+) -> List[int]:
+    """Ask Optuna for ``n_configs`` trial configs and write them to disk.
+
+    For each config, creates ``{output_dir}/trial_{number:05d}/`` with
+    a ``trial_config.json`` and a ``pending`` sentinel file.
+
+    Returns the list of trial numbers (used by the SLURM script to
+    dispatch fold workers).
+    """
+    exp = load_experiment_spec(experiment_path)
+    study_name = str(study_name) if study_name is not None else exp.name
+    direction = exp.objective.direction
+
+    sampler = optuna.samplers.TPESampler(
+        seed=int(sampler_seed),
+        multivariate=True,
+        constant_liar=True,
+        warn_independent_sampling=False,
+    )
+    pruner = optuna.pruners.NopPruner()
+
+    study = optuna.create_study(
+        study_name=study_name,
+        direction=direction,
+        storage=_make_storage(storage),
+        load_if_exists=True,
+        sampler=sampler,
+        pruner=pruner,
+    )
+
+    # Phase-transition seeding (once per study)
+    if (exp.tuning.prev_study is not None
+            and not study.user_attrs.get("_prev_study_seeded")):
+        study.set_user_attr("_prev_study_seeded", True)
+        _, top_params = narrow_search_space_from_study(
+            prev_study_name=exp.tuning.prev_study,
+            storage=storage,
+            top_fraction=exp.tuning.top_fraction,
+            enqueue_top_k=exp.tuning.enqueue_top_k,
+        )
+        for params in top_params:
+            study.enqueue_trial(params)
+        if top_params:
+            print(f"[Coordinated] Seeded {len(top_params)} top configs from "
+                  f"'{exp.tuning.prev_study}'", flush=True)
+
+    trial_numbers: List[int] = []
+    for _ in range(n_configs):
+        trial = study.ask()
+        try:
+            _, _, trial_cfg = _resolve_trial_configs(exp, trial)
+        except optuna.TrialPruned as exc:
+            # Config is geometrically invalid — tell Optuna and skip.
+            study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+            print(f"[Coordinated] Trial {trial.number} pruned: {exc}", flush=True)
+            continue
+
+        run_dir = os.path.join(exp.output_dir, f"trial_{trial.number:05d}")
+        os.makedirs(run_dir, exist_ok=True)
+
+        _write_json_atomic(
+            os.path.join(run_dir, "trial_config.json"), trial_cfg
+        )
+
+        # Write pending sentinel with trial metadata
+        _write_json_atomic(
+            os.path.join(run_dir, "coordinated_pending.json"),
+            {"trial_number": trial.number, "status": "pending"},
+        )
+
+        trial_numbers.append(trial.number)
+        print(f"[Coordinated] Asked trial {trial.number:05d} → {run_dir}", flush=True)
+
+    # Persist trial numbers for the SLURM script
+    _write_json_atomic(
+        os.path.join(exp.output_dir, "coordinated_active.json"),
+        {"trial_numbers": trial_numbers},
+    )
+
+    return trial_numbers
+
+
+def coordinated_tell(
+    experiment_path: str,
+    trial_numbers: Optional[List[int]] = None,
+    storage: str = "sqlite:///results_training/optuna.db",
+    study_name: Optional[str] = None,
+    sampler_seed: int = 42,
+) -> None:
+    """Report cross-fold results for completed coordinated trials.
+
+    Reads fold metrics from ``{output_dir}/trial_{number}/CV-fold_*/``,
+    computes the CV objective, and calls ``study.tell()`` for each trial.
+    If ``trial_numbers`` is None, reads from ``coordinated_active.json``.
+    """
+    exp = load_experiment_spec(experiment_path)
+    study_name = str(study_name) if study_name is not None else exp.name
+    direction = exp.objective.direction
+    metric = exp.objective.metric
+
+    sampler = optuna.samplers.TPESampler(
+        seed=int(sampler_seed),
+        multivariate=True,
+        constant_liar=True,
+        warn_independent_sampling=False,
+    )
+
+    study = optuna.create_study(
+        study_name=study_name,
+        direction=direction,
+        storage=_make_storage(storage),
+        load_if_exists=True,
+        sampler=sampler,
+        pruner=optuna.pruners.NopPruner(),
+    )
+
+    # Read active trial numbers if not provided
+    if trial_numbers is None:
+        active_path = os.path.join(exp.output_dir, "coordinated_active.json")
+        if not os.path.exists(active_path):
+            print("[Coordinated-tell] No coordinated_active.json found.", flush=True)
+            return
+        with open(active_path, "r") as f:
+            trial_numbers = json.load(f)["trial_numbers"]
+
+    # Map trial numbers to frozen trials for study.tell()
+    # study.tell() needs the trial object returned by study.ask(),
+    # but those are only available in the ask() process.  We use
+    # study.tell(trial_number, ...) which Optuna supports via the
+    # trial number when the trial is in WAITING or RUNNING state.
+    for trial_num in trial_numbers:
+        run_dir = os.path.join(exp.output_dir, f"trial_{trial_num:05d}")
+
+        # Check that all folds completed
+        folds = _folds_from_tsv(exp.data.training_set)
+        all_done = True
+        for fold_k in folds:
+            metrics_path = os.path.join(
+                run_dir, f"CV-fold_{fold_k}",
+                f"validation-fold_{fold_k}_metrics.json",
+            )
+            if not os.path.exists(metrics_path):
+                all_done = False
+                break
+
+        if not all_done:
+            print(f"[Coordinated-tell] Trial {trial_num:05d}: "
+                  f"not all folds complete — skipping.", flush=True)
+            # Tell Optuna this trial failed
+            study.tell(trial_num, state=optuna.trial.TrialState.FAIL)
+            continue
+
+        # Compute cross-fold objective (same as sequential CV)
+        try:
+            obj = compute_cv_objective(run_dir)
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            print(f"[Coordinated-tell] Trial {trial_num:05d}: "
+                  f"objective computation failed: {exc}", flush=True)
+            study.tell(trial_num, state=optuna.trial.TrialState.FAIL)
+            continue
+
+        try:
+            value = _objective_value(obj, metric=metric, direction=direction)
+        except ExperimentSpecError as exc:
+            print(f"[Coordinated-tell] Trial {trial_num:05d}: {exc}", flush=True)
+            study.tell(trial_num, state=optuna.trial.TrialState.FAIL)
+            continue
+
+        # Report to Optuna — cv_objective.json on disk preserves full
+        # cross-fold metrics; the study only stores the scalar objective.
+        study.tell(trial_num, value)
+
+        print(f"[Coordinated-tell] Trial {trial_num:05d}: "
+              f"{metric}={value:.4f}", flush=True)
+
+        # Remove pending sentinel
+        pending = os.path.join(run_dir, "coordinated_pending.json")
+        if os.path.exists(pending):
+            os.remove(pending)
+
+    _write_study_report(study, exp.output_dir)
+    print(f"[Coordinated-tell] Reported {len(trial_numbers)} trial(s).", flush=True)
+
+
+def run_coordinated_fold(
+    experiment_path: str,
+    trial_number: int,
+    fold_num: int,
+) -> None:
+    """Train a single fold for a coordinated trial.
+
+    Reads the trial config from ``{output_dir}/trial_{number}/trial_config.json``,
+    builds model/training configs, and runs ``train_model_cv`` for the
+    specified fold.  No Optuna interaction — pure training.
+    """
+    exp = load_experiment_spec(experiment_path)
+    run_dir = os.path.join(exp.output_dir, f"trial_{trial_number:05d}")
+    config_path = os.path.join(run_dir, "trial_config.json")
+
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(
+            f"Trial config not found: {config_path}\n"
+            f"Run 'tune-ask' first to generate configs."
+        )
+
+    with open(config_path, "r") as f:
+        trial_cfg = json.load(f)
+
+    # Reconstruct model and training configs from the saved trial config
+    s = trial_cfg["structural"]
+    t = trial_cfg["training"]
+    sc = trial_cfg["scale"]
+    tr = trial_cfg.get("transfer", {})
+
+    model_cfg = BioDVNConfig(
+        encoder_start=int(sc["encoder_start"]),
+        latent_size=int(sc["latent_size"]),
+        decoder_start=int(sc["decoder_start"]),
+        mdn_hidden=int(sc["mdn_hidden"]),
+        mdn_final=int(sc["mdn_final"]),
+        signal_filters=int(sc["signal_filters"]),
+        signal_ksize=int(sc["signal_ksize"]),
+        interaction_ksize=int(sc["interaction_ksize"]),
+        initial_reduction_channels=int(sc["initial_reduction_channels"]),
+        n_reductions=int(sc["n_reductions"]),
+        reduction_dilation=int(sc["reduction_dilation"]),
+        beta_background=float(s["beta_background"]),
+        beta_tcvae=float(s["beta_tcvae"]),
+        beta_contrastive=float(s["beta_contrastive"]),
+        beta_reconstruction=float(s["beta_reconstruction"]),
+        cl_margin=float(s["cl_margin"]),
+        internal_weight=float(s["internal_weight"]),
+        beta_grl=float(s["beta_grl"]),
+        beta_point_mse=float(s["beta_point_mse"]),
+        dropout_rate=float(sc["dropout_rate"]),
+        weight_decay=float(t["weight_decay"]),
+        max_lr=float(t["max_lr"]),
+        max_grad_norm=float(t["max_grad_norm"]),
+    )
+
+    train_cfg = TrainingConfig(
+        checkpoint_dir="",
+        max_lr=float(t["max_lr"]),
+        min_lr_ratio=float(t["min_lr_ratio"]),
+        warmup_start_lr=float(t["warmup_start_lr"]),
+        weight_decay=float(t["weight_decay"]),
+        max_grad_norm=float(t["max_grad_norm"]),
+        warmup_frac=float(t["warmup_frac"]),
+        schedule_frac=float(t["schedule_frac"]),
+        epochs=int(t["epochs"]),
+        patience=int(t["patience"]),
+        use_amp=bool(t["use_amp"]),
+        ema_decay=float(t["ema_decay"]),
+        base_weights=tr.get("base_weights"),
+        freeze_level=tr.get("freeze_level"),
+        freeze_mode=tr.get("freeze_mode"),
+        backbone_lr_multiplier=float(tr.get("backbone_lr_multiplier", 1.0)),
+    )
+
+    from Proteus import train_model_cv  # local import to avoid circulars
+
+    print(f"[Coordinated] Training trial {trial_number:05d}, fold {fold_num}",
+          flush=True)
+
+    train_model_cv(
+        model_name="BioDVN",
+        training_set_tsv=exp.data.training_set,
+        zarr_base=exp.data.zarr_base,
+        test_fold=int(fold_num),
+        out_dir=run_dir,
+        model_config=model_cfg,
+        training_config=train_cfg,
+        genes_per_batch=32,
+        chunk_size=256,
+        shuffle_genes_in_batch=True,
+        seed=exp.data.seed,
+        subsample_frac=exp.data.subsample_frac,
+        train_only_cohorts=exp.data.train_only_cohorts,
+        balance_cohorts=exp.data.balance_cohorts,
+        source_groups=exp.data.source_groups,
+        target_n_per_source=exp.data.target_n_per_source,
+        batch_mode=exp.data.batch_mode,
+    )

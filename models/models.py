@@ -99,7 +99,6 @@ class BioDVNConfig:
     initial_reduction_channels: int = 64
     n_reductions: int = 3
     reduction_dilation: int = 3
-    signal_encoder_width: int = 256  # First hidden dim of signal encoder funnel
     encoder_start: int = 128
     latent_size: int = 64
     decoder_start: int = 64
@@ -475,12 +474,23 @@ class BioDVN(nn.Module):
             dilation=config.reduction_dilation,
         )
         
-        # Signal encoding (must be built eagerly so all parameters exist before
-        # optimizer construction and torch.compile).
+        # Signal encoding: channel projection + adaptive average pooling.
+        # Conv1d(k=1) learns a linear combination of reduction output channels,
+        # then AdaptiveAvgPool1d squashes the spatial dimension — imposing
+        # translation invariance along the 2kb TSS window.
         self._tss_input_length = 2000
-        self.signal_encoded_dim = 64  # From signal encoder output
-        self.signal_encoder_input_dim = self._compute_signal_encoder_input_dim()
-        self.signal_encoder = self._build_signal_encoder(self.signal_encoder_input_dim)
+        self.signal_encoded_dim = 64  # Signal encoder output dim
+        reduction_out_channels = self.reduction.out_channels
+        self.signal_encoder = nn.Sequential(
+            # (batch, length, C) → permute → (batch, C, length)
+            # Conv1d projects channels: C → signal_encoded_dim
+            nn.Conv1d(reduction_out_channels, self.signal_encoded_dim, kernel_size=1),
+            get_norm_layer_conv1d(self.signal_encoded_dim),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),  # (batch, signal_encoded_dim, 1)
+            nn.Flatten(1),            # (batch, signal_encoded_dim)
+            nn.Dropout(config.dropout_rate),
+        )
         self.scalar_input_dim = 0
         # TSS scalar features (11 shared Triton features, matching GB).
         self.scalar_input_dim += 11
@@ -521,9 +531,14 @@ class BioDVN(nn.Module):
         )
 
         # Weight prediction for merging: TFX (predicted or raw) + latent stats.
+        # Small nonlinear MLP gives capacity to learn non-trivial
+        # TFX-to-weight mappings beyond a linear decision boundary.
         merge_input_dim = 1 + 4 * config.latent_size  # TFX + 2*(mean + log_var)
         self.weight_predictor = nn.Sequential(
-            nn.Linear(merge_input_dim, 2),
+            nn.Linear(merge_input_dim, 32),
+            nn.ReLU(),
+            nn.Dropout(config.dropout_rate),
+            nn.Linear(32, 2),
             nn.Softmax(dim=-1)
         )
         
@@ -600,75 +615,6 @@ class BioDVN(nn.Module):
             out = out // 2  # AvgPool1d(kernel_size=2, stride=2)
         return out
 
-    def _compute_signal_encoder_input_dim(self) -> int:
-        """Compute the flat dim feeding the signal encoder.
-
-        This must match the actual tensor shapes produced in forward().
-        """
-        # SignalProcessingBlock reduces length by (signal_ksize - 1) with padding=0.
-        base_len = self._tss_input_length - self.config.signal_ksize + 1
-        if base_len <= 0:
-            raise ValueError(
-                f'Invalid signal_ksize={self.config.signal_ksize} for TSS length {self._tss_input_length}'
-            )
-
-        # ReductionBlock output channels: initial_reduction_channels // (2 ** i) per iteration.
-        out_channels = max(
-            self.config.initial_reduction_channels // (2 ** max(self.config.n_reductions - 1, 0)),
-            1,
-        )
-
-        reduced_len = self._compute_reduction_output_length(
-            base_len,
-            interaction_ksize=self.config.interaction_ksize,
-            dilation=self.config.reduction_dilation,
-            n_reductions=self.config.n_reductions,
-        )
-
-        if reduced_len <= 0:
-            raise ValueError(
-                'Invalid reduction configuration produced non-positive sequence length: '
-                f'reduced_len={reduced_len} '
-                f'(tss_len={self._tss_input_length}, signal_ksize={self.config.signal_ksize}, '
-                f'n_reductions={self.config.n_reductions}, interaction_ksize={self.config.interaction_ksize}, '
-                f'dilation={self.config.reduction_dilation})'
-            )
-
-        return int(reduced_len) * int(out_channels)
-
-    def _build_signal_encoder(self, input_dim: int) -> nn.Module:
-        """Build a halving-funnel MLP: input_dim → width → width//2 → … → signal_encoded_dim."""
-        width = int(self.config.signal_encoder_width)
-        target_dim = self.signal_encoded_dim
-
-        layers: list[nn.Module] = [
-            nn.Linear(int(input_dim), width),
-            get_norm_layer(width),
-            nn.ReLU(),
-            nn.Dropout(self.config.dropout_rate),
-        ]
-        current = width
-        while current // 2 >= target_dim:
-            next_dim = current // 2
-            layers.extend([
-                nn.Linear(current, next_dim),
-                get_norm_layer(next_dim),
-                nn.ReLU(),
-                nn.Dropout(self.config.dropout_rate) if next_dim > target_dim else nn.Identity(),
-            ])
-            current = next_dim
-
-        # If the halving loop ended above target_dim, add a final
-        # projection.  (Only fires if width is not a power-of-2 multiple of 64.)
-        if current != target_dim:
-            layers.extend([
-                nn.Linear(current, target_dim),
-                get_norm_layer(target_dim),
-                nn.ReLU(),
-            ])
-
-        return nn.Sequential(*layers)
-    
     def forward(
         self,
         features: Dict[str, torch.Tensor],
@@ -718,19 +664,10 @@ class BioDVN(nn.Module):
         # Spatial reduction (skip connections integrate multi-scale features)
         x = self.reduction(x)
         
-        # Flatten
-        x_flat = x.reshape(x.shape[0], -1)
-
-        # Sanity check that precomputed encoder input dim matches runtime tensors.
-        runtime_dim = int(x_flat.shape[1])
-        if runtime_dim != int(self.signal_encoder_input_dim):
-            raise ValueError(
-                'Signal encoder input dim mismatch. '
-                f'Expected {self.signal_encoder_input_dim}, got {runtime_dim}. '
-                f'(TSS_signals length={int(x_signals.shape[1])}, configured_tss_len={self._tss_input_length})'
-            )
-
-        x_encoded = self.signal_encoder(x_flat)
+        # Signal encoding: permute to (batch, channels, length) for Conv1d,
+        # then the adaptive-pooling signal encoder squashes spatial dim.
+        x = x.permute(0, 2, 1)
+        x_encoded = self.signal_encoder(x)
         
         # Combine with scalar features.
         # Build encoder input.  TFX is never included — the encoder learns
@@ -970,9 +907,21 @@ class BioDVN_NoSeq(BioDVN):
             dilation=self.config.reduction_dilation,
         )
         
+        # Rebuild signal encoder to match new reduction output channels.
+        reduction_out_channels = self.reduction.out_channels
+        self.signal_encoder = nn.Sequential(
+            nn.Conv1d(reduction_out_channels, self.signal_encoded_dim, kernel_size=1),
+            get_norm_layer_conv1d(self.signal_encoded_dim),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(1),
+            nn.Dropout(self.config.dropout_rate),
+        )
+        
         # Re-apply weight initialization to newly created layers
         self.signal_processor.apply(self._init_weights)
         self.reduction.apply(self._init_weights)
+        self.signal_encoder.apply(self._init_weights)
 
 
 class SignalProcessingBlock_NoSeq(nn.Module):
@@ -1049,6 +998,17 @@ class BioDVN_OnlySeq(BioDVN):
             dilation=self.config.reduction_dilation,
         )
 
+        # Rebuild signal encoder to match new reduction output channels.
+        reduction_out_channels = self.reduction.out_channels
+        self.signal_encoder = nn.Sequential(
+            nn.Conv1d(reduction_out_channels, self.signal_encoded_dim, kernel_size=1),
+            get_norm_layer_conv1d(self.signal_encoded_dim),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(1),
+            nn.Dropout(self.config.dropout_rate),
+        )
+
         # Exclude sample-derived scalar features (TSS_features=11, GB_features=11).
         # Only reference scalars (3) are retained — these are gene-level
         # constants (NumExons, transcript_length, mRNA_size) that do not
@@ -1079,6 +1039,7 @@ class BioDVN_OnlySeq(BioDVN):
         # Re-apply weight initialization to all newly created layers
         self.signal_processor.apply(self._init_weights)
         self.reduction.apply(self._init_weights)
+        self.signal_encoder.apply(self._init_weights)
         self.tumor_encoder.apply(self._init_weights)
         self.background_encoder.apply(self._init_weights)
         self.decoder.apply(self._init_weights)
@@ -1099,9 +1060,10 @@ class BioDVN_OnlySeq(BioDVN):
         # Spatial reduction
         x = self.reduction(x)
 
-        # Flatten + encode spatial features
-        x_flat = x.reshape(x.shape[0], -1)
-        x_encoded = self.signal_encoder(x_flat)
+        # Signal encoding: permute to (batch, channels, length) for Conv1d,
+        # then the adaptive-pooling signal encoder squashes spatial dim.
+        x = x.permute(0, 2, 1)
+        x_encoded = self.signal_encoder(x)
 
         # Encoder input: signal encoding + reference scalars only.
         # TSS_features and GB_features are deliberately excluded — they

@@ -2,20 +2,20 @@
 set -euo pipefail
 
 # =====================================================================
-# PLCA Phase 1.6 — Min-source GVW-r objective, narrowed LR, tunable epochs
+# PLCA Phase 1.7 — Sequential CV tuning (cross-fold objective)
 #
-# 4 workers per fold × 5 folds = 20 SLURM jobs.
-# All share the same Optuna study via SQLite storage.
-# Each worker runs 50 trials; 4 workers × 50 = 200 trials per fold.
-# Workers for the same fold get different sampler seeds so each
-# explores a distinct region of HP space.
+# Each worker runs ALL 5 folds per trial → proper cross-fold optimization.
+# 20 SLURM workers, each with 1 GPU, sharing an Optuna study via SQLite.
+# Each trial trains 15 epochs × 5 folds ≈ 42h → expect ~1.5 trials/worker.
+# Top-10 configs from phase 1.6 are seeded; remaining trials are
+# TPE-sampled from narrowed HP ranges.
 # =====================================================================
-EXPERIMENT="PLCA_tuning/biodvn_tune-plca_phase1-6"
-TAG="PLCA_1-6"
+EXPERIMENT="PLCA_tuning/biodvn_tune-plca_phase1-7"
+TAG="PLCA_1-7"
 YAML="config/experiments/${EXPERIMENT}.yaml"
 ENV_NAME="proteus"
-N_WORKERS_PER_FOLD=4
-TRIALS_PER_WORKER=50
+N_WORKERS=20
+TRIALS_PER_WORKER=3
 BASE_SAMPLER_SEED=42
 POLL_INTERVAL=15
 MONITOR_INTERVAL=120
@@ -36,15 +36,15 @@ _build_exclude() {
 }
 
 # =====================================================================
-# Helper: submit a fold worker
+# Helper: submit a CV worker (no --test_fold → all folds per trial)
 # =====================================================================
-submit_fold_worker() {
-    local fold=$1 worker_id=$2 partition=$3 gpu_spec=$4 time_limit=$5 sampler_seed=$6
-    local job_name="${TAG}_F${fold}w${worker_id}"
+submit_cv_worker() {
+    local worker_id=$1 partition=$2 gpu_spec=$3 time_limit=$4 sampler_seed=$5
+    local job_name="${TAG}_w${worker_id}"
     local exclude_flag
     exclude_flag=$(_build_exclude)
     local job_script
-    job_script=$(mktemp "job_f${fold}w${worker_id}_XXXXXX.sh")
+    job_script=$(mktemp "job_w${worker_id}_XXXXXX.sh")
 
     cat > "${job_script}" <<EOL
 #!/bin/bash
@@ -63,7 +63,6 @@ micromamba activate ${ENV_NAME}
 python Proteus.py \\
     --run_mode tune \\
     --experiment ${YAML} \\
-    --test_fold ${fold} \\
     --n_trials ${TRIALS_PER_WORKER} \\
     --sampler_seed ${sampler_seed}
 EOL
@@ -89,26 +88,25 @@ _blacklist_node() {
     fi
 }
 
-TOTAL_WORKERS=$((N_WORKERS_PER_FOLD * 5))
-echo "=== PLCA Phase 1.6: ${N_WORKERS_PER_FOLD} workers/fold × 5 folds = ${TOTAL_WORKERS} workers, ${TRIALS_PER_WORKER} trials/worker ==="
+echo "=== PLCA Phase 1.7: ${N_WORKERS} CV workers, ${TRIALS_PER_WORKER} trials/worker, 5 folds/trial ==="
 
 # =====================================================================
-# Phase 1: Submit first worker for Fold 1 to initialize the Optuna study
+# Phase 1: Submit worker 0 to initialize the Optuna study + seed prev
 # =====================================================================
-echo "=== Phase 1: Submitting Fold 1 worker 0 (RTX 2080 Ti) to initialize study ==="
+echo "=== Phase 1: Submitting worker 0 to initialize study ==="
 INIT_SEED="${BASE_SAMPLER_SEED}"
-INIT_JOB=$(submit_fold_worker 1 0 campus-new "rtx2080ti:1" "72:00:00" "${INIT_SEED}")
-echo "  Fold 1 worker 0 submitted: job ${INIT_JOB}"
+INIT_JOB=$(submit_cv_worker 0 campus-new "rtx2080ti:1" "72:00:00" "${INIT_SEED}")
+echo "  Worker 0 submitted: job ${INIT_JOB}"
 
-echo "=== Waiting for Fold 1 worker 0 (job ${INIT_JOB}) to start running ==="
+echo "=== Waiting for worker 0 (job ${INIT_JOB}) to start running ==="
 while true; do
     state=$(squeue -j "${INIT_JOB}" -h -o '%T' 2>/dev/null || true)
     if [[ "${state}" == "RUNNING" ]]; then
-        echo "  Fold 1 worker 0 is RUNNING — proceeding."
+        echo "  Worker 0 is RUNNING — proceeding."
         sleep 10
         break
     elif [[ -z "${state}" ]]; then
-        echo "  WARNING: Fold 1 worker 0 job ${INIT_JOB} no longer in queue."
+        echo "  WARNING: Worker 0 job ${INIT_JOB} no longer in queue."
         echo "  Proceeding anyway (the DB may already exist from a prior run)."
         break
     fi
@@ -116,34 +114,25 @@ while true; do
 done
 
 # =====================================================================
-# Phase 2: Submit remaining workers (3 more for fold 1, 4 each for 2-5)
+# Phase 2: Submit remaining 19 workers
 # =====================================================================
-echo "=== Phase 2: Submitting remaining $((TOTAL_WORKERS - 1)) workers ==="
+echo "=== Phase 2: Submitting remaining $((N_WORKERS - 1)) workers ==="
 
 declare -a JOB_IDS=()
 declare -a JOB_LABELS=()
-declare -a JOB_FOLDS=()
 declare -a JOB_WIDS=()
 declare -a JOB_SEEDS=()
 declare -a RETRIES=()
 
 # Track the initializer
-JOB_IDS+=("${INIT_JOB}"); JOB_LABELS+=("F1w0"); JOB_FOLDS+=(1); JOB_WIDS+=(0); JOB_SEEDS+=("${INIT_SEED}"); RETRIES+=(0)
+JOB_IDS+=("${INIT_JOB}"); JOB_LABELS+=("w0"); JOB_WIDS+=(0); JOB_SEEDS+=("${INIT_SEED}"); RETRIES+=(0)
 
-global_idx=1  # worker 0 already submitted
-for fold in 1 2 3 4 5; do
-    start_w=0
-    if [[ "${fold}" -eq 1 ]]; then
-        start_w=1  # worker 0 for fold 1 already submitted
-    fi
-    for w in $(seq "${start_w}" $((N_WORKERS_PER_FOLD - 1))); do
-        seed=$((BASE_SAMPLER_SEED + global_idx))
-        jid=$(submit_fold_worker "${fold}" "${w}" campus-new "rtx2080ti:1" "72:00:00" "${seed}")
-        label="F${fold}w${w}"
-        echo "  ${label}: job ${jid} (seed ${seed})"
-        JOB_IDS+=("${jid}"); JOB_LABELS+=("${label}"); JOB_FOLDS+=("${fold}"); JOB_WIDS+=("${w}"); JOB_SEEDS+=("${seed}"); RETRIES+=(0)
-        global_idx=$((global_idx + 1))
-    done
+for w in $(seq 1 $((N_WORKERS - 1))); do
+    seed=$((BASE_SAMPLER_SEED + w))
+    jid=$(submit_cv_worker "${w}" campus-new "rtx2080ti:1" "72:00:00" "${seed}")
+    label="w${w}"
+    echo "  ${label}: job ${jid} (seed ${seed})"
+    JOB_IDS+=("${jid}"); JOB_LABELS+=("${label}"); JOB_WIDS+=("${w}"); JOB_SEEDS+=("${seed}"); RETRIES+=(0)
 done
 
 n_slots=${#JOB_IDS[@]}
@@ -160,7 +149,6 @@ while true; do
     for i in $(seq 0 $((n_slots - 1))); do
         jid="${JOB_IDS[$i]}"
         label="${JOB_LABELS[$i]}"
-        fold="${JOB_FOLDS[$i]}"
         wid="${JOB_WIDS[$i]}"
         seed="${JOB_SEEDS[$i]}"
         retries="${RETRIES[$i]}"
@@ -186,7 +174,7 @@ while true; do
         fi
 
         echo "  [$(date '+%H:%M:%S')] ${label} (job ${jid}) failed (exit ${exit_code}) — resubmitting..."
-        new_jid=$(submit_fold_worker "${fold}" "${wid}" campus-new "rtx2080ti:1" "72:00:00" "${seed}")
+        new_jid=$(submit_cv_worker "${wid}" campus-new "rtx2080ti:1" "72:00:00" "${seed}")
         JOB_IDS[$i]="${new_jid}"
         RETRIES[$i]=$((retries + 1))
         echo "    New job: ${new_jid} (retry $((retries + 1))/${MAX_RETRIES})"
@@ -199,4 +187,4 @@ while true; do
     fi
 done
 
-echo "=== PLCA Phase 1.6 tuning complete. ==="
+echo "=== PLCA Phase 1.7 tuning complete. ==="

@@ -248,7 +248,6 @@ class ScaleSpec:
     mdn_hidden: ParamSpec
     mdn_final: ParamSpec
     signal_filters: ParamSpec
-    signal_encoder_width: ParamSpec
     signal_ksize: ParamSpec
     interaction_ksize: ParamSpec
     initial_reduction_channels: ParamSpec
@@ -262,11 +261,12 @@ class ScaleSpec:
         allowed = [
             "encoder_start", "latent_size", "decoder_start",
             "mdn_hidden", "mdn_final",
-            "signal_filters", "signal_encoder_width",
+            "signal_filters",
             "signal_ksize", "interaction_ksize",
             "initial_reduction_channels", "n_reductions",
             "reduction_dilation",
             "dropout_rate",
+            "signal_encoder_width",  # Legacy key; ignored (pooling replaced MLP)
         ]
         _check_no_unknown_keys(d, allowed=allowed, ctx="scale")
 
@@ -280,7 +280,6 @@ class ScaleSpec:
             mdn_hidden=p("mdn_hidden", 64),
             mdn_final=p("mdn_final", 32),
             signal_filters=p("signal_filters", 16),
-            signal_encoder_width=p("signal_encoder_width", 256),
             signal_ksize=p("signal_ksize", 6),
             interaction_ksize=p("interaction_ksize", 3),
             initial_reduction_channels=p("initial_reduction_channels", 64),

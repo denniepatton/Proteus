@@ -1745,7 +1745,6 @@ def _build_configs_from_spec(experiment_spec, args) -> tuple:
         mdn_hidden=int(experiment_spec.scale.mdn_hidden.fixed),
         mdn_final=int(experiment_spec.scale.mdn_final.fixed),
         signal_filters=int(experiment_spec.scale.signal_filters.fixed),
-        signal_encoder_width=int(experiment_spec.scale.signal_encoder_width.fixed),
         signal_ksize=int(experiment_spec.scale.signal_ksize.fixed),
         interaction_ksize=int(experiment_spec.scale.interaction_ksize.fixed),
         initial_reduction_channels=int(experiment_spec.scale.initial_reduction_channels.fixed),
@@ -1831,13 +1830,16 @@ def main():
     
     # Training arguments
     parser.add_argument("--model_name", type=str, default="BioDVN", help="Model architecture name")
-    parser.add_argument("--run_mode", type=str, default='train', choices=['train', 'full-train', 'tune', 'run'], help="train=CV training, full-train=final model, tune=Optuna CV tuning, run=inference")
+    parser.add_argument("--run_mode", type=str, default='train', choices=['train', 'full-train', 'tune', 'tune-ask', 'tune-tell', 'tune-fold', 'run'], help="train=CV training, full-train=final model, tune=Optuna CV tuning, tune-ask/tune-tell/tune-fold=coordinated fold-parallel tuning, run=inference")
     parser.add_argument("--test_fold", type=int, default=None, help="Specific fold to train (for HPC parallelization)")
     parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
 
     # Experiment / tuning
     parser.add_argument("--experiment", type=str, default=None, help="Path to experiment YAML (required for train/full-train/tune modes)")
     parser.add_argument("--n_trials", type=int, default=50, help="Number of Optuna trials for --run_mode tune")
+    parser.add_argument("--n_configs", type=int, default=4, help="Number of parallel config groups for --run_mode tune-ask")
+    parser.add_argument("--trial_number", type=int, default=None, help="Trial number for --run_mode tune-fold")
+    parser.add_argument("--trial_numbers", type=str, default=None, help="Comma-separated trial numbers for --run_mode tune-tell (default: read from coordinated_active.json)")
     parser.add_argument("--optuna_storage", type=str, default="sqlite:///results_training/optuna.db", help="Optuna storage URL (default: sqlite:///results_training/optuna.db)")
     parser.add_argument("--study_name", type=str, default=None, help="Optuna study name override (default: experiment.name)")
     parser.add_argument("--sampler_seed", type=int, default=42, help="Optuna sampler seed")
@@ -2058,6 +2060,56 @@ def main():
                 study_name=(None if args.study_name is None else str(args.study_name)),
                 sampler_seed=int(args.sampler_seed),
             )
+
+    elif args.run_mode == 'tune-ask':
+        if args.experiment is None:
+            raise ValueError("--run_mode tune-ask requires --experiment <path/to/experiment.yaml>")
+
+        from tuning.optuna_tuner import coordinated_ask
+
+        trial_numbers = coordinated_ask(
+            experiment_path=str(args.experiment),
+            n_configs=int(args.n_configs),
+            storage=str(args.optuna_storage),
+            study_name=(None if args.study_name is None else str(args.study_name)),
+            sampler_seed=int(args.sampler_seed),
+        )
+        # Print trial numbers for SLURM script to parse
+        print(f"TRIAL_NUMBERS={','.join(str(t) for t in trial_numbers)}", flush=True)
+
+    elif args.run_mode == 'tune-tell':
+        if args.experiment is None:
+            raise ValueError("--run_mode tune-tell requires --experiment <path/to/experiment.yaml>")
+
+        from tuning.optuna_tuner import coordinated_tell
+
+        trial_nums = None
+        if args.trial_numbers is not None:
+            trial_nums = [int(x.strip()) for x in args.trial_numbers.split(",")]
+
+        coordinated_tell(
+            experiment_path=str(args.experiment),
+            trial_numbers=trial_nums,
+            storage=str(args.optuna_storage),
+            study_name=(None if args.study_name is None else str(args.study_name)),
+            sampler_seed=int(args.sampler_seed),
+        )
+
+    elif args.run_mode == 'tune-fold':
+        if args.experiment is None:
+            raise ValueError("--run_mode tune-fold requires --experiment <path/to/experiment.yaml>")
+        if args.trial_number is None:
+            raise ValueError("--run_mode tune-fold requires --trial_number <N>")
+        if args.test_fold is None:
+            raise ValueError("--run_mode tune-fold requires --test_fold <K>")
+
+        from tuning.optuna_tuner import run_coordinated_fold
+
+        run_coordinated_fold(
+            experiment_path=str(args.experiment),
+            trial_number=int(args.trial_number),
+            fold_num=int(args.test_fold),
+        )
     
     elif args.run_mode == 'run':
         # Resolve model weights path.  When an experiment YAML is provided,

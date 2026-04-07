@@ -3179,6 +3179,95 @@ def run_benchmarking(args: argparse.Namespace) -> None:
     )
     print(f"  Summary: {len(metrics_table)} rows")
 
+    # ── Gene rankings (all models) and top-10 gene scatters (Proteus_Base) ──
+    if not gene_rho_table.empty:
+        ranking_dir = ensure_dir(os.path.join(out_dir, "gene_rankings"))
+
+        # Per-model, per-cell ranking TSVs (unchanged – save for every model)
+        for model_name in model_order:
+            model_rho = gene_rho_table[gene_rho_table["model"] == model_name]
+            if model_rho.empty:
+                continue
+            model_slug = model_name.replace(" ", "_")
+            for depth in _BENCH_DEPTH_ORDER:
+                for tfx in _BENCH_TFX_ORDER:
+                    cell = model_rho[
+                        (model_rho["tfx"] == tfx) & (model_rho["depth"] == depth)
+                    ].copy()
+                    if cell.empty:
+                        continue
+                    ranked = (cell[["gene", "spearman_rho"]]
+                              .dropna(subset=["spearman_rho"])
+                              .sort_values("spearman_rho", ascending=False)
+                              .reset_index(drop=True))
+                    ranked.index = ranked.index + 1
+                    ranked.index.name = "rank"
+                    ranked.to_csv(
+                        os.path.join(ranking_dir, f"{model_slug}_{depth}_{tfx}_gene_ranking.tsv"),
+                        sep="\t",
+                    )
+        print(f"  Gene rankings saved to {ranking_dir}")
+
+        # Gene scatters for Proteus_Base only, colored by subtype
+        scatter_genes = [
+            "AR", "RB1", "TP53", "ASCL1", "DLL3",
+            "NEUROD1", "MYC", "EZH2", "BCL2", "SOX2",
+        ]
+        pw_base = model_preds.get("Proteus_Base")
+        if pw_base is not None:
+            scatter_dir = ensure_dir(os.path.join(out_dir, "gene_scatters"))
+
+            # Build subtypes DataFrame for PHS samples (PDX parent → subtype)
+            _pdx_name_remap = {"DIVE_CDX172": "DIVE_CDX17"}
+            pc_sub = pd.read_csv(
+                PROJECT_ROOT / "labels" / "PC-PDX_TFX_Subtype.tsv", sep="\t",
+            )
+            sclc_sub = pd.read_csv(
+                PROJECT_ROOT / "labels" / "SCLC-PDX_TFX_Subtype.tsv", sep="\t",
+            )
+            pdx_subtype_map: Dict[str, str] = {}
+            for _df in (pc_sub, sclc_sub):
+                for _, _row in _df.iterrows():
+                    pdx_subtype_map[_row["sample"]] = _row["subtype"]
+            subtypes_rows_list = []
+            for s in all_samples:
+                info = parse_phs_sample(s)
+                pdx_name = _pdx_name_remap.get(info["pdx"], info["pdx"])
+                subtypes_rows_list.append({
+                    "sample": s,
+                    "subtype": pdx_subtype_map.get(pdx_name, "Unknown"),
+                })
+            subtypes_df = pd.DataFrame(subtypes_rows_list).set_index("sample")
+
+            # Generate scatter plots per (depth, TFx) cell
+            for depth in _BENCH_DEPTH_ORDER:
+                for tfx in _BENCH_TFX_ORDER:
+                    cell_samples = sorted(
+                        meta_df[
+                            (meta_df["tfx"] == tfx) & (meta_df["depth"] == depth)
+                        ]["sample"]
+                    )
+                    tw_cell = truth_wide[
+                        [s for s in cell_samples if s in truth_wide.columns]
+                    ]
+                    pw_cell = pw_base[
+                        [s for s in cell_samples if s in pw_base.columns]
+                    ]
+                    if tw_cell.shape[1] < 2 or pw_cell.shape[1] < 2:
+                        continue
+
+                    cell_scatter_dir = ensure_dir(
+                        os.path.join(scatter_dir, f"{depth}_{tfx}")
+                    )
+                    for gi, gene in enumerate(scatter_genes, 1):
+                        gene_target_scatter(
+                            tw_cell, pw_cell, gene,
+                            os.path.join(cell_scatter_dir, f"top{gi}_{gene}"),
+                            subtypes_df=subtypes_df,
+                        )
+
+            print(f"  Gene scatters saved to {scatter_dir}")
+
     # ── Build eCDNA table (aggregate across depth for line plots) ───────
     # eCDNA = TFx_numeric * depth_numeric
     tfx_num = {f"TF{v}": float(v) for v in ["0.50", "0.30", "0.10", "0.05", "0.03", "0.01"]}
