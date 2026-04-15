@@ -1399,3 +1399,492 @@ def compute_coverage_curve(
         coverage = float(((y >= adj_lo) & (y <= adj_hi)).sum() / len(y))
         empiricals.append(coverage)
     return {"nominal": list(nominal_levels), "empirical": empiricals}
+
+
+# ---------------------------------------------------------------------------
+# PAM50 centroid classifier (Parker et al. 2009, JCO 27:1160-1167)
+# ---------------------------------------------------------------------------
+
+# Centroid values from Parker et al. 2009, Supplementary Table 3.
+# Each entry: gene → [Basal, HER2, LumA, LumB, Normal]
+# Normal is retained in the raw centroids for completeness but excluded
+# from classification (see _PAM50_CLINICAL_SUBTYPES) because it
+# represents normal tissue contamination / low-TFx artefacts and is not
+# clinically actionable.
+_PAM50_SUBTYPES = ("Basal", "HER2", "LumA", "LumB", "Normal")
+_PAM50_CLINICAL_SUBTYPES = ("Basal", "HER2", "LumA", "LumB")
+
+_PAM50_CENTROIDS_RAW: Dict[str, List[float]] = {
+    "UBE2T":   [ 0.635,  0.286, -0.505,  0.215, -0.462],
+    "BIRC5":   [ 0.577,  0.315, -0.577,  0.290, -0.400],
+    "NUF2":    [ 0.558,  0.285, -0.524,  0.251, -0.383],
+    "CDC6":    [ 0.508,  0.190, -0.371,  0.156, -0.326],
+    "CCNB1":   [ 0.608,  0.257, -0.528,  0.244, -0.383],
+    "TYMS":    [ 0.502,  0.192, -0.408,  0.180, -0.291],
+    "MYBL2":   [ 0.534,  0.250, -0.480,  0.224, -0.341],
+    "CEP55":   [ 0.582,  0.258, -0.521,  0.254, -0.370],
+    "MELK":    [ 0.599,  0.226, -0.504,  0.218, -0.349],
+    "NDC80":   [ 0.534,  0.253, -0.491,  0.240, -0.339],
+    "RRM2":    [ 0.485,  0.179, -0.408,  0.171, -0.256],
+    "UBE2C":   [ 0.591,  0.268, -0.535,  0.256, -0.370],
+    "CENPF":   [ 0.525,  0.207, -0.440,  0.192, -0.304],
+    "PTTG1":   [ 0.520,  0.264, -0.510,  0.258, -0.337],
+    "EXO1":    [ 0.528,  0.214, -0.451,  0.213, -0.323],
+    "ORC6":    [ 0.440,  0.181, -0.374,  0.155, -0.236],
+    "ANLN":    [ 0.550,  0.212, -0.459,  0.208, -0.325],
+    "CCNE1":   [ 0.394,  0.170, -0.300,  0.086, -0.219],
+    "CDC20":   [ 0.560,  0.254, -0.505,  0.241, -0.350],
+    "MKI67":   [ 0.553,  0.226, -0.482,  0.223, -0.329],
+    "KIF2C":   [ 0.527,  0.246, -0.480,  0.233, -0.331],
+    "ACTR3B":  [ 0.283,  0.063, -0.187,  0.032, -0.126],
+    "MYC":     [ 0.273,  0.017, -0.109, -0.019, -0.101],
+    "EGFR":    [ 0.418, -0.105, -0.145, -0.143, -0.004],
+    "KRT5":    [ 0.449, -0.145, -0.157, -0.163,  0.029],
+    "PHGDH":   [ 0.342, -0.055, -0.159, -0.096, -0.006],
+    "CDH3":    [ 0.427, -0.038, -0.225, -0.089, -0.045],
+    "MIA":     [ 0.148, -0.025, -0.055, -0.029, -0.022],
+    "KRT17":   [ 0.444, -0.143, -0.155, -0.157,  0.018],
+    "FOXC1":   [ 0.375, -0.109, -0.136, -0.130,  0.005],
+    "SFRP1":   [-0.095, -0.174,  0.064, -0.093,  0.276],
+    "KRT14":   [ 0.382, -0.126, -0.146, -0.147,  0.049],
+    "ESR1":    [-0.381,  0.017,  0.289,  0.083,  0.015],
+    "SLC39A6": [-0.261,  0.041,  0.181,  0.046, -0.010],
+    "BAG1":    [-0.151,  0.013,  0.111,  0.022,  0.017],
+    "MAPT":    [-0.234,  0.009,  0.178,  0.014,  0.031],
+    "PGR":     [-0.259, -0.049,  0.243,  0.002,  0.066],
+    "CXXC5":   [-0.204,  0.045,  0.123,  0.039, -0.004],
+    "MLPH":    [-0.303,  0.046,  0.222,  0.040, -0.001],
+    "BCL2":    [-0.272, -0.006,  0.233,  0.001,  0.048],
+    "MDM2":    [-0.115,  0.016,  0.087,  0.007,  0.000],
+    "NAT1":    [-0.254,  0.048,  0.173,  0.013,  0.023],
+    "FOXA1":   [-0.349,  0.070,  0.245,  0.049, -0.024],
+    "BLVRA":   [-0.082,  0.028,  0.047,  0.008, -0.003],
+    "MMP11":   [-0.026,  0.084, -0.003,  0.014, -0.057],
+    "GPR160":  [-0.184,  0.055,  0.113,  0.031, -0.016],
+    "FGFR4":   [-0.054,  0.038,  0.016, -0.006,  0.002],
+    "GRB7":    [-0.101,  0.343, -0.066,  0.000, -0.088],
+    "TMEM45B": [-0.083,  0.132, -0.015,  0.007, -0.020],
+    "ERBB2":   [-0.146,  0.317, -0.050, -0.017, -0.036],
+}
+
+
+def pam50_classify(expr_df: pd.DataFrame) -> pd.DataFrame:
+    """Classify samples using the PAM50 centroid correlation method.
+
+    Uses the 4 clinical subtypes (Basal, HER2, LumA, LumB).
+    Normal is excluded — it represents tissue contamination / low-TFx
+    artefacts rather than a clinically actionable subtype.
+
+    Parameters
+    ----------
+    expr_df : pd.DataFrame
+        Genes × samples expression matrix (log2 scale).
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per sample with columns ``predicted_subtype`` and per-subtype
+        Spearman correlations (``corr_Basal``, ``corr_HER2``, etc.).
+    """
+    from scipy.stats import spearmanr as _spearmanr
+
+    centroid_genes = [g for g in _PAM50_CENTROIDS_RAW if g in expr_df.index]
+    if len(centroid_genes) < 10:
+        warnings.warn(f"PAM50: only {len(centroid_genes)}/50 genes found — "
+                      "classification unreliable")
+    # Build centroid matrix for all 5 subtypes (index aligned to raw data)
+    centroid_df = pd.DataFrame(
+        {g: _PAM50_CENTROIDS_RAW[g] for g in centroid_genes},
+        index=list(_PAM50_SUBTYPES),
+    ).T  # genes × subtypes
+
+    # Subset and median-center gene expression
+    expr_sub = expr_df.loc[centroid_genes].copy()
+    expr_sub = expr_sub.subtract(expr_sub.median(axis=1), axis=0)
+
+    rows = []
+    for sample in expr_sub.columns:
+        sample_vec = expr_sub[sample].values
+        corrs = {}
+        # Compute correlations against all 5 centroids for reporting
+        for st in _PAM50_SUBTYPES:
+            rho, _ = _spearmanr(sample_vec, centroid_df[st].values)
+            corrs[f"corr_{st}"] = rho
+        # Classify using only the 4 clinical subtypes
+        clinical_corrs = {k: v for k, v in corrs.items()
+                         if k.replace("corr_", "") in _PAM50_CLINICAL_SUBTYPES}
+        best = max(clinical_corrs, key=clinical_corrs.get)
+        predicted = best.replace("corr_", "")
+        rows.append({"sample": sample, "predicted_subtype": predicted, **corrs})
+
+    return pd.DataFrame(rows)
+
+
+def pam50_classify_mc(
+    draws: List[pd.DataFrame],
+    point_pred: pd.DataFrame,
+) -> pd.DataFrame:
+    """Run PAM50 classification on MC draws and aggregate.
+
+    Parameters
+    ----------
+    draws : list[DataFrame]
+        M expression matrices from ``mdn_monte_carlo_sample()``.
+    point_pred : pd.DataFrame
+        Point-prediction matrix (genes x samples) used to identify
+        which samples to classify.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per sample with ``predicted_subtype`` (modal across draws),
+        ``stability`` (fraction of draws agreeing on modal), and per-subtype
+        mean Spearman correlations.
+    """
+    from collections import Counter
+
+    # Collect per-sample subtype votes across draws
+    sample_votes: Dict[str, List[str]] = {s: [] for s in point_pred.columns}
+    sample_corrs: Dict[str, List[Dict[str, float]]] = {
+        s: [] for s in point_pred.columns}
+
+    for draw in draws:
+        # Subset to point_pred's columns; drop columns that are entirely NaN
+        draw_sub = draw.reindex(columns=point_pred.columns)
+        draw_sub = draw_sub.loc[:, draw_sub.notna().any(axis=0)]
+        if draw_sub.shape[1] == 0:
+            continue
+        result = pam50_classify(draw_sub)
+        for _, row in result.iterrows():
+            s = row["sample"]
+            if s in sample_votes:
+                sample_votes[s].append(row["predicted_subtype"])
+                corr_cols = {k: v for k, v in row.items()
+                             if k.startswith("corr_")}
+                sample_corrs[s].append(corr_cols)
+
+    rows = []
+    for sample in point_pred.columns:
+        votes = sample_votes[sample]
+        if not votes:
+            continue
+        counts = Counter(votes)
+        modal_subtype = counts.most_common(1)[0][0]
+        stability = counts[modal_subtype] / len(votes)
+
+        # Mean correlations across draws
+        mean_corrs: Dict[str, float] = {}
+        if sample_corrs[sample]:
+            all_keys = sample_corrs[sample][0].keys()
+            for k in all_keys:
+                vals = [d[k] for d in sample_corrs[sample] if k in d]
+                mean_corrs[k] = float(np.mean(vals))
+
+        rows.append({
+            "sample": sample,
+            "predicted_subtype": modal_subtype,
+            "stability": stability,
+            **mean_corrs,
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Pluvicto clinical data loaders
+# ---------------------------------------------------------------------------
+
+def extract_pluvicto_patient_id(sample_name: str) -> str:
+    """Extract patient ID from a Pluvicto sample name.
+
+    ``FH0084_E_C1`` → ``FH0084``.  Splits on ``_E_`` or ``_S_`` and
+    returns the prefix.
+    """
+    for sep in ("_E_", "_S_"):
+        if sep in sample_name:
+            return sample_name.split(sep)[0]
+    return sample_name
+
+
+def load_pluvicto_outcomes() -> pd.DataFrame:
+    """Load reference/CRPC-Pluvicto_outcomes.csv → DataFrame indexed by Sample_ID."""
+    path = PROJECT_ROOT / "reference" / "CRPC-Pluvicto_outcomes.csv"
+    df = pd.read_csv(path)
+    df = df.set_index("Sample_ID")
+    # Coerce NA strings to NaN for numeric columns
+    for col in df.columns:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def load_pluvicto_clinical() -> pd.DataFrame:
+    """Load reference/CRPC-Pluvicto_baseline-clinical.csv → DataFrame indexed by Sample_ID.
+
+    Handles ``>60`` and ``N/A`` string values by coercing to NaN.
+    """
+    path = PROJECT_ROOT / "reference" / "CRPC-Pluvicto_baseline-clinical.csv"
+    df = pd.read_csv(path, na_values=["N/A", "NA", ""])
+    df = df.set_index("Sample_ID")
+    for col in df.columns:
+        df[col] = df[col].apply(
+            lambda v: np.nan if isinstance(v, str) and v.startswith(">") else v
+        )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def compute_geneset_score(
+    expr_df: pd.DataFrame,
+    gene_list: List[str],
+) -> pd.Series:
+    """Mean expression of *gene_list* genes for each sample.
+
+    Parameters
+    ----------
+    expr_df : pd.DataFrame
+        Genes × samples expression matrix.
+    gene_list : list of str
+        Gene symbols to average.
+
+    Returns
+    -------
+    pd.Series
+        Per-sample mean expression score, indexed by sample name.
+    """
+    present = [g for g in gene_list if g in expr_df.index]
+    if not present:
+        return pd.Series(dtype=float)
+    return expr_df.loc[present].mean(axis=0)
+
+
+def compute_cox_univariate(
+    time: pd.Series,
+    event: pd.Series,
+    covariates_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Fit univariate Cox PH for each column in *covariates_df*.
+
+    Parameters
+    ----------
+    time : pd.Series
+        Survival time.
+    event : pd.Series
+        Event indicator (1 = event, 0 = censored).
+    covariates_df : pd.DataFrame
+        One column per covariate, rows aligned with *time* / *event*.
+
+    Returns
+    -------
+    pd.DataFrame
+        Rows = covariates, columns = ``HR``, ``HR_lo``, ``HR_hi``, ``p``.
+    """
+    from lifelines import CoxPHFitter
+
+    results = []
+    for col in covariates_df.columns:
+        cph_df = pd.DataFrame({
+            "T": time.values,
+            "E": event.values,
+            col: covariates_df[col].values,
+        }).dropna()
+        if cph_df.shape[0] < 10 or cph_df["E"].sum() < 3:
+            results.append({
+                "variable": col, "HR": np.nan, "HR_lo": np.nan,
+                "HR_hi": np.nan, "p": np.nan,
+            })
+            continue
+        # Standardise covariate to unit variance for comparable HRs
+        std = cph_df[col].std()
+        if std < 1e-12:
+            results.append({
+                "variable": col, "HR": np.nan, "HR_lo": np.nan,
+                "HR_hi": np.nan, "p": np.nan,
+            })
+            continue
+        cph_df[col] = cph_df[col] / std
+
+        cph = CoxPHFitter()
+        cph.fit(cph_df, duration_col="T", event_col="E")
+        summary = cph.summary
+        results.append({
+            "variable": col,
+            "HR": float(summary.loc[col, "exp(coef)"]),
+            "HR_lo": float(summary.loc[col, "exp(coef) lower 95%"]),
+            "HR_hi": float(summary.loc[col, "exp(coef) upper 95%"]),
+            "p": float(summary.loc[col, "p"]),
+        })
+    return pd.DataFrame(results)
+
+
+def compute_cox_multivariate(
+    time: pd.Series,
+    event: pd.Series,
+    covariates_df: pd.DataFrame,
+    adjust_for: pd.Series,
+    adjust_name: str = "TFx",
+) -> pd.DataFrame:
+    """Fit multivariate Cox PH for each column in *covariates_df*,
+    adjusting for a single confounding covariate (*adjust_for*).
+
+    Each model fits two covariates: the target variable and the
+    adjustment variable.  Only the target variable's HR is reported.
+
+    Parameters
+    ----------
+    time : pd.Series
+        Survival time.
+    event : pd.Series
+        Event indicator (1 = event, 0 = censored).
+    covariates_df : pd.DataFrame
+        One column per covariate, rows aligned with *time* / *event*.
+    adjust_for : pd.Series
+        Confounding covariate to include in every model (e.g. TFx).
+    adjust_name : str
+        Column name for the adjustment variable.
+
+    Returns
+    -------
+    pd.DataFrame
+        Rows = covariates, columns = ``HR``, ``HR_lo``, ``HR_hi``, ``p``.
+    """
+    from lifelines import CoxPHFitter
+
+    results = []
+    for col in covariates_df.columns:
+        if col == adjust_name:
+            continue
+        cph_df = pd.DataFrame({
+            "T": time.values,
+            "E": event.values,
+            col: covariates_df[col].values,
+            adjust_name: adjust_for.values,
+        }).dropna()
+        if cph_df.shape[0] < 10 or cph_df["E"].sum() < 3:
+            results.append({
+                "variable": col, "HR": np.nan, "HR_lo": np.nan,
+                "HR_hi": np.nan, "p": np.nan,
+            })
+            continue
+        # Standardise both covariates to unit variance
+        for c in (col, adjust_name):
+            std = cph_df[c].std()
+            if std < 1e-12:
+                cph_df[c] = 0.0
+            else:
+                cph_df[c] = cph_df[c] / std
+
+        cph = CoxPHFitter()
+        cph.fit(cph_df, duration_col="T", event_col="E")
+        summary = cph.summary
+        results.append({
+            "variable": col,
+            "HR": float(summary.loc[col, "exp(coef)"]),
+            "HR_lo": float(summary.loc[col, "exp(coef) lower 95%"]),
+            "HR_hi": float(summary.loc[col, "exp(coef) upper 95%"]),
+            "p": float(summary.loc[col, "p"]),
+        })
+    return pd.DataFrame(results)
+
+
+# ---------------------------------------------------------------------------
+# MDN Monte Carlo sampling
+# ---------------------------------------------------------------------------
+
+# Fixed constants matching model_utils.py
+_K_GAMMA = 0.80   # Gamma shape parameter (fixed)
+_Y_MAX = 19.93    # Expression ceiling
+
+
+def mdn_monte_carlo_sample(
+    pi_delta: pd.DataFrame,
+    pi_gamma: pd.DataFrame,
+    pi_normal: pd.DataFrame,
+    gamma_beta: pd.DataFrame,
+    normal_mean: pd.DataFrame,
+    normal_stdev: pd.DataFrame,
+    M: int = 100,
+    seed: int = 42,
+) -> List[pd.DataFrame]:
+    """Draw *M* independent expression matrices from the MDN posterior.
+
+    Each input is a genes x samples wide DataFrame sharing the same index
+    (gene names) and columns (sample names).
+
+    Returns a list of *M* DataFrames, each genes x samples, where each
+    element is an independent draw from the 3-component mixture
+    (hurdle at 0, Gamma(k=0.80, beta), Normal(mu, sigma^2)),
+    clamped to [0, Y_MAX].
+    """
+    genes = pi_delta.index
+    samples = pi_delta.columns
+    G, S = len(genes), len(samples)
+
+    # Convert to numpy arrays (G, S)
+    pd_arr = pi_delta.values.astype(np.float64)
+    pg_arr = pi_gamma.values.astype(np.float64)
+    pn_arr = pi_normal.values.astype(np.float64)
+    gb_arr = gamma_beta.values.astype(np.float64)
+    nm_arr = normal_mean.values.astype(np.float64)
+    ns_arr = normal_stdev.values.astype(np.float64)
+
+    rng = np.random.default_rng(seed)
+    draws: List[pd.DataFrame] = []
+
+    for m in range(M):
+        # Draw component indices: 0=hurdle, 1=gamma, 2=normal
+        u = rng.random((G, S))
+        cum_delta = pd_arr
+        cum_gamma = cum_delta + pg_arr
+        comp = np.where(u < cum_delta, 0, np.where(u < cum_gamma, 1, 2))
+
+        # Gamma: shape=K_GAMMA, scale=1/beta (numpy uses scale, not rate)
+        gamma_scale = np.where(gb_arr > 0, 1.0 / gb_arr, 1.0)
+        gamma_draw = rng.gamma(shape=_K_GAMMA, scale=gamma_scale, size=(G, S))
+
+        # Normal
+        normal_draw = rng.normal(loc=nm_arr, scale=np.maximum(ns_arr, 1e-8),
+                                 size=(G, S))
+
+        # Assemble: hurdle -> 0, gamma -> gamma_draw, normal -> normal_draw
+        x = np.where(comp == 0, 0.0,
+                      np.where(comp == 1, gamma_draw, normal_draw))
+        x = np.clip(x, 0.0, _Y_MAX)
+
+        draws.append(pd.DataFrame(x, index=genes, columns=samples))
+
+    return draws
+
+
+def mdn_predictive_variance(
+    pi_delta: pd.DataFrame,
+    pi_gamma: pd.DataFrame,
+    pi_normal: pd.DataFrame,
+    gamma_beta: pd.DataFrame,
+    normal_mean: pd.DataFrame,
+    normal_stdev: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compute analytical predictive variance of the MDN mixture.
+
+    Var[X] = E[X^2] - (E[X])^2 where:
+      E[X]   = pi_gamma * K/beta + pi_normal * mu
+      E[X^2] = pi_gamma * K(K+1)/beta^2 + pi_normal * (mu^2 + sigma^2)
+
+    Returns a genes x samples DataFrame of variances (same shape as inputs).
+    """
+    pd_arr = pi_delta.values.astype(np.float64)
+    pg_arr = pi_gamma.values.astype(np.float64)
+    pn_arr = pi_normal.values.astype(np.float64)
+    gb_arr = np.maximum(gamma_beta.values.astype(np.float64), 1e-8)
+    nm_arr = normal_mean.values.astype(np.float64)
+    ns_arr = normal_stdev.values.astype(np.float64)
+
+    # E[X] (hurdle component contributes 0)
+    ex = pg_arr * (_K_GAMMA / gb_arr) + pn_arr * nm_arr
+
+    # E[X^2]
+    ex2 = (pg_arr * (_K_GAMMA * (_K_GAMMA + 1.0) / (gb_arr ** 2))
+           + pn_arr * (nm_arr ** 2 + ns_arr ** 2))
+
+    var = np.maximum(ex2 - ex ** 2, 1e-12)
+
+    return pd.DataFrame(var, index=pi_delta.index, columns=pi_delta.columns)

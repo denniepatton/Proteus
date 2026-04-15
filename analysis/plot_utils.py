@@ -1457,6 +1457,89 @@ def benchmark_ecdna_lines(
     plt.close(fig)
 
 
+def benchmark_depth_lines(
+    metrics_table: pd.DataFrame,
+    name: str,
+    *,
+    depth: str,
+    model_order: Sequence[str],
+) -> None:
+    """Line plots of 6 metrics vs TFx for a single sequencing depth.
+
+    Parameters
+    ----------
+    metrics_table : pd.DataFrame
+        Full benchmark metrics table with columns ``tfx``, ``depth``,
+        ``model``, and metric columns.
+    depth : str
+        Depth filter value (e.g. "10x" or "5x").
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+
+    # Parse TFx strings to numeric
+    _tfx_num = {"TF0.50": 0.50, "TF0.30": 0.30, "TF0.10": 0.10,
+                "TF0.05": 0.05, "TF0.03": 0.03, "TF0.01": 0.01}
+
+    sub = metrics_table[metrics_table["depth"] == depth].copy()
+    if sub.empty:
+        return
+
+    sub["tfx_numeric"] = sub["tfx"].map(_tfx_num)
+    sub = sub.dropna(subset=["tfx_numeric"])
+
+    metric_defs = [
+        ("gvw_rho", "GVW Spearman \u03c1"),
+        ("mean_top10pct_gene_rho", "Mean \u03c1 (Top 10% Var.)"),
+        ("median_gene_rho", "Median Gene Spearman \u03c1"),
+        ("mean_gene_rho", "Mean Gene Spearman \u03c1"),
+        ("sample_rho_mean", "Mean Sample Spearman \u03c1"),
+        ("rmse", "Mean Gene RMSE"),
+    ]
+
+    n_rows, n_cols = 3, 2
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(12, 12), squeeze=False)
+
+    legend_handles = []
+    for idx, (col, label) in enumerate(metric_defs):
+        ri, ci = divmod(idx, n_cols)
+        ax = axes[ri, ci]
+        for model in model_order:
+            msub = sub[sub["model"] == model].sort_values("tfx_numeric")
+            if msub.empty or col not in msub.columns or msub[col].isna().all():
+                continue
+            color = cmap.get(model, "#BBBBBB")
+            line, = ax.plot(msub["tfx_numeric"], msub[col], "o-",
+                            color=color, markersize=10, linewidth=1.4,
+                            markeredgecolor=_darken(color),
+                            markeredgewidth=1.2)
+            if idx == 0:
+                legend_handles.append((line, model))
+        ax.set_xlabel("Tumor Fraction (TFx)", fontsize=9)
+        ax.set_ylabel(label, fontsize=9)
+        ax.set_xscale("log")
+        # Absolute-value tick labels at every observed TFx
+        seen_tfx = sorted(sub["tfx_numeric"].unique())
+        if seen_tfx:
+            ax.set_xticks(seen_tfx)
+            ax.set_xticklabels([f"{v:g}" for v in seen_tfx])
+            ax.xaxis.set_minor_formatter(mpl.ticker.NullFormatter())
+        ax.set_title(label, fontsize=10, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+
+    if legend_handles:
+        handles, labels = zip(*legend_handles)
+        fig.legend(handles, labels, loc="lower center",
+                   ncol=min(len(labels), 6), fontsize=8,
+                   framealpha=0.8, bbox_to_anchor=(0.5, -0.02))
+
+    fig.suptitle(f"Benchmark Metrics vs TFx — {depth} depth",
+                 fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=[0, 0.04, 1, 0.97])
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------------------
 # Benchmarking cohort-panel plots (Benchmarking_PAN-FT)
 # ---------------------------------------------------------------------------
@@ -1483,11 +1566,6 @@ def benchmark_cohort_boxplots(
     _ensure_dir(name)
     cmap = _bench_color_map(model_order)
     n_cohorts = len(cohort_order)
-
-    # Marker symbols per cohort for scalar dot plots
-    _COHORT_MARKERS = ["s", "^", "D", "P"]  # square, triangle, diamond, plus
-    cohort_markers = {c: _COHORT_MARKERS[i % len(_COHORT_MARKERS)]
-                      for i, c in enumerate(cohort_order)}
 
     # Filter to models present in the data
     present_models = [m for m in model_order
@@ -1522,13 +1600,16 @@ def benchmark_cohort_boxplots(
                    ls="--", lw=1.2, zorder=0)
 
     if all_scalar:
-        # Dot plot: one marker per (model, cohort); different symbols per cohort
+        # Dot plot: circle markers for all cohorts; second cohort gets
+        # different marker to distinguish.
+        from matplotlib.patches import Patch
         group_width = 0.3
         offsets = np.linspace(-group_width / 2, group_width / 2, n_cohorts)
-        legend_handles = []
+        cohort_alpha = {c: 0.55 + 0.15 * i for i, c in enumerate(cohort_order)}
+        _cohort_markers = ["o", "D", "s", "^", "v"]  # circle, diamond, square, ...
+
         for ci_idx, cohort in enumerate(cohort_order):
-            marker = cohort_markers[cohort]
-            first_handle = None
+            marker = _cohort_markers[ci_idx % len(_cohort_markers)]
             for mi, model in enumerate(present_models):
                 vals = metrics_table.loc[
                     (metrics_table["model"] == model) &
@@ -1538,21 +1619,35 @@ def benchmark_cohort_boxplots(
                     continue
                 color = cmap.get(model, "#BBBBBB")
                 x = mi + 1 + offsets[ci_idx]
-                h = ax.plot(x, vals[0], marker=marker, color=color,
-                            markersize=12,
-                            markeredgecolor=_darken(color),
-                            markeredgewidth=1.2, zorder=3,
-                            linestyle="none")
-                if first_handle is None:
-                    first_handle = h[0]
-            if first_handle is not None:
-                legend_handles.append((first_handle, cohort))
+                y = float(vals[0])
+                alpha = cohort_alpha.get(cohort, 0.7)
+                ax.plot(x, y, marker=marker, markersize=10,
+                        color=color, markeredgecolor=_darken(color),
+                        markeredgewidth=1.2, alpha=alpha, zorder=3,
+                        linestyle="none")
+
+        # Legend: proxy patches
+        legend_patches = []
+        for ci_idx, cohort in enumerate(cohort_order):
+            marker = _cohort_markers[ci_idx % len(_cohort_markers)]
+            p = ax.plot([], [], marker=marker, markersize=8,
+                        color="#888888", alpha=cohort_alpha.get(cohort, 0.7),
+                        markeredgecolor="#555555", linestyle="none",
+                        label=cohort)[0]
+            legend_patches.append(p)
+        ax.legend(handles=legend_patches, fontsize=8, loc="best",
+                  framealpha=0.8)
 
         ax.set_xticks(range(1, n_models + 1))
         ax.set_xticklabels(present_models, rotation=55, ha="right", fontsize=7)
-        if legend_handles:
-            handles, labels = zip(*legend_handles)
-            ax.legend(handles, labels, fontsize=8, loc="best", framealpha=0.8)
+        # Auto-scale y
+        all_vals = metrics_table[metric_col].dropna().values
+        if len(all_vals):
+            ymin, ymax = float(np.min(all_vals)), float(np.max(all_vals))
+            margin = max(0.05 * (ymax - ymin), 0.02)
+            ax.set_ylim(ymin - margin, ymax + margin)
+        ax.set_xlim(0.4, n_models + 0.6)
+        ax.set_aspect("auto")
 
     else:
         # Paired boxplots: for each model, n_cohorts side-by-side boxes
@@ -1956,6 +2051,470 @@ def enrichment_dot_plot(
               framealpha=0.8, handletextpad=0.5)
 
     ax.grid(True, axis="x", alpha=0.2)
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+# =====================================================================
+# Binary status boxplot (e.g. receptor status 0/1 vs gene expression)
+# =====================================================================
+
+def binary_status_boxplot(
+    values_0: np.ndarray,
+    values_1: np.ndarray,
+    name: str,
+    *,
+    xlabel: str = "Status",
+    ylabel: str = "Predicted Expression (log₂CPM+1)",
+    title: str = "",
+    label_0: str = "Negative (0)",
+    label_1: str = "Positive (1)",
+    pval: Optional[float] = None,
+) -> None:
+    """Paired boxplot with strip overlay for binary status comparison.
+
+    Draws two boxes (status 0 and 1) with individual data points
+    overlaid, and annotates with a p-value (typically Mann-Whitney U).
+    """
+    _ensure_dir(name)
+    pal = load_palette()
+
+    fig, ax = plt.subplots(figsize=(4, 5))
+
+    data = [np.asarray(values_0, dtype=float),
+            np.asarray(values_1, dtype=float)]
+    positions = [0, 1]
+    colors = ["#BBDDEE", "#EE9955"]
+
+    bp = ax.boxplot(
+        data, positions=positions, widths=0.5,
+        patch_artist=True,
+        medianprops=dict(color="black", linewidth=1.5),
+        flierprops=dict(markersize=0),
+        showfliers=False,
+    )
+    for patch, c in zip(bp["boxes"], colors):
+        patch.set_facecolor(c)
+        patch.set_alpha(0.6)
+        patch.set_edgecolor("black")
+
+    # Strip overlay
+    for pos, vals, c in zip(positions, data, colors):
+        jitter = np.random.default_rng(42).uniform(-0.12, 0.12, size=len(vals))
+        ax.scatter(pos + jitter, vals, color=c, edgecolor="black",
+                   linewidth=0.6, s=40, zorder=4, alpha=0.85)
+
+    ax.set_xticks(positions)
+    ax.set_xticklabels([label_0, label_1], fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    ax.set_xlabel(xlabel, fontsize=11)
+    if title:
+        ax.set_title(title, fontsize=13, fontweight="bold")
+
+    # P-value annotation
+    if pval is not None:
+        y_top = max(np.max(data[0]) if len(data[0]) else 0,
+                    np.max(data[1]) if len(data[1]) else 0)
+        y_ann = y_top + 0.08 * (ax.get_ylim()[1] - ax.get_ylim()[0])
+        ax.plot([0, 0, 1, 1], [y_ann - 0.02, y_ann, y_ann, y_ann - 0.02],
+                lw=1.0, color="black")
+        ax.text(0.5, y_ann + 0.01, format_pval(pval),
+                ha="center", va="bottom", fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+# =====================================================================
+# Confusion matrix heatmap
+# =====================================================================
+
+def confusion_matrix_heatmap(
+    true_labels: Sequence[str],
+    pred_labels: Sequence[str],
+    name: str,
+    *,
+    class_order: Optional[Sequence[str]] = None,
+    title: str = "PAM50 Classification",
+) -> None:
+    """Plot a confusion matrix as an annotated heatmap.
+
+    Rows = true, columns = predicted.  Numbers are absolute counts
+    with row-normalised color shading.
+    """
+    _ensure_dir(name)
+
+    labels_true = list(true_labels)
+    labels_pred = list(pred_labels)
+    if class_order is None:
+        class_order = sorted(set(labels_true + labels_pred))
+    n = len(class_order)
+    label_to_idx = {l: i for i, l in enumerate(class_order)}
+
+    cm = np.zeros((n, n), dtype=int)
+    for t, p in zip(labels_true, labels_pred):
+        ti = label_to_idx.get(t)
+        pi = label_to_idx.get(p)
+        if ti is not None and pi is not None:
+            cm[ti, pi] += 1
+
+    # Row-normalised for colour
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_norm = np.divide(cm, row_sums, where=row_sums > 0,
+                        out=np.zeros_like(cm, dtype=float))
+
+    fig, ax = plt.subplots(figsize=(max(4, n + 1), max(4, n + 1)))
+    im = ax.imshow(cm_norm, cmap="Blues", vmin=0, vmax=1, aspect="equal")
+
+    # Annotate with counts
+    for i in range(n):
+        for j in range(n):
+            color = "white" if cm_norm[i, j] > 0.5 else "black"
+            ax.text(j, i, str(cm[i, j]), ha="center", va="center",
+                    fontsize=14, fontweight="bold", color=color)
+
+    ax.set_xticks(range(n))
+    ax.set_xticklabels(class_order, fontsize=10, rotation=45, ha="right")
+    ax.set_yticks(range(n))
+    ax.set_yticklabels(class_order, fontsize=10)
+    ax.set_xlabel("Predicted", fontsize=12)
+    ax.set_ylabel("True", fontsize=12)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    fig.colorbar(im, ax=ax, shrink=0.7, label="Row-normalised")
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+# =====================================================================
+# Forest plot (hazard ratios with confidence intervals)
+# =====================================================================
+
+def forest_plot(
+    hr_table: pd.DataFrame,
+    name: str,
+    *,
+    hr_table_mv: Optional[pd.DataFrame] = None,
+    title: str = "Forest Plot",
+    hr_col: str = "HR",
+    lo_col: str = "HR_lo",
+    hi_col: str = "HR_hi",
+    pval_col: str = "p",
+    label_col: str = "variable",
+    sig_threshold: float = 0.05,
+) -> None:
+    """Horizontal forest plot of hazard ratios with 95% CI.
+
+    ``hr_table`` must have columns for the HR point estimate,
+    lower/upper CI bounds, p-value, and variable label.
+
+    When *hr_table_mv* is provided (multivariate results, e.g.
+    TFx-adjusted), both univariate and multivariate HRs are shown:
+
+    - **Univariate**: black (significant) / gray (non-significant)
+    - **Multivariate**: maroon (significant) / faded maroon (non-sig)
+    - **Significant** markers are diamonds at full saturation
+    - **Non-significant** markers are circles at reduced saturation
+    """
+    _ensure_dir(name)
+
+    df = hr_table.copy()
+    df = df.sort_values(hr_col, ascending=True).reset_index(drop=True)
+    n = len(df)
+    if n == 0:
+        return
+
+    has_mv = hr_table_mv is not None and not hr_table_mv.empty
+
+    fig_height = max(4, 0.4 * n + 1.5)
+    fig, ax = plt.subplots(figsize=(8, fig_height))
+
+    y_pos = np.arange(n)
+    hrs = df[hr_col].values.astype(float)
+    lo = df[lo_col].values.astype(float)
+    hi = df[hi_col].values.astype(float)
+    pvals = df[pval_col].values.astype(float)
+
+    # Build mv lookup by variable name
+    mv_map: Dict[str, Dict] = {}
+    if has_mv:
+        for _, row in hr_table_mv.iterrows():
+            mv_map[str(row[label_col])] = {
+                "HR": float(row[hr_col]), "lo": float(row[lo_col]),
+                "hi": float(row[hi_col]), "p": float(row[pval_col]),
+            }
+
+    # Vertical offset for uni vs mv when both present
+    offset = 0.15 if has_mv else 0.0
+
+    # --- Univariate ---
+    for i in range(n):
+        sig = pvals[i] < sig_threshold
+        if has_mv:
+            color = "#000000" if sig else "#AAAAAA"
+            alpha = 1.0 if sig else 0.45
+        else:
+            color = "#CC3311" if sig else "#555555"
+            alpha = 1.0
+        y = y_pos[i] + offset
+        ax.plot([lo[i], hi[i]], [y, y],
+                color=color, lw=1.5, solid_capstyle="round", alpha=alpha)
+        marker = "D" if sig else "o"
+        ax.plot(hrs[i], y, marker, color=color, markersize=7,
+                zorder=4, alpha=alpha)
+
+    # --- Multivariate ---
+    if has_mv:
+        _MAROON = "#800000"
+        _MAROON_FADED = "#CC9999"
+        for i in range(n):
+            var_name = str(df[label_col].iloc[i])
+            mv = mv_map.get(var_name)
+            if mv is None or np.isnan(mv["HR"]):
+                continue
+            sig = mv["p"] < sig_threshold
+            color = _MAROON if sig else _MAROON_FADED
+            alpha = 1.0 if sig else 0.45
+            y = y_pos[i] - offset
+            ax.plot([mv["lo"], mv["hi"]], [y, y],
+                    color=color, lw=1.5, solid_capstyle="round", alpha=alpha)
+            marker = "D" if sig else "o"
+            ax.plot(mv["HR"], y, marker, color=color, markersize=7,
+                    zorder=4, alpha=alpha)
+
+    # Reference line at HR=1
+    ax.axvline(1.0, color="grey", ls="--", lw=0.8, alpha=0.7)
+
+    # Labels and p-values on right margin
+    ax.set_yticks(y_pos)
+    labels = df[label_col].values
+    cleaned = [str(l).replace("HALLMARK_", "").replace("_", " ") for l in labels]
+    ax.set_yticklabels(cleaned, fontsize=8)
+
+    # P-value text on right side (univariate)
+    all_hi = list(hi)
+    if has_mv:
+        all_hi.extend(v["hi"] for v in mv_map.values() if np.isfinite(v["hi"]))
+    x_max = float(np.nanmax(all_hi)) * 1.3 if all_hi else 2.0
+    for i in range(n):
+        pv_str = format_pval(pvals[i])
+        var_name = str(df[label_col].iloc[i])
+        mv = mv_map.get(var_name)
+        if has_mv and mv is not None and np.isfinite(mv["p"]):
+            pv_str += f"  |  {format_pval(mv['p'])}"
+        ax.text(x_max, y_pos[i], pv_str,
+                va="center", fontsize=7, color="#555555")
+
+    ax.set_xlabel("Hazard Ratio (95% CI)", fontsize=11)
+    ax.set_xscale("log")
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.grid(True, axis="x", alpha=0.15)
+
+    # Legend when multivariate is present
+    if has_mv:
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], color="#000000", marker="D", markersize=6,
+                   lw=1.5, label="Univariate (sig.)"),
+            Line2D([0], [0], color="#AAAAAA", marker="o", markersize=6,
+                   lw=1.5, alpha=0.45, label="Univariate (n.s.)"),
+            Line2D([0], [0], color=_MAROON, marker="D", markersize=6,
+                   lw=1.5, label="Multivariate / TFx-adj. (sig.)"),
+            Line2D([0], [0], color=_MAROON_FADED, marker="o", markersize=6,
+                   lw=1.5, alpha=0.45, label="Multivariate / TFx-adj. (n.s.)"),
+        ]
+        ax.legend(handles=legend_elements, fontsize=7, loc="lower right",
+                  framealpha=0.9)
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+# =====================================================================
+# Kaplan-Meier survival curve
+# =====================================================================
+
+def kaplan_meier_plot(
+    time_lo: np.ndarray,
+    event_lo: np.ndarray,
+    time_hi: np.ndarray,
+    event_hi: np.ndarray,
+    name: str,
+    *,
+    label_lo: str = "Low",
+    label_hi: str = "High",
+    title: str = "Kaplan-Meier",
+    logrank_p: Optional[float] = None,
+) -> None:
+    """Kaplan-Meier curves for two groups (low vs high).
+
+    Uses the lifelines ``KaplanMeierFitter`` to compute and plot
+    survival curves with at-risk counts and log-rank p-value.
+    """
+    from lifelines import KaplanMeierFitter
+
+    _ensure_dir(name)
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    colors = ["#0077BB", "#CC3311"]
+
+    for arr_t, arr_e, label, color in [
+        (time_lo, event_lo, label_lo, colors[0]),
+        (time_hi, event_hi, label_hi, colors[1]),
+    ]:
+        kmf = KaplanMeierFitter()
+        kmf.fit(arr_t, event_observed=arr_e, label=label)
+        kmf.plot_survival_function(ax=ax, ci_show=True, color=color, lw=2)
+
+    ax.set_xlabel("Time (days)", fontsize=11)
+    ax.set_ylabel("Survival Probability", fontsize=11)
+    ax.set_title(title, fontsize=13, fontweight="bold")
+
+    if logrank_p is not None:
+        ax.text(0.98, 0.02, format_pval(logrank_p),
+                transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=10, bbox=dict(boxstyle="round,pad=0.3",
+                                       facecolor="white", alpha=0.8))
+
+    ax.legend(fontsize=10, loc="best", framealpha=0.8)
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+# =====================================================================
+# Clinical correlation scatter (gene expression vs clinical variable)
+# =====================================================================
+
+def clinical_correlation_scatter(
+    x_vals: np.ndarray,
+    y_vals: np.ndarray,
+    name: str,
+    *,
+    xlabel: str = "Clinical Variable",
+    ylabel: str = "Predicted Expression",
+    title: str = "",
+) -> None:
+    """Scatter with regression line and correlation annotation.
+
+    Displays both Pearson and Spearman correlation coefficients and
+    a least-squares regression line with 95% confidence band.
+    """
+    _ensure_dir(name)
+
+    x = np.asarray(x_vals, dtype=float)
+    y = np.asarray(y_vals, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x, y = x[mask], y[mask]
+
+    if len(x) < 3:
+        return
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(x, y, color="#0077BB", edgecolor="white", s=50,
+               alpha=0.8, linewidths=0.5)
+
+    # Regression line
+    from scipy.stats import linregress as _lr
+    slope, intercept, _, _, _ = _lr(x, y)
+    x_line = np.linspace(float(np.min(x)), float(np.max(x)), 100)
+    ax.plot(x_line, slope * x_line + intercept, color="#CC3311",
+            lw=1.8, ls="-", alpha=0.8)
+
+    # Correlation annotations
+    r_p, p_p = pearsonr(x, y)
+    r_s, p_s = spearmanr(x, y)
+    annot = (f"Pearson r = {r_p:.3f}  ({format_pval(p_p)})\n"
+             f"Spearman ρ = {r_s:.3f}  ({format_pval(p_s)})")
+    ax.text(0.03, 0.97, annot, transform=ax.transAxes,
+            va="top", ha="left", fontsize=8,
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    if title:
+        ax.set_title(title, fontsize=13, fontweight="bold")
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# ROC — on/off gene calling
+# ---------------------------------------------------------------------------
+
+def roc_gene_calling(
+    roc_curves: Dict[str, Tuple],
+    name: str,
+    *,
+    title: str = "ROC — Gene On/Off Calling",
+    model_order: Sequence[str] = (),
+) -> None:
+    """Plot ROC curves for binary on/off gene expression classification.
+
+    Parameters
+    ----------
+    roc_curves : dict
+        ``{model_name: (fpr, tpr, auc, n)}`` where fpr/tpr are arrays,
+        auc is a float, and n is the number of gene-sample pairs tested.
+    name : str
+        Output path (without .pdf extension).
+    title : str
+        Plot title.
+    model_order : sequence[str]
+        Preferred ordering; models not in this list appear at the end.
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+
+    # Diagonal reference
+    ax.plot([0, 1], [0, 1], ls="--", color="#BBBBBB", lw=1.2, zorder=0)
+
+    # Sort models: preferential order, then alphabetical remainder
+    ordered = [m for m in model_order if m in roc_curves]
+    remaining = sorted(set(roc_curves) - set(ordered))
+    ordered.extend(remaining)
+
+    for model in ordered:
+        entry = roc_curves[model]
+        fpr, tpr, auc_val = entry[0], entry[1], entry[2]
+        n_tested = entry[3] if len(entry) > 3 else None
+
+        # CI-filtered lines inherit their parent model's color
+        is_ci = "CI-filtered" in model
+        if is_ci:
+            parent = model.replace(" (CI-filtered)", "")
+            color = cmap.get(parent, cmap.get(model, "#888888"))
+        else:
+            color = cmap.get(model, "#888888")
+
+        lw = 2.5 if "Proteus" in model else 1.8
+        ls = "--" if is_ci else "-"
+
+        # Legend label: AUC + n
+        lbl = f"{model} (AUC={auc_val:.3f}"
+        if n_tested is not None:
+            lbl += f", n={n_tested:,}"
+        lbl += ")"
+
+        ax.plot(fpr, tpr, color=color, lw=lw, ls=ls,
+                label=lbl, zorder=2)
+
+    ax.set_xlabel("False Positive Rate", fontsize=11)
+    ax.set_ylabel("True Positive Rate", fontsize=11)
+    ax.set_xlim([-0.01, 1.01])
+    ax.set_ylim([-0.01, 1.01])
+    ax.set_title(title, fontsize=13, fontweight="bold")
+    ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
+    ax.grid(True, alpha=0.2)
+    ax.set_aspect("equal")
+
     fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)

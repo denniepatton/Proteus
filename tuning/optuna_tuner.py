@@ -1694,11 +1694,28 @@ def coordinated_ask(
     study_name = str(study_name) if study_name is not None else exp.name
     direction = exp.objective.direction
 
+    # Probe the study to count existing trials *before* building the sampler.
+    # TPESampler(seed=S) resets its internal RNG to seed S each time it is
+    # instantiated.  During the random startup phase (n_startup_trials=10 by
+    # default), the sampler draws from this RNG without conditioning on
+    # completed trials, so recreating the sampler with the same seed across
+    # rounds produces identical suggestions.  Offsetting the seed by the
+    # number of existing trials makes each round deterministic-but-unique.
+    _probe_store = _make_storage(storage)
+    try:
+        _probe = optuna.load_study(
+            study_name=study_name, storage=_probe_store)
+        n_existing = len(_probe.trials)
+    except KeyError:
+        n_existing = 0
+    effective_seed = int(sampler_seed) + n_existing
+
     sampler = optuna.samplers.TPESampler(
-        seed=int(sampler_seed),
+        seed=effective_seed,
         multivariate=True,
         constant_liar=True,
         warn_independent_sampling=False,
+        n_startup_trials=n_configs,
     )
     pruner = optuna.pruners.NopPruner()
 
@@ -1806,11 +1823,14 @@ def coordinated_tell(
         with open(active_path, "r") as f:
             trial_numbers = json.load(f)["trial_numbers"]
 
-    # Map trial numbers to frozen trials for study.tell()
-    # study.tell() needs the trial object returned by study.ask(),
-    # but those are only available in the ask() process.  We use
-    # study.tell(trial_number, ...) which Optuna supports via the
-    # trial number when the trial is in WAITING or RUNNING state.
+    # Build trial number → internal ID map for intermediate value reporting.
+    # Intermediate values (per-fold metrics) must be set while the trial is
+    # still in RUNNING state, i.e. before study.tell().  This uses Optuna's
+    # storage-level API because coordinated mode separates ask/tell processes.
+    _frozen_id_map: Dict[int, int] = {
+        t.number: t._trial_id for t in study.trials  # type: ignore[attr-defined]
+    }
+
     for trial_num in trial_numbers:
         run_dir = os.path.join(exp.output_dir, f"trial_{trial_num:05d}")
 
@@ -1848,6 +1868,23 @@ def coordinated_tell(
             print(f"[Coordinated-tell] Trial {trial_num:05d}: {exc}", flush=True)
             study.tell(trial_num, state=optuna.trial.TrialState.FAIL)
             continue
+
+        # Report per-fold balanced_tumor_gvw_r as intermediate values so
+        # the Optuna Dashboard can display fold-level performance plots.
+        try:
+            if trial_num in _frozen_id_map:
+                _tid = _frozen_id_map[trial_num]
+                fold_rows = _collect_fold_metrics(run_dir)
+                for step, row in enumerate(fold_rows):
+                    fold_r = row.get("balanced_tumor_gvw_r")
+                    if (fold_r is not None
+                            and isinstance(fold_r, (int, float))
+                            and math.isfinite(float(fold_r))):
+                        study._storage.set_trial_intermediate_value(
+                            _tid, step, float(fold_r))
+        except (RuntimeError, AttributeError) as exc:
+            print(f"[Coordinated-tell] Trial {trial_num:05d}: "
+                  f"could not set intermediate values: {exc}", flush=True)
 
         # Report to Optuna — cv_objective.json on disk preserves full
         # cross-fold metrics; the study only stores the scalar objective.

@@ -12,13 +12,13 @@ set -euo pipefail
 # This gives true cross-fold optimization with fold-level parallelism:
 # 4 configs × 5 folds = 20 simultaneous GPU jobs per round.
 # =====================================================================
-EXPERIMENT="PLCA_tuning/biodvn_tune-plca_phase1-8"
-TAG="PLCA_1-8"
+EXPERIMENT="PLCA_tuning/biodvn_tune-plca_phase2-1"
+TAG="PLCA_2-1"
 YAML="config/experiments/${EXPERIMENT}.yaml"
 ENV_NAME="proteus"
 N_CONFIGS=4          # Configs to ask per round
 N_FOLDS=5            # Folds per config
-N_ROUNDS=12          # Total rounds (N_ROUNDS × N_CONFIGS = total trials)
+N_ROUNDS=10          # Total rounds (N_ROUNDS × N_CONFIGS = total trials)
 BASE_SAMPLER_SEED=42
 POLL_INTERVAL=30
 MAX_RETRIES=2
@@ -57,7 +57,7 @@ submit_fold_worker() {
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=200G
 #SBATCH --gpus=rtx2080ti:1
-#SBATCH --time=12:00:00
+#SBATCH --time=16:00:00
 #SBATCH -A nelson_p
 
 eval "\$(micromamba shell hook -s bash)"
@@ -141,7 +141,7 @@ wait_for_jobs() {
     done
 }
 
-echo "=== PLCA Phase 1.8: Coordinated tuning ==="
+echo "=== PLCA Phase 2.1: Coordinated tuning (20 epochs, GRL tuning) ==="
 echo "    ${N_CONFIGS} configs/round × ${N_FOLDS} folds × ${N_ROUNDS} rounds = $((N_CONFIGS * N_ROUNDS)) total trials"
 echo ""
 
@@ -209,4 +209,4 @@ for round in $(seq 1 "${N_ROUNDS}"); do
     echo ""
 done
 
-echo "=== PLCA Phase 1.8 tuning complete (${N_ROUNDS} rounds). ==="
+echo "=== PLCA Phase 2.1 tuning complete (${N_ROUNDS} rounds). ==="

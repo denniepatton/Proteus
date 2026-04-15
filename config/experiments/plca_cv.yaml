@@ -1,0 +1,66 @@
+# Proteus PLCA model — 5-fold cross-validation (BioDVN)
+#
+# All HPs cemented from PLCA phase 2-0/2-1 tuning (best: trial 12/0).
+# patience=999 ensures all 20 epochs run (final-epoch predictions for CV).
+# Multi-source batch mode: 4 source groups × 24 samples/source per epoch.
+
+name: proteus_plca-model_cv
+output_dir: results_training/proteus_plca-model_cv
+
+transfer: ~
+
+objective:
+  metric: tumor_gvw_crps_mean
+  direction: minimize
+
+tuning: ~
+
+data:
+  training_set: data/PLCA_sample-splits.tsv
+  zarr_base: /hpc/temp/ha_g/user/rpatton/ProteusZarrs
+  subsample_frac: 1.00
+  seed: 23
+  batch_mode: multi_source
+  source_groups:
+    CRPC-RA: [CRPC-RA]
+    SCLC: [SCLC]
+    Prostate-Synthetic: [PC-PDX]
+    SCLC-Synthetic: [SCLC-PDX]
+  target_n_per_source: 24
+
+structural:
+  beta_point_mse: 0.15
+  beta_background: 1.0
+  beta_tcvae: 2.0
+  beta_contrastive: 1.0
+  beta_grl: 0.2
+  beta_reconstruction: 0.50
+  cl_margin: 1.0
+  internal_weight: 0.4
+
+training:
+  epochs: 20
+  patience: 999
+  use_amp: true
+  ema_decay: 0.9999
+  min_lr_ratio: 0.01
+  warmup_start_lr: 1.0e-5
+  warmup_frac: 0.05
+  schedule_frac: 0.90
+  max_grad_norm: 10.0
+  max_lr: 1.278e-4
+  weight_decay: 2.026e-6
+
+scale:
+  signal_ksize: 6
+  interaction_ksize: 3
+  n_reductions: 3
+  reduction_dilation: 3
+  encoder_start: 512
+  latent_size: 128
+  decoder_start: 64
+  mdn_hidden: 64
+  mdn_final: 16
+  signal_filters: 16
+  initial_reduction_channels: 64
+  dropout_rate: 0.50

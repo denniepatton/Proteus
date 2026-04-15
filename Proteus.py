@@ -1416,6 +1416,9 @@ def full_train_from_splits(
     subsample_frac: Optional[float] = None,
     train_only_cohorts: Optional[List[str]] = None,
     balance_cohorts: Optional[List[str]] = None,
+    source_groups: Optional[Dict[str, List[str]]] = None,
+    target_n_per_source: Optional[int] = None,
+    batch_mode: str = 'chunk',
 ):
     """Train a single model on ALL samples in the training_set TSV (no fold holdout).
 
@@ -1540,30 +1543,157 @@ def full_train_from_splits(
           f'raw variance [{min(_raw_vals):.4f}, {max(_raw_vals):.4f}], '
           f'clipped to [0.100, 10.000]')
 
+    # -- Source groups handling (for multi-source batch mode) --
+    sample_to_source: Optional[Dict[str, str]] = None
+    source_tumor_variance: Optional[Dict[str, Dict[str, float]]] = None
+    _sample_paths_by_source: Optional[Dict[str, List[str]]] = None
+    if source_groups:
+        import re
+        # Invert source_groups: cohort → source name.
+        _cohort_to_source: Dict[str, str] = {}
+        for src_name, cohorts in source_groups.items():
+            for coh in cohorts:
+                _cohort_to_source[coh] = src_name
+
+        # Collect known PDX sample names per cohort (for matching PHT names).
+        _pdx_sample_to_cohort: Dict[str, str] = {}
+        with open(training_set_tsv, 'r', newline='') as f:
+            reader = csv.DictReader(f, delimiter='\t')
+            for row in reader:
+                coh = row['Cohort'].strip()
+                samp = row['Sample'].strip()
+                if samp.startswith(f"{coh}_"):
+                    samp = samp[len(coh) + 1:]
+                if coh in _cohort_to_source:
+                    _pdx_sample_to_cohort[samp] = coh
+
+        _pht_re = re.compile(r'^PHT-Fold-\d+_(.+)-BP\d+')
+        sample_to_source = {}
+        _sample_paths_by_source = {src: [] for src in source_groups}
+        _source_variance_paths: Dict[str, List[str]] = {src: [] for src in source_groups}
+
+        for zarr_path in all_paths:
+            cohort = zarr_cohort_map[zarr_path]
+            sample = zarr_sample_name_map[zarr_path]
+
+            if cohort in _cohort_to_source:
+                source = _cohort_to_source[cohort]
+            elif cohort == 'PHT':
+                m = _pht_re.match(sample)
+                if m:
+                    pdx_name = m.group(1)
+                    pdx_coh = _pdx_sample_to_cohort.get(pdx_name)
+                    if pdx_coh is not None:
+                        source = _cohort_to_source[pdx_coh]
+                    else:
+                        raise ValueError(
+                            f"PHT sample '{sample}' has PDX name '{pdx_name}' "
+                            f"that does not match any known PDX sample. "
+                            f"Known: {sorted(_pdx_sample_to_cohort.keys())}"
+                        )
+                else:
+                    raise ValueError(
+                        f"Could not parse PDX name from PHT sample: '{sample}'. "
+                        f"Expected format: PHT-Fold-X_<PDX_NAME>-BP..."
+                    )
+            else:
+                continue  # cohort not in any source group
+
+            sample_to_source[sample] = source
+            _sample_paths_by_source[source].append(zarr_path)
+            # Only non-PHT samples contribute to per-source variance.
+            if cohort != 'PHT':
+                _source_variance_paths[source].append(zarr_path)
+
+        # Compute per-source unclipped tumor variance.
+        print('Computing per-source gene variance for GVW evaluation...')
+        source_tumor_variance = {}
+        for src_name in sorted(source_groups):
+            src_paths = _source_variance_paths[src_name]
+            if src_paths:
+                source_tumor_variance[src_name] = compute_gene_variances_unclipped(
+                    src_paths, label_key='flat/tumor_exp',
+                )
+                vals = list(source_tumor_variance[src_name].values())
+                print(
+                    f'  Source "{src_name}": {len(vals)} genes, '
+                    f'variance range [{min(vals):.3f}, {max(vals):.3f}], '
+                    f'{len(src_paths)} samples'
+                )
+            else:
+                print(f'  Source "{src_name}": no zarr paths found — skipping')
+
     # Create loaders.
-    # Train: ALL samples with gene-level 10% chunk split; cohort-balanced
-    # sampling so minority cohorts are not under-represented per epoch.
-    # Val: PATIENT-ONLY samples with the same chunk split, metadata enabled
-    # so the Trainer can compute per-cohort balanced CRPS for early stopping.
+    # Val: PATIENT-ONLY samples with 10% gene chunk split, metadata enabled
+    # so the Trainer can compute per-cohort/source balanced CRPS.
     val_frac = 0.10
-    train_loader, train_steps = create_data_loader(
-        index_file=all_index,
-        num_workers=_loader_workers(),
-        shuffle=False,
-        labeled=True,
-        loader_mode='chunk',
-        chunk_size=chunk_size,
-        genes_per_batch=genes_per_batch,
-        shuffle_genes_in_batch=shuffle_genes_in_batch,
-        seed=seed,
-        drop_last=False,
-        subsample_frac=subsample_frac,
-        gene_weights=gene_weights,
-        val_frac=val_frac,
-        val_split=False,
-        cohort_map=zarr_cohort_map if balance_cohorts else None,
-        balance_cohorts=balance_cohorts,
-    )
+
+    if batch_mode == 'multi_source':
+        # Multi-source training loader: gene-conditioned batches balanced
+        # across source groups.  ALL samples participate (no fold holdout).
+        from proteus_utils.proteus_utils import (
+            ProteusMultiSourceBatchDataset, _collate_identity,
+        )
+        if _sample_paths_by_source is None:
+            raise ValueError(
+                "batch_mode='multi_source' requires source_groups")
+
+        train_dataset = ProteusMultiSourceBatchDataset(
+            sample_paths_by_source=_sample_paths_by_source,
+            gene_variance=train_fold_variance_raw,
+            n_eff_per_source=target_n_per_source or 24,
+            seed=seed,
+            labeled=True,
+            sample_name_map=zarr_sample_name_map,
+            include_metadata=False,
+            subsample_frac=subsample_frac,
+        )
+
+        base_generator = torch.Generator()
+        base_generator.manual_seed(seed)
+
+        def _seed_worker(worker_id: int) -> None:
+            worker_seed = torch.initial_seed() % (2**32)
+            random.seed(worker_seed)
+            np.random.seed(worker_seed)
+            torch.manual_seed(worker_seed)
+
+        _nw = _loader_workers()
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=_nw,
+            collate_fn=_collate_identity,
+            persistent_workers=_nw > 0,
+            prefetch_factor=4 if _nw > 0 else None,
+            worker_init_fn=_seed_worker if _nw > 0 else None,
+            generator=base_generator,
+            drop_last=False,
+            pin_memory=True,
+        )
+        train_steps = len(train_dataset)
+    else:
+        # Standard chunk-based training loader with optional cohort balancing.
+        # Uses 90% of gene chunks (10% reserved for val).
+        train_loader, train_steps = create_data_loader(
+            index_file=all_index,
+            num_workers=_loader_workers(),
+            shuffle=False,
+            labeled=True,
+            loader_mode='chunk',
+            chunk_size=chunk_size,
+            genes_per_batch=genes_per_batch,
+            shuffle_genes_in_batch=shuffle_genes_in_batch,
+            seed=seed,
+            drop_last=False,
+            subsample_frac=subsample_frac,
+            gene_weights=gene_weights,
+            val_frac=val_frac,
+            val_split=False,
+            cohort_map=zarr_cohort_map if balance_cohorts else None,
+            balance_cohorts=balance_cohorts,
+        )
 
     val_loader, val_steps = create_data_loader(
         index_file=patient_index,
@@ -1601,9 +1731,14 @@ def full_train_from_splits(
 
     # Train
     trainer = Trainer(model, training_config, model_config, device)
-    # Provide sample→cohort mapping so the Trainer can compute per-cohort
-    # balanced CRPS for early stopping (patient cohorts only).
-    if sample_cohort_map and _train_only:
+    trainer.val_gene_weight_map = train_fold_variance_raw
+    # Per-source gene variance for epoch-level per-source GVW-CRPS/GVW-r.
+    trainer.val_source_gene_weight_map = source_tumor_variance
+    # Enable epoch-level per-group CRPS monitoring.  When source_groups
+    # is active, group by source; otherwise by cohort (patient-only).
+    if sample_to_source:
+        trainer.val_sample_cohort_map = sample_to_source
+    elif sample_cohort_map and _train_only:
         patient_cohort_map = {
             k: v for k, v in sample_cohort_map.items() if v not in _train_only
         }
@@ -1782,6 +1917,7 @@ def _build_configs_from_spec(experiment_spec, args) -> tuple:
         epochs=int(experiment_spec.training.epochs.fixed),
         patience=int(experiment_spec.training.patience.fixed),
         use_amp=bool(experiment_spec.training.use_amp.fixed),
+        ema_decay=float(experiment_spec.training.ema_decay.fixed),
         runtime_device_banner=bool(args.runtime_device_banner),
         base_weights=experiment_spec.transfer.base_weights,
         freeze_level=experiment_spec.transfer.freeze_level,
@@ -2003,6 +2139,9 @@ def main():
             subsample_frac=args.subsample,
             train_only_cohorts=experiment_spec.data.train_only_cohorts,
             balance_cohorts=experiment_spec.data.balance_cohorts,
+            source_groups=experiment_spec.data.source_groups,
+            target_n_per_source=experiment_spec.data.target_n_per_source,
+            batch_mode=experiment_spec.data.batch_mode,
         )
     
     elif args.run_mode == 'full-train':
@@ -2032,6 +2171,9 @@ def main():
             subsample_frac=args.subsample,
             train_only_cohorts=experiment_spec.data.train_only_cohorts,
             balance_cohorts=experiment_spec.data.balance_cohorts,
+            source_groups=experiment_spec.data.source_groups,
+            target_n_per_source=experiment_spec.data.target_n_per_source,
+            batch_mode=experiment_spec.data.batch_mode,
         )
 
     elif args.run_mode == 'tune':

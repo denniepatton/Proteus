@@ -41,11 +41,15 @@ from analysis.analysis_utils import (
     clean_epicseq_sample_names,
     clean_epicseq_sample_names_wcdt,
     cohort_summary_table,
+    compute_cox_univariate,
+    compute_cox_multivariate,
     compute_coverage_curve,
     compute_gene_variance,
+    compute_geneset_score,
     compute_subset_metrics,
     empirical_coverage,
     ensure_dir,
+    extract_pluvicto_patient_id,
     gene_level_metrics,
     gene_list_available,
     generate_null_predictions,
@@ -61,8 +65,14 @@ from analysis.analysis_utils import (
     load_holdout_predictions_proteus_full,
     load_holdout_predictions_xgboost,
     load_pdx_truth_for_phs,
+    load_pluvicto_clinical,
+    load_pluvicto_outcomes,
     load_subtypes,
     load_truth,
+    mdn_monte_carlo_sample,
+    mdn_predictive_variance,
+    pam50_classify,
+    pam50_classify_mc,
     parse_phs_sample,
     PC_PDX_STUDY,
     PDX_HOLDOUT_SAMPLES,
@@ -89,11 +99,17 @@ from analysis.plot_utils import (
     benchmark_cohort_boxplots,
     benchmark_cohort_histograms,
     benchmark_cohort_metrics_lines,
+    benchmark_depth_lines,
     benchmark_ecdna_lines,
     benchmark_grid_boxplots,
     benchmark_grid_histograms,
+    binary_status_boxplot,
+    clinical_correlation_scatter,
+    confusion_matrix_heatmap,
     double_heatmap,
+    forest_plot,
     gene_target_scatter,
+    kaplan_meier_plot,
     metric_distribution,
     metric_distribution_by_variance,
     plot_calibration_coverage,
@@ -103,6 +119,7 @@ from analysis.plot_utils import (
     plot_reliability_scatter,
     plot_reliability_weights,
     plot_retention_curve,
+    roc_gene_calling,
     sample_expression_kde,
     sample_scatter,
     single_heatmap,
@@ -1769,11 +1786,17 @@ def _run_gsea(
     out_dir: str,
     overwrite: bool,
     contrast: str = "NEPC-ARPC",
+    tag: str = "",
 ) -> None:
     """Run GSEA (prerank) on limma DE results using gseapy.
 
     Runs against Hallmark pathways and the CRPC shortlist gene sets
     (ARG.10, NE.10, CCP.31).  Saves results TSVs and enrichment dot plots.
+
+    Parameters
+    ----------
+    tag : str
+        Suffix appended to output subdirectory names.
     """
     import gseapy as gp
 
@@ -1787,16 +1810,16 @@ def _run_gsea(
     rank_series = rank_series[~rank_series.index.duplicated(keep="first")]
     rank_series = rank_series.sort_values(ascending=False)
 
-    gsea_out = ensure_dir(os.path.join(out_dir, "GSEA"))
+    gsea_out = ensure_dir(os.path.join(out_dir, f"GSEA{tag}"))
 
     # --- (1) Hallmark pathways ---
     if _GSEA_HALLMARK_GMT.exists():
         hallmark_sets = _load_gmt(_GSEA_HALLMARK_GMT)
-        print(f"    GSEA Hallmark: {len(hallmark_sets)} gene sets, "
+        print(f"    GSEA Hallmark{tag}: {len(hallmark_sets)} gene sets, "
               f"{len(rank_series)} ranked genes")
 
         hallmark_out = ensure_dir(os.path.join(gsea_out, "Hallmark"))
-        hallmark_tsv = os.path.join(hallmark_out, "gsea_hallmark_results.tsv")
+        hallmark_tsv = os.path.join(hallmark_out, f"gsea_hallmark_results{tag}.tsv")
 
         if overwrite or not os.path.exists(hallmark_tsv):
             res_h = gp.prerank(
@@ -1839,7 +1862,7 @@ def _run_gsea(
                       f"(e.g. {', '.join(genes[:4])})")
 
             shortlist_out = ensure_dir(os.path.join(gsea_out, "Shortlist"))
-            shortlist_tsv = os.path.join(shortlist_out, "gsea_shortlist_results.tsv")
+            shortlist_tsv = os.path.join(shortlist_out, f"gsea_shortlist_results{tag}.tsv")
 
             if overwrite or not os.path.exists(shortlist_tsv):
                 res_s = gp.prerank(
@@ -1885,8 +1908,21 @@ def _run_limma_de(
     contrast: str = "NEPC-ARPC",
     padj_thresh: float = 0.05,
     lfc_thresh: float = 1.0,
+    tag: str = "",
+    weights: Optional[pd.DataFrame] = None,
+    tfx_series: Optional[pd.Series] = None,
 ) -> Optional[pd.DataFrame]:
     """Run limma DE on predicted expression between two subtypes via rpy2.
+
+    Parameters
+    ----------
+    tag : str
+        Suffix appended to output filenames (e.g. "_raw", "_uncertainty-adjusted").
+    weights : pd.DataFrame, optional
+        Observation-level precision weights (genes x samples), passed to
+        ``lmFit(..., weights=)``.
+    tfx_series : pd.Series, optional
+        Continuous TFx values indexed by sample name, added as a confounder.
 
     Returns the full topTable DataFrame, or None if skipped.
     """
@@ -1943,17 +1979,32 @@ def _run_limma_de(
     with localconverter(converter):
         r_expr = ro.conversion.get_conversion().py2rpy(expr)
         r_groups = ro.StrVector(list(groups))
-        de_r = ro.globalenv["run_limma_de"](r_expr, r_groups, contrast)
+
+        # Optional weights (genes x samples, aligned to expr)
+        r_weights = ro.NULL
+        if weights is not None:
+            w = weights.reindex(index=expr.index, columns=common).fillna(1.0)
+            r_weights = ro.conversion.get_conversion().py2rpy(w)
+
+        # Optional TFx confounder (per-sample continuous)
+        r_tfx = ro.NULL
+        if tfx_series is not None:
+            tfx_vals = tfx_series.reindex(common).fillna(tfx_series.median())
+            r_tfx = ro.FloatVector(tfx_vals.values.tolist())
+
+        de_r = ro.globalenv["run_limma_de"](
+            r_expr, r_groups, contrast, r_weights, r_tfx)
         de_results = ro.conversion.get_conversion().rpy2py(de_r)
 
     # Save TSV
-    de_path = os.path.join(out_dir, f"limma_DE_{contrast.replace('-', '_vs_')}.tsv")
+    contrast_tag = contrast.replace("-", "_vs_")
+    de_path = os.path.join(out_dir, f"limma_DE_{contrast_tag}{tag}.tsv")
     de_results.to_csv(de_path, sep="\t")
     print(f"    Saved DE results: {de_path}")
 
     # Volcano plot
     _maybe(volcano_plot, overwrite, de_results,
-           os.path.join(out_dir, f"volcano_{contrast.replace('-', '_vs_')}"),
+           os.path.join(out_dir, f"volcano_{contrast_tag}{tag}"),
            padj_thresh=padj_thresh, lfc_thresh=lfc_thresh,
            contrast_name=contrast)
 
@@ -1969,6 +2020,506 @@ def _run_limma_de(
           f"at padj<{padj_thresh}, |logFC|>{lfc_thresh}")
 
     return de_results
+
+
+# ---------------------------------------------------------------------------
+# Patient_Discovery: BC-Ghana receptor expression + PAM50
+# ---------------------------------------------------------------------------
+
+_BC_GHANA_RECEPTOR_PAIRS = [
+    ("HER2_status", "ERBB2", "HER2"),
+    ("ER_status",   "ESR1",  "ER"),
+    ("PR_stats",    "PGR",   "PR"),
+]
+
+
+def _run_bc_ghana_analysis(
+    pred: pd.DataFrame,
+    model_out: str,
+    overwrite: bool,
+    tag: str = "",
+    mc_draws: Optional[List[pd.DataFrame]] = None,
+) -> None:
+    """Receptor-gene expression boxplots and PAM50 classification for BC-Ghana.
+
+    Parameters
+    ----------
+    tag : str
+        Suffix appended to output filenames.
+    mc_draws : list[DataFrame], optional
+        MC draws for uncertainty-adjusted PAM50 (uses ``pam50_classify_mc``).
+    """
+    meta_path = PROJECT_ROOT / "reference" / "BC-Ghana_metadata.tsv"
+    if not meta_path.exists():
+        print("    [skip] BC-Ghana metadata not found")
+        return
+
+    meta = pd.read_csv(meta_path, sep="\t").set_index("sample")
+    common_samples = [s for s in pred.columns if s in meta.index]
+    if len(common_samples) < 3:
+        print(f"    [skip] BC-Ghana: only {len(common_samples)} matched samples")
+        return
+    print(f"    BC-Ghana: {len(common_samples)} samples matched to metadata")
+
+    # --- Receptor-gene expression boxplots ---
+    receptor_out = ensure_dir(os.path.join(model_out, "receptor_expression"))
+    for status_col, gene, receptor_name in _BC_GHANA_RECEPTOR_PAIRS:
+        if gene not in pred.index:
+            print(f"    [skip] {gene} not in predictions")
+            continue
+        if status_col not in meta.columns:
+            print(f"    [skip] {status_col} not in metadata")
+            continue
+
+        expr_vals = pred.loc[gene, common_samples].astype(float)
+        status_vals = meta.loc[common_samples, status_col].astype(int)
+
+        vals_neg = expr_vals[status_vals == 0].values
+        vals_pos = expr_vals[status_vals == 1].values
+        # Mann-Whitney U p-value
+        from scipy.stats import mannwhitneyu
+        if len(vals_neg) >= 2 and len(vals_pos) >= 2:
+            _, mwu_p = mannwhitneyu(vals_neg, vals_pos, alternative="two-sided")
+        else:
+            mwu_p = None
+        _maybe(
+            binary_status_boxplot, overwrite,
+            vals_neg, vals_pos,
+            os.path.join(receptor_out,
+                         f"{receptor_name}_status_vs_{gene}_expression"),
+            xlabel=f"{receptor_name} IHC status",
+            ylabel=f"{gene} predicted expression (log₂CPM+1)",
+            title=f"{gene} expression by {receptor_name} status — BC-Ghana",
+            pval=mwu_p,
+        )
+
+    # --- PAM50 classification ---
+    pam50_out = ensure_dir(os.path.join(model_out, f"PAM50{tag}"))
+    pred_sub = pred[common_samples]
+
+    if mc_draws is not None:
+        # Uncertainty-adjusted: classify each MC draw, aggregate
+        draws_sub = [d.reindex(columns=common_samples) for d in mc_draws]
+        pam50_results = pam50_classify_mc(draws_sub, pred_sub)
+        print(f"    PAM50 MC classification saved ({len(pam50_results)} samples)")
+    else:
+        pam50_results = pam50_classify(pred_sub)
+        print(f"    PAM50 classification saved ({len(pam50_results)} samples)")
+
+    pam50_results.to_csv(
+        os.path.join(pam50_out, f"pam50_classification{tag}.tsv"),
+        sep="\t", index=False)
+
+    if pam50_results.empty or "sample" not in pam50_results.columns:
+        print(f"    [skip] PAM50 confusion matrix: no classified samples")
+        return
+
+    # Confusion matrix: predicted vs metadata subtype
+    truth_subtypes = meta.loc[common_samples, "subtype"]
+    pam50_indexed = pam50_results.set_index("sample")
+    matched = truth_subtypes.index.intersection(pam50_indexed.index)
+    if len(matched) >= 3:
+        y_true = truth_subtypes.loc[matched].values
+        y_pred = pam50_indexed.loc[matched, "predicted_subtype"].values
+        all_labels = sorted(set(y_true) | set(y_pred))
+        _maybe(
+            confusion_matrix_heatmap, overwrite,
+            y_true, y_pred,
+            os.path.join(pam50_out, f"pam50_confusion_matrix{tag}"),
+            class_order=all_labels,
+            title="PAM50 classification — BC-Ghana",
+        )
+        correct = (y_true == y_pred).sum()
+        print(f"    PAM50 accuracy: {correct}/{len(matched)} "
+              f"({100 * correct / len(matched):.1f}%)")
+
+
+# ---------------------------------------------------------------------------
+# Patient_Discovery: CRPC-Pluvicto ssGSEA + survival + clinical
+# ---------------------------------------------------------------------------
+
+def _run_pluvicto_ssgsea(
+    pred: pd.DataFrame,
+    model_out: str,
+    overwrite: bool,
+    tag: str = "",
+) -> Optional[pd.DataFrame]:
+    """Run ssGSEA (Hallmark) on per-sample Pluvicto predictions.
+
+    Parameters
+    ----------
+    tag : str
+        Suffix appended to output filenames.
+
+    Returns a pathway-score DataFrame (pathways x samples) or None.
+    """
+    import gseapy as gp
+
+    if not _GSEA_HALLMARK_GMT.exists():
+        print(f"    [skip] Hallmark GMT not found: {_GSEA_HALLMARK_GMT}")
+        return None
+
+    ssgsea_out = ensure_dir(os.path.join(model_out, f"ssGSEA{tag}"))
+    scores_tsv = os.path.join(ssgsea_out, f"ssgsea_hallmark_scores{tag}.tsv")
+
+    if overwrite or not os.path.exists(scores_tsv):
+        hallmark_sets = _load_gmt(_GSEA_HALLMARK_GMT)
+        print(f"    ssGSEA Hallmark: {len(hallmark_sets)} gene sets, "
+              f"{pred.shape[1]} samples")
+        res = gp.ssgsea(
+            data=pred,
+            gene_sets=hallmark_sets,
+            outdir=None,
+            min_size=10,
+            max_size=500,
+            no_plot=True,
+            verbose=False,
+        )
+        scores = res.res2d.pivot(
+            index="Term", columns="Name", values="NES",
+        ).apply(pd.to_numeric, errors="coerce")
+        scores.to_csv(scores_tsv, sep="\t")
+        print(f"    Saved: {scores_tsv}")
+    else:
+        scores = pd.read_csv(scores_tsv, sep="\t", index_col=0)
+
+    # Summary: top/bottom 5 pathways by mean NES
+    mean_nes = scores.mean(axis=1).sort_values()
+    n_show = min(5, len(mean_nes))
+    print(f"    Top {n_show} enriched: "
+          + ", ".join(mean_nes.tail(n_show).index.tolist()))
+    print(f"    Bottom {n_show} depleted: "
+          + ", ".join(mean_nes.head(n_show).index.tolist()))
+
+    return scores
+
+
+def _run_pluvicto_ssgsea_mc(
+    draws: List[pd.DataFrame],
+    model_out: str,
+    overwrite: bool,
+) -> Optional[pd.DataFrame]:
+    """Run ssGSEA on each MC draw and aggregate (mean NES + 95% CI).
+
+    Returns mean pathway scores (pathways x samples) or None.
+    Saves mean, CI-lo, and CI-hi score matrices.
+    """
+    import gseapy as gp
+
+    if not _GSEA_HALLMARK_GMT.exists():
+        print(f"    [skip] ssGSEA MC: Hallmark GMT not found")
+        return None
+
+    tag = "_uncertainty-adjusted"
+    ssgsea_out = ensure_dir(os.path.join(model_out, f"ssGSEA{tag}"))
+    mean_tsv = os.path.join(ssgsea_out, f"ssgsea_hallmark_scores{tag}.tsv")
+
+    if not overwrite and os.path.exists(mean_tsv):
+        return pd.read_csv(mean_tsv, sep="\t", index_col=0)
+
+    hallmark_sets = _load_gmt(_GSEA_HALLMARK_GMT)
+    M = len(draws)
+    print(f"    ssGSEA MC: {M} draws × {len(hallmark_sets)} gene sets")
+
+    all_scores: List[pd.DataFrame] = []
+    for i, draw in enumerate(draws):
+        res = gp.ssgsea(
+            data=draw,
+            gene_sets=hallmark_sets,
+            outdir=None,
+            min_size=10,
+            max_size=500,
+            no_plot=True,
+            verbose=False,
+        )
+        scores = res.res2d.pivot(
+            index="Term", columns="Name", values="NES",
+        ).apply(pd.to_numeric, errors="coerce")
+        all_scores.append(scores)
+        if (i + 1) % 10 == 0:
+            print(f"      ssGSEA MC draw {i + 1}/{M} complete")
+
+    # Stack and compute statistics
+    stacked = np.stack([s.values for s in all_scores], axis=0)  # (M, P, S)
+    mean_scores = pd.DataFrame(
+        np.mean(stacked, axis=0),
+        index=all_scores[0].index, columns=all_scores[0].columns)
+    ci_lo = pd.DataFrame(
+        np.percentile(stacked, 2.5, axis=0),
+        index=all_scores[0].index, columns=all_scores[0].columns)
+    ci_hi = pd.DataFrame(
+        np.percentile(stacked, 97.5, axis=0),
+        index=all_scores[0].index, columns=all_scores[0].columns)
+
+    mean_scores.to_csv(mean_tsv, sep="\t")
+    ci_lo.to_csv(os.path.join(ssgsea_out, f"ssgsea_hallmark_ci_lo{tag}.tsv"),
+                 sep="\t")
+    ci_hi.to_csv(os.path.join(ssgsea_out, f"ssgsea_hallmark_ci_hi{tag}.tsv"),
+                 sep="\t")
+    print(f"    Saved MC ssGSEA: {mean_tsv}")
+
+    return mean_scores
+
+
+def _run_pluvicto_survival(
+    pred: pd.DataFrame,
+    ssgsea_scores: Optional[pd.DataFrame],
+    model_out: str,
+    overwrite: bool,
+    tag: str = "",
+) -> None:
+    """Forest plots and KM curves for Pluvicto survival analysis."""
+    outcomes = load_pluvicto_outcomes()
+    clinical = load_pluvicto_clinical()
+
+    # Match prediction samples to outcomes via patient ID
+    pid_map = {s: extract_pluvicto_patient_id(s) for s in pred.columns}
+    matched_pids = {pid for pid in pid_map.values() if pid in outcomes.index}
+    if len(matched_pids) < 10:
+        print(f"    [skip] Pluvicto survival: only {len(matched_pids)} matched")
+        return
+    # Use one sample per patient (first encountered)
+    pid_to_sample: Dict[str, str] = {}
+    for s, pid in pid_map.items():
+        if pid in matched_pids and pid not in pid_to_sample:
+            pid_to_sample[pid] = s
+    pids = sorted(pid_to_sample.keys())
+    samples = [pid_to_sample[p] for p in pids]
+
+    time = outcomes.loc[pids, "survival_days"]
+    event = outcomes.loc[pids, "Death"]
+    valid = time.notna() & event.notna()
+    pids_v = [p for p, v in zip(pids, valid) if v]
+    samples_v = [pid_to_sample[p] for p in pids_v]
+    time_v = time.loc[pids_v].astype(float)
+    event_v = event.loc[pids_v].astype(int)
+    print(f"    Pluvicto survival: {len(pids_v)} patients with events "
+          f"({int(event_v.sum())} deaths)")
+
+    survival_out = ensure_dir(os.path.join(model_out, f"survival{tag}"))
+
+    # --- Load TFx for multivariate adjustment (used by both forest plots) ---
+    tfx_by_pid: Dict[str, float] = {}
+    sub_path = PROJECT_ROOT / "labels" / "CRPC-Pluvicto_TFX_Subtype.tsv"
+    if sub_path.exists():
+        sub_df = load_subtypes("CRPC-Pluvicto")
+        if "tfx" in sub_df.columns:
+            for sname, tfx_val in sub_df["tfx"].items():
+                pid = extract_pluvicto_patient_id(str(sname))
+                if pid in pids_v and pid not in tfx_by_pid:
+                    tfx_by_pid[pid] = float(tfx_val)
+    tfx_series_v = pd.Series(tfx_by_pid).reindex(pids_v) if tfx_by_pid else None
+
+    # --- Forest plot 1: ssGSEA pathway scores ---
+    if ssgsea_scores is not None and not ssgsea_scores.empty:
+        pathway_covs = ssgsea_scores[samples_v].T
+        pathway_covs.index = pids_v
+        cox_pathway = compute_cox_univariate(time_v, event_v, pathway_covs)
+        cox_pathway.to_csv(
+            os.path.join(survival_out, f"cox_pathway_results{tag}.tsv"),
+            sep="\t", index=False)
+
+        # Multivariate (TFx-adjusted)
+        cox_pathway_mv = None
+        if tfx_series_v is not None:
+            cox_pathway_mv = compute_cox_multivariate(
+                time_v, event_v, pathway_covs, tfx_series_v)
+            cox_pathway_mv.to_csv(
+                os.path.join(survival_out, f"cox_pathway_results_mv{tag}.tsv"),
+                sep="\t", index=False)
+
+        # Top/bottom 10 by HR
+        cox_sig = cox_pathway.dropna(subset=["HR"])
+        if not cox_sig.empty:
+            cox_sig = cox_sig.sort_values("HR")
+            n_show = min(10, len(cox_sig))
+            show_rows = pd.concat([cox_sig.head(n_show), cox_sig.tail(n_show)])
+            show_rows = show_rows.drop_duplicates(subset=["variable"])
+            # Match multivariate rows to the same variables
+            show_mv = None
+            if cox_pathway_mv is not None:
+                show_mv = cox_pathway_mv[
+                    cox_pathway_mv["variable"].isin(show_rows["variable"])
+                ]
+            _maybe(
+                forest_plot, overwrite,
+                show_rows,
+                os.path.join(survival_out, f"forest_pathway{tag}"),
+                title=f"Cox PH — Hallmark pathway scores{tag}",
+                hr_table_mv=show_mv,
+            )
+
+            # KM curve for strongest pathway (lowest p)
+            best_pw = cox_sig.loc[cox_sig["p"].idxmin(), "variable"]
+            if best_pw in pathway_covs.columns:
+                vals = pathway_covs[best_pw]
+                median_val = vals.median()
+                is_hi = vals >= median_val
+                from lifelines.statistics import logrank_test
+                lr = logrank_test(
+                    time_v[~is_hi], time_v[is_hi],
+                    event_v[~is_hi], event_v[is_hi],
+                )
+                _maybe(
+                    kaplan_meier_plot, overwrite,
+                    time_v[~is_hi].values, event_v[~is_hi].values,
+                    time_v[is_hi].values, event_v[is_hi].values,
+                    os.path.join(survival_out, f"KM_{best_pw}{tag}"),
+                    title=f"Overall survival — {best_pw}",
+                    logrank_p=lr.p_value,
+                )
+
+    # --- Forest plot 2: clinical / imaging variables ---
+    imaging_cols = [
+        "PSMA-PET_SUVmax", "PSMA-PET_SUVmean",
+        "PSMA-PET_PSMAexpression", "PSMA-PET_Volume",
+        "FDG_SUVmax", "FDG_SUVmean", "FDG_TLG", "FDG_Volume",
+    ]
+    extra_cols = ["Baseline_PSA"]
+    clin_cols = [c for c in imaging_cols + extra_cols if c in clinical.columns]
+    clin_pids = [p for p in pids_v if p in clinical.index]
+    if len(clin_pids) >= 10 and clin_cols:
+        clin_covs = clinical.loc[clin_pids, clin_cols]
+        time_c = time_v.loc[clin_pids]
+        event_c = event_v.loc[clin_pids]
+
+        # Add TFx from pre-loaded series
+        if tfx_series_v is not None:
+            tfx_clin = tfx_series_v.reindex(clin_pids).dropna()
+            if not tfx_clin.empty:
+                clin_covs = clin_covs.copy()
+                clin_covs["TFx"] = tfx_clin
+
+        cox_clin = compute_cox_univariate(time_c, event_c, clin_covs)
+        cox_clin.to_csv(
+            os.path.join(survival_out, f"cox_clinical_results{tag}.tsv"),
+            sep="\t", index=False)
+
+        # Multivariate (TFx-adjusted) — only non-TFx covariates
+        cox_clin_mv = None
+        if tfx_series_v is not None:
+            tfx_c = tfx_series_v.reindex(clin_pids)
+            non_tfx_cols = [c for c in clin_covs.columns if c != "TFx"]
+            if non_tfx_cols:
+                clin_covs_notfx = clin_covs[non_tfx_cols]
+                cox_clin_mv = compute_cox_multivariate(
+                    time_c, event_c, clin_covs_notfx, tfx_c)
+                cox_clin_mv.to_csv(
+                    os.path.join(survival_out, f"cox_clinical_results_mv{tag}.tsv"),
+                    sep="\t", index=False)
+
+        cox_clin_valid = cox_clin.dropna(subset=["HR"])
+        if not cox_clin_valid.empty:
+            # Match multivariate rows
+            clin_mv_for_plot = None
+            if cox_clin_mv is not None:
+                clin_mv_for_plot = cox_clin_mv[
+                    cox_clin_mv["variable"].isin(cox_clin_valid["variable"])
+                ]
+            _maybe(
+                forest_plot, overwrite,
+                cox_clin_valid,
+                os.path.join(survival_out, f"forest_clinical{tag}"),
+                title=f"Cox PH — clinical & imaging variables{tag}",
+                hr_table_mv=clin_mv_for_plot,
+            )
+
+            # KM curve for strongest clinical variable (lowest p)
+            best_cl = cox_clin_valid.loc[
+                cox_clin_valid["p"].idxmin(), "variable"]
+            if best_cl in clin_covs.columns:
+                vals = clin_covs[best_cl].loc[clin_pids]
+                valid_km = vals.dropna()
+                if len(valid_km) >= 10:
+                    median_val = valid_km.median()
+                    is_hi = valid_km >= median_val
+                    t_km = time_c.loc[valid_km.index]
+                    e_km = event_c.loc[valid_km.index]
+                    from lifelines.statistics import logrank_test
+                    lr = logrank_test(
+                        t_km[~is_hi], t_km[is_hi],
+                        e_km[~is_hi], e_km[is_hi],
+                    )
+                    _maybe(
+                        kaplan_meier_plot, overwrite,
+                        t_km[~is_hi].values, e_km[~is_hi].values,
+                        t_km[is_hi].values, e_km[is_hi].values,
+                        os.path.join(survival_out, f"KM_{best_cl}{tag}"),
+                        title=f"Overall survival — {best_cl}",
+                        logrank_p=lr.p_value,
+                    )
+
+
+def _run_pluvicto_clinical_correlations(
+    pred: pd.DataFrame,
+    model_out: str,
+    overwrite: bool,
+) -> None:
+    """Scatter plots: FOLH1 vs PSMA-PET, CCP31 vs FDG imaging variables."""
+    clinical = load_pluvicto_clinical()
+
+    # Match prediction samples to clinical data via patient ID
+    pid_map = {s: extract_pluvicto_patient_id(s) for s in pred.columns}
+    pid_to_sample: Dict[str, str] = {}
+    for s, pid in pid_map.items():
+        if pid in clinical.index and pid not in pid_to_sample:
+            pid_to_sample[pid] = s
+    pids = sorted(pid_to_sample.keys())
+    samples = [pid_to_sample[p] for p in pids]
+    if len(pids) < 5:
+        print(f"    [skip] Pluvicto clinical correlations: "
+              f"only {len(pids)} matched")
+        return
+    print(f"    Pluvicto clinical correlations: {len(pids)} patients matched")
+
+    corr_out = ensure_dir(os.path.join(model_out, "clinical_correlations"))
+
+    # --- FOLH1 vs PSMA-PET ---
+    if "FOLH1" in pred.index:
+        folh1_vals = pred.loc["FOLH1", samples].values.astype(float)
+        folh1_series = pd.Series(folh1_vals, index=pids)
+        for psma_col in ["PSMA-PET_SUVmax", "PSMA-PET_SUVmean",
+                         "PSMA-PET_PSMAexpression", "PSMA-PET_Volume"]:
+            if psma_col not in clinical.columns:
+                continue
+            clin_vals = clinical.loc[pids, psma_col]
+            valid = folh1_series.notna() & clin_vals.notna()
+            if valid.sum() < 5:
+                continue
+            _maybe(
+                clinical_correlation_scatter, overwrite,
+                folh1_series[valid].values, clin_vals[valid].values,
+                os.path.join(corr_out, f"FOLH1_vs_{psma_col}"),
+                xlabel="FOLH1 predicted expression (log₂CPM+1)",
+                ylabel=psma_col,
+                title=f"FOLH1 vs {psma_col}",
+            )
+    else:
+        print("    [skip] FOLH1 not in predictions")
+
+    # --- CCP31 score vs FDG ---
+    ccp31_name = STANDARD_GENE_SETS.get("CCP31", "CCP31")
+    if gene_list_available(ccp31_name):
+        ccp31_genes = get_gene_list(ccp31_name)
+        ccp31_score = compute_geneset_score(pred[samples], ccp31_genes)
+        ccp31_series = pd.Series(ccp31_score.values, index=pids)
+        for fdg_col in ["FDG_SUVmax", "FDG_SUVmean", "FDG_TLG", "FDG_Volume"]:
+            if fdg_col not in clinical.columns:
+                continue
+            clin_vals = clinical.loc[pids, fdg_col]
+            valid = ccp31_series.notna() & clin_vals.notna()
+            if valid.sum() < 5:
+                continue
+            _maybe(
+                clinical_correlation_scatter, overwrite,
+                ccp31_series[valid].values, clin_vals[valid].values,
+                os.path.join(corr_out, f"CCP31_vs_{fdg_col}"),
+                xlabel="CCP31 score (mean log₂CPM+1)",
+                ylabel=fdg_col,
+                title=f"CCP31 vs {fdg_col}",
+            )
+    else:
+        print("    [skip] CCP31 gene set not available")
 
 
 def _run_discovery_cohort(
@@ -1998,7 +2549,28 @@ def _run_discovery_cohort(
             print(f"    [skip] {model_name}: not found")
             continue
 
-        pred, ci_lo, ci_hi = load_holdout_predictions_proteus(str(path))
+        # Load full MDN parameters for uncertainty propagation
+        full_data = load_holdout_predictions_proteus_full(str(path))
+        pred = full_data["pred_wide"]
+        ci_lo = full_data.get("ci_lo_wide")
+        ci_hi = full_data.get("ci_hi_wide")
+
+        # Build MC draws if MDN params available
+        mc_draws: Optional[List[pd.DataFrame]] = None
+        pred_var: Optional[pd.DataFrame] = None
+        has_mdn = all(full_data.get(k) is not None for k in (
+            "p0_wide", "pi_gamma_wide", "pi_normal_wide",
+            "gamma_beta_wide", "normal_mean_wide", "normal_stdev_wide"))
+        if has_mdn:
+            mc_draws = mdn_monte_carlo_sample(
+                full_data["p0_wide"], full_data["pi_gamma_wide"],
+                full_data["pi_normal_wide"], full_data["gamma_beta_wide"],
+                full_data["normal_mean_wide"], full_data["normal_stdev_wide"],
+                M=100, seed=42)
+            pred_var = mdn_predictive_variance(
+                full_data["p0_wide"], full_data["pi_gamma_wide"],
+                full_data["pi_normal_wide"], full_data["gamma_beta_wide"],
+                full_data["normal_mean_wide"], full_data["normal_stdev_wide"])
 
         # CRPC-Pluvicto: restrict to clinical FH samples (not FHL) at cycle 1
         if cohort == "CRPC-Pluvicto":
@@ -2013,6 +2585,10 @@ def _run_discovery_cohort(
                 ci_lo = ci_lo[[s for s in keep if s in ci_lo.columns]]
             if ci_hi is not None:
                 ci_hi = ci_hi[[s for s in keep if s in ci_hi.columns]]
+            if mc_draws is not None:
+                mc_draws = [d[keep] for d in mc_draws]
+            if pred_var is not None:
+                pred_var = pred_var[keep]
             print(f"    Pluvicto filter: {n_before} → {pred.shape[1]} samples "
                   f"(FH* !FHL*, *C1)")
 
@@ -2036,11 +2612,58 @@ def _run_discovery_cohort(
 
         pred.to_csv(os.path.join(model_out, "predictions_wide.tsv"), sep="\t")
 
-        # Limma DE: ARPC vs NEPC for CRPC-UW
+        # --- Limma DE + GSEA: ARPC vs NEPC for CRPC-UW ---
         if cohort == "CRPC-UW" and sub_dict is not None and subtypes_df is not None:
-            de_results = _run_limma_de(pred, subtypes_df, model_out, args.overwrite)
-            if de_results is not None:
-                _run_gsea(de_results, model_out, args.overwrite)
+            # TFx series for uncertainty-adjusted limma
+            tfx_for_limma = None
+            if subtypes_df is not None and "tfx" in subtypes_df.columns:
+                tfx_for_limma = subtypes_df["tfx"]
+
+            # _raw: point predictions, TFx confounder, no precision weights
+            de_raw = _run_limma_de(pred, subtypes_df, model_out,
+                                   args.overwrite, tag="_raw",
+                                   tfx_series=tfx_for_limma)
+            if de_raw is not None:
+                _run_gsea(de_raw, model_out, args.overwrite, tag="_raw")
+
+            # _uncertainty-adjusted: TFx confounder + inverse-variance weights
+            if pred_var is not None:
+                limma_weights = 1.0 / pred_var
+                de_adj = _run_limma_de(
+                    pred, subtypes_df, model_out, args.overwrite,
+                    tag="_uncertainty-adjusted",
+                    weights=limma_weights, tfx_series=tfx_for_limma)
+                if de_adj is not None:
+                    _run_gsea(de_adj, model_out, args.overwrite,
+                              tag="_uncertainty-adjusted")
+
+        # --- BC-Ghana: receptor expression boxplots + PAM50 classification ---
+        if cohort == "BC-Ghana":
+            _run_bc_ghana_analysis(pred, model_out, args.overwrite,
+                                   tag="_raw")
+            if mc_draws is not None:
+                _run_bc_ghana_analysis(
+                    pred, model_out, args.overwrite,
+                    tag="_uncertainty-adjusted", mc_draws=mc_draws)
+
+        # --- CRPC-Pluvicto: ssGSEA, survival, clinical correlations ---
+        if cohort == "CRPC-Pluvicto":
+            # _raw ssGSEA + survival
+            ssgsea_raw = _run_pluvicto_ssgsea(
+                pred, model_out, args.overwrite, tag="_raw")
+            _run_pluvicto_survival(
+                pred, ssgsea_raw, model_out, args.overwrite, tag="_raw")
+
+            # _uncertainty-adjusted ssGSEA + survival
+            if mc_draws is not None:
+                ssgsea_mc = _run_pluvicto_ssgsea_mc(
+                    mc_draws, model_out, args.overwrite)
+                _run_pluvicto_survival(
+                    pred, ssgsea_mc, model_out, args.overwrite,
+                    tag="_uncertainty-adjusted")
+
+            _run_pluvicto_clinical_correlations(
+                pred, model_out, args.overwrite)
 
 
 def run_patient_discovery(args: argparse.Namespace) -> None:
@@ -2573,6 +3196,149 @@ _PANFT_EPIC_CLEANERS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# ROC on/off gene calling helpers
+# ---------------------------------------------------------------------------
+
+_ONOFF_THRESHOLD = 2.0  # log2(CPM+1) threshold for on/off calling
+
+_ROC_GENE_SETS = {
+    "DruggableGenome_Tier1": "DruggableGenome_Tier1",
+    "CancerSurfaceome": "CancerSurfaceome",
+}
+
+
+def _compute_roc_for_model(
+    truth_flat: np.ndarray,
+    pred_flat: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """Compute ROC curve for binary on/off classification.
+
+    truth_flat and pred_flat are 1-D arrays of matching length.
+    Binary labels: truth >= threshold → on (1), else off (0).
+    """
+    from sklearn.metrics import roc_curve, roc_auc_score
+
+    y_true = (truth_flat >= _ONOFF_THRESHOLD).astype(int)
+    # Edge case: all same class
+    if y_true.sum() == 0 or y_true.sum() == len(y_true):
+        return np.array([0, 1]), np.array([0, 1]), 0.5
+
+    auc = roc_auc_score(y_true, pred_flat)
+    fpr, tpr, _ = roc_curve(y_true, pred_flat)
+    return fpr, tpr, auc
+
+
+def _run_roc_gene_calling(
+    truth_wide: pd.DataFrame,
+    model_preds: Dict[str, pd.DataFrame],
+    proteus_ci: Dict[str, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]],
+    out_dir: str,
+    overwrite: bool,
+    model_order: Sequence[str],
+    cohort: str,
+    ci_level: float = 0.90,
+) -> None:
+    """Compute and plot ROC curves for on/off gene calling.
+
+    Parameters
+    ----------
+    proteus_ci : dict
+        ``{model_name: (ci_lo, ci_hi)}`` for Proteus models that have CIs.
+    ci_level : float
+        CI level for the CI-filtered Proteus curve (default 0.90 → q5/q95).
+    """
+    for gs_display, gs_key in _ROC_GENE_SETS.items():
+        if not gene_list_available(gs_key):
+            continue
+        gene_list = get_gene_list(gs_key)
+        common_genes = [g for g in gene_list if g in truth_wide.index]
+        if len(common_genes) < 10:
+            print(f"    [skip] ROC {gs_display}: only {len(common_genes)} genes "
+                  f"overlap with truth")
+            continue
+
+        roc_curves: Dict[str, Tuple[np.ndarray, np.ndarray, float]] = {}
+
+        for model_name in model_order:
+            if model_name not in model_preds:
+                continue
+            # Skip the row-shuffled Naïve baseline — the shuffled-truth
+            # naive (below) is the sole null reference for ROC.
+            if model_name == "Na\u00efve":
+                continue
+            pw = model_preds[model_name]
+            common_samples = [s for s in pw.columns if s in truth_wide.columns]
+            cg = [g for g in common_genes if g in pw.index]
+            if not common_samples or len(cg) < 5:
+                continue
+
+            t = truth_wide.loc[cg, common_samples].values.flatten()
+            p = pw.loc[cg, common_samples].values.flatten()
+
+            # Drop NaNs
+            valid = np.isfinite(t) & np.isfinite(p)
+            if valid.sum() < 10:
+                continue
+
+            n_valid = int(valid.sum())
+            fpr, tpr, auc = _compute_roc_for_model(t[valid], p[valid])
+            roc_curves[model_name] = (fpr, tpr, auc, n_valid)
+
+            # CI-filtered variant: drop ambiguous gene-sample pairs
+            if model_name in proteus_ci:
+                ci_lo, ci_hi = proteus_ci[model_name]
+                if ci_lo is not None and ci_hi is not None:
+                    cg_ci = [g for g in cg
+                             if g in ci_lo.index and g in ci_hi.index]
+                    cs_ci = [s for s in common_samples
+                             if s in ci_lo.columns and s in ci_hi.columns]
+                    if len(cg_ci) >= 5 and len(cs_ci) >= 3:
+                        lo = ci_lo.loc[cg_ci, cs_ci].values.flatten()
+                        hi = ci_hi.loc[cg_ci, cs_ci].values.flatten()
+                        tc = truth_wide.loc[cg_ci, cs_ci].values.flatten()
+                        pc = pw.loc[cg_ci, cs_ci].values.flatten()
+                        # Keep only confident pairs: CI does not cross threshold
+                        confident = ~(
+                            (lo < _ONOFF_THRESHOLD) & (hi > _ONOFF_THRESHOLD))
+                        valid_ci = confident & np.isfinite(tc) & np.isfinite(pc)
+                        if valid_ci.sum() >= 10:
+                            n_ci = int(valid_ci.sum())
+                            f2, t2, a2 = _compute_roc_for_model(
+                                tc[valid_ci], pc[valid_ci])
+                            ci_name = f"{model_name} (CI-filtered)"
+                            roc_curves[ci_name] = (f2, t2, a2, n_ci)
+                            pct_kept = 100 * n_ci / max(n_valid, 1)
+                            print(f"    ROC {gs_display} CI-filtered: "
+                                  f"{pct_kept:.0f}% pairs retained")
+
+        # Shuffled-truth naive (labelled "Naïve")
+        first_model = next(iter(model_preds.values()))
+        common_samples_naive = [s for s in first_model.columns
+                                if s in truth_wide.columns]
+        cg_naive = [g for g in common_genes if g in first_model.index]
+        if len(common_samples_naive) >= 3 and len(cg_naive) >= 5:
+            t_naive = truth_wide.loc[cg_naive, common_samples_naive].values.flatten()
+            rng_naive = np.random.default_rng(42)
+            t_shuffled = rng_naive.permutation(t_naive)
+            p_naive = first_model.loc[cg_naive, common_samples_naive].values.flatten()
+            valid_naive = np.isfinite(t_shuffled) & np.isfinite(p_naive)
+            if valid_naive.sum() >= 10:
+                n_naive = int(valid_naive.sum())
+                fn, tn, an = _compute_roc_for_model(
+                    t_shuffled[valid_naive], p_naive[valid_naive])
+                roc_curves["Na\u00efve"] = (fn, tn, an, n_naive)
+
+        if roc_curves:
+            _maybe(roc_gene_calling, overwrite,
+                   roc_curves,
+                   os.path.join(out_dir, f"ROC_{gs_display}_{cohort}"),
+                   title=f"ROC Gene On/Off — {gs_display} ({cohort})",
+                   model_order=list(model_order))
+
+        print(f"    ROC {gs_display}: {len(roc_curves)} curves")
+
+
 def run_benchmarking_panft(args: argparse.Namespace) -> None:
     """Benchmarking on real patient cohorts (CRPC-WCDT, BLCA-RA).
 
@@ -2607,15 +3373,22 @@ def run_benchmarking_panft(args: argparse.Namespace) -> None:
 
         # Collect model predictions for this cohort
         model_preds: Dict[str, pd.DataFrame] = {}
+        proteus_ci: Dict[str, Tuple[Optional[pd.DataFrame],
+                                     Optional[pd.DataFrame]]] = {}
 
         # Proteus models
         proteus_paths = _PANFT_PROTEUS_PATHS.get(cohort, {})
         for model_name, rel_path in proteus_paths.items():
             path = PROJECT_ROOT / rel_path
             if path.exists():
-                pred, _, _ = load_holdout_predictions_proteus(str(path))
+                pred, ci_lo, ci_hi = load_holdout_predictions_proteus(str(path))
                 _apply_prefix_map(pred, pmap)
+                if ci_lo is not None:
+                    _apply_prefix_map(ci_lo, pmap)
+                if ci_hi is not None:
+                    _apply_prefix_map(ci_hi, pmap)
                 model_preds[model_name] = pred
+                proteus_ci[model_name] = (ci_lo, ci_hi)
                 print(f"    Loaded {model_name}: {pred.shape[1]} samples")
             else:
                 print(f"    [skip] {model_name}: {rel_path} not found")
@@ -2693,6 +3466,11 @@ def run_benchmarking_panft(args: argparse.Namespace) -> None:
                     "cohort": cohort, "model": model_name,
                     "spearman_rho": rho_val,
                 })
+
+        # ROC on/off gene calling (per cohort)
+        _run_roc_gene_calling(
+            truth_wide, model_preds, proteus_ci,
+            out_dir, args.overwrite, model_order, cohort)
 
     metrics_table = pd.DataFrame(all_metrics_rows)
     gene_rho_table = pd.DataFrame(all_gene_rho_rows)
@@ -3179,95 +3957,6 @@ def run_benchmarking(args: argparse.Namespace) -> None:
     )
     print(f"  Summary: {len(metrics_table)} rows")
 
-    # ── Gene rankings (all models) and top-10 gene scatters (Proteus_Base) ──
-    if not gene_rho_table.empty:
-        ranking_dir = ensure_dir(os.path.join(out_dir, "gene_rankings"))
-
-        # Per-model, per-cell ranking TSVs (unchanged – save for every model)
-        for model_name in model_order:
-            model_rho = gene_rho_table[gene_rho_table["model"] == model_name]
-            if model_rho.empty:
-                continue
-            model_slug = model_name.replace(" ", "_")
-            for depth in _BENCH_DEPTH_ORDER:
-                for tfx in _BENCH_TFX_ORDER:
-                    cell = model_rho[
-                        (model_rho["tfx"] == tfx) & (model_rho["depth"] == depth)
-                    ].copy()
-                    if cell.empty:
-                        continue
-                    ranked = (cell[["gene", "spearman_rho"]]
-                              .dropna(subset=["spearman_rho"])
-                              .sort_values("spearman_rho", ascending=False)
-                              .reset_index(drop=True))
-                    ranked.index = ranked.index + 1
-                    ranked.index.name = "rank"
-                    ranked.to_csv(
-                        os.path.join(ranking_dir, f"{model_slug}_{depth}_{tfx}_gene_ranking.tsv"),
-                        sep="\t",
-                    )
-        print(f"  Gene rankings saved to {ranking_dir}")
-
-        # Gene scatters for Proteus_Base only, colored by subtype
-        scatter_genes = [
-            "AR", "RB1", "TP53", "ASCL1", "DLL3",
-            "NEUROD1", "MYC", "EZH2", "BCL2", "SOX2",
-        ]
-        pw_base = model_preds.get("Proteus_Base")
-        if pw_base is not None:
-            scatter_dir = ensure_dir(os.path.join(out_dir, "gene_scatters"))
-
-            # Build subtypes DataFrame for PHS samples (PDX parent → subtype)
-            _pdx_name_remap = {"DIVE_CDX172": "DIVE_CDX17"}
-            pc_sub = pd.read_csv(
-                PROJECT_ROOT / "labels" / "PC-PDX_TFX_Subtype.tsv", sep="\t",
-            )
-            sclc_sub = pd.read_csv(
-                PROJECT_ROOT / "labels" / "SCLC-PDX_TFX_Subtype.tsv", sep="\t",
-            )
-            pdx_subtype_map: Dict[str, str] = {}
-            for _df in (pc_sub, sclc_sub):
-                for _, _row in _df.iterrows():
-                    pdx_subtype_map[_row["sample"]] = _row["subtype"]
-            subtypes_rows_list = []
-            for s in all_samples:
-                info = parse_phs_sample(s)
-                pdx_name = _pdx_name_remap.get(info["pdx"], info["pdx"])
-                subtypes_rows_list.append({
-                    "sample": s,
-                    "subtype": pdx_subtype_map.get(pdx_name, "Unknown"),
-                })
-            subtypes_df = pd.DataFrame(subtypes_rows_list).set_index("sample")
-
-            # Generate scatter plots per (depth, TFx) cell
-            for depth in _BENCH_DEPTH_ORDER:
-                for tfx in _BENCH_TFX_ORDER:
-                    cell_samples = sorted(
-                        meta_df[
-                            (meta_df["tfx"] == tfx) & (meta_df["depth"] == depth)
-                        ]["sample"]
-                    )
-                    tw_cell = truth_wide[
-                        [s for s in cell_samples if s in truth_wide.columns]
-                    ]
-                    pw_cell = pw_base[
-                        [s for s in cell_samples if s in pw_base.columns]
-                    ]
-                    if tw_cell.shape[1] < 2 or pw_cell.shape[1] < 2:
-                        continue
-
-                    cell_scatter_dir = ensure_dir(
-                        os.path.join(scatter_dir, f"{depth}_{tfx}")
-                    )
-                    for gi, gene in enumerate(scatter_genes, 1):
-                        gene_target_scatter(
-                            tw_cell, pw_cell, gene,
-                            os.path.join(cell_scatter_dir, f"top{gi}_{gene}"),
-                            subtypes_df=subtypes_df,
-                        )
-
-            print(f"  Gene scatters saved to {scatter_dir}")
-
     # ── Build eCDNA table (aggregate across depth for line plots) ───────
     # eCDNA = TFx_numeric * depth_numeric
     tfx_num = {f"TF{v}": float(v) for v in ["0.50", "0.30", "0.10", "0.05", "0.03", "0.01"]}
@@ -3337,6 +4026,14 @@ def run_benchmarking(args: argparse.Namespace) -> None:
         _maybe(benchmark_ecdna_lines, args.overwrite,
                ecdna_table, os.path.join(out_dir, "benchmark_ecdna_lines"),
                model_order=model_order)
+
+    # Depth-specific line plots (TFx on x-axis)
+    if not metrics_table.empty:
+        for depth_val in ["10x", "5x"]:
+            _maybe(benchmark_depth_lines, args.overwrite,
+                   metrics_table,
+                   os.path.join(out_dir, f"benchmark_lines_{depth_val}"),
+                   depth=depth_val, model_order=model_order)
 
     # ── NaiveExample: illustrative scatter / distribution baseline plots ──
     _generate_naive_example(out_dir, args.overwrite)
