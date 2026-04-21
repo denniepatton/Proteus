@@ -10,6 +10,6 @@ sources:
 
 # Label files (relative to paths.base.labels_dir)
 labels:
-  tfx: "UW_TFX_Subtype.tsv"
+  tfx: "CRPC-UW_TFX_Subtype.tsv"
   tumor_exp: null
   background_exp: null

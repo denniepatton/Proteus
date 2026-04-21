@@ -41,6 +41,7 @@ import json
 import logging
 import shutil
 from functools import partial
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 from multiprocessing import Pool
 
@@ -68,13 +69,14 @@ def _get_default_zarr_base() -> str:
     if env_zarr_base:
         return env_zarr_base
     
-    # Try to load from config
+    # Try to load from paths.yaml
     try:
-        from config.config_loader import ConfigLoader
-        loader = ConfigLoader()
-        paths_config = loader.load_paths()
-        return paths_config.get_path('zarr_base_dir')
-    except (ImportError, FileNotFoundError, KeyError, OSError) as e:
+        import yaml as _yaml
+        _paths_file = Path(__file__).resolve().parent.parent / 'config' / 'paths.yaml'
+        with open(_paths_file) as _f:
+            _paths = _yaml.safe_load(_f)
+        return _paths['base']['zarr_base_dir']
+    except (FileNotFoundError, KeyError, OSError) as e:
         logging.debug('Config-based zarr_base_dir lookup failed: %s', e)
     
     # Fallback to hardcoded default
@@ -95,13 +97,14 @@ def _get_default_raw_data_dir() -> str:
     if env_raw_data:
         return env_raw_data
     
-    # Try to load from config
+    # Try to load from paths.yaml
     try:
-        from config.config_loader import ConfigLoader
-        loader = ConfigLoader()
-        paths_config = loader.load_paths()
-        return paths_config.get_path('raw_data_dir')
-    except (ImportError, FileNotFoundError, KeyError, OSError) as e:
+        import yaml as _yaml
+        _paths_file = Path(__file__).resolve().parent.parent / 'config' / 'paths.yaml'
+        with open(_paths_file) as _f:
+            _paths = _yaml.safe_load(_f)
+        return _paths['base']['raw_data_dir']
+    except (FileNotFoundError, KeyError, OSError) as e:
         logging.debug('Config-based raw_data_dir lookup failed: %s', e)
     
     # Fallback to hardcoded default
@@ -168,6 +171,12 @@ LOG_TRANSFORM_FEATURES = ['fl-kurtosis', 'pn-mean-spacing', 'pn-mean-amplitude']
 
 # NaN thresholds for gene exclusion (signal NaN is encoded, not thresholded)
 MAX_FEATURE_NAN_FRACTION = 0.5
+
+# Signal clipping bounds for mean-normalized channels.
+# After division by gene-level mean, values beyond these bounds are extreme
+# spikes (>10× the mean) — clipped to prevent float16 overflow under AMP.
+SIGNAL_CLIP_MIN = -10.0
+SIGNAL_CLIP_MAX = 10.0
 
 # Data shapes for Zarr stores
 SHAPES = {
@@ -241,14 +250,14 @@ def get_samples(triton_results_dir: str, dataset: str = None) -> List[str]:
 def _scale_signal(input_array: np.ndarray) -> np.ndarray:
     """Scale an input array by dividing by its mean (avoid division by zero/Inf).
 
-    After division the expected baseline is ~1.0.  Values beyond [-10, 10] are
-    extreme spikes (>10× the gene-level mean) and are clipped to prevent
-    float16 overflow under AMP and to suppress noise.
+    After division the expected baseline is ~1.0.  Values beyond the clipping
+    bounds (SIGNAL_CLIP_MIN/MAX) are extreme spikes (>10× the gene-level mean)
+    and are clipped to prevent float16 overflow under AMP and to suppress noise.
     """
     mean_val = np.nanmean(input_array)
     if mean_val > 1e-10 and not np.isnan(mean_val):  # Use small threshold, not just != 0
         result = input_array / mean_val
-        result = np.clip(result, -10.0, 10.0)
+        result = np.clip(result, SIGNAL_CLIP_MIN, SIGNAL_CLIP_MAX)
         return result
     return input_array
 
@@ -828,7 +837,7 @@ def process_sample_to_zarr(
                 flat = existing['flat']
                 if 'TSS_signals' in flat and flat['TSS_signals'].shape[0] > 0:
                     return (zarr_path, None, None)
-        except (KeyError, OSError, zarr.errors.ContainsGroupError) as e:
+        except (KeyError, OSError, zarr.errors.ContainsGroupError, zarr.errors.PathNotFoundError) as e:
             print(f'  Note: Regenerating invalid store for {sample}: {e}')
 
     # --- Verify TSS directory ---

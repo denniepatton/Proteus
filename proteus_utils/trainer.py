@@ -81,6 +81,12 @@ class TrainingConfig:
     # Early stopping
     patience: int = 3
     min_delta: float = 0.0
+
+    # Model selection metric.
+    # 'min_balanced_crps': select epoch with lowest balanced GVW-CRPS (default)
+    # 'max_gvw_r_lower_bound': select epoch with highest
+    #   balanced_tumor_gvw_r_lower_bound (mean − std across sources)
+    selection_metric: str = 'min_balanced_crps'
     
     # Checkpointing
     checkpoint_dir: str = 'checkpoints'
@@ -283,12 +289,6 @@ class Trainer:
         # Print model summary (parameter counts)
         print_model_summary(self.model, model_name="BioDVN")
         
-        # NOTE: channels_last disabled - it's designed for 4D NCHW tensors (Conv2d)
-        # but this model primarily uses Conv1d (3D) and Linear (2D), which can cause
-        # silent tensor layout corruption.
-        # if self.device.type == 'cuda':
-        #     self.model = self.model.to(memory_format=torch.channels_last)
-        
         # Load base weights if provided
         if config.base_weights is not None:
             self._load_weights(config.base_weights)
@@ -374,33 +374,26 @@ class Trainer:
             param_groups = filter(lambda p: p.requires_grad,
                                   self.model.parameters())
 
-        # Optimizer with fused AdamW if available (PyTorch 2.0+)
-        try:
-            return torch.optim.AdamW(
-                param_groups,
-                lr=self.config.max_lr,
-                weight_decay=self.config.weight_decay,
-                fused=True,
-            )
-        except TypeError:
-            return torch.optim.AdamW(
-                param_groups,
-                lr=self.config.max_lr,
-                weight_decay=self.config.weight_decay,
-            )
+        # Fused AdamW — always available on PyTorch 2.0+.
+        return torch.optim.AdamW(
+            param_groups,
+            lr=self.config.max_lr,
+            weight_decay=self.config.weight_decay,
+            fused=True,
+        )
 
     def _prepare_for_fit(self) -> None:
         if self._prepared_for_fit:
             return
 
-        # Apply torch.compile() if enabled (PyTorch 2.0+)
-        if self.config.use_compile and hasattr(torch, 'compile'):
+        # Apply torch.compile() if enabled.
+        if self.config.use_compile:
             try:
                 compile_mode = getattr(self.config, 'compile_mode', 'reduce-overhead')
                 print(f'Compiling model with torch.compile(mode={compile_mode!r})...')
                 self.model = torch.compile(self.model, mode=compile_mode)
                 print('  Model compiled successfully.')
-            except Exception as e:
+            except (RuntimeError, TypeError) as e:
                 print(f'  Warning: torch.compile failed ({e}), continuing without compilation.')
 
         self.model.train()
@@ -429,15 +422,15 @@ class Trainer:
             try:
                 idx = torch.cuda.current_device()
                 print(f'  cuda_device_index={idx} name={torch.cuda.get_device_name(idx)}')
-            except Exception:
+            except (RuntimeError, AttributeError):
                 pass
             try:
                 print(f'  cudnn.benchmark={torch.backends.cudnn.benchmark}')
-            except Exception:
+            except (RuntimeError, AttributeError):
                 pass
             try:
                 print(f'  matmul.allow_tf32={torch.backends.cuda.matmul.allow_tf32} cudnn.allow_tf32={torch.backends.cudnn.allow_tf32}')
-            except Exception:
+            except (RuntimeError, AttributeError):
                 pass
         else:
             print('  WARNING: training device is not CUDA; training will run on CPU.')
@@ -445,7 +438,7 @@ class Trainer:
         try:
             p = next(self.model.parameters())
             print(f'  model_param_device={p.device} dtype={p.dtype}')
-        except Exception:
+        except StopIteration:
             pass
 
         if features is not None:
@@ -459,7 +452,7 @@ class Trainer:
             try:
                 torch.cuda.synchronize()
                 print(f'  cuda_mem_allocated_GB={torch.cuda.memory_allocated()/1e9:.3f} max_allocated_GB={torch.cuda.max_memory_allocated()/1e9:.3f}')
-            except Exception:
+            except RuntimeError:
                 pass
     
     def _load_weights(self, weights_path: str):
@@ -1155,6 +1148,12 @@ class Trainer:
             if per_src_r:
                 metrics['val_balanced_tumor_gvw_r'] = sum(per_src_r) / len(per_src_r)
                 metrics['val_min_tumor_gvw_r'] = min(per_src_r)
+                if len(per_src_r) > 1:
+                    _mean_r = sum(per_src_r) / len(per_src_r)
+                    _std_r = math.sqrt(
+                        sum((v - _mean_r) ** 2 for v in per_src_r) / len(per_src_r))
+                    metrics['val_balanced_tumor_gvw_r_std'] = _std_r
+                    metrics['val_balanced_tumor_gvw_r_lower_bound'] = _mean_r - _std_r
 
         if rich_progress is not None:
             rich_progress.stop()
@@ -1219,6 +1218,9 @@ class Trainer:
         }
 
         best_val_score = float('inf')
+        # For maximize metrics, we track negative-of-score so that
+        # "lower is better" logic works uniformly.
+        _maximize = self.config.selection_metric == 'max_gvw_r_lower_bound'
         
         print(f'Starting training for {epochs} epochs')
         print(f'Device: {self.device}')
@@ -1299,16 +1301,27 @@ class Trainer:
                 )
 
                 # Model selection / early stopping metric.
-                # Prefer balanced (per-cohort equal-weight) CRPS when available;
-                # fall back to pooled GVW-CRPS, then val_loss.
-                _bal = val_metrics.get('val_balanced_tumor_gvw_crps')
-                _gvw = val_metrics.get('val_tumor_gvw_crps')
-                if _bal is not None:
-                    val_score = _bal
-                elif _gvw is not None:
-                    val_score = _gvw
+                if _maximize:
+                    # max_gvw_r_lower_bound: higher is better → negate for
+                    # uniform "lower is better" comparison.
+                    _lb = val_metrics.get('val_balanced_tumor_gvw_r_lower_bound')
+                    _br = val_metrics.get('val_balanced_tumor_gvw_r')
+                    if _lb is not None:
+                        val_score = -_lb
+                    elif _br is not None:
+                        val_score = -_br
+                    else:
+                        val_score = val_metrics['val_loss']
                 else:
-                    val_score = val_metrics['val_loss']
+                    # min_balanced_crps (default): lower is better.
+                    _bal = val_metrics.get('val_balanced_tumor_gvw_crps')
+                    _gvw = val_metrics.get('val_tumor_gvw_crps')
+                    if _bal is not None:
+                        val_score = _bal
+                    elif _gvw is not None:
+                        val_score = _gvw
+                    else:
+                        val_score = val_metrics['val_loss']
 
                 # If validation collapses to NaN/Inf, stop immediately.
                 if not isinstance(val_score, (int, float)) or not math.isfinite(float(val_score)):
@@ -1343,8 +1356,13 @@ class Trainer:
                 if _ema_backup is not None:
                     self._ema.restore(self.model, _ema_backup)
         
-        metric_label = 'Balanced-CRPS' if 'val_balanced_tumor_gvw_crps' in (history or {}) else 'GVW-CRPS'
-        print(f'\nTraining complete. Best validation score ({metric_label}): {best_val_score:.4f}')
+        if _maximize:
+            metric_label = 'GVW-r-LB'
+            display_score = -best_val_score
+        else:
+            metric_label = 'Balanced-CRPS' if 'val_balanced_tumor_gvw_crps' in (history or {}) else 'GVW-CRPS'
+            display_score = best_val_score
+        print(f'\nTraining complete. Best validation score ({metric_label}): {display_score:.4f}')
         
         return history
     

@@ -46,6 +46,8 @@ from analysis.analysis_utils import (
     compute_coverage_curve,
     compute_gene_variance,
     compute_geneset_score,
+    compute_onoff_confusion,
+    compute_risk_coverage_data,
     compute_subset_metrics,
     empirical_coverage,
     ensure_dir,
@@ -119,6 +121,8 @@ from analysis.plot_utils import (
     plot_reliability_scatter,
     plot_reliability_weights,
     plot_retention_curve,
+    onoff_confusion_summary_plot,
+    risk_coverage_plot,
     roc_gene_calling,
     sample_expression_kde,
     sample_scatter,
@@ -165,6 +169,12 @@ _COHORT_CONFIG = {
 # ---------------------------------------------------------------------------
 
 _BTS_CV_PATH = "results_training/proteus_base-model_cv"
+
+# IMPORTANT: results_holdout/BioDVN/ was overwritten by PLCA inference.
+# Base model holdout predictions are no longer available.  Set this flag to
+# True only if the original Base model holdout files are restored.
+_BASE_HO_ENABLED = False
+
 _BTS_HO_PATHS = {
     "PC-PDX": "results_holdout/BioDVN/PC-PDX/predictions_tumor.tsv",
     "SCLC-PDX": "results_holdout/BioDVN/SCLC-PDX/predictions_tumor.tsv",
@@ -252,7 +262,7 @@ def run_bts_cv(args: argparse.Namespace) -> None:
 
         # Fit the CQR calibrator on OOF data
         calibrator = RegimeCalibrator.fit(
-            cal_truth, proteus_ci_lo, proteus_ci_hi, regime_df, alpha=0.05,
+            cal_truth, proteus_ci_lo, proteus_ci_hi, regime_df, alpha=0.10,
         )
         print(f"  {calibrator.summary()}")
 
@@ -292,28 +302,35 @@ def run_bts_cv(args: argparse.Namespace) -> None:
         ]]
 
     # ── Load holdout PDX predictions (full: with p0) ──
+    # NOTE: _BASE_HO_ENABLED is False because results_holdout/BioDVN/ was
+    # overwritten by PLCA inference.  The HO PDX files are no longer valid
+    # Base model predictions.  HO evaluation is handled in run_plca_cv().
     ho_preds: Dict[str, Dict[str, Any]] = {}
     _MDN_WIDE_KEYS = ("p0_wide", "pi_gamma_wide", "pi_normal_wide",
                        "gamma_beta_wide", "normal_mean_wide", "normal_stdev_wide")
-    for cohort_name, rel_path in _BTS_HO_PATHS.items():
-        ho_path = PROJECT_ROOT / rel_path
-        if ho_path.exists():
-            print(f"  Loading HO {cohort_name}: {rel_path}")
-            ho_full = load_holdout_predictions_proteus_full(str(ho_path))
-            # Keep only the 5 true holdout samples
-            ho_samples = [s for s in ho_full["pred_wide"].columns if s in PDX_HOLDOUT_SAMPLES]
-            if ho_samples:
-                entry: Dict[str, Any] = {
-                    "pred_wide": ho_full["pred_wide"][ho_samples],
-                    "ci_lo_wide": ho_full["ci_lo_wide"][ho_samples] if ho_full["ci_lo_wide"] is not None else None,
-                    "ci_hi_wide": ho_full["ci_hi_wide"][ho_samples] if ho_full["ci_hi_wide"] is not None else None,
-                }
-                for mk in _MDN_WIDE_KEYS:
-                    entry[mk] = ho_full[mk][ho_samples] if ho_full.get(mk) is not None else None
-                ho_preds[cohort_name] = entry
-                print(f"    HO samples: {ho_samples}")
-        else:
-            print(f"  [skip] HO {cohort_name} not found: {rel_path}")
+    if _BASE_HO_ENABLED:
+        for cohort_name, rel_path in _BTS_HO_PATHS.items():
+            ho_path = PROJECT_ROOT / rel_path
+            if ho_path.exists():
+                print(f"  Loading HO {cohort_name}: {rel_path}")
+                ho_full = load_holdout_predictions_proteus_full(str(ho_path))
+                # Keep only the 5 true holdout samples
+                ho_samples = [s for s in ho_full["pred_wide"].columns if s in PDX_HOLDOUT_SAMPLES]
+                if ho_samples:
+                    entry: Dict[str, Any] = {
+                        "pred_wide": ho_full["pred_wide"][ho_samples],
+                        "ci_lo_wide": ho_full["ci_lo_wide"][ho_samples] if ho_full["ci_lo_wide"] is not None else None,
+                        "ci_hi_wide": ho_full["ci_hi_wide"][ho_samples] if ho_full["ci_hi_wide"] is not None else None,
+                    }
+                    for mk in _MDN_WIDE_KEYS:
+                        entry[mk] = ho_full[mk][ho_samples] if ho_full.get(mk) is not None else None
+                    ho_preds[cohort_name] = entry
+                    print(f"    HO samples: {ho_samples}")
+            else:
+                print(f"  [skip] HO {cohort_name} not found: {rel_path}")
+    else:
+        print("  [Base HO disabled] results_holdout/BioDVN/ now holds PLCA predictions; "
+              "see run_plca_cv() for HO PDX evaluation.")
 
     # ──────────────────────────────────────────────────────────────────────
     # Apply CQR calibration to ALL intervals (CV + HO) and evaluate once
@@ -325,27 +342,28 @@ def run_bts_cv(args: argparse.Namespace) -> None:
         cal_out = ensure_dir(os.path.join(out_dir, "Calibration"))
 
         # Evaluate on combined holdout data (raw CIs → base vs calibrated)
-        ho_pred_parts, ho_ci_lo_parts, ho_ci_hi_parts = [], [], []
-        for cname in _COHORT_CONFIG:
-            hd = ho_preds.get(cname)
-            if hd is not None and hd["ci_lo_wide"] is not None:
-                ho_pred_parts.append(hd["pred_wide"])
-                ho_ci_lo_parts.append(hd["ci_lo_wide"])
-                ho_ci_hi_parts.append(hd["ci_hi_wide"])
+        if _BASE_HO_ENABLED:
+            ho_pred_parts, ho_ci_lo_parts, ho_ci_hi_parts = [], [], []
+            for cname in _COHORT_CONFIG:
+                hd = ho_preds.get(cname)
+                if hd is not None and hd["ci_lo_wide"] is not None:
+                    ho_pred_parts.append(hd["pred_wide"])
+                    ho_ci_lo_parts.append(hd["ci_lo_wide"])
+                    ho_ci_hi_parts.append(hd["ci_hi_wide"])
 
-        if ho_pred_parts:
-            common_ho_genes = ho_pred_parts[0].index
-            for part in ho_pred_parts[1:]:
-                common_ho_genes = common_ho_genes.intersection(part.index)
-            all_ho_pred = pd.concat([p.loc[common_ho_genes] for p in ho_pred_parts], axis=1)
-            all_ho_ci_lo = pd.concat([p.loc[common_ho_genes] for p in ho_ci_lo_parts], axis=1)
-            all_ho_ci_hi = pd.concat([p.loc[common_ho_genes] for p in ho_ci_hi_parts], axis=1)
+            if ho_pred_parts:
+                common_ho_genes = ho_pred_parts[0].index
+                for part in ho_pred_parts[1:]:
+                    common_ho_genes = common_ho_genes.intersection(part.index)
+                all_ho_pred = pd.concat([p.loc[common_ho_genes] for p in ho_pred_parts], axis=1)
+                all_ho_ci_lo = pd.concat([p.loc[common_ho_genes] for p in ho_ci_lo_parts], axis=1)
+                all_ho_ci_hi = pd.concat([p.loc[common_ho_genes] for p in ho_ci_hi_parts], axis=1)
 
-            _run_calibration_evaluation(
-                all_ho_pred, canonical_truth, all_ho_ci_lo, all_ho_ci_hi,
-                calibrator, "BTS", cal_out,
-                overwrite=args.overwrite,
-            )
+                _run_calibration_evaluation(
+                    all_ho_pred, canonical_truth, all_ho_ci_lo, all_ho_ci_hi,
+                    calibrator, "BTS", cal_out,
+                    overwrite=args.overwrite,
+                )
 
         # Apply calibration to CV OOF intervals in-place
         if proteus_ci_lo is not None:
@@ -354,15 +372,16 @@ def run_bts_cv(args: argparse.Namespace) -> None:
             )
             print(f"  Applied CQR calibration to {proteus_ci_lo.shape[1]} CV OOF intervals")
 
-        # Apply calibration to holdout intervals in-place
-        for cname in ho_preds:
-            hd = ho_preds[cname]
-            if hd["ci_lo_wide"] is not None:
-                hd["ci_lo_wide"], hd["ci_hi_wide"] = calibrator.apply(
-                    hd["ci_lo_wide"], hd["ci_hi_wide"],
-                )
-        if ho_preds:
-            print(f"  Applied CQR calibration to holdout intervals")
+        # Apply calibration to holdout intervals in-place (only if HO data loaded)
+        if _BASE_HO_ENABLED:
+            for cname in ho_preds:
+                hd = ho_preds[cname]
+                if hd["ci_lo_wide"] is not None:
+                    hd["ci_lo_wide"], hd["ci_hi_wide"] = calibrator.apply(
+                        hd["ci_lo_wide"], hd["ci_hi_wide"],
+                    )
+            if ho_preds:
+                print(f"  Applied CQR calibration to holdout intervals")
 
     # ── Run per-cohort analyses ──
     for cohort_name, cfg in _COHORT_CONFIG.items():
@@ -377,7 +396,7 @@ def run_bts_cv(args: argparse.Namespace) -> None:
 
         # Determine which samples are CV vs HO
         cv_samples = sorted(cp.columns)
-        ho_data = ho_preds.get(cohort_name)
+        ho_data = ho_preds.get(cohort_name) if _BASE_HO_ENABLED else None
         ho_pred_w = ho_ci_lo_w = ho_ci_hi_w = ho_p0_w = None
         ho_samples = []
         if ho_data is not None:
@@ -584,8 +603,8 @@ def _run_calibration_evaluation(
     conf_curve = compute_coverage_curve(t_flat, lo_adj_flat, hi_adj_flat, p_flat, levels)
 
     print(f"  CQR calibration evaluation ({label} HO):")
-    print(f"    Base  95% coverage: {empirical_coverage(t_flat, lo_flat, hi_flat):.3f}")
-    print(f"    CQR   95% coverage: {empirical_coverage(t_flat, lo_adj_flat, hi_adj_flat):.3f}")
+    print(f"    Base  90% coverage: {empirical_coverage(t_flat, lo_flat, hi_flat):.3f}")
+    print(f"    CQR   90% coverage: {empirical_coverage(t_flat, lo_adj_flat, hi_adj_flat):.3f}")
 
     _maybe(plot_calibration_coverage, overwrite,
            base_curve, conf_curve,
@@ -1184,6 +1203,8 @@ def _run_patient_validation_cohort(
         "cohort": cohort,
         "truth_wide": truth_wide,
         "pred_wide": pred,
+        "ci_lo": ci_lo,
+        "ci_hi": ci_hi,
         "subtypes_df": subtypes_df,
         "tfx_dict": tfx_dict,
         "status": "holdout",
@@ -1433,6 +1454,7 @@ def _run_collected_validation(
 
     # Build combined truth and pred on the common gene index
     truth_parts, pred_parts = [], []
+    ci_lo_parts, ci_hi_parts = [], []
     for cd in cohort_data:
         tw = cd["truth_wide"].loc[all_genes]
         pw = cd["pred_wide"].loc[all_genes]
@@ -1440,6 +1462,18 @@ def _run_collected_validation(
         if len(common_samples) > 0:
             truth_parts.append(tw[common_samples])
             pred_parts.append(pw[common_samples])
+            _lo = cd.get("ci_lo")
+            _hi = cd.get("ci_hi")
+            if _lo is not None and _hi is not None:
+                lo_genes = all_genes.intersection(_lo.index)
+                hi_genes = all_genes.intersection(_hi.index)
+                ci_genes = lo_genes.intersection(hi_genes)
+                lo_samp = [s for s in common_samples if s in _lo.columns]
+                hi_samp = [s for s in common_samples if s in _hi.columns]
+                ci_samp = sorted(set(lo_samp) & set(hi_samp))
+                if len(ci_genes) > 0 and len(ci_samp) > 0:
+                    ci_lo_parts.append(_lo.loc[ci_genes, ci_samp])
+                    ci_hi_parts.append(_hi.loc[ci_genes, ci_samp])
 
     if not truth_parts:
         print("    [skip] No overlapping samples")
@@ -1447,6 +1481,13 @@ def _run_collected_validation(
 
     combined_truth = pd.concat(truth_parts, axis=1)
     combined_pred = pd.concat(pred_parts, axis=1)
+    combined_ci_lo: Optional[pd.DataFrame] = None
+    combined_ci_hi: Optional[pd.DataFrame] = None
+    if ci_lo_parts and ci_hi_parts:
+        combined_ci_lo = pd.concat(ci_lo_parts, axis=1).reindex(
+            index=all_genes, columns=combined_pred.columns)
+        combined_ci_hi = pd.concat(ci_hi_parts, axis=1).reindex(
+            index=all_genes, columns=combined_pred.columns)
     print(f"    Combined: {combined_truth.shape[0]} genes × "
           f"{combined_truth.shape[1]} samples")
 
@@ -1527,6 +1568,7 @@ def _run_collected_validation(
         batch_gene_scatters(
             combined_truth, combined_pred, composite_genes, target_dir,
             subtypes_df=collected_subtypes, tfx_dict=collected_tfx,
+            ci_lo_wide=combined_ci_lo, ci_hi_wide=combined_ci_hi,
             n_workers=args.n_workers,
         )
 
@@ -1658,6 +1700,8 @@ def run_patient_validation_panft(args: argparse.Namespace) -> None:
                 "cohort": cohort,
                 "truth_wide": truth_wide,
                 "pred_wide": pred_c,
+                "ci_lo": ci_lo_c,
+                "ci_hi": ci_hi_c,
                 "subtypes_df": subtypes_df,
                 "tfx_dict": tfx_dict,
                 "status": "validation",
@@ -1702,6 +1746,163 @@ def run_patient_validation_base(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Group: Patient_Validation_PLCA (all three PLCA model variants)
+# ---------------------------------------------------------------------------
+
+def run_patient_validation_plca(args: argparse.Namespace) -> None:
+    """PLCA Patient Validation analysis — all three model variants.
+
+    True PLCA holdout cohorts (CRPC-WCDT, BLCA-RA) are evaluated from
+    results_holdout/BioDVN/, BioDVN_NoSeq/, and BioDVN_OnlySeq/.
+    CRPC-RA and SCLC are PLCA CV cohorts and contribute only to Collected
+    analysis via out-of-fold predictions (circle markers).
+    """
+    print("\n" + "=" * 70)
+    print("  ANALYSIS GROUP: Patient_Validation_PLCA")
+    print("=" * 70)
+
+    out_base = ensure_dir(
+        str(PROJECT_ROOT / "analysis" / "results" / "Patient_Validation_PLCA"))
+    n_workers = args.n_workers
+
+    # Variant label → holdout path template (format with cohort=<name>)
+    _plca_variant_paths: Dict[str, str] = {
+        "Proteus_PLCA":         "results_holdout/BioDVN/{cohort}/predictions_tumor.tsv",
+        "Proteus_PLCA_NoSeq":   "results_holdout/BioDVN_NoSeq/{cohort}/predictions_tumor.tsv",
+        "Proteus_PLCA_OnlySeq": "results_holdout/BioDVN_OnlySeq/{cohort}/predictions_tumor.tsv",
+    }
+    # CV results dir for each variant (used for CRPC-RA, SCLC Collected contribution)
+    _plca_variant_cv_dirs: Dict[str, str] = {
+        "Proteus_PLCA":         _PLCA_CV_PATHS["BioDVN"],
+        "Proteus_PLCA_NoSeq":   _PLCA_CV_PATHS["BioDVN_NoSeq"],
+        "Proteus_PLCA_OnlySeq": _PLCA_CV_PATHS["BioDVN_OnlySeq"],
+    }
+
+    # CV fold-splits metadata (shared across variants)
+    fold_splits = _load_plca_fold_splits()
+    cohort_map_cv: Dict[str, str] = dict(
+        zip(fold_splits["Sample"], fold_splits["Cohort"])
+    )
+    prefix_map_cv: Dict[str, str] = {}
+    for _, row in fold_splits.iterrows():
+        prefixed = row["Sample"]
+        short = str(strip_cohort_prefix(
+            pd.Index([prefixed]), row["Cohort"],
+        )[0])
+        prefix_map_cv[short] = prefixed
+
+    for variant_label, ho_path_template in _plca_variant_paths.items():
+        out_dir = ensure_dir(os.path.join(out_base, variant_label))
+        cohort_data: List[Dict[str, Any]] = []
+
+        print(f"\n{'─'*70}")
+        print(f"  Variant: {variant_label}")
+
+        # Per-cohort holdout analysis for true PLCA holdout cohorts
+        for cohort in _PLCA_HOLDOUT_COHORTS:
+            ho_rel = ho_path_template.format(cohort=cohort)
+            ho_abs = PROJECT_ROOT / ho_rel
+            print(f"\n  ── Cohort: {cohort} (PLCA holdout) ──")
+            if not ho_abs.exists():
+                print(f"    [skip] Predictions not found: {ho_rel}")
+                continue
+            truth_path_c = PROJECT_ROOT / "labels" / f"{cohort}_Log2CPMplus1.tsv"
+            if not truth_path_c.exists():
+                print(f"    [skip] Truth not found for {cohort}")
+                continue
+            truth_wide = load_truth(cohort)
+            subtypes_df_c = None
+            sub_path_c = PROJECT_ROOT / "labels" / f"{cohort}_TFX_Subtype.tsv"
+            if sub_path_c.exists():
+                subtypes_df_c = load_subtypes(cohort)
+            tfx_dict_c = None
+            if subtypes_df_c is not None and "tfx" in subtypes_df_c.columns:
+                tfx_dict_c = subtypes_df_c["tfx"].to_dict()
+
+            pred_c, ci_lo_c, ci_hi_c = load_holdout_predictions_proteus(str(ho_abs))
+            pmap = _build_prefix_map(truth_wide.columns, cohort)
+            _apply_prefix_map(pred_c, pmap)
+            _apply_prefix_map(ci_lo_c, pmap)
+            _apply_prefix_map(ci_hi_c, pmap)
+
+            summaries_c: List[Dict[str, Any]] = []
+            _run_holdout_suite(
+                pred_c, truth_wide,
+                f"{variant_label} — {cohort}", out_dir,
+                ci_lo=ci_lo_c, ci_hi=ci_hi_c, subtypes_df=subtypes_df_c,
+                n_workers=n_workers, overwrite=args.overwrite,
+                summaries=summaries_c, scatter_ci=args.scatter_ci,
+            )
+            cohort_data.append({
+                "cohort": cohort,
+                "truth_wide": truth_wide,
+                "pred_wide": pred_c,
+                "ci_lo": ci_lo_c,
+                "ci_hi": ci_hi_c,
+                "subtypes_df": subtypes_df_c,
+                "tfx_dict": tfx_dict_c,
+                "status": "holdout",
+            })
+
+        # Load CV OOF for PLCA training cohorts (Collected contribution only)
+        cv_rel = _plca_variant_cv_dirs[variant_label]
+        cv_dir_v = str(PROJECT_ROOT / cv_rel)
+        if os.path.isdir(cv_dir_v):
+            cv_pred, _cv_truth, cv_ci_lo, cv_ci_hi = load_cv_predictions_proteus(cv_dir_v)
+            _apply_prefix_map(cv_pred, prefix_map_cv)
+            _apply_prefix_map(cv_ci_lo, prefix_map_cv)
+            _apply_prefix_map(cv_ci_hi, prefix_map_cv)
+
+            for cohort in _PLCA_CV_COHORTS:
+                print(f"\n  ── Cohort: {cohort} (PLCA CV — Collected only) ──")
+                truth_path_v = PROJECT_ROOT / "labels" / f"{cohort}_Log2CPMplus1.tsv"
+                if not truth_path_v.exists():
+                    print(f"    [skip] Truth not found: {cohort}")
+                    continue
+                truth_wide = load_truth(cohort)
+                cohort_samples = [
+                    s for s in cv_pred.columns if cohort_map_cv.get(s) == cohort
+                ]
+                if not cohort_samples:
+                    print(f"    [skip] No CV samples for {cohort}")
+                    continue
+                pred_oof = cv_pred[cohort_samples]
+                ci_lo_oof = (cv_ci_lo[[s for s in cohort_samples if s in cv_ci_lo.columns]]
+                             if cv_ci_lo is not None else None)
+                ci_hi_oof = (cv_ci_hi[[s for s in cohort_samples if s in cv_ci_hi.columns]]
+                             if cv_ci_hi is not None else None)
+                print(f"    OOF predictions: {pred_oof.shape[0]} genes × {pred_oof.shape[1]} samples")
+
+                subtypes_df_v = None
+                sub_path_v = PROJECT_ROOT / "labels" / f"{cohort}_TFX_Subtype.tsv"
+                if sub_path_v.exists():
+                    subtypes_df_v = load_subtypes(cohort)
+                tfx_dict_v = None
+                if subtypes_df_v is not None and "tfx" in subtypes_df_v.columns:
+                    tfx_dict_v = subtypes_df_v["tfx"].to_dict()
+
+                cohort_data.append({
+                    "cohort": cohort,
+                    "truth_wide": truth_wide,
+                    "pred_wide": pred_oof,
+                    "ci_lo": ci_lo_oof,
+                    "ci_hi": ci_hi_oof,
+                    "subtypes_df": subtypes_df_v,
+                    "tfx_dict": tfx_dict_v,
+                    "status": "validation",
+                })
+        else:
+            print(f"  [skip] PLCA CV results not found for {variant_label}: {cv_rel}")
+
+        # Collected cross-cohort analysis for this variant
+        if len(cohort_data) >= 2:
+            _run_collected_validation(cohort_data, out_dir, args,
+                                      label=f"Collected ({variant_label})")
+
+    print("\n  Done")
+
+
+# ---------------------------------------------------------------------------
 # Analysis group: Patient_Discovery (predictions only — no truth)
 # ---------------------------------------------------------------------------
 
@@ -1715,9 +1916,14 @@ _DISCOVERY_COHORTS: List[Tuple[str, Optional[str]]] = [
 ]
 
 # Models to check for each discovery cohort (ordered by priority).
+# NOTE: "Proteus_Tuned" renamed to "Proteus_PANFT"; "Proteus_Base" renamed to
+# "Proteus_PLCA" (BioDVN/ now contains PLCA inference outputs).
+# OnlySeq included as a negative control.
 _DISCOVERY_MODELS = [
-    ("Proteus_Tuned", "results_holdout/BioDVN_PAN-FT/{cohort}/predictions_tumor.tsv"),
-    ("Proteus_Base", "results_holdout/BioDVN/{cohort}/predictions_tumor.tsv"),
+    ("Proteus_PANFT",         "results_holdout/BioDVN_PAN-FT/{cohort}/predictions_tumor.tsv"),
+    ("Proteus_PLCA",          "results_holdout/BioDVN/{cohort}/predictions_tumor.tsv"),
+    ("Proteus_PLCA_NoSeq",    "results_holdout/BioDVN_NoSeq/{cohort}/predictions_tumor.tsv"),
+    ("Proteus_PLCA_OnlySeq",  "results_holdout/BioDVN_OnlySeq/{cohort}/predictions_tumor.tsv"),
 ]
 
 # GMT files for GSEA
@@ -2869,7 +3075,7 @@ def run_panft_cv(args: argparse.Namespace) -> None:
               f"from {len(regime_df)} genes")
 
         calibrator = RegimeCalibrator.fit(
-            cal_truth, proteus_ci_lo, proteus_ci_hi, regime_df, alpha=0.05,
+            cal_truth, proteus_ci_lo, proteus_ci_hi, regime_df, alpha=0.10,
         )
         print(f"  {calibrator.summary()}")
 
@@ -3123,10 +3329,12 @@ _BENCH_DEPTH_ORDER = ["10x", "5x"]
 _BENCH_EXCLUDED_DEPTHS = {"1x", "30x", "50x"}
 
 # Model directories under results_holdout/
+# NOTE: BioDVN/ now holds PLCA model predictions (Base was overwritten).
 _BENCH_PROTEUS_MODELS: Dict[str, str] = {
-    "Proteus_Base": "results_holdout/BioDVN/PHS/predictions_tumor.tsv",
-    "Proteus_NoSeq": "results_holdout/BioDVN_NoSeq/PHS/predictions_tumor.tsv",
-    "Proteus_OnlySeq": "results_holdout/BioDVN_OnlySeq/PHS/predictions_tumor.tsv",
+    # "Proteus_Base": "results_holdout/BioDVN/PHS/predictions_tumor.tsv",  # overwritten by PLCA
+    "Proteus_PLCA": "results_holdout/BioDVN/PHS/predictions_tumor.tsv",
+    "Proteus_PLCA_NoSeq": "results_holdout/BioDVN_NoSeq/PHS/predictions_tumor.tsv",
+    "Proteus_PLCA_OnlySeq": "results_holdout/BioDVN_OnlySeq/PHS/predictions_tumor.tsv",
 }
 _BENCH_XGB_PATH = "results_holdout/XGBoost/PHS/predictions_tumor.tsv"
 _EPIC_SEQ_PATH = "results_holdout/EPIC-Seq/PHS/EPICSeqInferredExpressionValues.txt"
@@ -3158,21 +3366,32 @@ def _bench_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
 _PANFT_COHORTS = ["CRPC-WCDT", "BLCA-RA"]
 
 _PANFT_MODEL_ORDER = [
-    "Proteus_Tuned", "Proteus_Base", "Proteus_NoSeq", "XGBoost",
-    "EPIC_GEP", "EPIC_PFE", "EPIC_NDR", "Naïve",
+    # "Proteus_Tuned" renamed to "Proteus_PANFT"; "Proteus_Base"/"Proteus_NoSeq"
+    # replaced by PLCA equivalents (BioDVN/ overwritten by PLCA inference).
+    "Proteus_PANFT", "Proteus_PLCA", "Proteus_PLCA_NoSeq", "Proteus_PLCA_OnlySeq",
+    "XGBoost", "EPIC_GEP", "EPIC_PFE", "EPIC_NDR", "Naïve",
 ]
 
 # Per-cohort model paths (relative to PROJECT_ROOT).
+# NOTE: "Proteus_Tuned" renamed to "Proteus_PANFT" to avoid ambiguity with PLCA.
+# NOTE: BioDVN/ and BioDVN_NoSeq/ now hold PLCA model predictions.
+#       "Proteus_Base" path kept as a commented reference (file overwritten).
 _PANFT_PROTEUS_PATHS: Dict[str, Dict[str, str]] = {
     "CRPC-WCDT": {
-        "Proteus_Tuned": "results_holdout/BioDVN_PAN-FT/CRPC-WCDT/predictions_tumor.tsv",
-        "Proteus_Base": "results_holdout/BioDVN/CRPC-WCDT/predictions_tumor.tsv",
-        "Proteus_NoSeq": "results_holdout/BioDVN_NoSeq/CRPC-WCDT/predictions_tumor.tsv",
+        # "Proteus_Tuned": was renamed to Proteus_PANFT
+        "Proteus_PANFT": "results_holdout/BioDVN_PAN-FT/CRPC-WCDT/predictions_tumor.tsv",
+        # "Proteus_Base": "results_holdout/BioDVN/CRPC-WCDT/...",  # overwritten by PLCA
+        "Proteus_PLCA": "results_holdout/BioDVN/CRPC-WCDT/predictions_tumor.tsv",
+        "Proteus_PLCA_NoSeq": "results_holdout/BioDVN_NoSeq/CRPC-WCDT/predictions_tumor.tsv",
+        "Proteus_PLCA_OnlySeq": "results_holdout/BioDVN_OnlySeq/CRPC-WCDT/predictions_tumor.tsv",
     },
     "BLCA-RA": {
-        "Proteus_Tuned": "results_holdout/BioDVN_PAN-FT/BLCA-RA/predictions_tumor.tsv",
-        "Proteus_Base": "results_holdout/BioDVN/BLCA-RA/predictions_tumor.tsv",
-        "Proteus_NoSeq": "results_holdout/BioDVN_NoSeq/BLCA-RA/predictions_tumor.tsv",
+        # "Proteus_Tuned": was renamed to Proteus_PANFT
+        "Proteus_PANFT": "results_holdout/BioDVN_PAN-FT/BLCA-RA/predictions_tumor.tsv",
+        # "Proteus_Base": "results_holdout/BioDVN/BLCA-RA/...",  # overwritten by PLCA
+        "Proteus_PLCA": "results_holdout/BioDVN/BLCA-RA/predictions_tumor.tsv",
+        "Proteus_PLCA_NoSeq": "results_holdout/BioDVN_NoSeq/BLCA-RA/predictions_tumor.tsv",
+        "Proteus_PLCA_OnlySeq": "results_holdout/BioDVN_OnlySeq/BLCA-RA/predictions_tumor.tsv",
     },
 }
 
@@ -3265,7 +3484,7 @@ def _run_roc_gene_calling(
                 continue
             # Skip the row-shuffled Naïve baseline — the shuffled-truth
             # naive (below) is the sole null reference for ROC.
-            if model_name == "Na\u00efve":
+            if model_name == "Naïve":
                 continue
             pw = model_preds[model_name]
             common_samples = [s for s in pw.columns if s in truth_wide.columns]
@@ -3327,7 +3546,7 @@ def _run_roc_gene_calling(
                 n_naive = int(valid_naive.sum())
                 fn, tn, an = _compute_roc_for_model(
                     t_shuffled[valid_naive], p_naive[valid_naive])
-                roc_curves["Na\u00efve"] = (fn, tn, an, n_naive)
+                roc_curves["Naïve"] = (fn, tn, an, n_naive)
 
         if roc_curves:
             _maybe(roc_gene_calling, overwrite,
@@ -3337,6 +3556,123 @@ def _run_roc_gene_calling(
                    model_order=list(model_order))
 
         print(f"    ROC {gs_display}: {len(roc_curves)} curves")
+
+        # ── Risk coverage curve: coverage vs PPV / FPR ──
+        # Proteus models with CIs get smooth lines (sweep CI width);
+        # comparators (XGBoost, EPIC, Naïve) get single points at 100%.
+        risk_data: Dict[str, Dict[str, np.ndarray]] = {}
+        _proteus_model_names: List[str] = []
+
+        for model_name in model_order:
+            if model_name not in model_preds:
+                continue
+            pw = model_preds[model_name]
+            cg_r = [g for g in common_genes if g in pw.index]
+            cs_r = [s for s in pw.columns if s in truth_wide.columns]
+            if len(cg_r) < 5 or len(cs_r) < 3:
+                continue
+
+            t_r = truth_wide.loc[cg_r, cs_r].values.flatten()
+            p_r = pw.loc[cg_r, cs_r].values.flatten()
+
+            lo_r = hi_r = None
+            if model_name in proteus_ci:
+                ci_lo, ci_hi = proteus_ci[model_name]
+                if ci_lo is not None and ci_hi is not None:
+                    cg_ci = [g for g in cg_r
+                             if g in ci_lo.index and g in ci_hi.index]
+                    cs_ci = [s for s in cs_r
+                             if s in ci_lo.columns and s in ci_hi.columns]
+                    if len(cg_ci) >= 5 and len(cs_ci) >= 3:
+                        lo_r = ci_lo.loc[cg_ci, cs_ci].values.flatten()
+                        hi_r = ci_hi.loc[cg_ci, cs_ci].values.flatten()
+                        t_r = truth_wide.loc[cg_ci, cs_ci].values.flatten()
+                        p_r = pw.loc[cg_ci, cs_ci].values.flatten()
+                        _proteus_model_names.append(model_name)
+
+            rd = compute_risk_coverage_data(
+                t_r, p_r, lo_r, hi_r, threshold=_ONOFF_THRESHOLD)
+            if len(rd["coverage"]) > 0:
+                risk_data[model_name] = rd
+
+        if risk_data:
+            _maybe(risk_coverage_plot, overwrite,
+                   risk_data,
+                   os.path.join(out_dir,
+                                f"RiskCoverage_{gs_display}_{cohort}"),
+                   title=f"Risk Coverage — {gs_display} ({cohort})",
+                   model_order=list(model_order),
+                   proteus_models=_proteus_model_names)
+            print(f"    RiskCoverage {gs_display}: "
+                  f"{len(risk_data)} models")
+
+        # ── 3-way confusion summary: ON / OFF / INDETERMINATE ──
+        confusion_results: Dict[str, Dict[str, Any]] = {}
+
+        for model_name in model_order:
+            if model_name not in model_preds:
+                continue
+            if model_name == "Naïve":
+                continue
+            pw = model_preds[model_name]
+            common_samples = [s for s in pw.columns if s in truth_wide.columns]
+            cg = [g for g in common_genes if g in pw.index]
+            if not common_samples or len(cg) < 5:
+                continue
+
+            t = truth_wide.loc[cg, common_samples].values.flatten()
+            p = pw.loc[cg, common_samples].values.flatten()
+
+            lo_c = hi_c = None
+            if model_name in proteus_ci:
+                ci_lo, ci_hi = proteus_ci[model_name]
+                if ci_lo is not None and ci_hi is not None:
+                    cg_ci = [g for g in cg
+                             if g in ci_lo.index and g in ci_hi.index]
+                    cs_ci = [s for s in common_samples
+                             if s in ci_lo.columns and s in ci_hi.columns]
+                    if len(cg_ci) >= 5 and len(cs_ci) >= 3:
+                        lo_c = ci_lo.loc[cg_ci, cs_ci].values.flatten()
+                        hi_c = ci_hi.loc[cg_ci, cs_ci].values.flatten()
+                        t = truth_wide.loc[cg_ci, cs_ci].values.flatten()
+                        p = pw.loc[cg_ci, cs_ci].values.flatten()
+
+            d = compute_onoff_confusion(
+                t, p, lo_c, hi_c, threshold=_ONOFF_THRESHOLD)
+            if d.get("n_total", 0) > 0:
+                confusion_results[model_name] = d
+
+        if confusion_results:
+            # Save TSV
+            conf_rows = []
+            for m, d in confusion_results.items():
+                conf_rows.append({
+                    "model": m,
+                    "n_total": d["n_total"],
+                    "n_on": d["n_on"], "n_off": d["n_off"],
+                    "n_indet": d["n_indet"],
+                    "accuracy": d.get("accuracy", float("nan")),
+                    "ppv": d.get("ppv", float("nan")),
+                    "npv": d.get("npv", float("nan")),
+                    "fpr": d.get("fpr", float("nan")),
+                    "coverage": d.get("coverage", float("nan")),
+                })
+            conf_df = pd.DataFrame(conf_rows)
+            conf_df.to_csv(
+                os.path.join(out_dir,
+                             f"OnOffConfusion_{gs_display}_{cohort}.tsv"),
+                sep="\t", index=False,
+            )
+
+            _maybe(onoff_confusion_summary_plot, overwrite,
+                   confusion_results,
+                   os.path.join(out_dir,
+                                f"OnOffConfusion_{gs_display}_{cohort}"),
+                   title=(f"On/Off Confusion — {gs_display} ({cohort}), "
+                          f"90% CI"),
+                   model_order=list(model_order))
+            print(f"    OnOffConfusion {gs_display}: "
+                  f"{len(confusion_results)} models")
 
 
 def run_benchmarking_panft(args: argparse.Namespace) -> None:
@@ -3538,12 +3874,9 @@ def _generate_naive_example(
     1. Replicate scatter: LuCaP_136 vs LuCaP_136CR.
     2. Naïve scatter: LuCaP_136 truth vs a randomly chosen other sample's
        truth value per gene (destroys sample identity).
-    3. Replicate distribution: PCA of all 25 truth profiles; for each
-       sample, the nearest neighbor in PCA space serves as its
-       "prediction".  Per-gene Pearson r across 25 (truth, NN-pred) pairs.
-    4. Lineage-derivative distribution: pseudo-paired CR / non-CR lines
+    3. Lineage-derivative distribution: pseudo-paired CR / non-CR lines
        (e.g. LuCaP_136 vs 136CR).  Per-gene Pearson r across 6 pairs.
-    5. Naïve distribution: per-gene Pearson r from row-shuffled truth
+    4. Naïve distribution: per-gene Pearson r from row-shuffled truth
        (shuffle sample labels independently per gene).  One shuffle gives
        n=25 points per gene → one r per gene, distributed ≈ N(0, σ).
     """
@@ -3617,50 +3950,9 @@ def _generate_naive_example(
                 "LuCaP_136 vs Random Other", path_b, goi=None,
             )
 
-    # --- (3) Replicate distribution: PCA nearest-sample Pearson r ---
-    # For each sample, find its nearest neighbor in PCA space (across all
-    # genes) and use that neighbor's expression profile as the "prediction".
-    # This gives 25 (truth, pred) pairs per gene → one Pearson r per gene.
-    from sklearn.decomposition import PCA
-
-    # Transpose to (samples × genes), drop genes with any NaN for PCA
-    T_T = T.T  # (25, G)
-    finite_genes = T_T.columns[T_T.notna().all()]
-    T_pca_input = T_T[finite_genes].values  # (25, G')
-
-    pca = PCA(n_components=min(10, T_pca_input.shape[0] - 1))
-    scores = pca.fit_transform(T_pca_input)  # (25, k)
-
-    # Pairwise Euclidean distances in PCA space
-    from scipy.spatial.distance import cdist
-    dists = cdist(scores, scores, metric="euclidean")  # (25, 25)
-    np.fill_diagonal(dists, np.inf)  # exclude self
-    nn_idx = np.argmin(dists, axis=1)  # nearest neighbor per sample
-
-    # Build prediction matrix: for each sample j, pred[:,j] = truth[:,nn[j]]
-    nn_pred = T_arr[:, nn_idx]  # (G, 25)
-
-    replicate_r = _gene_pearson_r(T_arr, nn_pred)
-    replicate_r_series = pd.Series(
-        replicate_r[np.isfinite(replicate_r)], name="pearson_r",
-    )
-    path_c = os.path.join(ne_dir, "replicate_pca_nearest_sample_pearson_r_distribution")
-    if overwrite or not os.path.exists(f"{path_c}.pdf"):
-        metric_distribution(
-            replicate_r_series,
-            "Per-Gene Pearson r (PCA Nearest Sample)",
-            path_c,
-            xlim=(-1.0, 1.0), square=True,
-        )
-    # Report NN pairs
-    nn_pairs = [(T.columns[j], T.columns[nn_idx[j]]) for j in range(n_samp)]
-    print(f"  PCA nearest-sample dist: {len(replicate_r_series)} genes, "
-          f"median r={float(replicate_r_series.median()):.4f}")
-    print(f"    NN pairs: {', '.join(f'{a}→{b}' for a, b in nn_pairs[:5])}...")
-
-    # --- (4) Lineage-derivative distribution: CR / non-CR pairs ---
+    # --- (3) Lineage-derivative distribution: CR / non-CR pairs ---
     # Pseudo-paired: non-CR sample expression vs its CR derivative.
-    # 6 pairs within the 25-sample study set.
+    # 6 pairs within the 25-sample study set (renumbered after PCA removal).
     _cr_pairs = [
         ("LuCaP_35", "LuCaP_35CR"),
         ("LuCaP_70", "LuCaP_70CR"),
@@ -3687,6 +3979,7 @@ def _generate_naive_example(
                 "Per-Gene Pearson r (CR / non-CR Pairs)",
                 path_lin,
                 xlim=(-1.0, 1.0), square=True,
+                draw_stat_lines=False,
             )
         print(f"  Lineage-derivative dist: {len(lineage_r_series)} genes, "
               f"median r={float(lineage_r_series.median()):.4f}  "
@@ -3697,7 +3990,7 @@ def _generate_naive_example(
         print(f"  [skip] Lineage-derivative: only {len(valid_pairs)} "
               f"CR/non-CR pairs found")
 
-    # --- (5) Naïve distribution: per-gene row-shuffled Pearson r ---
+    # --- (4) Naïve distribution: per-gene row-shuffled Pearson r ---
     # Shuffle truth values across 25 samples independently per gene,
     # then compute Pearson r per gene (one r per gene per shuffle).
     # Single shuffle: n=25 samples per gene → one r per gene.
@@ -3713,6 +4006,7 @@ def _generate_naive_example(
             "Per-Gene Pearson r (Na\u00efve)",
             path_d,
             xlim=(-1.0, 1.0), square=True,
+            draw_stat_lines=False,
         )
     print(f"  Naïve dist: {len(naive_r_series)} genes, "
           f"median r={float(naive_r_series.median()):.4f}")
@@ -3722,17 +4016,10 @@ def _generate_naive_example(
     gene_names = T.index.astype(str).values
     w_gene = np.array([var_map.get(g, 0.0) for g in gene_names], dtype=np.float64)
 
-    gvw_r_rep = _gvw_r_from_wide(T_arr, nn_pred, w_gene)
-    gvw_rho_rep = _gvw_rho_from_wide(T_arr, nn_pred, w_gene)
     gvw_r_naive = _gvw_r_from_wide(T_arr, naive_pred.values.astype(np.float64), w_gene)
     gvw_rho_naive = _gvw_rho_from_wide(T_arr, naive_pred.values.astype(np.float64), w_gene)
 
-    rows = [
-        {"method": "PCA_Nearest_Sample",
-         "GVW_r": gvw_r_rep, "GVW_rho": gvw_rho_rep,
-         "median_gene_r": float(replicate_r_series.median()),
-         "n_genes": len(replicate_r_series), "n_samples": n_samp},
-    ]
+    rows = []
     if lineage_r_series is not None:
         w_lin = np.array([var_map.get(g, 0.0) for g in T[[a for a, _ in valid_pairs]].index.astype(str)], dtype=np.float64)
         gvw_r_lin = _gvw_r_from_wide(nonCR_arr, CR_arr, w_lin)
@@ -3753,8 +4040,7 @@ def _generate_naive_example(
     summary_path = os.path.join(ne_dir, "naive_example_gvw_summary.tsv")
     summary_df.to_csv(summary_path, sep="\t", index=False)
     print(f"  GVW summary saved: {summary_path}")
-    print(f"    PCA Nearest: GVW-r={gvw_r_rep:.4f}, GVW-ρ={gvw_rho_rep:.4f}")
-    print(f"    Naïve:       GVW-r={gvw_r_naive:.4f}, GVW-ρ={gvw_rho_naive:.4f}")
+    print(f"    Naïve: GVW-r={gvw_r_naive:.4f}, GVW-ρ={gvw_rho_naive:.4f}")
 
 
 def run_benchmarking(args: argparse.Namespace) -> None:
@@ -3766,10 +4052,10 @@ def run_benchmarking(args: argparse.Namespace) -> None:
     boxplots, histograms, and eCDNA line plots.
     """
     print("\n" + "=" * 70)
-    print("  ANALYSIS GROUP: Benchmarking_Base")
+    print("  ANALYSIS GROUP: Benchmarking_PLCA")
     print("=" * 70)
 
-    out_dir = ensure_dir(str(PROJECT_ROOT / "analysis" / "results" / "Benchmarking_Base"))
+    out_dir = ensure_dir(str(PROJECT_ROOT / "analysis" / "results" / "Benchmarking_PLCA"))
     n_workers = args.n_workers
 
     # ── Load model predictions and build truth ──────────────────────────
@@ -3821,9 +4107,9 @@ def run_benchmarking(args: argparse.Namespace) -> None:
     var_map = compute_gene_variance(unique_truth)
     print(f"  Variance map: {len(var_map)} genes from {len(unique_pdx_names)} unique PDX profiles")
 
-    # Na\u00efve model: column-wise shuffled truth
+    # Naïve model: column-wise shuffled truth
     naive_pred = generate_null_predictions(truth_wide, seed=42)
-    model_preds["Na\u00efve"] = naive_pred
+    model_preds["Naïve"] = naive_pred
 
     # ── Load EPIC-Seq scores ───────────────────────────────────────────
     epic_path = PROJECT_ROOT / _EPIC_SEQ_PATH
@@ -3857,12 +4143,13 @@ def run_benchmarking(args: argparse.Namespace) -> None:
     print(f"  Grid samples (after depth filter): {len(grid_samples)}")
 
     # ── Compute metrics per (TFx, depth, model) ────────────────────────
-    # Canonical model order for Benchmarking_Base (excludes Proteus_Tuned)
-    _BASE_MODEL_ORDER = [
-        "Proteus_Base", "Proteus_NoSeq", "Proteus_OnlySeq",
-        "XGBoost", "EPIC_GEP", "EPIC_PFE", "EPIC_NDR", "Na\u00efve",
+    # Canonical model order for Benchmarking_PLCA (excludes Proteus_PANFT)
+    # NOTE: Proteus_Base replaced by Proteus_PLCA (BioDVN/ now holds PLCA predictions)
+    _PLCA_BENCH_MODEL_ORDER = [
+        "Proteus_PLCA", "Proteus_PLCA_NoSeq", "Proteus_PLCA_OnlySeq",
+        "XGBoost", "EPIC_GEP", "EPIC_PFE", "EPIC_NDR", "Naïve",
     ]
-    model_order = [m for m in _BASE_MODEL_ORDER if m in model_preds]
+    model_order = [m for m in _PLCA_BENCH_MODEL_ORDER if m in model_preds]
 
     metrics_rows = []     # one row per (tfx, depth, model) with scalar metrics
     gene_rho_rows = []    # one row per (tfx, depth, model, gene) with gene rho
@@ -4042,18 +4329,350 @@ def run_benchmarking(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Group: PLCA-CV (all-cohort cross-validation — full pipeline)
+# ---------------------------------------------------------------------------
+
+# CV results dirs for the three PLCA model variants.
+_PLCA_CV_PATHS: Dict[str, str] = {
+    "BioDVN":         "results_training/proteus_plca-model_cv",
+    "BioDVN_NoSeq":   "results_training/proteus_plca-model_no-seq_cv",
+    "BioDVN_OnlySeq": "results_training/proteus_plca-model_only-seq_cv",
+}
+_PLCA_SPLITS_TSV = "data/PLCA_sample-splits.tsv"
+
+# Cohorts that have ground-truth expression labels and appear in PLCA training.
+_PLCA_CV_COHORTS = ["CRPC-RA", "SCLC", "PC-PDX", "SCLC-PDX"]
+# True holdout cohorts (have truth labels, excluded from CV splits).
+_PLCA_HOLDOUT_COHORTS = ["CRPC-WCDT", "BLCA-RA"]
+
+# HO PDX paths: the 5 samples per cohort that were held out of PLCA training.
+# Written by the PLCA full-train inference run (results_holdout/BioDVN/...).
+_PLCA_HO_PDX_PATHS: Dict[str, str] = {
+    "PC-PDX":   "results_holdout/BioDVN/PC-PDX/predictions_tumor.tsv",
+    "SCLC-PDX": "results_holdout/BioDVN/SCLC-PDX/predictions_tumor.tsv",
+}
+
+# Per-cohort analysis config for PLCA-CV splits
+_PLCA_CV_COHORT_CONFIG: Dict[str, Dict[str, Any]] = {
+    "CRPC-RA": {
+        "heatmap_gene_sets": ["PC-Phenotyping", "Targets_CRPC"],
+        "goi": DEFAULT_GOI_PC,
+        "gene_scatter_sets": ["Targets_CRPC"],
+        "truth_label": "CRPC-RA",
+    },
+    "SCLC": {
+        "heatmap_gene_sets": ["Targets_SCLC"],
+        "goi": DEFAULT_GOI_SCLC,
+        "gene_scatter_sets": ["Targets_SCLC"],
+        "truth_label": "SCLC",
+    },
+    "PC-PDX": {
+        "heatmap_gene_sets": ["PC-Phenotyping", "Targets_CRPC"],
+        "goi": DEFAULT_GOI_PC,
+        "gene_scatter_sets": ["Targets_CRPC"],
+        "truth_label": "PC-PDX",
+    },
+    "SCLC-PDX": {
+        "heatmap_gene_sets": ["Targets_SCLC"],
+        "goi": DEFAULT_GOI_SCLC,
+        "gene_scatter_sets": ["Targets_SCLC"],
+        "truth_label": "SCLC-PDX",
+    },
+}
+
+
+def _load_plca_fold_splits() -> pd.DataFrame:
+    """Load data/PLCA_sample-splits.tsv → DataFrame with Cohort, Sample, Fold."""
+    path = PROJECT_ROOT / _PLCA_SPLITS_TSV
+    return pd.read_csv(path, sep="\t")
+
+
+def _build_plca_truth() -> pd.DataFrame:
+    """Build canonical truth for PLCA CV cohorts (CRPC-RA, SCLC, PC-PDX, SCLC-PDX).
+
+    Loads Log2CPMplus1 labels for all four cohorts, keeps only samples present
+    in the PLCA sample-splits table (excludes HO PDX), concatenates on a common
+    gene index.  PHT samples are excluded from truth (no independent labels).
+    """
+    splits = _load_plca_fold_splits()
+    split_samples = set(splits["Sample"])
+
+    parts = []
+    for cohort in _PLCA_CV_COHORTS:
+        truth_path = PROJECT_ROOT / "labels" / f"{cohort}_Log2CPMplus1.tsv"
+        if not truth_path.exists():
+            continue
+        tw = load_truth(cohort)
+        keep = [s for s in tw.columns if s in split_samples]
+        if keep:
+            parts.append(tw[keep])
+
+    if not parts:
+        return pd.DataFrame()
+
+    common_genes = parts[0].index
+    for p in parts[1:]:
+        common_genes = common_genes.intersection(p.index)
+    return pd.concat([p.loc[common_genes] for p in parts], axis=1)
+
+
+def _build_plca_subtypes() -> Optional[pd.DataFrame]:
+    """Build subtypes DataFrame for PLCA CV samples (all four CV cohorts)."""
+    parts = []
+    for cohort in _PLCA_CV_COHORTS:
+        path = PROJECT_ROOT / "labels" / f"{cohort}_TFX_Subtype.tsv"
+        if path.exists():
+            parts.append(load_subtypes(cohort))
+    if not parts:
+        return None
+    return pd.concat(parts, axis=0)
+
+
+def run_plca_cv(args: argparse.Namespace) -> None:
+    """PLCA cross-validation analysis — all three model variants.
+
+    For each variant (BioDVN, BioDVN_NoSeq, BioDVN_OnlySeq):
+      1. Loads full MDN OOF predictions from the corresponding CV results dir.
+      2. Splits by cohort (CRPC-RA, SCLC, PC-PDX, SCLC-PDX); excludes PHT.
+      3. Fits CQR calibration on all OOF samples.
+      4. Fits gene-level reliability model on OOF features.
+      5. Runs the full per-cohort analysis suite.
+      6. Loads the 5 HO PDX samples (BioDVN variant only — canonical HO PDX).
+      7. Prints a combined summary table across all variants and cohorts.
+
+    Outputs go to analysis/results/PLCA-CV/<variant>/<cohort>/
+    """
+    print("\n" + "=" * 70)
+    print("  ANALYSIS GROUP: PLCA-CV (Cross-Validation)")
+    print("=" * 70)
+
+    out_base = ensure_dir(str(PROJECT_ROOT / "analysis" / "results" / "PLCA-CV"))
+    n_workers = args.n_workers
+    all_summaries: List[Dict[str, Any]] = []
+
+    # Load fold-split table for sample→cohort mapping.
+    fold_splits = _load_plca_fold_splits()
+    cohort_map: Dict[str, str] = dict(
+        zip(fold_splits["Sample"], fold_splits["Cohort"])
+    )
+
+    # Build short→prefixed prefix map per cohort
+    _prefix_map: Dict[str, str] = {}
+    for _, row in fold_splits.iterrows():
+        prefixed = row["Sample"]
+        short = str(strip_cohort_prefix(
+            pd.Index([prefixed]), row["Cohort"],
+        )[0])
+        _prefix_map[short] = prefixed
+
+    subtypes_df = _build_plca_subtypes()
+    canonical_truth = _build_plca_truth()
+    if canonical_truth.empty:
+        print("  [skip] No canonical truth could be built for PLCA")
+        return
+    print(f"  Canonical truth: {canonical_truth.shape[0]} genes × "
+          f"{canonical_truth.shape[1]} samples")
+
+    def _split_by_cohort_plca(
+        pred: pd.DataFrame,
+        truth: pd.DataFrame,
+        ci_lo: Optional[pd.DataFrame],
+        ci_hi: Optional[pd.DataFrame],
+        cohort: str,
+    ) -> Tuple:
+        samples = sorted(s for s in pred.columns if cohort_map.get(s) == cohort)
+        if not samples:
+            return None, None, None, None
+        p = pred[[s for s in samples if s in pred.columns]]
+        t = truth[[s for s in samples if s in truth.columns]]
+        cl = ci_lo[[s for s in samples if s in ci_lo.columns]] if ci_lo is not None else None
+        ch = ci_hi[[s for s in samples if s in ci_hi.columns]] if ci_hi is not None else None
+        return p, t, cl, ch
+
+    # ── Iterate over all three PLCA model variants ──
+    for variant_name, cv_rel_path in _PLCA_CV_PATHS.items():
+        cv_dir = str(PROJECT_ROOT / cv_rel_path)
+        if not os.path.isdir(cv_dir):
+            print(f"\n  [skip] CV results not found for {variant_name}: {cv_rel_path}")
+            continue
+
+        out_dir = ensure_dir(os.path.join(out_base, variant_name))
+        variant_summaries: List[Dict[str, Any]] = []
+
+        print(f"\n{'─'*70}")
+        print(f"  Variant: {variant_name}")
+        print(f"  CV dir : {cv_rel_path}")
+
+        # Load full MDN CV predictions
+        cv_full = load_cv_predictions_proteus_full(cv_dir)
+
+        # Rename columns to canonical prefixed sample names
+        for key in ("pred_wide", "truth_wide", "ci_lo_wide", "ci_hi_wide",
+                    "p0_wide", "pi_gamma_wide", "pi_normal_wide",
+                    "gamma_beta_wide", "normal_mean_wide", "normal_stdev_wide"):
+            cv_full[key] = _apply_prefix_map(cv_full.get(key), _prefix_map)
+        for fold_id, fd in cv_full.get("fold_data", {}).items():
+            for fk in list(fd.keys()):
+                if isinstance(fd[fk], pd.DataFrame):
+                    fd[fk] = _apply_prefix_map(fd[fk], _prefix_map)
+        cv_full["sample_fold"] = {
+            _prefix_map.get(s, s): f for s, f in cv_full["sample_fold"].items()
+        }
+
+        proteus_pred = cv_full["pred_wide"]
+        _pred_truth = cv_full["truth_wide"]
+        proteus_ci_lo = cv_full["ci_lo_wide"]
+        proteus_ci_hi = cv_full["ci_hi_wide"]
+
+        # ── CQR calibration on all OOF samples ──
+        calibrator: Optional[RegimeCalibrator] = None
+        regime_df: Optional[pd.DataFrame] = None
+        if proteus_ci_lo is not None and proteus_ci_hi is not None:
+            cal_truth = _pred_truth.reindex(
+                index=proteus_ci_lo.index, columns=proteus_ci_lo.columns,
+            )
+            regime_df = compute_gene_regimes(canonical_truth)
+            calibrator = RegimeCalibrator.fit(
+                cal_truth, proteus_ci_lo, proteus_ci_hi, regime_df, alpha=0.10,
+            )
+            print(f"  CQR: {calibrator.summary()}")
+            _maybe(plot_regime_qhat_heatmap, args.overwrite,
+                   calibrator.q_hats,
+                   os.path.join(out_dir, "regime_qhat_heatmap"),
+                   title=f"CQR q̂ by Gene Regime (PLCA {variant_name})")
+
+        # ── Gene-level reliability model on OOF features ──
+        reliability_model: Optional[ReliabilityModel] = None
+        if proteus_ci_lo is not None and cv_full.get("fold_data"):
+            print(f"\n  ── Fitting reliability model ({variant_name}) ──")
+            reliability_model = ReliabilityModel.fit(
+                cv_full["fold_data"], canonical_truth, ridge_alpha=1.0,
+            )
+            print(f"    {reliability_model.summary()}")
+            _maybe(plot_reliability_weights, args.overwrite,
+                   reliability_model.feature_columns, reliability_model.weights,
+                   os.path.join(out_dir, "reliability_feature_weights"),
+                   title=f"Reliability Feature Weights (PLCA {variant_name} OOF)")
+
+        # Apply CQR calibration to CV OOF intervals
+        if calibrator is not None and proteus_ci_lo is not None:
+            proteus_ci_lo, proteus_ci_hi = calibrator.apply(
+                proteus_ci_lo, proteus_ci_hi,
+            )
+            print(f"  Applied CQR to {proteus_ci_lo.shape[1]} OOF intervals")
+
+        # ── Per-cohort analysis ──
+        for cohort_name, cfg in _PLCA_CV_COHORT_CONFIG.items():
+            cp, ct, ccl, cch = _split_by_cohort_plca(
+                proteus_pred, canonical_truth, proteus_ci_lo, proteus_ci_hi, cohort_name,
+            )
+            if cp is None or cp.shape[1] < 2:
+                print(f"  [skip] Too few {cohort_name} samples for PLCA CV")
+                continue
+
+            cohort_out = ensure_dir(os.path.join(out_dir, cohort_name))
+            print(f"\n  ── Metrics: {cohort_name} ({cp.shape[1]} samples) ──")
+            cv_truth = canonical_truth.reindex(index=cp.index, columns=cp.columns)
+            label = f"PLCA CV {variant_name} ({cohort_name})"
+            cv_summary = cohort_summary_table(cv_truth, cp, label=label, n_workers=n_workers)
+            variant_summaries.append(cv_summary)
+            all_summaries.append(cv_summary)
+
+            cohort_subtypes = None
+            if subtypes_df is not None:
+                cohort_samples_sub = [s for s in cp.columns if s in subtypes_df.index]
+                if cohort_samples_sub:
+                    cohort_subtypes = subtypes_df.loc[cohort_samples_sub]
+
+            _run_cv_suite(
+                cp, cv_truth, label, cohort_out,
+                ci_lo=ccl, ci_hi=cch,
+                goi=cfg["goi"], subtypes_df=cohort_subtypes,
+                heatmap_gene_sets=cfg["heatmap_gene_sets"],
+                gene_scatter_sets=cfg.get("gene_scatter_sets", []),
+                gene_met=cv_summary["_gene_metrics"],
+                sample_met=cv_summary["_sample_metrics"],
+                n_workers=n_workers, overwrite=args.overwrite,
+                scatter_ci=args.scatter_ci,
+            )
+
+        # ── HO PDX evaluation (BioDVN variant only for full holdout pipeline;
+        #    NoSeq and OnlySeq also evaluated for comparison) ──
+        ho_out = ensure_dir(os.path.join(out_dir, "HO_PDX"))
+        for pdx_cohort, ho_rel in _PLCA_HO_PDX_PATHS.items():
+            ho_path = PROJECT_ROOT / ho_rel
+            if not ho_path.exists():
+                print(f"  [skip] HO PDX {pdx_cohort} not found: {ho_rel}")
+                continue
+            ho_full = load_holdout_predictions_proteus_full(str(ho_path))
+            ho_samples = [s for s in ho_full["pred_wide"].columns if s in PDX_HOLDOUT_SAMPLES]
+            if not ho_samples:
+                print(f"  [skip] No matching HO samples for {pdx_cohort}")
+                continue
+            ho_pred = ho_full["pred_wide"][ho_samples]
+            ho_truth = load_truth(pdx_cohort)
+            ho_truth = ho_truth.reindex(columns=ho_samples).dropna(how="all")
+            common_genes = ho_pred.index.intersection(ho_truth.index)
+            if len(common_genes) < 100:
+                print(f"  [skip] Insufficient common genes for HO {pdx_cohort}")
+                continue
+            ho_pred = ho_pred.loc[common_genes]
+            ho_truth = ho_truth.loc[common_genes, ho_samples]
+            ho_ci_lo = ho_full["ci_lo_wide"][ho_samples].loc[common_genes] if ho_full.get("ci_lo_wide") is not None else None
+            ho_ci_hi = ho_full["ci_hi_wide"][ho_samples].loc[common_genes] if ho_full.get("ci_hi_wide") is not None else None
+            if calibrator is not None and ho_ci_lo is not None:
+                ho_ci_lo, ho_ci_hi = calibrator.apply(ho_ci_lo, ho_ci_hi)
+            cohort_cfg = _PLCA_CV_COHORT_CONFIG.get(pdx_cohort, {})
+            label_ho = f"PLCA {variant_name} HO ({pdx_cohort})"
+            ho_summary = cohort_summary_table(ho_truth, ho_pred, label=label_ho, n_workers=n_workers)
+            all_summaries.append(ho_summary)
+            print(f"\n  ── HO: {pdx_cohort} ({len(ho_samples)} samples) ──")
+            _run_cv_suite(
+                ho_pred, ho_truth, label_ho,
+                ensure_dir(os.path.join(ho_out, pdx_cohort)),
+                ci_lo=ho_ci_lo, ci_hi=ho_ci_hi,
+                goi=cohort_cfg.get("goi"),
+                heatmap_gene_sets=cohort_cfg.get("heatmap_gene_sets", []),
+                gene_met=ho_summary["_gene_metrics"],
+                sample_met=ho_summary["_sample_metrics"],
+                n_workers=n_workers, overwrite=args.overwrite,
+                scatter_ci=args.scatter_ci,
+            )
+
+        # Per-variant summary
+        if variant_summaries:
+            print(f"\n  ── Summary: {variant_name} ──")
+            print_summary_table(variant_summaries)
+            _save_summary_tsv(variant_summaries,
+                              os.path.join(out_dir, "summary_metrics.tsv"))
+
+    # ── Cross-variant combined summary ──
+    if all_summaries:
+        print("\n" + "─" * 70)
+        print("  PLCA-CV Combined Summary (all variants × cohorts)")
+        print_summary_table(all_summaries)
+        _save_summary_tsv(all_summaries, os.path.join(out_base, "summary_metrics.tsv"))
+
+    print("\n  Done")
+
+
+
+
+# ---------------------------------------------------------------------------
+# Entry point
 # ---------------------------------------------------------------------------
 
 GROUPS = {
     "BTS-CV": run_bts_cv,
-    "Benchmarking_Base": run_benchmarking,
+    "PLCA-CV": run_plca_cv,                                    # new: PLCA all-cohort CV
+    "Benchmarking_PLCA": run_benchmarking,                     # was: Benchmarking_Base
     "Benchmarking_PAN-FT": run_benchmarking_panft,
     "PAN-FT-CV": run_panft_cv,
     "CRPC-FT-CV": run_crpc_finetune_cv,
     "XGB-FT-CV": run_xgb_finetune_cv,
     "Patient_Validation_PAN-FT": run_patient_validation_panft,
-    "Patient_Validation_BASE": run_patient_validation_base,
+    "Patient_Validation_BASE": run_patient_validation_base,    # kept: CV-only Base reference
+    "Patient_Validation_PLCA": run_patient_validation_plca,    # new: PLCA holdout validation
     "Patient_Discovery": run_patient_discovery,
 }
 

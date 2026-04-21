@@ -119,7 +119,7 @@ Confidence intervals for scalar metrics use the **percentile bootstrap** method 
 
 1. Resample $n$ samples (columns) with replacement, $B$ times (default $B = 100$).
 2. Compute the metric on each bootstrap replicate.
-3. Report the $\alpha/2$ and $1 - \alpha/2$ percentiles where $\alpha = 0.05$.
+3. Report the $\alpha/2$ and $1 - \alpha/2$ percentiles where $\alpha = 0.10$.
 
 Metrics with CIs: GVW-$\rho$, RMSE, mean sample $\rho$, mean gene $\rho$, mean top-10% gene $\rho$.
 
@@ -150,7 +150,7 @@ $$\hat{A}_{ig} = \frac{A_{ig}}{S_{ig} + \epsilon} \quad \text{where } \epsilon =
 
 ### Per-Regime Quantile
 
-For regime $r$ with $n_r$ valid observations and target miscoverage $\alpha$ (default 0.05):
+For regime $r$ with $n_r$ valid observations and target miscoverage $\alpha$ (default 0.10):
 
 $$q_r = \left\lceil \frac{(1 - \alpha)(n_r + 1)}{n_r} \right\rceil\text{-th quantile of } \{\hat{A}_{ig}\}_{(i,g) \in r}$$
 

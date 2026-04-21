@@ -27,170 +27,11 @@ import torch
 from torch.utils.data import Dataset, DataLoader, IterableDataset
 import zarr
 
-import bisect
-
-
-def _normalize_fold_index_to_sample_paths(loaded: Any) -> List[str]:
-    """Normalize a fold index JSON payload to a unique list of sample Zarr paths.
-
-    Expects a flat list of absolute Zarr paths:
-        ["/abs/path/sample1.zarr", "/abs/path/sample2.zarr", ...]
-
-    Returns paths in first-seen order with duplicates removed.
-    """
-    if not isinstance(loaded, list):
-        raise ValueError('Fold index JSON must be a list.')
-
-    paths = [str(p) for p in loaded]
-
-    seen: set[str] = set()
-    uniq: List[str] = []
-    for p in paths:
-        if p not in seen:
-            seen.add(p)
-            uniq.append(p)
-    return uniq
-
-
-class ProteusGeneDataset(Dataset):
-    """Gene-level Dataset backed by flat per-sample Zarr arrays.
-
-    This keeps the model's training semantics intact (each item = one gene),
-    while still avoiding the on-disk per-gene hierarchy.
-
-    Input index format:
-      - ["/path/to/sampleA.zarr", "/path/to/sampleB.zarr", ...]
-        -> dataset length is total genes across all samples.
-    """
-
-    def __init__(
-        self,
-        index_file: Optional[str] = None,
-        zarr_paths: Optional[List[str]] = None,
-        labeled: bool = True,
-        cache_stores: bool = True,
-        include_metadata: bool = False,
-        gene_weights: Optional[Dict[str, float]] = None,
-    ):
-        self.labeled = labeled
-        self.cache_stores = cache_stores
-        self.include_metadata = bool(include_metadata)
-        self.gene_weights = gene_weights
-        self._store_cache: Dict[str, zarr.Group] = {}
-        self._gene_names_cache: Dict[str, List[str]] = {}
-        self._sample_name_cache: Dict[str, str] = {}
-
-        if index_file is not None:
-            with open(index_file, 'r') as f:
-                loaded = json.load(f)
-        elif zarr_paths is not None:
-            loaded = list(zarr_paths)
-        else:
-            raise ValueError("Either index_file or zarr_paths must be provided")
-
-        self._sample_paths: Optional[List[str]] = None
-        self._cum_gene_offsets: Optional[List[int]] = None
-        self._n_genes_per_sample: Optional[List[int]] = None
-
-        self._sample_paths = [str(p) for p in loaded]
-        if cache_stores:
-            for path in set(self._sample_paths):
-                self._store_cache[path] = zarr.open(path, mode='r')
-
-        n_genes_per_sample: List[int] = []
-        for path in self._sample_paths:
-            store = self._get_store(path)
-            data_grp = store['flat']
-            n_genes_per_sample.append(int(data_grp['TSS_signals'].shape[0]))
-        self._n_genes_per_sample = n_genes_per_sample
-
-        cum = [0]
-        running = 0
-        for n in n_genes_per_sample:
-            running += int(n)
-            cum.append(running)
-        self._cum_gene_offsets = cum
-
-    def __len__(self) -> int:
-        if self._cum_gene_offsets is None:
-            raise RuntimeError('Dataset not initialized: _cum_gene_offsets is None')
-        return self._cum_gene_offsets[-1]
-
-    def _get_store(self, zarr_path: str) -> zarr.Group:
-        if self.cache_stores and zarr_path in self._store_cache:
-            return self._store_cache[zarr_path]
-        return zarr.open(zarr_path, mode='r')
-
-    def _get_sample_name(self, store: zarr.Group, zarr_path: str) -> str:
-        cached = self._sample_name_cache.get(zarr_path)
-        if cached is not None:
-            return cached
-        # Prefer explicit display name (full TSV sample name with cohort
-        # prefix) so that internal maps and output TSVs carry unambiguous
-        # identifiers like "CRPC-RA_00-010" instead of bare "00-010".
-        name_map = getattr(self, 'sample_name_map', None)
-        if isinstance(name_map, dict) and zarr_path in name_map:
-            name = name_map[zarr_path]
-        else:
-            name = store.attrs.get('sample_name')
-            if name is None:
-                name = Path(zarr_path).stem.replace('.zarr', '')
-        name = str(name)
-        self._sample_name_cache[zarr_path] = name
-        return name
-
-    def _get_gene_name(self, store: zarr.Group, zarr_path: str, gene_idx: int) -> str:
-        names = self._gene_names_cache.get(zarr_path)
-        if names is None:
-            names = [str(g) for g in list(store['gene_names'][:])]
-            self._gene_names_cache[zarr_path] = names
-        return str(names[int(gene_idx)])
-
-    def __getitem__(self, idx: int) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-        if self._sample_paths is None or self._cum_gene_offsets is None:
-            raise RuntimeError('Dataset not initialized: _sample_paths or _cum_gene_offsets is None')
-        # Find which sample this gene index belongs to
-        sample_i = bisect.bisect_right(self._cum_gene_offsets, idx) - 1
-        zarr_path = self._sample_paths[sample_i]
-        gene_idx = idx - self._cum_gene_offsets[sample_i]
-        store = self._get_store(zarr_path)
-        data_grp = store['flat']
-
-        features = {
-            'TSS_signals': torch.from_numpy(data_grp['TSS_signals'][gene_idx]),
-            'TSS_nucleotides': torch.from_numpy(data_grp['TSS_nucleotides'][gene_idx].astype(np.float32)),
-            'TSS_features': torch.from_numpy(data_grp['TSS_features'][gene_idx]),
-            'GB_features': torch.from_numpy(data_grp['GB_features'][gene_idx]),
-            'ref_scalars': torch.from_numpy(data_grp['ref_scalars'][gene_idx]),
-        }
-
-        tfx = torch.tensor(float(data_grp['TFX_label'][gene_idx]), dtype=torch.float32)
-
-        if self.include_metadata:
-            features['sample_name'] = self._get_sample_name(store, zarr_path)
-            features['gene_name'] = self._get_gene_name(store, zarr_path, int(gene_idx))
-
-        if self.gene_weights is not None:
-            gname = self._get_gene_name(store, zarr_path, int(gene_idx))
-            gene_weight = torch.tensor(self.gene_weights.get(gname, 1.0), dtype=torch.float32)
-        elif 'gene_weight' in data_grp:
-            gene_weight = torch.tensor(float(data_grp['gene_weight'][gene_idx]), dtype=torch.float32)
-        else:
-            gene_weight = torch.tensor(1.0, dtype=torch.float32)
-
-        if self.labeled:
-            tumor_exp = torch.tensor(float(data_grp['tumor_exp'][gene_idx]), dtype=torch.float32)
-            background_exp = torch.tensor(float(data_grp['background_exp'][gene_idx]), dtype=torch.float32)
-            labels: Dict[str, torch.Tensor] = {
-                'tumor_exp': tumor_exp,
-                'background_exp': background_exp,
-                'sample_weight': gene_weight,
-                'TFX_label': tfx,
-            }
-        else:
-            labels = {'sample_weight': gene_weight, 'TFX_label': tfx}
-
-        return features, labels
+from proteus_utils.data_helpers import (
+    zarr_name_for_sample, zarr_path_for_sample,
+    resolve_pht_source, invert_source_groups, collect_pdx_names,
+    assign_source,
+)
 
 
 def _collate_identity(batch: List[Any]) -> Any:
@@ -266,41 +107,31 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
 
         with open(self.index_file, 'r') as f:
             loaded = json.load(f)
-        self.sample_paths = _normalize_fold_index_to_sample_paths(loaded)
+        if not isinstance(loaded, list):
+            raise ValueError('Fold index JSON must be a list of Zarr paths.')
+        # Deduplicate while preserving first-seen order.
+        seen: set[str] = set()
+        self.sample_paths: List[str] = []
+        for p in loaded:
+            s = str(p)
+            if s not in seen:
+                seen.add(s)
+                self.sample_paths.append(s)
 
-        # Precompute (and persist) a deterministic chunk schedule.
-        cache_path = f"{self.index_file}.chunksched_{self.chunk_size}_seed{self.seed}.json"
-        if os.path.exists(cache_path):
-            with open(cache_path, 'r') as f:
-                self._chunks: List[Tuple[str, int, int]] = [
-                    (str(p), int(s), int(e)) for (p, s, e) in json.load(f)
-                ]
-        else:
-            chunks: List[Tuple[str, int, int]] = []
-            for path in self.sample_paths:
-                store = zarr.open(path, mode='r')
-                n_genes = int(store['flat']['TSS_signals'].shape[0])
-                for start in range(0, n_genes, self.chunk_size):
-                    end = min(start + self.chunk_size, n_genes)
-                    chunks.append((str(path), int(start), int(end)))
-
-            rng = random.Random(self.seed)
-            rng.shuffle(chunks)
-            self._chunks = chunks
-            with open(cache_path, 'w') as f:
-                json.dump(self._chunks, f)
+        # Build chunk schedule (deterministic, cached to disk).
+        self._chunks = self._build_chunk_schedule(
+            self.index_file, self.sample_paths, self.chunk_size, self.seed,
+        )
 
         # Apply subsampling if requested (for fast sanity checks).
-        # This deterministically selects a fraction of chunks.
         if self.subsample_frac is not None and self.subsample_frac < 1.0:
             n_chunks = len(self._chunks)
             n_keep = max(1, int(n_chunks * self.subsample_frac))
-            rng = random.Random(self.seed + 999)  # Different seed for subsample selection
+            rng = random.Random(self.seed + 999)
             subsample_indices = sorted(rng.sample(range(n_chunks), n_keep))
             self._chunks = [self._chunks[i] for i in subsample_indices]
 
         # Gene-level train/val split at chunk granularity.
-        # Deterministic: same seed + val_frac → same partition.
         if self.val_frac is not None and self.val_frac > 0:
             n_chunks = len(self._chunks)
             n_val = max(1, int(n_chunks * self.val_frac))
@@ -311,85 +142,128 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
             else:
                 self._chunks = [c for i, c in enumerate(self._chunks) if i not in val_indices]
 
-        # Compute how many fixed-size microbatches we will yield.
         self._n_batches = self._count_batches(self._chunks)
+        self._balanced_n_batches = self._estimate_balanced_batches(
+            self._chunks, self.sample_paths, self.genes_per_batch,
+            self.source_map, self.target_n_per_source,
+            self.cohort_map, self.balance_cohorts,
+            self._n_batches,
+        )
 
-        # For balanced training, pre-compute a guaranteed upper-bound
-        # batch count.  With persistent_workers the main-process
-        # _balance_iter never advances, so __len__ can't predict
-        # exactly which epoch the workers will use.  Instead we take
-        # the maximum over all possible random subsets by selecting the
-        # n_min samples with the highest per-sample batch counts from
-        # each balanced cohort.  The bound is tight (within 1-2
-        # batches of the actual count) and prevents the PyTorch
-        # "more samples fetched than reported" warning.
-        if self.source_map and self.target_n_per_source:
-            from collections import defaultdict
+        # Per-worker caches (populated lazily).
+        self._store_cache: Dict[str, zarr.Group] = {}
+        self._flat_grp_cache: Dict[str, zarr.Group] = {}
+        self._gene_names_cache: Dict[str, List[str]] = {}
+        self._sample_name_cache: Dict[str, str] = {}
+
+    # ------------------------------------------------------------------
+    # Static helpers (extracted from __init__ for clarity)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_chunk_schedule(
+        index_file: str,
+        sample_paths: List[str],
+        chunk_size: int,
+        seed: int,
+    ) -> List[Tuple[str, int, int]]:
+        """Build (or load cached) deterministic chunk schedule."""
+        cache_path = f"{index_file}.chunksched_{chunk_size}_seed{seed}.json"
+        if os.path.exists(cache_path):
+            with open(cache_path, 'r') as f:
+                return [(str(p), int(s), int(e)) for (p, s, e) in json.load(f)]
+
+        chunks: List[Tuple[str, int, int]] = []
+        for path in sample_paths:
+            store = zarr.open(path, mode='r')
+            n_genes = int(store['flat']['TSS_signals'].shape[0])
+            for start in range(0, n_genes, chunk_size):
+                end = min(start + chunk_size, n_genes)
+                chunks.append((str(path), int(start), int(end)))
+
+        rng = random.Random(seed)
+        rng.shuffle(chunks)
+        with open(cache_path, 'w') as f:
+            json.dump(chunks, f)
+        return chunks
+
+    @staticmethod
+    def _estimate_balanced_batches(
+        chunks: List[Tuple[str, int, int]],
+        sample_paths: List[str],
+        genes_per_batch: int,
+        source_map: Optional[Dict[str, str]],
+        target_n_per_source: Optional[int],
+        cohort_map: Optional[Dict[str, str]],
+        balance_cohorts: Optional[List[str]],
+        fallback: int,
+    ) -> int:
+        """Upper-bound batch count for balanced training modes.
+
+        With persistent_workers the main-process balance counter never
+        advances, so __len__ can't predict the exact epoch size.  This
+        computes a tight upper bound by assuming the worst-case sample
+        selection (samples with the most batches).
+        """
+        from collections import defaultdict
+
+        if source_map and target_n_per_source:
             batches_per_sample: Dict[str, int] = {}
-            for path, start, end in self._chunks:
+            for path, start, end in chunks:
                 batches_per_sample[path] = (
                     batches_per_sample.get(path, 0)
-                    + (end - start) // self.genes_per_batch
+                    + (end - start) // genes_per_batch
                 )
-            source_paths_map: Dict[str, List[str]] = defaultdict(list)
-            for path in self.sample_paths:
-                src = self.source_map.get(path)
+            source_paths: Dict[str, List[str]] = defaultdict(list)
+            for path in sample_paths:
+                src = source_map.get(path)
                 if src is not None:
-                    source_paths_map[src].append(path)
-            max_balanced = 0
-            for src_name, paths in source_paths_map.items():
+                    source_paths[src].append(path)
+            total = 0
+            for paths in source_paths.values():
                 per_sample = sorted(
                     [batches_per_sample.get(p, 0) for p in paths],
                     reverse=True,
                 )
-                n_target = self.target_n_per_source
-                # Worst case: we pick the samples with highest batch counts
-                if len(per_sample) >= n_target:
-                    max_balanced += sum(per_sample[:n_target])
+                if len(per_sample) >= target_n_per_source:
+                    total += sum(per_sample[:target_n_per_source])
                 else:
-                    # Oversampling: each sample can appear multiple times
-                    full_copies = n_target // len(per_sample)
-                    remainder = n_target % len(per_sample)
-                    max_balanced += sum(per_sample) * full_copies + sum(per_sample[:remainder])
-            self._balanced_n_batches = max_balanced
-        elif self.cohort_map and self.balance_cohorts:
-            from collections import defaultdict
-            batches_per_sample: Dict[str, int] = {}
-            for path, start, end in self._chunks:
+                    full = target_n_per_source // len(per_sample)
+                    rem = target_n_per_source % len(per_sample)
+                    total += sum(per_sample) * full + sum(per_sample[:rem])
+            return total
+
+        if cohort_map and balance_cohorts:
+            batches_per_sample = {}
+            for path, start, end in chunks:
                 batches_per_sample[path] = (
                     batches_per_sample.get(path, 0)
-                    + (end - start) // self.genes_per_batch
+                    + (end - start) // genes_per_batch
                 )
-            cohort_paths_map: Dict[str, List[str]] = defaultdict(list)
-            for path in self.sample_paths:
-                coh = self.cohort_map.get(path)
+            cohort_paths: Dict[str, List[str]] = defaultdict(list)
+            for path in sample_paths:
+                coh = cohort_map.get(path)
                 if coh is not None:
-                    cohort_paths_map[coh].append(path)
-            balance_set = set(self.balance_cohorts)
+                    cohort_paths[coh].append(path)
+            balance_set = set(balance_cohorts)
             per_cohort_counts = {
-                c: len(cohort_paths_map[c])
-                for c in self.balance_cohorts if c in cohort_paths_map
+                c: len(cohort_paths[c])
+                for c in balance_cohorts if c in cohort_paths
             }
             n_min = min(per_cohort_counts.values()) if per_cohort_counts else 0
-            max_balanced = 0
-            for coh, paths in cohort_paths_map.items():
+            total = 0
+            for coh, paths in cohort_paths.items():
                 per_sample = sorted(
                     [batches_per_sample.get(p, 0) for p in paths],
                     reverse=True,
                 )
                 if coh in balance_set:
-                    max_balanced += sum(per_sample[:n_min])
+                    total += sum(per_sample[:n_min])
                 else:
-                    max_balanced += sum(per_sample)
-            self._balanced_n_batches = max_balanced
-        else:
-            self._balanced_n_batches = self._n_batches
+                    total += sum(per_sample)
+            return total
 
-        # These caches live per-process (per DataLoader worker).
-        self._store_cache: Dict[str, zarr.Group] = {}
-        self._flat_grp_cache: Dict[str, zarr.Group] = {}
-        self._gene_names_cache: Dict[str, List[str]] = {}
-        self._sample_name_cache: Dict[str, str] = {}
+        return fallback
 
     def _count_batches(self, chunks: List[Tuple[str, int, int]]) -> int:
         n_batches = 0
@@ -658,21 +532,20 @@ class ProteusInferenceDataset(Dataset):
 
 
 class ProteusMultiSourceBatchDataset(IterableDataset):
-    """Multi-source gene-conditioned batch loader.
+    """Multi-source gene-conditioned batch loader using a union gene universe.
 
-    Each batch contains ``genes_per_batch × n_sources × samples_per_source``
-    items, where different sources contribute observations of the same genes.
-    Default geometry: 2 genes × 4 sources × 4 samples/source = 32 items.
+    Uses the **union** of all source gene sets so that no data is discarded.
+    Each batch contains 32 items drawn from 2–3 unique genes with roughly
+    equal representation across available sources.
 
-    Gene sampling uses a mixture distribution:
-        P(gene_i) = frac × (var_i / Σvar) + (1 − frac) × (1/n)
-    where *frac* controls the variance-priority weight (default 0.70).
+    Gene iteration is a **uniform shuffle without replacement** over the full
+    union gene list, guaranteeing every gene is seen at least once per epoch.
 
-    Source balancing builds an exposure list of ``n_eff_per_source`` sample
-    slots per source per epoch.  Small sources are oversampled via
-    repeat-plus-shuffle to reach ``n_eff_per_source``.  The list is cycled
-    and reshuffled when exhausted so that every active sample sees a
-    statistically representative gene set.
+    For each gene in a batch, only sources that actually have that gene
+    contribute samples.  Slots are distributed roughly equally across
+    available sources, and within each source samples are drawn without
+    replacement from a cycling queue (reshuffled and restarted when
+    depleted), ensuring every sample is seen over 1–2 epochs.
 
     Loss weights per gene are compressed: ``sqrt(variance) / median_stdev``,
     clamped to ``[gene_weight_min, gene_weight_max]``.
@@ -680,8 +553,13 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
     All training samples are preloaded into RAM at init time to eliminate
     Zarr chunk-decompression overhead on the hot path.  TSS_signals are
     stored as float16 and TSS_nucleotides as uint8 to fit within typical
-    HPC node memory budgets (~114 GB for 144 samples × 18K genes).
+    HPC node memory budgets (~114 GB for 180 samples × 18K genes).
     DataLoader workers share the preloaded arrays via fork copy-on-write.
+
+    An optional ``val_mask`` (2-D bool array, shape [n_samples, n_union_genes])
+    can be provided for full-training holdout mode: marked pairs are skipped
+    during training iteration (drawn samples that hit a held-out pair are
+    replaced by the next available sample from the same source).
     """
 
     def __init__(
@@ -690,8 +568,7 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         gene_variance: Dict[str, float],
         n_eff_per_source: int = 24,
         genes_per_batch: int = 2,
-        samples_per_source: int = 4,
-        variance_sample_frac: float = 0.70,
+        batch_size: int = 32,
         gene_weight_min: float = 0.5,
         gene_weight_max: float = 2.0,
         seed: int = 42,
@@ -699,6 +576,7 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         sample_name_map: Optional[Dict[str, str]] = None,
         include_metadata: bool = False,
         subsample_frac: Optional[float] = None,
+        val_mask: Optional[np.ndarray] = None,
     ):
         super().__init__()
         self.sample_paths_by_source = dict(sample_paths_by_source)
@@ -706,60 +584,66 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         self.n_sources = len(self.source_names)
         self.n_eff_per_source = n_eff_per_source
         self.genes_per_batch = genes_per_batch
-        self.samples_per_source = samples_per_source
-        self.variance_sample_frac = variance_sample_frac
+        self.batch_size = batch_size
         self.gene_weight_min = gene_weight_min
         self.gene_weight_max = gene_weight_max
         self.seed = seed
         self.labeled = labeled
         self.sample_name_map = sample_name_map
         self.include_metadata = include_metadata
-        self.batch_size = genes_per_batch * self.n_sources * samples_per_source
         self._epoch_counter = 0
+        self.val_mask = val_mask  # shape [n_samples, n_union_genes] or None
 
-        # Build gene universe: intersection of all samples' gene sets.
+        # Build gene universe: union of all sources' gene sets.
         all_paths = [p for paths in self.sample_paths_by_source.values()
                      for p in paths]
         if not all_paths:
             raise ValueError("No sample paths provided to "
                              "ProteusMultiSourceBatchDataset")
 
-        gene_sets: List[set] = []
-        for zpath in all_paths:
-            store = zarr.open(zpath, mode='r')
-            names = [str(g) for g in store['gene_names'][:]]
-            gene_sets.append(set(names))
-        common = set.intersection(*gene_sets)
-        if not common:
-            raise ValueError("No common genes found across all samples")
-        self._common_genes: List[str] = sorted(common)
-        n_genes = len(self._common_genes)
+        # Discover per-source gene sets.  Samples within a source can have
+        # slightly different gene panels (genes with >50% NaN features are
+        # dropped per-sample at Zarr compilation time), so we union across
+        # all samples in each source.
+        source_gene_sets: Dict[str, set] = {}
+        for src in self.source_names:
+            genes: set = set()
+            for p in self.sample_paths_by_source[src]:
+                store = zarr.open(p, mode='r')
+                genes.update(str(g) for g in store['gene_names'][:])
+            source_gene_sets[src] = genes
 
-        # Preload all samples into RAM (eliminates Zarr chunk decompression
-        # from the hot path).  Must happen before workers are forked so they
-        # share the arrays via OS copy-on-write pages.
+        union_genes = sorted(set.union(*source_gene_sets.values()))
+        self._union_genes: List[str] = union_genes
+        n_genes = len(union_genes)
+        gene_to_idx = {g: i for i, g in enumerate(union_genes)}
+
+        # Per-source gene availability mask.
+        self._source_gene_mask: Dict[str, np.ndarray] = {}
+        for src in self.source_names:
+            mask = np.zeros(n_genes, dtype=np.bool_)
+            for g in source_gene_sets[src]:
+                mask[gene_to_idx[g]] = True
+            self._source_gene_mask[src] = mask
+
+        # Ordered list of all unique sample paths (for val_mask indexing).
+        self._all_sample_paths: List[str] = sorted(set(all_paths))
+        self._sample_path_to_idx: Dict[str, int] = {
+            p: i for i, p in enumerate(self._all_sample_paths)
+        }
+
+        # Preload all samples into RAM, reindexed to union gene order.
+        # Genes missing from a source get zeros (never accessed at runtime
+        # because source_gene_mask prevents drawing them).
         self._preloaded: Dict[str, Dict[str, np.ndarray]] = {}
-        self._preload_all_samples(all_paths)
+        self._preload_all_samples(all_paths, source_gene_sets, gene_to_idx)
 
-        # Gene sampling distribution (mixture of variance-priority + uniform).
+        # Per-gene loss weights: sqrt(variance) / median(stdev), clamped.
         variance_arr = np.array(
-            [gene_variance.get(g, 0.0) for g in self._common_genes],
+            [gene_variance.get(g, 0.0) for g in union_genes],
             dtype=np.float64,
         )
         variance_arr = np.maximum(variance_arr, 0.0)
-        sum_var = variance_arr.sum()
-        if sum_var > 0:
-            var_probs = variance_arr / sum_var
-        else:
-            var_probs = np.ones(n_genes, dtype=np.float64) / n_genes
-        uniform_probs = np.ones(n_genes, dtype=np.float64) / n_genes
-        self._gene_probs = (
-            self.variance_sample_frac * var_probs
-            + (1.0 - self.variance_sample_frac) * uniform_probs
-        )
-        self._gene_probs /= self._gene_probs.sum()
-
-        # Per-gene loss weights: sqrt(variance) / median(stdev), clamped.
         stdevs = np.sqrt(variance_arr)
         positive_stdevs = stdevs[stdevs > 0]
         median_std = float(np.median(positive_stdevs)) if len(positive_stdevs) > 0 else 1.0
@@ -770,18 +654,20 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
             raw_weights, gene_weight_min, gene_weight_max,
         ).astype(np.float32)
 
-        # Epoch length: each of n_eff samples per source sees ~all genes once.
-        slots_per_source_per_batch = self.genes_per_batch * self.samples_per_source
-        total_source_slots = self.n_eff_per_source * n_genes
-        self._n_batches = max(1, total_source_slots // slots_per_source_per_batch)
+        # Epoch length: every gene seen by n_eff_total samples per epoch.
+        # n_eff_total = n_sources × n_eff_per_source effective sample draws.
+        # Each batch holds batch_size items, so total batches = n_eff_total × n_genes / batch_size.
+        items_per_gene = self.batch_size // self.genes_per_batch
+        n_eff_total = self.n_eff_per_source * self.n_sources
+        self._n_batches = max(1, (n_eff_total * n_genes) // self.batch_size)
 
         if subsample_frac is not None and 0.0 < subsample_frac < 1.0:
             self._n_batches = max(1, int(self._n_batches * subsample_frac))
 
-        print(f"  [MultiSource] {n_genes} common genes, "
+        print(f"  [MultiSource] {n_genes} union genes, "
               f"{self.n_sources} sources × {self.n_eff_per_source} eff/source, "
               f"batch={self.batch_size} ({self.genes_per_batch}g × "
-              f"{self.n_sources}s × {self.samples_per_source}sps), "
+              f"{items_per_gene}sps), "
               f"{self._n_batches} batches/epoch")
 
     def __len__(self) -> int:
@@ -789,51 +675,76 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
 
     # -- RAM preloading --
 
-    def _preload_all_samples(self, all_paths: List[str]) -> None:
-        """Preload all training samples' common-gene arrays into RAM.
+    def _preload_all_samples(
+        self,
+        all_paths: List[str],
+        source_gene_sets: Dict[str, set],
+        gene_to_idx: Dict[str, int],
+    ) -> None:
+        """Preload all training samples' arrays into RAM, reindexed to the
+        union gene order.
 
-        Each sample's arrays are reindexed to common-gene canonical order
-        so that ``__iter__`` can use a direct integer index into the
-        preloaded arrays without per-sample gene name → index lookup.
-
-        Compact dtypes minimise memory footprint:
-        - TSS_signals: float16 (~648 MB / sample for 18K genes)
-        - TSS_nucleotides: uint8 (~144 MB / sample)
-        - All other arrays: float32 (negligible)
-
-        Decompression is parallelised across threads (zstd releases the
-        GIL) to keep init time short (~30-60 s for 144 samples).
+        Genes that a source does not have are filled with zeros in the
+        preloaded arrays — they are never accessed at runtime because
+        ``_source_gene_mask`` prevents drawing those (source, gene) pairs.
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        common_gene_set = set(self._common_genes)
-        n_common = len(self._common_genes)
-        common_gene_order = {g: i for i, g in enumerate(self._common_genes)}
+        n_union = len(self._union_genes)
+
+        # Invert: zarr_path → source name (for determining which genes exist).
+        path_to_source: Dict[str, str] = {}
+        for src, paths in self.sample_paths_by_source.items():
+            for p in paths:
+                path_to_source[p] = src
 
         def _load_one(zarr_path: str) -> tuple:
             store = zarr.open(zarr_path, mode='r')
             gene_names = [str(g) for g in store['gene_names'][:]]
-
-            # Build index array: position i in common_genes → local index.
-            local_indices = np.empty(n_common, dtype=np.intp)
-            gene_to_local = {g: i for i, g in enumerate(gene_names)}
-            for g, common_pos in common_gene_order.items():
-                local_indices[common_pos] = gene_to_local[g]
-
+            n_local = len(gene_names)
             flat = store['flat']
 
-            # Read full arrays and reindex to common gene order.
-            signals = flat['TSS_signals'][:][local_indices].astype(np.float16)
-            nucleotides = flat['TSS_nucleotides'][:][local_indices]  # uint8
-            tss_features = flat['TSS_features'][:][local_indices].astype(np.float32)
-            gb_features = flat['GB_features'][:][local_indices].astype(np.float32)
-            ref_scalars = flat['ref_scalars'][:][local_indices].astype(np.float32)
-            tumor_exp = flat['tumor_exp'][:][local_indices].astype(np.float32)
-            bg_exp = flat['background_exp'][:][local_indices].astype(np.float32)
-            tfx_label = flat['TFX_label'][:][local_indices].astype(np.float32)
+            # Build reindex map: for each local gene, where does it go
+            # in the union array.
+            local_to_union = np.array(
+                [gene_to_idx[g] for g in gene_names], dtype=np.intp,
+            )
 
-            # Resolve sample display name at load time (avoids keeping
-            # Zarr stores open after init).
+            # Read full local arrays, then scatter into union-sized arrays.
+            local_signals = flat['TSS_signals'][:].astype(np.float16)
+            local_nt = flat['TSS_nucleotides'][:]  # uint8
+            local_tss = flat['TSS_features'][:].astype(np.float32)
+            local_gb = flat['GB_features'][:].astype(np.float32)
+            local_ref = flat['ref_scalars'][:].astype(np.float32)
+            local_tumor = flat['tumor_exp'][:].astype(np.float32)
+            local_bg = flat['background_exp'][:].astype(np.float32)
+            local_tfx = flat['TFX_label'][:].astype(np.float32)
+
+            # Allocate union-sized arrays (zeros for missing genes).
+            sig_shape = (n_union,) + local_signals.shape[1:]
+            signals = np.zeros(sig_shape, dtype=np.float16)
+            nt_shape = (n_union,) + local_nt.shape[1:]
+            nucleotides = np.zeros(nt_shape, dtype=local_nt.dtype)
+            tss_shape = (n_union,) + local_tss.shape[1:]
+            tss_features = np.zeros(tss_shape, dtype=np.float32)
+            gb_shape = (n_union,) + local_gb.shape[1:]
+            gb_features = np.zeros(gb_shape, dtype=np.float32)
+            ref_shape = (n_union,) + local_ref.shape[1:]
+            ref_scalars = np.zeros(ref_shape, dtype=np.float32)
+            tumor_exp = np.zeros(n_union, dtype=np.float32)
+            bg_exp = np.zeros(n_union, dtype=np.float32)
+            tfx_label = np.zeros(n_union, dtype=np.float32)
+
+            signals[local_to_union] = local_signals
+            nucleotides[local_to_union] = local_nt
+            tss_features[local_to_union] = local_tss
+            gb_features[local_to_union] = local_gb
+            ref_scalars[local_to_union] = local_ref
+            tumor_exp[local_to_union] = local_tumor
+            bg_exp[local_to_union] = local_bg
+            tfx_label[local_to_union] = local_tfx
+
+            # Resolve sample display name.
             if isinstance(self.sample_name_map, dict) and zarr_path in self.sample_name_map:
                 sample_display = self.sample_name_map[zarr_path]
             else:
@@ -856,21 +767,19 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         unique_paths = sorted(set(all_paths))
         n_samples = len(unique_paths)
 
-        # Estimate memory requirement.
+        # Estimate memory (conservative upper bound).
         per_sample_mb = (
-            n_common * 2000 * 9 * 2     # TSS_signals float16
-            + n_common * 2000 * 4 * 1   # TSS_nucleotides uint8
-            + n_common * (11 + 11 + 3 + 1 + 1 + 1) * 4  # small float32
+            n_union * 2000 * 9 * 2     # TSS_signals float16
+            + n_union * 2000 * 4 * 1   # TSS_nucleotides uint8
+            + n_union * (11 + 11 + 3 + 1 + 1 + 1) * 4  # small float32
         ) / (1024 ** 2)
         total_gb = per_sample_mb * n_samples / 1024
         print(f"  [MultiSource] Preloading {n_samples} samples "
-              f"({n_common} common genes) into RAM — "
+              f"({n_union} union genes) into RAM — "
               f"estimated {total_gb:.1f} GB...")
 
         self._sample_display_names: Dict[str, str] = {}
 
-        # Use 4 threads: limits transient peak memory (~5 GB) while still
-        # saturating zstd decompression throughput.
         max_threads = min(4, n_samples)
         with ThreadPoolExecutor(max_workers=max_threads) as executor:
             futures = {executor.submit(_load_one, p): p for p in unique_paths}
@@ -891,25 +800,35 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
             Path(zarr_path).stem.replace('.zarr', ''),
         )
 
-    # -- Exposure list management --
+    # -- Per-source cycling queues --
 
-    def _build_exposure_lists(
+    def _build_source_queues(
         self, rng: random.Random,
     ) -> Dict[str, List[str]]:
-        exposure: Dict[str, List[str]] = {}
+        """Build per-source sample queues for without-replacement cycling.
+
+        Large sources are shuffled as-is.  Small sources (fewer samples
+        than n_eff_per_source) are repeated enough times to cover n_eff
+        slots, then shuffled — so every real sample appears at least once
+        before any repeats.
+        """
+        queues: Dict[str, List[str]] = {}
         for src in self.source_names:
-            paths = self.sample_paths_by_source[src]
+            paths = list(self.sample_paths_by_source[src])
             n_avail = len(paths)
             n_eff = self.n_eff_per_source
             if n_avail >= n_eff:
-                chosen = rng.sample(paths, n_eff)
+                # Undersample: shuffle and draw without replacement.
+                rng.shuffle(paths)
+                queues[src] = paths
             else:
+                # Oversample: repeat to reach n_eff, then shuffle.
                 full_copies = n_eff // n_avail
                 remainder = n_eff % n_avail
-                chosen = paths * full_copies + rng.sample(paths, remainder)
-            rng.shuffle(chosen)
-            exposure[src] = chosen
-        return exposure
+                expanded = paths * full_copies + rng.sample(paths, remainder)
+                rng.shuffle(expanded)
+                queues[src] = expanded
+        return queues
 
     # -- Core iteration --
 
@@ -925,11 +844,15 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         self._epoch_counter += 1
         epoch_seed = self.seed + self._epoch_counter * 997 + worker_id * 31
         rng = random.Random(epoch_seed)
-        np_rng = np.random.RandomState(epoch_seed % (2**31))
 
-        # Build initial exposure lists and position cursors.
-        exposure = self._build_exposure_lists(rng)
+        # Build per-source cycling queues and position cursors.
+        queues = self._build_source_queues(rng)
         positions: Dict[str, int] = {src: 0 for src in self.source_names}
+
+        # Uniform shuffle of all genes (without replacement → full coverage).
+        n_genes = len(self._union_genes)
+        gene_order = list(range(n_genes))
+        rng.shuffle(gene_order)
 
         # Divide batches across workers.
         total_batches = self._n_batches
@@ -937,18 +860,23 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         if worker_id < (total_batches % num_workers):
             worker_batches += 1
 
-        n_genes = len(self._common_genes)
-        sps = self.samples_per_source
+        # Gene cursor: consume genes_per_batch genes per batch from the
+        # shuffled order, wrapping around if needed.
+        gene_cursor = worker_id * self.genes_per_batch  # offset by worker
+
+        items_per_gene = self.batch_size // self.genes_per_batch
 
         for _batch_idx in range(worker_batches):
-            # Sample genes from mixture distribution (without replacement
-            # within a single batch to maximise gene diversity).
-            gene_indices = np_rng.choice(
-                n_genes, size=self.genes_per_batch,
-                replace=False, p=self._gene_probs,
-            )
+            # Take next genes_per_batch genes from the shuffled order.
+            batch_gene_indices = []
+            for _ in range(self.genes_per_batch):
+                if gene_cursor >= n_genes:
+                    rng.shuffle(gene_order)
+                    gene_cursor = 0
+                batch_gene_indices.append(gene_order[gene_cursor])
+                gene_cursor += self.genes_per_batch * num_workers
+                # If that jumps past the end, wrap later at the top of loop.
 
-            # Collect items: genes_per_batch × n_sources × sps.
             feat_signals = []
             feat_nt = []
             feat_tss = []
@@ -961,23 +889,61 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
             meta_samples: List[str] = []
             meta_genes: List[str] = []
 
-            for g_idx in gene_indices:
-                gene_name = self._common_genes[g_idx]
+            for g_idx in batch_gene_indices:
+                gene_name = self._union_genes[g_idx]
                 gene_weight = float(self._gene_loss_weights[g_idx])
 
-                for src in self.source_names:
-                    for _ in range(sps):
+                # Determine which sources have this gene.
+                available_sources = [
+                    src for src in self.source_names
+                    if self._source_gene_mask[src][g_idx]
+                ]
+                if not available_sources:
+                    continue  # gene not in any source (shouldn't happen)
+
+                # Distribute items_per_gene slots roughly equally.
+                n_avail_src = len(available_sources)
+                base_per_src = items_per_gene // n_avail_src
+                remainder = items_per_gene % n_avail_src
+                # Rotate remainder assignment to avoid always favoring
+                # the same sources.
+                src_counts = {}
+                for si, src in enumerate(available_sources):
+                    src_counts[src] = base_per_src + (1 if si < remainder else 0)
+
+                for src, n_draws in src_counts.items():
+                    for _ in range(n_draws):
+                        # Draw next sample from this source's queue.
                         pos = positions[src]
-                        if pos >= len(exposure[src]):
-                            rng.shuffle(exposure[src])
+                        if pos >= len(queues[src]):
+                            rng.shuffle(queues[src])
                             pos = 0
-                        zarr_path = exposure[src][pos]
+                        zarr_path = queues[src][pos]
                         positions[src] = pos + 1
+
+                        # Skip held-out (sample, gene) pairs if val_mask
+                        # is active (full-training mode).
+                        if self.val_mask is not None:
+                            s_idx = self._sample_path_to_idx[zarr_path]
+                            if self.val_mask[s_idx, g_idx]:
+                                # Try next sample from same source.
+                                found = False
+                                for _retry in range(len(queues[src])):
+                                    pos2 = positions[src]
+                                    if pos2 >= len(queues[src]):
+                                        rng.shuffle(queues[src])
+                                        pos2 = 0
+                                    zarr_path = queues[src][pos2]
+                                    positions[src] = pos2 + 1
+                                    s_idx = self._sample_path_to_idx[zarr_path]
+                                    if not self.val_mask[s_idx, g_idx]:
+                                        found = True
+                                        break
+                                if not found:
+                                    continue  # all samples held out for this gene+source
 
                         sd = self._preloaded[zarr_path]
 
-                        # Preloaded arrays are in common-gene order,
-                        # so g_idx indexes directly (no name lookup).
                         feat_signals.append(
                             torch.from_numpy(
                                 sd['TSS_signals'][g_idx].astype(np.float32)))
@@ -1003,6 +969,10 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                             meta_samples.append(
                                 self._get_sample_name(zarr_path))
                             meta_genes.append(gene_name)
+
+            # If val_mask filtering removed all items, skip this batch.
+            if not feat_signals:
+                continue
 
             # Stack into batch tensors.
             features: Dict[str, Any] = {
@@ -1037,37 +1007,128 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
             yield features, labels
 
 
-def collate_proteus_genes(batch: List[Tuple[Dict, Dict]]) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """Collate gene-level items (each item is one gene)."""
-    features_list, labels_list = zip(*batch)
+class ProteusHoldoutValDataset(IterableDataset):
+    """Validation dataset for full-training holdout mode.
 
-    batched_features = {
-        'TSS_signals': torch.stack([f['TSS_signals'] for f in features_list]),
-        'TSS_nucleotides': torch.stack([f['TSS_nucleotides'] for f in features_list]),
-        'TSS_features': torch.stack([f['TSS_features'] for f in features_list]),
-        'GB_features': torch.stack([f['GB_features'] for f in features_list]),
-        'ref_scalars': torch.stack([f['ref_scalars'] for f in features_list]),
-    }
+    Iterates over all held-out (sample, gene) pairs from a preloaded
+    ``ProteusMultiSourceBatchDataset``, yielding fixed-size batches of 32
+    with sample/gene metadata for per-cohort/source metrics.
 
-    if features_list and 'sample_name' in features_list[0]:
-        batched_features['sample_name'] = [str(f['sample_name']) for f in features_list]
-    if features_list and 'gene_name' in features_list[0]:
-        batched_features['gene_name'] = [str(f['gene_name']) for f in features_list]
+    Shares the preloaded arrays from the training dataset (no extra RAM).
+    """
 
-    if labels_list and 'tumor_exp' in labels_list[0]:
-        batched_labels = {
-            'tumor_exp': torch.stack([l['tumor_exp'] for l in labels_list]).unsqueeze(-1),
-            'background_exp': torch.stack([l['background_exp'] for l in labels_list]).unsqueeze(-1),
-            'sample_weight': torch.stack([l.get('sample_weight', torch.tensor(1.0)) for l in labels_list]).unsqueeze(-1),
-            'TFX_label': torch.stack([l['TFX_label'] for l in labels_list]).unsqueeze(-1),
-        }
-    else:
-        batched_labels = {
-            'sample_weight': torch.stack([l.get('sample_weight', torch.tensor(1.0)) for l in labels_list]).unsqueeze(-1),
-            'TFX_label': torch.stack([l['TFX_label'] for l in labels_list]).unsqueeze(-1),
-        }
+    def __init__(
+        self,
+        train_dataset: 'ProteusMultiSourceBatchDataset',
+        val_mask: np.ndarray,
+        batch_size: int = 32,
+        seed: int = 42,
+    ):
+        super().__init__()
+        self._train_ds = train_dataset
+        self.val_mask = val_mask
+        self.batch_size = batch_size
+        self.seed = seed
 
-    return batched_features, batched_labels
+        # Pre-compute all (sample_idx, gene_idx) val pairs.
+        sample_indices, gene_indices = np.where(val_mask)
+        self._val_pairs = list(zip(sample_indices.tolist(), gene_indices.tolist()))
+        self._n_batches = max(1, len(self._val_pairs) // self.batch_size)
+
+        print(f"  [HoldoutVal] {len(self._val_pairs)} held-out pairs, "
+              f"{self._n_batches} batches of {self.batch_size}")
+
+    def __len__(self) -> int:
+        return self._n_batches
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            worker_id = 0
+            num_workers = 1
+        else:
+            worker_id = int(worker_info.id)
+            num_workers = int(worker_info.num_workers)
+
+        ds = self._train_ds
+        all_paths = ds._all_sample_paths
+        union_genes = ds._union_genes
+        preloaded = ds._preloaded
+
+        # Deterministic shuffle of val pairs.
+        rng = random.Random(self.seed + 555)
+        pairs = list(self._val_pairs)
+        rng.shuffle(pairs)
+
+        # Shard across workers.
+        worker_pairs = pairs[worker_id::num_workers]
+
+        # Yield fixed-size batches.
+        buf_signals = []
+        buf_nt = []
+        buf_tss = []
+        buf_gb = []
+        buf_ref = []
+        buf_tumor = []
+        buf_bg = []
+        buf_weight = []
+        buf_tfx = []
+        buf_samples: List[str] = []
+        buf_genes: List[str] = []
+
+        for s_idx, g_idx in worker_pairs:
+            zarr_path = all_paths[s_idx]
+            sd = preloaded[zarr_path]
+            gene_name = union_genes[g_idx]
+            gene_weight = float(ds._gene_loss_weights[g_idx])
+
+            buf_signals.append(torch.from_numpy(
+                sd['TSS_signals'][g_idx].astype(np.float32)))
+            buf_nt.append(torch.from_numpy(
+                sd['TSS_nucleotides'][g_idx].astype(np.float32)))
+            buf_tss.append(torch.from_numpy(sd['TSS_features'][g_idx]))
+            buf_gb.append(torch.from_numpy(sd['GB_features'][g_idx]))
+            buf_ref.append(torch.from_numpy(sd['ref_scalars'][g_idx]))
+            buf_tfx.append(float(sd['TFX_label'][g_idx]))
+            buf_weight.append(gene_weight)
+            buf_tumor.append(float(sd['tumor_exp'][g_idx]))
+            buf_bg.append(float(sd['background_exp'][g_idx]))
+            buf_samples.append(ds._get_sample_name(zarr_path))
+            buf_genes.append(gene_name)
+
+            if len(buf_signals) == self.batch_size:
+                features: Dict[str, Any] = {
+                    'TSS_signals': torch.stack(buf_signals),
+                    'TSS_nucleotides': torch.stack(buf_nt),
+                    'TSS_features': torch.stack(buf_tss),
+                    'GB_features': torch.stack(buf_gb),
+                    'ref_scalars': torch.stack(buf_ref),
+                    'sample_name': list(buf_samples),
+                    'gene_name': list(buf_genes),
+                }
+                labels: Dict[str, torch.Tensor] = {
+                    'tumor_exp': torch.tensor(
+                        buf_tumor, dtype=torch.float32).unsqueeze(-1),
+                    'background_exp': torch.tensor(
+                        buf_bg, dtype=torch.float32).unsqueeze(-1),
+                    'sample_weight': torch.tensor(
+                        buf_weight, dtype=torch.float32).unsqueeze(-1),
+                    'TFX_label': torch.tensor(
+                        buf_tfx, dtype=torch.float32).unsqueeze(-1),
+                }
+                yield features, labels
+
+                buf_signals.clear()
+                buf_nt.clear()
+                buf_tss.clear()
+                buf_gb.clear()
+                buf_ref.clear()
+                buf_tumor.clear()
+                buf_bg.clear()
+                buf_weight.clear()
+                buf_tfx.clear()
+                buf_samples.clear()
+                buf_genes.clear()
 
 
 def collate_inference(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -1081,21 +1142,94 @@ def collate_inference(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     }
 
 
+# ==============================================================================
+# Splits TSV Parsing
+# ==============================================================================
+
+def _parse_splits_tsv(
+    training_set_tsv: str,
+    zarr_base: str,
+    val_fold: int,
+    train_only_cohorts: Optional[List[str]] = None,
+) -> Tuple[List[str], List[str], Dict[str, str], Dict[str, str]]:
+    """Parse a Cohort/Sample/Fold TSV and partition into train/val Zarr paths.
+
+    Args:
+        training_set_tsv: Path to TSV with Cohort/Sample/Fold columns.
+        zarr_base: Base directory for Zarr stores.
+        val_fold: Which fold to hold out for validation.
+        train_only_cohorts: Cohorts always routed to training.
+
+    Returns:
+        (train_paths, val_paths, zarr_path_to_cohort, zarr_path_to_sample_name)
+
+    Raises:
+        FileNotFoundError: If TSV or any Zarr store is missing.
+        ValueError: If TSV format is invalid or partitions are empty.
+    """
+    import csv
+
+    if not os.path.exists(training_set_tsv):
+        raise FileNotFoundError(f"Training set TSV not found: {training_set_tsv}")
+
+    train_paths: List[str] = []
+    val_paths: List[str] = []
+    missing_samples: List[str] = []
+    zarr_path_to_cohort: Dict[str, str] = {}
+    zarr_path_to_sample_name: Dict[str, str] = {}
+    _train_only = set(train_only_cohorts or [])
+
+    with open(training_set_tsv, 'r', newline='') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        required = {'Cohort', 'Sample', 'Fold'}
+        if reader.fieldnames is None or not required.issubset(set(reader.fieldnames)):
+            raise ValueError(
+                f"TSV must have columns: {sorted(required)}. "
+                f"Found: {reader.fieldnames}"
+            )
+        for row in reader:
+            cohort = row['Cohort'].strip()
+            sample = row['Sample'].strip()
+            fold = int(row['Fold'])
+
+            zpath = zarr_path_for_sample(sample, cohort, zarr_base)
+            if not os.path.isdir(zpath):
+                bare = zarr_name_for_sample(sample, cohort)
+                missing_samples.append(
+                    f"  {cohort}/zarr_files/{bare}.zarr  "
+                    f"(Fold={fold}, TSV sample={sample})")
+                continue
+
+            zarr_path_to_cohort[zpath] = cohort
+            zarr_path_to_sample_name[zpath] = sample
+
+            if cohort in _train_only:
+                train_paths.append(zpath)
+            elif fold == val_fold:
+                val_paths.append(zpath)
+            else:
+                train_paths.append(zpath)
+
+    if missing_samples:
+        raise FileNotFoundError(
+            f"Missing {len(missing_samples)} Zarr store(s) under {zarr_base}:\n"
+            + "\n".join(missing_samples))
+    if not train_paths:
+        raise ValueError(f"No training samples found (all in fold {val_fold}?)")
+    if not val_paths:
+        raise ValueError(f"No validation samples found for fold {val_fold}")
+
+    return train_paths, val_paths, zarr_path_to_cohort, zarr_path_to_sample_name
+
+
 def create_data_loader(
-    index_file: Optional[str] = None,
-    zarr_paths: Optional[List[str]] = None,
+    index_file: str,
     num_workers: int = 4,
-    shuffle: bool = True,
     labeled: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
-    loader_mode: str = 'gene',
-    chunk_size: int = 256,
-    genes_per_batch: int = 32,
-    shuffle_genes_in_batch: bool = True,
     seed: int = 42,
     include_metadata: bool = False,
-    drop_last: bool = False,
     subsample_frac: Optional[float] = None,
     gene_weights: Optional[Dict[str, float]] = None,
     val_frac: Optional[float] = None,
@@ -1106,33 +1240,33 @@ def create_data_loader(
     target_n_per_source: Optional[int] = None,
     sample_name_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[DataLoader, int]:
-    """
-    Create a DataLoader for Proteus training/validation.
-    
+    """Create a chunk-based DataLoader for Proteus training/validation.
+
+    Uses fixed invariants: chunk_size=256, genes_per_batch=32.
+
     Args:
-        index_file: Path to fold index JSON file
-        zarr_paths: List of Zarr store paths (alternative)
-        num_workers: Number of data loading workers
-        shuffle: Whether to shuffle data
-        labeled: Whether dataset has labels
-        persistent_workers: Keep workers alive between epochs
-        prefetch_factor: Number of batches to prefetch per worker
+        index_file: Path to fold index JSON (list of Zarr paths).
+        num_workers: Number of data loading workers.
+        labeled: Whether dataset has labels.
+        persistent_workers: Keep workers alive between epochs.
+        prefetch_factor: Number of batches to prefetch per worker.
+        seed: Random seed for reproducibility.
+        include_metadata: Include sample/gene metadata in each batch.
         subsample_frac: Optional fraction (0.0-1.0) of genes for fast sanity checks.
-        
+        gene_weights: Per-gene variance weights for loss scaling.
+        val_frac: Fraction of chunks to reserve for validation.
+        val_split: If True, yield only val chunks; if False, yield only train chunks.
+        cohort_map: zarr_path → cohort name (for cohort balancing).
+        balance_cohorts: Cohort names to balance by undersampling.
+        source_map: zarr_path → source group name (for source balancing).
+        target_n_per_source: Target samples per source per epoch.
+        sample_name_map: zarr_path → display name (TSV sample name).
+
     Returns:
-        DataLoader and number of batches
+        (DataLoader, n_batches)
     """
-    mode = str(loader_mode).lower()
-
-    # Invariant: a "batch" is always exactly 32 genes.
-    if int(genes_per_batch) != 32:
-        raise ValueError(f"genes_per_batch must be 32 (invariant). Got {genes_per_batch}.")
-    if int(chunk_size) != 256:
-        raise ValueError(f"chunk_size must be 256 (invariant). Got {chunk_size}.")
-
-    base_seed = int(seed)
     base_generator = torch.Generator()
-    base_generator.manual_seed(base_seed)
+    base_generator.manual_seed(int(seed))
 
     def _seed_worker(worker_id: int) -> None:
         worker_seed = torch.initial_seed() % (2**32)
@@ -1140,71 +1274,38 @@ def create_data_loader(
         np.random.seed(worker_seed)
         torch.manual_seed(worker_seed)
 
-    if mode == 'chunk':
-        if index_file is None:
-            raise ValueError('Chunk loader requires index_file (v5 sample-path list).')
+    dataset = ProteusGeneChunkIterableDataset(
+        index_file=index_file,
+        seed=seed,
+        labeled=labeled,
+        cache_stores=True,
+        include_metadata=include_metadata,
+        subsample_frac=subsample_frac,
+        gene_weights=gene_weights,
+        val_frac=val_frac,
+        val_split=val_split,
+        cohort_map=cohort_map,
+        balance_cohorts=balance_cohorts,
+        source_map=source_map,
+        target_n_per_source=target_n_per_source,
+        sample_name_map=sample_name_map,
+    )
 
-        dataset = ProteusGeneChunkIterableDataset(
-            index_file=index_file,
-            chunk_size=chunk_size,
-            genes_per_batch=genes_per_batch,
-            seed=seed,
-            labeled=labeled,
-            cache_stores=True,
-            include_metadata=include_metadata,
-            subsample_frac=subsample_frac,
-            gene_weights=gene_weights,
-            val_frac=val_frac,
-            val_split=val_split,
-            cohort_map=cohort_map,
-            balance_cohorts=balance_cohorts,
-            source_map=source_map,
-            target_n_per_source=target_n_per_source,
-            sample_name_map=sample_name_map,
-        )
+    loader = DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=_collate_identity,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        worker_init_fn=_seed_worker if num_workers > 0 else None,
+        generator=base_generator,
+        drop_last=False,
+        pin_memory=True,
+    )
 
-        # IterableDataset already yields fixed-size training batches.
-        loader = DataLoader(
-            dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=num_workers,
-            collate_fn=_collate_identity,
-            persistent_workers=persistent_workers and num_workers > 0,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            worker_init_fn=_seed_worker if num_workers > 0 else None,
-            generator=base_generator,
-            drop_last=False,
-            pin_memory=True,
-        )
-    else:
-        # Default: per-gene items
-        dataset = ProteusGeneDataset(
-            index_file=index_file,
-            zarr_paths=zarr_paths,
-            labeled=labeled,
-            cache_stores=True,
-            include_metadata=include_metadata,
-            gene_weights=gene_weights,
-        )
-
-        loader = DataLoader(
-            dataset,
-            batch_size=32,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            collate_fn=collate_proteus_genes,
-            persistent_workers=persistent_workers and num_workers > 0,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            worker_init_fn=_seed_worker if num_workers > 0 else None,
-            generator=base_generator,
-            drop_last=bool(drop_last),
-            pin_memory=True,
-        )
-
-    n_batches = len(dataset) if mode == 'chunk' else len(loader)
-    
-    return loader, n_batches
+    return loader, len(dataset)
 
 
 def create_inference_loader(
@@ -1240,10 +1341,6 @@ def build_loaders_from_splits(
     zarr_base: str,
     val_fold: int,
     num_workers: int = 4,
-    loader_mode: str = 'chunk',
-    chunk_size: int = 256,
-    genes_per_batch: int = 32,
-    shuffle_genes_in_batch: bool = True,
     persistent_workers: bool = True,
     prefetch_factor: int = 4,
     seed: int = 42,
@@ -1257,39 +1354,25 @@ def build_loaders_from_splits(
     """Build train/val DataLoaders from a deterministic splits TSV file.
 
     The TSV must have columns: Cohort, Sample, Fold (tab-separated, with header).
-    This function reads the TSV, constructs Zarr paths as:
-        {zarr_base}/{cohort}/{sample}.zarr
-    and builds loaders where training = all folds except val_fold.
+    Zarr paths are constructed as ``{zarr_base}/{cohort}/zarr_files/{sample}.zarr``.
+    Training uses all folds except ``val_fold``.
 
     Args:
         training_set_tsv: Path to TSV with Cohort/Sample/Fold columns.
         zarr_base: Base directory containing cohort subdirs with sample.zarr stores.
         val_fold: Which fold to hold out for validation.
         num_workers: DataLoader workers.
-        loader_mode: 'chunk' (recommended) or 'gene'.
-        chunk_size: Genes per chunk (256 invariant).
-        genes_per_batch: Genes per batch (32 invariant).
-        shuffle_genes_in_batch: Shuffle genes within batch.
         persistent_workers: Keep workers alive between epochs.
         prefetch_factor: Batches to prefetch per worker.
         seed: Random seed for reproducibility.
         subsample_frac: Optional fraction (0.0-1.0) of genes to use per epoch.
-                        Useful for fast sanity checks. None = use all genes.
+        gene_weights: Per-gene variance weights for loss scaling.
         train_only_cohorts: Cohorts that always go to training (never
                             validation), regardless of fold assignment.
-                            E.g. ``['PHT']`` for PDX admixtures.
-        balance_cohorts: Cohorts to balance by per-epoch undersampling
-                         of the majority cohort(s) to the minority count.
-                         E.g. ``['CRPC-RA', 'SCLC']``.  Cohorts not
-                         listed are always included at full count.
-        source_groups: Source-level batch balancing.  Maps source name to
-                       list of cohort names.  PHT samples are automatically
-                       assigned to the source whose PDX cohort they derive
-                       from (parsed from the embedded PDX name in the
-                       sample name: ``PHT-Fold-X_<PDX_NAME>-BP...``).
+        balance_cohorts: Cohorts to balance by per-epoch undersampling.
+        source_groups: Source-level batch balancing (maps source → cohort list).
                        Mutually exclusive with ``balance_cohorts``.
         target_n_per_source: Target samples per source group per epoch.
-                             Only used when ``source_groups`` is set.
 
     Returns:
         (train_loader, val_loader, train_steps, val_steps)
@@ -1298,125 +1381,30 @@ def build_loaders_from_splits(
         FileNotFoundError: If training_set_tsv or any Zarr store doesn't exist.
         ValueError: If TSV format is invalid.
     """
-    import csv
-
-    if not os.path.exists(training_set_tsv):
-        raise FileNotFoundError(f"Training set TSV not found: {training_set_tsv}")
-
-    train_paths: List[str] = []
-    val_paths: List[str] = []
-    missing_samples: List[str] = []
-    zarr_path_to_cohort: Dict[str, str] = {}       # for cohort balancing
-    zarr_path_to_sample_name: Dict[str, str] = {}  # zarr_path -> full TSV sample name
-    _train_only = set(train_only_cohorts or [])
-
-    with open(training_set_tsv, 'r', newline='') as f:
-        reader = csv.DictReader(f, delimiter='\t')
-        required = {'Cohort', 'Sample', 'Fold'}
-        if reader.fieldnames is None or not required.issubset(set(reader.fieldnames)):
-            raise ValueError(
-                f"TSV must have columns: {sorted(required)}. "
-                f"Found: {reader.fieldnames}"
-            )
-
-        for row in reader:
-            cohort = row['Cohort'].strip()
-            sample = row['Sample'].strip()
-            fold = int(row['Fold'])
-
-            # Zarr files on disk use bare names (without cohort prefix),
-            # but we retain the full TSV name for internal maps / outputs.
-            zarr_name = sample
-            if sample.startswith(f"{cohort}_"):
-                zarr_name = sample[len(cohort) + 1:]
-
-            zarr_path = os.path.join(zarr_base, cohort, 'zarr_files', f"{zarr_name}.zarr")
-            if not os.path.isdir(zarr_path):
-                missing_samples.append(f"  {cohort}/zarr_files/{zarr_name}.zarr  (Fold={fold}, TSV sample={sample})")
-                continue
-
-            zarr_path_to_cohort[zarr_path] = cohort
-            zarr_path_to_sample_name[zarr_path] = sample
-
-            if cohort in _train_only:
-                # Always route to training (e.g. PDX admixtures).
-                train_paths.append(zarr_path)
-            elif fold == val_fold:
-                val_paths.append(zarr_path)
-            else:
-                train_paths.append(zarr_path)
-
-    if missing_samples:
-        raise FileNotFoundError(
-            f"Missing {len(missing_samples)} Zarr store(s) under {zarr_base}:\n"
-            + "\n".join(missing_samples)
-        )
-
-    if not train_paths:
-        raise ValueError(f"No training samples found (all in fold {val_fold}?)")
-    if not val_paths:
-        raise ValueError(f"No validation samples found for fold {val_fold}")
+    train_paths, val_paths, zarr_path_to_cohort, zarr_path_to_sample_name = (
+        _parse_splits_tsv(training_set_tsv, zarr_base, val_fold, train_only_cohorts)
+    )
 
     # Shuffle training paths deterministically
     rng = np.random.RandomState(seed)
     rng.shuffle(train_paths)
 
     # Build source_map: zarr_path -> source group name.
-    # For PHT samples, parse the embedded PDX name from the sample name
-    # (format: PHT-Fold-X_<PDX_NAME>-BP...) and match against known
-    # PDX sample names to determine which source group they belong to.
     zarr_path_to_source: Optional[Dict[str, str]] = None
     if source_groups:
-        import re
-        # Invert source_groups: cohort -> source name
-        cohort_to_source: Dict[str, str] = {}
-        for src_name, cohorts in source_groups.items():
-            for coh in cohorts:
-                cohort_to_source[coh] = src_name
+        _cohort_to_source = invert_source_groups(source_groups)
+        _pdx_names = collect_pdx_names(training_set_tsv, _cohort_to_source)
 
-        # Collect known PDX sample names per cohort (for matching PHT names).
-        pdx_sample_to_cohort: Dict[str, str] = {}
-        with open(training_set_tsv, 'r', newline='') as f2:
-            reader2 = csv.DictReader(f2, delimiter='\t')
-            for row in reader2:
-                coh = row['Cohort'].strip()
-                samp = row['Sample'].strip()
-                if samp.startswith(f"{coh}_"):
-                    samp = samp[len(coh) + 1:]
-                # Only index non-PHT cohorts that appear in source groups
-                if coh in cohort_to_source:
-                    pdx_sample_to_cohort[samp] = coh
-
-        # Build the source map for all training paths.
         zarr_path_to_source = {}
-        pht_re = re.compile(r'^PHT-Fold-\d+_(.+)-BP\d+')
         for zpath, coh in zarr_path_to_cohort.items():
             if zpath not in train_paths:
                 continue
-            if coh in cohort_to_source:
-                zarr_path_to_source[zpath] = cohort_to_source[coh]
-            elif coh == 'PHT':
-                # Extract PDX name from the zarr filename.
-                basename = os.path.basename(zpath).replace('.zarr', '')
-                m = pht_re.match(basename)
-                if m:
-                    pdx_name = m.group(1)
-                    pdx_coh = pdx_sample_to_cohort.get(pdx_name)
-                    if pdx_coh is not None:
-                        zarr_path_to_source[zpath] = cohort_to_source[pdx_coh]
-                    else:
-                        raise ValueError(
-                            f"PHT sample '{basename}' has PDX name '{pdx_name}' "
-                            f"that does not match any known PDX sample. "
-                            f"Known: {sorted(pdx_sample_to_cohort.keys())}"
-                        )
-                else:
-                    raise ValueError(
-                        f"Could not parse PDX name from PHT sample: '{basename}'. "
-                        f"Expected format: PHT-Fold-X_<PDX_NAME>-BP..."
-                    )
+            basename = os.path.basename(zpath).replace('.zarr', '')
+            source = assign_source(coh, basename, _cohort_to_source,
+                                   _pdx_names)
+            if source is not None:
+                zarr_path_to_source[zpath] = source
 
-        # Report source group assignments.
         from collections import Counter
         src_counts = Counter(zarr_path_to_source.values())
         print(f"  [Source groups] {dict(src_counts)}, "
@@ -1440,16 +1428,9 @@ def build_loaders_from_splits(
     train_loader, train_steps = create_data_loader(
         index_file=train_index,
         num_workers=num_workers,
-        shuffle=(loader_mode.lower() == 'gene'),
-        labeled=True,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
-        loader_mode=loader_mode,
-        chunk_size=chunk_size,
-        genes_per_batch=genes_per_batch,
-        shuffle_genes_in_batch=shuffle_genes_in_batch,
         seed=seed,
-        drop_last=(loader_mode.lower() == 'gene'),
         subsample_frac=subsample_frac,
         gene_weights=gene_weights,
         cohort_map=zarr_path_to_cohort if balance_cohorts else None,
@@ -1461,17 +1442,10 @@ def build_loaders_from_splits(
     val_loader, val_steps = create_data_loader(
         index_file=val_index,
         num_workers=num_workers,
-        shuffle=False,
-        labeled=True,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
-        loader_mode=loader_mode,
-        chunk_size=chunk_size,
-        genes_per_batch=genes_per_batch,
-        shuffle_genes_in_batch=False,
         seed=seed,
         include_metadata=True,
-        drop_last=False,
         subsample_frac=subsample_frac,
         gene_weights=gene_weights,
         sample_name_map=zarr_path_to_sample_name,
@@ -1488,8 +1462,7 @@ def build_multisource_loaders_from_splits(
     gene_variance: Dict[str, float],
     n_eff_per_source: int = 24,
     genes_per_batch: int = 2,
-    samples_per_source: int = 4,
-    variance_sample_frac: float = 0.70,
+    batch_size: int = 32,
     gene_weight_min: float = 0.5,
     gene_weight_max: float = 2.0,
     num_workers: int = 4,
@@ -1511,11 +1484,10 @@ def build_multisource_loaders_from_splits(
         zarr_base: Base directory for Zarr stores.
         val_fold: Fold number held out for validation.
         source_groups: Mapping of source name → list of cohort names.
-        gene_variance: Per-gene raw variance (for mixture sampler + loss weights).
+        gene_variance: Per-gene raw variance (for loss weights).
         n_eff_per_source: Effective samples per source per epoch.
         genes_per_batch: Unique genes drawn per batch (default 2).
-        samples_per_source: Samples drawn per source per gene (default 4).
-        variance_sample_frac: Weight for variance-priority sampling (default 0.70).
+        batch_size: Total items per batch (default 32).
         gene_weight_min: Minimum compressed loss weight (default 0.5).
         gene_weight_max: Maximum compressed loss weight (default 2.0).
         num_workers: DataLoader workers.
@@ -1529,107 +1501,23 @@ def build_multisource_loaders_from_splits(
     Returns:
         (train_loader, val_loader, train_steps, val_steps)
     """
-    import csv
-    import re
-
-    if not os.path.exists(training_set_tsv):
-        raise FileNotFoundError(f"Training set TSV not found: {training_set_tsv}")
-
-    train_paths: List[str] = []
-    val_paths: List[str] = []
-    missing_samples: List[str] = []
-    zarr_path_to_cohort: Dict[str, str] = {}
-    zarr_path_to_sample_name: Dict[str, str] = {}
-    _train_only = set(train_only_cohorts or [])
-
-    with open(training_set_tsv, 'r', newline='') as f:
-        reader = csv.DictReader(f, delimiter='\t')
-        required = {'Cohort', 'Sample', 'Fold'}
-        if reader.fieldnames is None or not required.issubset(set(reader.fieldnames)):
-            raise ValueError(
-                f"TSV must have columns: {sorted(required)}. "
-                f"Found: {reader.fieldnames}"
-            )
-        for row in reader:
-            cohort = row['Cohort'].strip()
-            sample = row['Sample'].strip()
-            fold = int(row['Fold'])
-
-            zarr_name = sample
-            if sample.startswith(f"{cohort}_"):
-                zarr_name = sample[len(cohort) + 1:]
-
-            zarr_path = os.path.join(
-                zarr_base, cohort, 'zarr_files', f"{zarr_name}.zarr")
-            if not os.path.isdir(zarr_path):
-                missing_samples.append(
-                    f"  {cohort}/zarr_files/{zarr_name}.zarr  "
-                    f"(Fold={fold}, TSV sample={sample})")
-                continue
-
-            zarr_path_to_cohort[zarr_path] = cohort
-            zarr_path_to_sample_name[zarr_path] = sample
-
-            if cohort in _train_only:
-                train_paths.append(zarr_path)
-            elif fold == val_fold:
-                val_paths.append(zarr_path)
-            else:
-                train_paths.append(zarr_path)
-
-    if missing_samples:
-        raise FileNotFoundError(
-            f"Missing {len(missing_samples)} Zarr store(s) under {zarr_base}:\n"
-            + "\n".join(missing_samples))
-    if not train_paths:
-        raise ValueError(f"No training samples found (all in fold {val_fold}?)")
-    if not val_paths:
-        raise ValueError(f"No validation samples found for fold {val_fold}")
+    train_paths, val_paths, zarr_path_to_cohort, zarr_path_to_sample_name = (
+        _parse_splits_tsv(training_set_tsv, zarr_base, val_fold, train_only_cohorts)
+    )
 
     # -- Assign training paths to source groups (including PHT → parent PDX) --
-    cohort_to_source: Dict[str, str] = {}
-    for src_name, cohorts in source_groups.items():
-        for coh in cohorts:
-            cohort_to_source[coh] = src_name
+    _cohort_to_source = invert_source_groups(source_groups)
+    _pdx_names = collect_pdx_names(training_set_tsv, _cohort_to_source)
 
-    # Collect known PDX sample names per cohort for PHT matching.
-    pdx_sample_to_cohort: Dict[str, str] = {}
-    with open(training_set_tsv, 'r', newline='') as f2:
-        reader2 = csv.DictReader(f2, delimiter='\t')
-        for row in reader2:
-            coh = row['Cohort'].strip()
-            samp = row['Sample'].strip()
-            if samp.startswith(f"{coh}_"):
-                samp = samp[len(coh) + 1:]
-            if coh in cohort_to_source:
-                pdx_sample_to_cohort[samp] = coh
-
-    pht_re = re.compile(r'^PHT-Fold-\d+_(.+)-BP\d+')
     sample_paths_by_source: Dict[str, List[str]] = {
         src: [] for src in source_groups
     }
-
     for zpath in train_paths:
         coh = zarr_path_to_cohort[zpath]
-        if coh in cohort_to_source:
-            sample_paths_by_source[cohort_to_source[coh]].append(zpath)
-        elif coh == 'PHT':
-            basename = os.path.basename(zpath).replace('.zarr', '')
-            m = pht_re.match(basename)
-            if m:
-                pdx_name = m.group(1)
-                pdx_coh = pdx_sample_to_cohort.get(pdx_name)
-                if pdx_coh is not None:
-                    sample_paths_by_source[cohort_to_source[pdx_coh]].append(zpath)
-                else:
-                    raise ValueError(
-                        f"PHT sample '{basename}' has PDX name '{pdx_name}' "
-                        f"that does not match any known PDX sample. "
-                        f"Known: {sorted(pdx_sample_to_cohort.keys())}")
-            else:
-                raise ValueError(
-                    f"Could not parse PDX name from PHT sample: '{basename}'. "
-                    f"Expected format: PHT-Fold-X_<PDX_NAME>-BP...")
+        basename = os.path.basename(zpath).replace('.zarr', '')
+        source = assign_source(coh, basename, _cohort_to_source, _pdx_names)
+        if source is not None:
+            sample_paths_by_source[source].append(zpath)
 
     # Report source assignments.
     for src_name in sorted(sample_paths_by_source):
@@ -1642,8 +1530,7 @@ def build_multisource_loaders_from_splits(
         gene_variance=gene_variance,
         n_eff_per_source=n_eff_per_source,
         genes_per_batch=genes_per_batch,
-        samples_per_source=samples_per_source,
-        variance_sample_frac=variance_sample_frac,
+        batch_size=batch_size,
         gene_weight_min=gene_weight_min,
         gene_weight_max=gene_weight_max,
         seed=seed,
@@ -1687,17 +1574,10 @@ def build_multisource_loaders_from_splits(
     val_loader, val_steps = create_data_loader(
         index_file=val_index,
         num_workers=num_workers,
-        shuffle=False,
-        labeled=True,
         persistent_workers=persistent_workers,
         prefetch_factor=prefetch_factor,
-        loader_mode='chunk',
-        chunk_size=256,
-        genes_per_batch=32,
-        shuffle_genes_in_batch=False,
         seed=seed,
         include_metadata=True,
-        drop_last=False,
         subsample_frac=subsample_frac,
         gene_weights=gene_weights,
         sample_name_map=zarr_path_to_sample_name,

@@ -163,7 +163,7 @@ def compute_regime_qhats(
     ci_hi_wide: pd.DataFrame,
     regime_df: pd.DataFrame,
     *,
-    alpha: float = 0.05,
+    alpha: float = 0.10,
 ) -> Dict[str, float]:
     """Compute per-regime conformal quantile q̂_r from OOF data.
 
@@ -175,11 +175,11 @@ def compute_regime_qhats(
     ----------
     truth_wide, ci_lo_wide, ci_hi_wide :
         genes × samples wide DataFrames of OOF truth and base quantile
-        predictions (L = q₂.₅%, U = q₉₇.₅%).
+        predictions (L = q₅%, U = q₉₅%).
     regime_df :
         output of ``compute_gene_regimes``.  Must cover all genes in the
         prediction matrices.
-    alpha : miscoverage budget (default 0.05 → target 95% coverage).
+    alpha : miscoverage budget (default 0.10 → target 90% coverage).
 
     Returns
     -------
@@ -418,7 +418,7 @@ class RegimeCalibrator:
         # 1. Fit on OOF development data
         regime_df = compute_gene_regimes(dev_truth)
         calibrator = RegimeCalibrator.fit(
-            dev_truth, dev_ci_lo, dev_ci_hi, regime_df, alpha=0.05
+            dev_truth, dev_ci_lo, dev_ci_hi, regime_df, alpha=0.10
         )
 
         # 2. Apply to new data
@@ -431,7 +431,7 @@ class RegimeCalibrator:
     """
     regime_df: pd.DataFrame
     q_hats: Dict[str, float]
-    alpha: float = 0.05
+    alpha: float = 0.10
     n_regimes: int = 0
     n_calibration_obs: int = 0
 
@@ -443,7 +443,7 @@ class RegimeCalibrator:
         ci_hi_wide: pd.DataFrame,
         regime_df: pd.DataFrame,
         *,
-        alpha: float = 0.05,
+        alpha: float = 0.10,
     ) -> "RegimeCalibrator":
         """Fit q̂ values from OOF data.
 

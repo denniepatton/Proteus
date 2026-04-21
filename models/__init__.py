@@ -25,6 +25,7 @@ from .models import (
     BioDVN,
     BioDVNConfig,
     get_model_instance,
+    channel_mode_for_model,
     SignalProcessingBlock,
     ReductionBlock,
 )
@@ -35,9 +36,12 @@ __all__ = [
     # Loss functions
     'kl_divergence', 'contrastive_loss', 'reconstruction_loss',
     'InternalLossComputer', 'BioDVNMDNLoss',
+    # Gradient reversal
+    'GradientReversalLayer', 'TFXDiscriminator',
     # Metrics
     'MaskedR2Metric', 'MetricsTracker',
     # Models
     'BioDVN', 'BioDVNConfig', 'get_model_instance',
+    'channel_mode_for_model',
     'SignalProcessingBlock', 'ReductionBlock',
 ]

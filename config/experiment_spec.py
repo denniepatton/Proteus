@@ -386,6 +386,12 @@ class DataSpec:
         existing per-sample contiguous-chunk loader.  ``'multi_source'``
         uses multi-source gene-conditioned batches (2 genes × N sources
         × 4 samples/source = 32 items per batch).
+
+    selection_metric (optional, str: 'min_balanced_crps' | 'max_gvw_r_lower_bound'):
+        Model selection / early-stopping metric.  ``'min_balanced_crps'``
+        (default) selects the epoch with lowest balanced GVW-CRPS.
+        ``'max_gvw_r_lower_bound'`` selects the epoch with highest
+        balanced GVW-r lower bound (mean − std across sources).
     """
     training_set: str
     zarr_base: str
@@ -396,6 +402,7 @@ class DataSpec:
     source_groups: Optional[Dict[str, List[str]]]
     target_n_per_source: Optional[int]
     batch_mode: str
+    selection_metric: str
 
     @staticmethod
     def from_yaml(x: Any) -> "DataSpec":
@@ -403,7 +410,8 @@ class DataSpec:
         allowed = ["training_set", "zarr_base", "seed",
                     "subsample_frac", "train_only_cohorts",
                     "balance_cohorts", "source_groups",
-                    "target_n_per_source", "batch_mode"]
+                    "target_n_per_source", "batch_mode",
+                    "selection_metric"]
         _check_no_unknown_keys(d, allowed=allowed, ctx="data")
         subsample_raw = d.get("subsample_frac", None)
         subsample_frac: Optional[float] = None
@@ -459,6 +467,16 @@ class DataSpec:
             _fail("data.batch_mode='multi_source' requires "
                   "data.source_groups to be set")
 
+        selection_metric_raw = _as_str(
+            d.get("selection_metric", "min_balanced_crps"),
+            "data.selection_metric",
+        ).lower()
+        if selection_metric_raw not in (
+            "min_balanced_crps", "max_gvw_r_lower_bound",
+        ):
+            _fail(f"data.selection_metric must be 'min_balanced_crps' "
+                  f"or 'max_gvw_r_lower_bound', got '{selection_metric_raw}'")
+
         return DataSpec(
             training_set=_as_str(d["training_set"], "data.training_set"),
             zarr_base=_as_str(
@@ -472,6 +490,7 @@ class DataSpec:
             source_groups=source_groups,
             target_n_per_source=target_n,
             batch_mode=batch_mode_raw,
+            selection_metric=selection_metric_raw,
         )
 
 

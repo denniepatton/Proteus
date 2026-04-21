@@ -1,6 +1,7 @@
 # Proteus PLCA model only-seq — final full training (BioDVN_OnlySeq)
 #
 # Identical HPs to plca_final-training.yaml. Uses BioDVN_OnlySeq (drops bio signal channels).
+# HPs from PLCA phase 2.1 best trial (t2) with dropout corrected to 0.30.
 # patience=3 with gene-level 10% chunk split for early stopping.
 # Output: trained_models/proteus_plca-model_only-seq/full_train/final_model.pt
 
@@ -21,6 +22,7 @@ data:
   subsample_frac: 1.00
   seed: 23
   batch_mode: multi_source
+  selection_metric: max_gvw_r_lower_bound
   source_groups:
     CRPC-RA: [CRPC-RA]
     SCLC: [SCLC]
@@ -31,12 +33,12 @@ data:
 structural:
   beta_point_mse: 0.15
   beta_background: 1.0
-  beta_tcvae: 2.0
+  beta_tcvae: 1.0
   beta_contrastive: 1.0
-  beta_grl: 0.2
-  beta_reconstruction: 0.50
+  beta_grl: 0.3
+  beta_reconstruction: 0.25
   cl_margin: 1.0
-  internal_weight: 0.4
+  internal_weight: 0.5
 
 training:
   epochs: 20
@@ -48,8 +50,8 @@ training:
   warmup_frac: 0.05
   schedule_frac: 0.90
   max_grad_norm: 10.0
-  max_lr: 1.278e-4
-  weight_decay: 2.026e-6
+  max_lr: 7.31e-5
+  weight_decay: 3.82e-6
 
 scale:
   signal_ksize: 6
@@ -63,4 +65,4 @@ scale:
   mdn_final: 16
   signal_filters: 16
   initial_reduction_channels: 64
-  dropout_rate: 0.50
+  dropout_rate: 0.30

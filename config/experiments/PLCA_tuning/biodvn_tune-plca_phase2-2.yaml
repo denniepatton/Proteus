@@ -1,0 +1,114 @@
+# BioDVN PLCA Phase 2.2 – Targeted internal-loss ablation (serial L40s)
+#
+# Key findings from phase 2.1 (5 completed trials):
+#   - beta_tcvae=1.0 won → TC penalty may be actively harmful; test 0.0
+#   - internal_weight=0.5 won → CRPS-dominant training helps; test lower
+#   - beta_reconstruction=0.25 won → reconstruction may be unnecessary
+#   - beta_grl: 0.0–0.3 all similar; test 0.0 to preserve TFX signal in
+#     latent space (helps CRPC-RA, the bottleneck source)
+#   - dropout sweet spot: 0.30 (not 0.50 as previously believed)
+#   - max_lr sweet spot: 7e-5 to 4e-4 (extremes fail)
+#
+# Strategy: Fix dropout at 0.30, narrow LR, and focus tuning budget on
+# the 4 internal-loss weights that have the most remaining headroom.
+# 5 configs × 5 folds × 1 round minimum.  Report to same Optuna study.
+#
+# Hypothesis: The internal VAE objectives (TC, reconstruction, GRL) are
+# over-regularising the latent space for the prediction task.  CRPS should
+# dominate training; internal losses serve only as mild scaffolding.
+
+name: biodvn_tune-plca_phase2-2
+output_dir: results_training/biodvn_plca_phase2_2_training
+
+transfer: ~
+
+objective:
+  metric: balanced_tumor_gvw_r_lower_bound
+  direction: maximize
+
+tuning:
+  phase: "2.2"
+  n_trials_per_fold: 20
+  prev_study: ~
+  top_fraction: 0.10
+  enqueue_top_k: 0
+  pruner_type: none
+
+data:
+  training_set: data/PLCA_sample-splits.tsv
+  zarr_base: /hpc/temp/ha_g/user/rpatton/ProteusZarrs
+  subsample_frac: 1.00
+  seed: 23
+  batch_mode: multi_source
+  source_groups:
+    CRPC-RA: [CRPC-RA]
+    SCLC: [SCLC]
+    Prostate-Synthetic: [PC-PDX]
+    SCLC-Synthetic: [SCLC-PDX]
+  target_n_per_source: 24
+
+
+# =========================================================================
+# GROUP 1: Structural HPs  (loss weights — focused ablation)
+# =========================================================================
+structural:
+  beta_point_mse: 0.15
+  beta_background: 1.0
+  # Phase 2.1 winner: 1.0 (TC penalty = 0).  Test whether fully removing
+  # TC (0.0) or minimal TC (0.5) helps further.  At beta_tcvae=0.0, the
+  # loss term becomes KL + (-1)*TC = KL - TC, which is the mutual-info
+  # term only.  At 1.0, TC drops entirely.
+  beta_tcvae:
+    suggest: {type: float, low: 0.0, high: 1.0, step: 0.5}
+  beta_contrastive: 1.0
+  # GRL: test 0.0 (no adversarial TFX-invariance) vs mild 0.1–0.2.
+  # CRPC-RA has wildly heterogeneous TFX; preserving TFX signal in the
+  # latent space may help the MDN heads adapt to tumor fraction.
+  beta_grl:
+    suggest: {type: float, low: 0.0, high: 0.2, step: 0.1}
+  # Reconstruction: 0.25 was best, but may not help at all.
+  # Test 0.0 (no reconstruction pressure) vs 0.25.
+  beta_reconstruction:
+    suggest: {type: categorical, choices: [0.0, 0.25]}
+  cl_margin: 1.0
+  # Internal weight: how much total internal loss vs CRPS.
+  # 0.5 won in 2.1.  Test 0.25 (CRPS even more dominant).
+  internal_weight:
+    suggest: {type: categorical, choices: [0.25, 0.50]}
+
+
+# =========================================================================
+# GROUP 2: Training HPs  (narrowed to confirmed sweet-spot)
+# =========================================================================
+training:
+  epochs: 20
+  patience: 20
+  use_amp: true
+  ema_decay: 0.9999
+  min_lr_ratio: 0.01
+  warmup_start_lr: 1.0e-5
+  warmup_frac: 0.05
+  schedule_frac: 0.90
+  max_grad_norm: 10.0
+  max_lr:
+    suggest: {type: float, low: 5.0e-5, high: 4.0e-4, log: true}
+  weight_decay:
+    suggest: {type: float, low: 1.0e-6, high: 1.0e-5, log: true}
+
+
+# =========================================================================
+# GROUP 3: Scale HPs  (fixed)
+# =========================================================================
+scale:
+  signal_ksize: 6
+  interaction_ksize: 3
+  n_reductions: 3
+  reduction_dilation: 3
+  encoder_start: 512
+  latent_size: 128
+  decoder_start: 64
+  mdn_hidden: 64
+  mdn_final: 16
+  signal_filters: 16
+  initial_reduction_channels: 64
+  dropout_rate: 0.30

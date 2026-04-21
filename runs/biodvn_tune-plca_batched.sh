@@ -2,26 +2,31 @@
 set -euo pipefail
 
 # =====================================================================
-# Coordinated fold-parallel tuning
+# Coordinated tuning — distributed folds on 2080ti (15 GPUs per round)
+#
+# Designed to run IN PARALLEL with biodvn_tune-plca_serial.sh.
+# Both share the same Optuna study/DB — coordinated_ask atomically
+# reserves trial numbers, so no duplicate configs.
+#
+# Resource budget: 15 2080ti (3 configs/round × 5 folds distributed)
+# Partner script uses 5 L40s (5 configs/round, folds serial)
+# Combined: 8 configs/round, 5 rounds = 40 total trials
 #
 # Each round:
-#   1. tune-ask:  Optuna suggests N_CONFIGS trial configs, writes to disk
-#   2. tune-fold: 5 fold workers per config train in parallel (N_CONFIGS×5 jobs)
-#   3. tune-tell: Read fold metrics, compute cross-fold objective, report to Optuna
-#
-# This gives true cross-fold optimization with fold-level parallelism:
-# 4 configs × 5 folds = 20 simultaneous GPU jobs per round.
+#   1. tune-ask:  Optuna suggests N_CONFIGS trial configs
+#   2. Single sbatch allocation with N_CONFIGS × N_FOLDS tasks (1 GPU each)
+#   3. tune-tell: Report cross-fold results to Optuna
 # =====================================================================
 EXPERIMENT="PLCA_tuning/biodvn_tune-plca_phase2-1"
-TAG="PLCA_2-1"
+TAG="PLCA_2-1b"
 YAML="config/experiments/${EXPERIMENT}.yaml"
 ENV_NAME="proteus"
-N_CONFIGS=4          # Configs to ask per round
-N_FOLDS=5            # Folds per config
-N_ROUNDS=10          # Total rounds (N_ROUNDS × N_CONFIGS = total trials)
+N_CONFIGS=3          # 3 configs × 5 folds = 15 GPUs per round
+N_FOLDS=5
+N_ROUNDS=5           # 5 rounds × 3 configs = 15 trials from this script
 BASE_SAMPLER_SEED=42
-POLL_INTERVAL=30
 MAX_RETRIES=2
+WALL_TIME="72:00:00"
 
 BLACKLIST_FILE="runs/bad_nodes.txt"
 touch "${BLACKLIST_FILE}"
@@ -37,112 +42,11 @@ _build_exclude() {
     fi
 }
 
-# =====================================================================
-# Helper: submit a fold worker for a specific trial + fold
-# =====================================================================
-submit_fold_worker() {
-    local trial_num=$1 fold_num=$2
-    local job_name="${TAG}_t${trial_num}_f${fold_num}"
-    local exclude_flag
-    exclude_flag=$(_build_exclude)
-    local job_script
-    job_script=$(mktemp "job_t${trial_num}_f${fold_num}_XXXXXX.sh")
+n_gpus_per_round=$((N_CONFIGS * N_FOLDS))
 
-    cat > "${job_script}" <<EOL
-#!/bin/bash
-#SBATCH --job-name=${job_name}
-#SBATCH --output=logs/${job_name}_%j.out
-#SBATCH --error=logs/${job_name}_%j.err
-#SBATCH --partition=campus-new
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=200G
-#SBATCH --gpus=rtx2080ti:1
-#SBATCH --time=16:00:00
-#SBATCH -A nelson_p
-
-eval "\$(micromamba shell hook -s bash)"
-micromamba activate ${ENV_NAME}
-python Proteus.py \\
-    --run_mode tune-fold \\
-    --experiment ${YAML} \\
-    --trial_number ${trial_num} \\
-    --test_fold ${fold_num}
-EOL
-
-    local job_id
-    job_id=$(sbatch --parsable ${exclude_flag} "${job_script}")
-    rm -f "${job_script}"
-    echo "${job_id}"
-}
-
-# =====================================================================
-# Record the node a failed job ran on into the blacklist file.
-# =====================================================================
-_blacklist_node() {
-    local jid=$1
-    local node
-    node=$(sacct -j "${jid}" -n -o NodeList -X 2>/dev/null | head -1 | tr -d '[:space:]')
-    if [[ -n "${node}" && "${node}" != "None" ]]; then
-        if ! grep -qxF "${node}" "${BLACKLIST_FILE}" 2>/dev/null; then
-            echo "${node}" >> "${BLACKLIST_FILE}"
-            echo "  [$(date '+%H:%M:%S')] Added ${node} to blacklist (${BLACKLIST_FILE})"
-        fi
-    fi
-}
-
-# =====================================================================
-# Wait for all jobs in an array to finish, resubmitting failures.
-# Args: parallel arrays JOB_IDS, JOB_TRIALS, JOB_FOLDS, JOB_RETRIES
-# =====================================================================
-wait_for_jobs() {
-    local n_slots=${#JOB_IDS[@]}
-    while true; do
-        sleep "${POLL_INTERVAL}"
-        local alive=0
-        for i in $(seq 0 $((n_slots - 1))); do
-            local jid="${JOB_IDS[$i]}"
-            local trial="${JOB_TRIALS[$i]}"
-            local fold="${JOB_FOLDS[$i]}"
-            local retries="${JOB_RETRIES[$i]}"
-
-            local state
-            state=$(squeue -j "${jid}" -h -o '%T' 2>/dev/null || true)
-            if [[ -n "${state}" ]]; then
-                alive=$((alive + 1))
-                continue
-            fi
-
-            # Job no longer in queue — check exit status
-            local exit_code
-            exit_code=$(sacct -j "${jid}" -n -o ExitCode -X 2>/dev/null | head -1 | tr -d '[:space:]')
-            if [[ "${exit_code}" == "0:0" ]]; then
-                continue
-            fi
-
-            # Job failed
-            _blacklist_node "${jid}"
-            if (( retries >= MAX_RETRIES )); then
-                echo "  [$(date '+%H:%M:%S')] trial=${trial} fold=${fold} (job ${jid}) failed — retry cap reached, skipping."
-                continue
-            fi
-
-            echo "  [$(date '+%H:%M:%S')] trial=${trial} fold=${fold} (job ${jid}) failed (exit ${exit_code}) — resubmitting..."
-            local new_jid
-            new_jid=$(submit_fold_worker "${trial}" "${fold}")
-            JOB_IDS[$i]="${new_jid}"
-            JOB_RETRIES[$i]=$((retries + 1))
-            echo "    New job: ${new_jid} (retry $((retries + 1))/${MAX_RETRIES})"
-            alive=$((alive + 1))
-        done
-
-        if (( alive == 0 )); then
-            break
-        fi
-    done
-}
-
-echo "=== PLCA Phase 2.1: Coordinated tuning (20 epochs, GRL tuning) ==="
-echo "    ${N_CONFIGS} configs/round × ${N_FOLDS} folds × ${N_ROUNDS} rounds = $((N_CONFIGS * N_ROUNDS)) total trials"
+echo "=== PLCA Phase 2.1: Batched-fold tuning (2080ti, ${N_CONFIGS}×${N_FOLDS}=${n_gpus_per_round} GPUs/round) ==="
+echo "    ${N_CONFIGS} configs/round × ${N_FOLDS} folds × ${N_ROUNDS} rounds = $((N_CONFIGS * N_ROUNDS)) trials from this script"
+echo "    Shares Optuna study with serial script (combined target: 40 trials)"
 echo ""
 
 for round in $(seq 1 "${N_ROUNDS}"); do
@@ -175,29 +79,99 @@ for round in $(seq 1 "${N_ROUNDS}"); do
         break
     fi
 
-    # Step 2: Submit fold workers for each trial
-    echo "  Submitting $((n_trials * N_FOLDS)) fold workers..."
-    declare -a JOB_IDS=()
-    declare -a JOB_TRIALS=()
-    declare -a JOB_FOLDS=()
-    declare -a JOB_RETRIES=()
+    n_tasks=$((n_trials * N_FOLDS))
 
+    # Step 2: Build a task manifest mapping SLURM_PROCID → (trial, fold)
+    MANIFEST=$(mktemp "manifest_round${round}_XXXXXX.tsv")
+    task_id=0
     for trial_num in "${TRIAL_NUMS[@]}"; do
         for fold in $(seq 1 "${N_FOLDS}"); do
-            jid=$(submit_fold_worker "${trial_num}" "${fold}")
-            JOB_IDS+=("${jid}")
-            JOB_TRIALS+=("${trial_num}")
-            JOB_FOLDS+=("${fold}")
-            JOB_RETRIES+=(0)
-            echo "    trial=${trial_num} fold=${fold}: job ${jid}"
+            echo -e "${task_id}\t${trial_num}\t${fold}" >> "${MANIFEST}"
+            task_id=$((task_id + 1))
         done
     done
 
-    # Step 3: Wait for all fold workers to finish
-    echo "  Waiting for $((n_trials * N_FOLDS)) fold workers..."
-    wait_for_jobs
+    # Step 3: Write the per-task worker script
+    WORKER_SCRIPT=$(mktemp "worker_round${round}_XXXXXX.sh")
+    cat > "${WORKER_SCRIPT}" <<'WORKER_EOF'
+#!/bin/bash
+set -euo pipefail
+MANIFEST_FILE="$1"
+YAML_FILE="$2"
+ENV_NAME="$3"
 
-    # Step 4: tune-tell — report results back to Optuna
+eval "$(micromamba shell hook -s bash)"
+micromamba activate "${ENV_NAME}"
+
+# Look up this task's trial and fold from the manifest
+TASK_LINE=$(awk -v id="${SLURM_PROCID}" '$1 == id' "${MANIFEST_FILE}")
+TRIAL_NUM=$(echo "${TASK_LINE}" | cut -f2)
+FOLD_NUM=$(echo "${TASK_LINE}" | cut -f3)
+
+echo "[Task ${SLURM_PROCID}] trial=${TRIAL_NUM} fold=${FOLD_NUM} node=$(hostname)"
+
+python Proteus.py \
+    --run_mode tune-fold \
+    --experiment "${YAML_FILE}" \
+    --trial_number "${TRIAL_NUM}" \
+    --test_fold "${FOLD_NUM}"
+WORKER_EOF
+    chmod +x "${WORKER_SCRIPT}"
+
+    # Step 4: Submit single allocation with all tasks
+    exclude_flag=$(_build_exclude)
+    job_name="${TAG}_r${round}"
+
+    echo "  Submitting 1 job with ${n_tasks} tasks (${n_tasks} GPUs)..."
+
+    job_id=$(sbatch --parsable \
+        --job-name="${job_name}" \
+        --output="logs/${job_name}_task%t_%j.out" \
+        --error="logs/${job_name}_task%t_%j.err" \
+        --partition=campus-new \
+        --ntasks="${n_tasks}" \
+        --cpus-per-task=8 \
+        --mem-per-cpu=20G \
+        --gpus-per-task=rtx2080ti:1 \
+        --time="${WALL_TIME}" \
+        -A ha_g \
+        ${exclude_flag} \
+        --wrap="srun bash ${WORKER_SCRIPT} ${MANIFEST} ${YAML} ${ENV_NAME}")
+
+    echo "  Job ${job_id}: ${n_tasks} tasks × 1 GPU each"
+
+    # Step 5: Wait for the single job to finish
+    echo "  Waiting for job ${job_id}..."
+    while true; do
+        sleep 30
+        state=$(squeue -j "${job_id}" -h -o '%T' 2>/dev/null || true)
+        if [[ -z "${state}" ]]; then
+            break
+        fi
+    done
+
+    # Check exit status
+    exit_code=$(sacct -j "${job_id}" -n -o ExitCode -X 2>/dev/null | head -1 | tr -d '[:space:]')
+    if [[ "${exit_code}" != "0:0" ]]; then
+        echo "  WARNING: Job ${job_id} exited with ${exit_code}"
+        echo "  Checking individual task statuses..."
+        sacct -j "${job_id}" --format=JobID,NodeList,ExitCode,State,Elapsed -n
+        # Blacklist failed nodes
+        while IFS= read -r node; do
+            node=$(echo "${node}" | tr -d '[:space:]')
+            if [[ -n "${node}" && "${node}" != "None" ]]; then
+                if ! grep -qxF "${node}" "${BLACKLIST_FILE}" 2>/dev/null; then
+                    echo "${node}" >> "${BLACKLIST_FILE}"
+                    echo "  Blacklisted node: ${node}"
+                fi
+            fi
+        done < <(sacct -j "${job_id}" -n -o NodeList --state=FAILED 2>/dev/null)
+    fi
+
+    # Clean up temp files
+    rm -f "${MANIFEST}" "${WORKER_SCRIPT}"
+
+    # Step 6: tune-tell — report results back to Optuna
     echo "  Reporting results to Optuna..."
     python Proteus.py \
         --run_mode tune-tell \

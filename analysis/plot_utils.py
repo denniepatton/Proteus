@@ -198,6 +198,7 @@ def gene_target_scatter(
     ci_hi_wide: Optional[pd.DataFrame] = None,
     bg_truth_wide: Optional[pd.DataFrame] = None,
     bg_pred_wide: Optional[pd.DataFrame] = None,
+    dim_threshold_genes: bool = True,
 ) -> None:
     """Scatter: samples as dots for one gene, truth vs pred.
 
@@ -205,6 +206,10 @@ def gene_target_scatter(
     Vertical error bars show per-sample model CIs when available.
     When ``bg_truth_wide`` / ``bg_pred_wide`` are provided, HD-L
     background predictions are overlaid as gray diamonds.
+
+    When ``dim_threshold_genes`` is True and CIs are available, samples
+    whose 90% CI crosses the on/off threshold (2.0) are drawn at 50%
+    alpha and excluded from fit-line / metric calculations.
     """
     _ensure_dir(name)
     if gene not in truth_wide.index or gene not in pred_wide.index:
@@ -219,14 +224,42 @@ def gene_target_scatter(
     if len(t) < 3:
         return
 
-    r_val, p_val = pearsonr(t.values, p.values)
-    rmse = float(np.sqrt(np.mean((t.values - p.values) ** 2)))
+    # Per-sample CI series for this gene (if available)
+    has_ci = (
+        ci_lo_wide is not None
+        and ci_hi_wide is not None
+        and gene in ci_lo_wide.index
+        and gene in ci_hi_wide.index
+    )
+    ci_lo_gene: Optional[pd.Series] = None
+    ci_hi_gene: Optional[pd.Series] = None
+    if has_ci:
+        ci_lo_gene = ci_lo_wide.loc[gene, common].reindex(t.index).astype(np.float64)
+        ci_hi_gene = ci_hi_wide.loc[gene, common].reindex(t.index).astype(np.float64)
+
+    # Identify ambiguous samples: 90% CI crosses the on/off threshold (2.0)
+    _DIM_THRESHOLD = 2.0
+    is_ambiguous = pd.Series(False, index=t.index)
+    if dim_threshold_genes and ci_lo_gene is not None and ci_hi_gene is not None:
+        is_ambiguous = (ci_lo_gene < _DIM_THRESHOLD) & (ci_hi_gene > _DIM_THRESHOLD)
+        is_ambiguous = is_ambiguous.fillna(False)
+
+    # Metrics computed on confident (non-ambiguous) subset only
+    confident_mask = ~is_ambiguous
+    t_conf = t[confident_mask]
+    p_conf = p[confident_mask]
+    if len(t_conf) >= 3:
+        r_val, p_val = pearsonr(t_conf.values, p_conf.values)
+        rmse = float(np.sqrt(np.mean((t_conf.values - p_conf.values) ** 2)))
+    else:
+        r_val, p_val = pearsonr(t.values, p.values)
+        rmse = float(np.sqrt(np.mean((t.values - p.values) ** 2)))
+        t_conf, p_conf = t, p  # fall back for fit line
 
     # Dynamic axis range (includes CI bounds so bars are fully visible).
     # Calibrated CIs are already clamped to [0, 19.93] by the calibrator.
     all_vals = np.concatenate([t.values, p.values])
-    if (ci_lo_wide is not None and ci_hi_wide is not None
-            and gene in ci_lo_wide.index and gene in ci_hi_wide.index):
+    if has_ci:
         lo_ci_vals = ci_lo_wide.loc[gene, common].reindex(t.index).dropna().values
         hi_ci_vals = ci_hi_wide.loc[gene, common].reindex(t.index).dropna().values
         all_vals = np.concatenate([all_vals, lo_ci_vals, hi_ci_vals])
@@ -255,18 +288,18 @@ def gene_target_scatter(
 
     fig, ax = plt.subplots(figsize=(6, 6))
 
-    # Fit line
-    coeffs = np.polyfit(t.values, p.values, 1)
+    # Fit line (computed on confident subset)
+    coeffs = np.polyfit(t_conf.values, p_conf.values, 1)
     fit_fn = np.poly1d(coeffs)
     x_line = np.linspace(axis_lo, axis_hi, 100)
     ax.plot(x_line, np.clip(fit_fn(x_line), axis_lo, axis_hi), "k-", lw=1, zorder=1)
 
-    # CI band
-    n = len(t)
+    # CI band (on confident subset)
+    n = len(t_conf)
     if n > 3:
         from scipy.stats import t as t_dist
-        x_vals = t.values
-        residuals = p.values - fit_fn(x_vals)
+        x_vals = t_conf.values
+        residuals = p_conf.values - fit_fn(x_vals)
         s_err = np.sqrt(np.sum(residuals ** 2) / (n - 2))
         mean_x = np.mean(x_vals)
         Sxx = np.sum((x_vals - mean_x) ** 2)
@@ -277,19 +310,6 @@ def gene_target_scatter(
         ax.fill_between(x_line, np.clip(y_line - ci, axis_lo, axis_hi),
                          np.clip(y_line + ci, axis_lo, axis_hi),
                          color="gray", alpha=0.25, zorder=0)
-
-    # Per-sample CI series for this gene (if available)
-    has_ci = (
-        ci_lo_wide is not None
-        and ci_hi_wide is not None
-        and gene in ci_lo_wide.index
-        and gene in ci_hi_wide.index
-    )
-    ci_lo_gene: Optional[pd.Series] = None
-    ci_hi_gene: Optional[pd.Series] = None
-    if has_ci:
-        ci_lo_gene = ci_lo_wide.loc[gene, common].reindex(t.index).astype(np.float64)
-        ci_hi_gene = ci_hi_wide.loc[gene, common].reindex(t.index).astype(np.float64)
 
     # Plot points
     pal = _palette()
@@ -308,6 +328,8 @@ def gene_target_scatter(
                 if "status" in subtypes_df.columns:
                     is_holdout = subtypes_df.loc[sample, "status"] == "holdout"
 
+            alpha = 0.5 if is_ambiguous[sample] else 0.75
+
             # Error bar (CI) — drawn before marker so marker sits on top
             if ci_lo_gene is not None and ci_hi_gene is not None:
                 lo = ci_lo_gene[sample]
@@ -317,20 +339,18 @@ def gene_target_scatter(
                         t[sample], p[sample],
                         yerr=[[max(p[sample] - lo, 0)], [max(hi - p[sample], 0)]],
                         fmt="none", ecolor="black", elinewidth=0.8,
-                        capsize=2, zorder=2,
+                        capsize=2, zorder=2, alpha=alpha,
                     )
 
             if is_holdout:
-                # Filled diamond for holdout
                 ax.scatter(
                     t[sample], p[sample], s=sz, c=color, marker="D",
-                    edgecolors="black", linewidths=0.5, alpha=0.75, zorder=3,
+                    edgecolors="black", linewidths=0.5, alpha=alpha, zorder=3,
                 )
             else:
-                # Filled circle for validation
                 ax.scatter(
                     t[sample], p[sample], s=sz, c=color, marker="o",
-                    edgecolors="black", linewidths=0.5, alpha=0.75, zorder=3,
+                    edgecolors="black", linewidths=0.5, alpha=alpha, zorder=3,
                 )
         handles = [
             plt.Line2D([0], [0], marker="o", color="w",
@@ -344,19 +364,32 @@ def gene_target_scatter(
         if ci_lo_gene is not None and ci_hi_gene is not None:
             yerr_lo = (p - ci_lo_gene).clip(lower=0).values
             yerr_hi = (ci_hi_gene - p).clip(lower=0).values
-            ax.errorbar(
-                t.values, p.values,
-                yerr=np.vstack([yerr_lo, yerr_hi]),
-                fmt="none", ecolor="black", elinewidth=0.8,
-                capsize=2, zorder=2,
-            )
+            eb_alpha = np.where(is_ambiguous.values, 0.5, 0.75)
+            for i in range(len(t)):
+                ax.errorbar(
+                    t.values[i], p.values[i],
+                    yerr=[[yerr_lo[i]], [yerr_hi[i]]],
+                    fmt="none", ecolor="black", elinewidth=0.8,
+                    capsize=2, zorder=2, alpha=float(eb_alpha[i]),
+                )
         sizes = [200] * len(t)
         if tfx_dict is not None:
             sizes = [max(30, tfx_dict.get(s, 1.0) * 300) for s in t.index]
-        ax.scatter(
-            t.values, p.values, s=sizes,
-            edgecolors="black", linewidths=0.5, alpha=0.75, zorder=3,
-        )
+        # Draw confident and ambiguous points with different alpha
+        conf_idx = ~is_ambiguous
+        amb_idx = is_ambiguous
+        if conf_idx.any():
+            ax.scatter(
+                t[conf_idx].values, p[conf_idx].values,
+                s=[sizes[i] for i, v in enumerate(conf_idx) if v],
+                edgecolors="black", linewidths=0.5, alpha=0.75, zorder=3,
+            )
+        if amb_idx.any():
+            ax.scatter(
+                t[amb_idx].values, p[amb_idx].values,
+                s=[sizes[i] for i, v in enumerate(amb_idx) if v],
+                edgecolors="black", linewidths=0.5, alpha=0.5, zorder=3,
+            )
 
     # HD-L background overlay (gray diamonds, behind tumor legend)
     if bg_t is not None and bg_p is not None:
@@ -375,9 +408,14 @@ def gene_target_scatter(
     ax.set_yticks(ticks)
     ax.set_box_aspect(1)
     ax.set_title(gene)
+
+    # Annotation: indicate when metrics exclude ambiguous points
+    n_amb = int(is_ambiguous.sum())
+    metric_note = f"Pearson r = {r_val:.3f}\n{format_pval(p_val)}\nRMSE = {rmse:.3f}"
+    if n_amb > 0:
+        metric_note += f"\n({n_amb} ambiguous dimmed)"
     ax.text(
-        0.05, 0.95,
-        f"Pearson r = {r_val:.3f}\n{format_pval(p_val)}\nRMSE = {rmse:.3f}",
+        0.05, 0.95, metric_note,
         transform=ax.transAxes, va="top", fontsize=9,
     )
 
@@ -604,12 +642,15 @@ def metric_distribution(
     xlim: Optional[Tuple[float, float]] = None,
     square: bool = False,
     log_y: bool = False,
+    draw_stat_lines: bool = True,
 ) -> None:
     """Histogram + KDE of a per-gene or per-sample metric.
 
     If ``square`` is True, figure uses equal aspect and a dashed gray
     vertical line is drawn at x=0.
     If ``log_y`` is True, the y-axis uses a log scale.
+    If ``draw_stat_lines`` is False, mean/median vertical lines are
+    suppressed (text annotations in the legend are still shown).
     """
     _ensure_dir(name)
     vals = values.dropna()
@@ -621,8 +662,13 @@ def metric_distribution(
     sns.histplot(vals, kde=True, stat="density", bins=40, ax=ax)
     ax.set_xlabel(metric_name.replace("_", " ").title())
     ax.set_ylabel("Density")
-    ax.axvline(vals.mean(), color="blue", ls="--", lw=1, label=f"mean={vals.mean():.3f}")
-    ax.axvline(vals.median(), color="red", ls="--", lw=1, label=f"median={vals.median():.3f}")
+    if draw_stat_lines:
+        ax.axvline(vals.mean(), color="blue", ls="--", lw=1, label=f"mean={vals.mean():.3f}")
+        ax.axvline(vals.median(), color="red", ls="--", lw=1, label=f"median={vals.median():.3f}")
+    else:
+        # Text-only legend entries (no drawn lines)
+        ax.plot([], [], ' ', label=f"mean={vals.mean():.3f}")
+        ax.plot([], [], ' ', label=f"median={vals.median():.3f}")
     if square:
         ax.axvline(0, color="gray", ls="--", lw=0.8, alpha=0.6)
     ax.legend(fontsize=9)
@@ -783,7 +829,7 @@ def plot_regime_coverage_heatmap(
     *,
     n_var_bins: int = 4,
     n_zero_bins: int = 4,
-    target_coverage: float = 0.95,
+    target_coverage: float = 0.90,
     title: Optional[str] = None,
 ) -> None:
     """Heatmap of empirical coverage by (variance quartile × zero-rate quartile).
@@ -1168,12 +1214,13 @@ def batch_sample_scatters(
 
 def _render_gene_scatter(args: Tuple) -> str:
     """Worker for parallel gene target scatters."""
-    truth_wide, pred_wide, gene, out_path, subtypes_df, tfx_dict, ci_lo_wide, ci_hi_wide, bg_truth_wide, bg_pred_wide = args
+    truth_wide, pred_wide, gene, out_path, subtypes_df, tfx_dict, ci_lo_wide, ci_hi_wide, bg_truth_wide, bg_pred_wide, dim_threshold_genes = args
     gene_target_scatter(
         truth_wide, pred_wide, gene, out_path,
         subtypes_df=subtypes_df, tfx_dict=tfx_dict,
         ci_lo_wide=ci_lo_wide, ci_hi_wide=ci_hi_wide,
         bg_truth_wide=bg_truth_wide, bg_pred_wide=bg_pred_wide,
+        dim_threshold_genes=dim_threshold_genes,
     )
     return gene
 
@@ -1190,6 +1237,7 @@ def batch_gene_scatters(
     ci_hi_wide: Optional[pd.DataFrame] = None,
     bg_truth_wide: Optional[pd.DataFrame] = None,
     bg_pred_wide: Optional[pd.DataFrame] = None,
+    dim_threshold_genes: bool = True,
     n_workers: Optional[int] = None,
 ) -> None:
     """Generate per-gene target scatter plots in parallel."""
@@ -1200,7 +1248,7 @@ def batch_gene_scatters(
     args_list = [
         (truth_wide, pred_wide, gene, os.path.join(out_dir, gene),
          subtypes_df, tfx_dict, ci_lo_wide, ci_hi_wide,
-         bg_truth_wide, bg_pred_wide)
+         bg_truth_wide, bg_pred_wide, dim_threshold_genes)
         for gene in genes
         if gene in truth_wide.index and gene in pred_wide.index
     ]
@@ -2517,5 +2565,210 @@ def roc_gene_calling(
 
     fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Risk coverage curve (coverage vs PPV / FPR for gene on/off calling)
+# ---------------------------------------------------------------------------
+
+
+def risk_coverage_plot(
+    coverage_data: Dict[str, Dict[str, np.ndarray]],
+    name: str,
+    *,
+    title: str = "Risk Coverage — Gene On/Off Calling",
+    model_order: Sequence[str] = (),
+    proteus_models: Sequence[str] = (),
+) -> None:
+    """Combined coverage-vs-PPV and coverage-vs-FPR plot.
+
+    Parameters
+    ----------
+    coverage_data : dict
+        ``{model_name: {"coverage": array, "ppv": array, "fpr": array}}``.
+        Proteus models have many points (smooth sweep); comparators have
+        a single point at coverage=1.0.
+    name : str
+        Output path (without .pdf extension).
+    title : str
+        Plot title.
+    model_order : sequence[str]
+        Preferred plotting order.
+    proteus_models : sequence[str]
+        Model names that should be drawn as smooth lines (others as points).
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+
+    fig, (ax_ppv, ax_fpr) = plt.subplots(1, 2, figsize=(14, 6))
+
+    ordered = [m for m in model_order if m in coverage_data]
+    remaining = sorted(set(coverage_data) - set(ordered))
+    ordered.extend(remaining)
+
+    for model in ordered:
+        d = coverage_data[model]
+        cov, ppv, fpr = d["coverage"], d["ppv"], d["fpr"]
+        color = cmap.get(model, "#888888")
+        is_proteus = model in proteus_models
+
+        if is_proteus and len(cov) > 1:
+            lw = 2.5
+            ax_ppv.plot(cov, ppv, color=color, lw=lw, label=model, zorder=2)
+            ax_fpr.plot(cov, fpr, color=color, lw=lw, label=model, zorder=2)
+        else:
+            # Single-point comparator at 100% coverage
+            ms = 10
+            ax_ppv.scatter(cov, ppv, color=color, s=ms**2,
+                           edgecolors="black", linewidths=0.5,
+                           marker="o", label=model, zorder=3)
+            ax_fpr.scatter(cov, fpr, color=color, s=ms**2,
+                           edgecolors="black", linewidths=0.5,
+                           marker="o", label=model, zorder=3)
+
+    for ax, ylabel, ax_title in [
+        (ax_ppv, "PPV (Precision)", f"{title} — PPV"),
+        (ax_fpr, "FPR", f"{title} — FPR"),
+    ]:
+        ax.set_xlabel("Coverage (fraction retained)", fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=11)
+        ax.set_xlim([-0.02, 1.05])
+        ax.set_ylim([-0.02, 1.05])
+        ax.set_title(ax_title, fontsize=11, fontweight="bold")
+        ax.legend(loc="best", fontsize=8, framealpha=0.9)
+        ax.grid(True, alpha=0.2)
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# On/off confusion summary table (3-way: ON / OFF / INDETERMINATE)
+# ---------------------------------------------------------------------------
+
+def onoff_confusion_summary_plot(
+    confusion_data: Dict[str, Dict[str, Any]],
+    name: str,
+    *,
+    title: str = "On/Off Gene Calling — Confusion Summary",
+    model_order: Sequence[str] = (),
+) -> None:
+    """Render a comparison table of on/off/indeterminate confusion metrics.
+
+    The figure has two parts stacked vertically:
+
+    1. **Stacked bar chart** — fraction ON / OFF / INDET per model.
+    2. **Metrics table** — Accuracy, PPV, NPV, FPR, Coverage for each model.
+
+    Parameters
+    ----------
+    confusion_data : dict
+        ``{model_name: confusion_dict}`` where each value is the dict
+        returned by ``compute_onoff_confusion()``.
+    name : str
+        Output path stem (without .pdf).
+    title : str
+        Figure title.
+    model_order : sequence[str]
+        Preferred left-to-right ordering.
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+
+    ordered = [m for m in model_order if m in confusion_data]
+    remaining = sorted(set(confusion_data) - set(ordered))
+    ordered.extend(remaining)
+
+    if not ordered:
+        return
+
+    # Collect data arrays
+    models = []
+    frac_on, frac_off, frac_indet = [], [], []
+    acc, ppv, npv, fpr_arr, cov = [], [], [], [], []
+
+    for m in ordered:
+        d = confusion_data[m]
+        n = d.get("n_total", 0)
+        if n == 0:
+            continue
+        models.append(m)
+        frac_on.append(d.get("n_on", 0) / n)
+        frac_off.append(d.get("n_off", 0) / n)
+        frac_indet.append(d.get("n_indet", 0) / n)
+        acc.append(d.get("accuracy", float("nan")))
+        ppv.append(d.get("ppv", float("nan")))
+        npv.append(d.get("npv", float("nan")))
+        fpr_arr.append(d.get("fpr", float("nan")))
+        cov.append(d.get("coverage", float("nan")))
+
+    if not models:
+        return
+
+    n_models = len(models)
+    fig, (ax_bar, ax_tbl) = plt.subplots(
+        2, 1, figsize=(max(8, n_models * 1.2), 7),
+        gridspec_kw={"height_ratios": [3, 2]},
+    )
+
+    # ── Stacked bar chart ──
+    x = np.arange(n_models)
+    bar_w = 0.6
+    colors_on = "#2ca02c"    # green
+    colors_off = "#1f77b4"   # blue
+    colors_ind = "#ff7f0e"   # orange
+
+    ax_bar.bar(x, frac_on, bar_w, label="ON (confident)", color=colors_on)
+    ax_bar.bar(x, frac_off, bar_w, bottom=frac_on, label="OFF (confident)",
+               color=colors_off)
+    bottoms = [a + b for a, b in zip(frac_on, frac_off)]
+    ax_bar.bar(x, frac_indet, bar_w, bottom=bottoms,
+               label="Indeterminate", color=colors_ind)
+
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels(models, rotation=30, ha="right", fontsize=9)
+    ax_bar.set_ylabel("Fraction of gene–sample pairs", fontsize=10)
+    ax_bar.set_ylim([0, 1.05])
+    ax_bar.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    ax_bar.set_title(title, fontsize=11, fontweight="bold")
+
+    # ── Metrics table ──
+    ax_tbl.axis("off")
+    col_labels = ["Model", "Accuracy", "PPV", "NPV", "FPR", "Coverage"]
+    cell_text = []
+    for i, m in enumerate(models):
+        row = [
+            m,
+            f"{acc[i]:.3f}" if np.isfinite(acc[i]) else "—",
+            f"{ppv[i]:.3f}" if np.isfinite(ppv[i]) else "—",
+            f"{npv[i]:.3f}" if np.isfinite(npv[i]) else "—",
+            f"{fpr_arr[i]:.3f}" if np.isfinite(fpr_arr[i]) else "—",
+            f"{cov[i]:.1%}" if np.isfinite(cov[i]) else "—",
+        ]
+        cell_text.append(row)
+
+    table = ax_tbl.table(
+        cellText=cell_text, colLabels=col_labels,
+        loc="center", cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.0, 1.4)
+
+    # Style header row
+    for j in range(len(col_labels)):
+        table[0, j].set_facecolor("#d9d9d9")
+        table[0, j].set_text_props(fontweight="bold")
+
+    # Color model column cells
+    for i, m in enumerate(models):
+        c = cmap.get(m, "#ffffff")
+        table[i + 1, 0].set_facecolor(c + "40")  # 25% alpha hex
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
     plt.close(fig)
 

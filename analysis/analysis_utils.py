@@ -1402,6 +1402,209 @@ def compute_coverage_curve(
 
 
 # ---------------------------------------------------------------------------
+# Risk coverage curve computation (on/off gene calling)
+# ---------------------------------------------------------------------------
+
+_ONOFF_THRESHOLD_DEFAULT = 2.0  # log2(CPM+1) on/off boundary
+
+
+def compute_risk_coverage_data(
+    truth_flat: np.ndarray,
+    pred_flat: np.ndarray,
+    ci_lo_flat: Optional[np.ndarray] = None,
+    ci_hi_flat: Optional[np.ndarray] = None,
+    threshold: float = _ONOFF_THRESHOLD_DEFAULT,
+    n_steps: int = 200,
+) -> Dict[str, np.ndarray]:
+    """Compute coverage-vs-PPV and coverage-vs-FPR at varying CI-width cuts.
+
+    For models with CIs (``ci_lo_flat`` / ``ci_hi_flat`` provided), we sweep
+    a CI-width threshold from wide (retain everything) to narrow (retain
+    only the most confident predictions).  At each threshold the retained
+    subset is evaluated for PPV and FPR of the binary on/off call
+    (truth >= ``threshold``).
+
+    For models without CIs, returns a single (coverage=1.0) point.
+
+    Returns
+    -------
+    dict with keys ``coverage``, ``ppv``, ``fpr`` — 1-D arrays of equal
+    length.
+    """
+    valid = np.isfinite(truth_flat) & np.isfinite(pred_flat)
+    if ci_lo_flat is not None and ci_hi_flat is not None:
+        valid &= np.isfinite(ci_lo_flat) & np.isfinite(ci_hi_flat)
+    t = truth_flat[valid]
+    p = pred_flat[valid]
+
+    y_true = (t >= threshold).astype(int)
+
+    # No CI → single point at full coverage
+    if ci_lo_flat is None or ci_hi_flat is None:
+        ppv, fpr = _ppv_fpr(y_true, p, threshold)
+        return {
+            "coverage": np.array([1.0]),
+            "ppv": np.array([ppv]),
+            "fpr": np.array([fpr]),
+        }
+
+    lo = ci_lo_flat[valid]
+    hi = ci_hi_flat[valid]
+    widths = hi - lo
+
+    # Sweep from widest (retain all) to narrowest (retain most confident)
+    w_min, w_max = float(np.min(widths)), float(np.max(widths))
+    if w_max <= w_min:
+        ppv, fpr = _ppv_fpr(y_true, p, threshold)
+        return {
+            "coverage": np.array([1.0]),
+            "ppv": np.array([ppv]),
+            "fpr": np.array([fpr]),
+        }
+
+    thresholds = np.linspace(w_max, w_min, n_steps)
+    coverages, ppvs, fprs = [], [], []
+
+    for wt in thresholds:
+        mask = widths <= wt
+        n_retained = mask.sum()
+        if n_retained < 10:
+            break
+        cov = n_retained / len(t)
+        ppv, fpr_val = _ppv_fpr(y_true[mask], p[mask], threshold)
+        coverages.append(cov)
+        ppvs.append(ppv)
+        fprs.append(fpr_val)
+
+    return {
+        "coverage": np.array(coverages),
+        "ppv": np.array(ppvs),
+        "fpr": np.array(fprs),
+    }
+
+
+def _ppv_fpr(
+    y_true: np.ndarray,
+    pred: np.ndarray,
+    threshold: float,
+) -> Tuple[float, float]:
+    """Compute PPV and FPR for a binary on/off call."""
+    y_pred = (pred >= threshold).astype(int)
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+    tn = int(((y_pred == 0) & (y_true == 0)).sum())
+    ppv = tp / max(tp + fp, 1)
+    fpr = fp / max(fp + tn, 1)
+    return ppv, fpr
+
+
+# ---------------------------------------------------------------------------
+# On/off confusion summary (3-way: ON / OFF / INDETERMINATE)
+# ---------------------------------------------------------------------------
+
+def compute_onoff_confusion(
+    truth_flat: np.ndarray,
+    pred_flat: np.ndarray,
+    ci_lo_flat: Optional[np.ndarray] = None,
+    ci_hi_flat: Optional[np.ndarray] = None,
+    threshold: float = _ONOFF_THRESHOLD_DEFAULT,
+) -> Dict[str, Any]:
+    """Compute 3-way on/off/indeterminate confusion summary.
+
+    Classification rules (using the on/off threshold, default 2.0):
+
+    * **Models without CIs** — every gene-sample pair is called ON
+      (pred >= threshold) or OFF (pred < threshold).  No indeterminate.
+    * **Models with 90% CIs** — a pair is INDETERMINATE when the CI
+      straddles the threshold (ci_lo < threshold < ci_hi).  Confident
+      ON requires ci_lo >= threshold; confident OFF requires
+      ci_hi < threshold.
+
+    Returns a dict with:
+        n_total, n_on, n_off, n_indet,
+        tp, fp, tn, fn  (on the confident subset only),
+        accuracy, ppv, npv, fpr, fnr, coverage (fraction not indet).
+    """
+    valid = np.isfinite(truth_flat) & np.isfinite(pred_flat)
+    if ci_lo_flat is not None and ci_hi_flat is not None:
+        valid &= np.isfinite(ci_lo_flat) & np.isfinite(ci_hi_flat)
+    t = truth_flat[valid]
+    p = pred_flat[valid]
+    n_total = len(t)
+    if n_total == 0:
+        return {"n_total": 0}
+
+    truth_on = t >= threshold
+
+    if ci_lo_flat is None or ci_hi_flat is None:
+        # No CIs: binary ON/OFF
+        pred_on = p >= threshold
+        tp = int(((pred_on) & (truth_on)).sum())
+        fp = int(((pred_on) & (~truth_on)).sum())
+        fn = int(((~pred_on) & (truth_on)).sum())
+        tn = int(((~pred_on) & (~truth_on)).sum())
+        return {
+            "n_total": n_total,
+            "n_on": int(pred_on.sum()),
+            "n_off": int((~pred_on).sum()),
+            "n_indet": 0,
+            "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+            "accuracy": (tp + tn) / max(n_total, 1),
+            "ppv": tp / max(tp + fp, 1),
+            "npv": tn / max(tn + fn, 1),
+            "fpr": fp / max(fp + tn, 1),
+            "fnr": fn / max(fn + tp, 1),
+            "coverage": 1.0,
+        }
+
+    lo = ci_lo_flat[valid]
+    hi = ci_hi_flat[valid]
+
+    # 3-way classification
+    indet = (lo < threshold) & (hi > threshold)
+    conf_on = lo >= threshold
+    conf_off = hi < threshold
+
+    n_indet = int(indet.sum())
+    n_on = int(conf_on.sum())
+    n_off = int(conf_off.sum())
+
+    # Metrics on confident subset only
+    confident = ~indet
+    n_conf = int(confident.sum())
+    if n_conf == 0:
+        return {
+            "n_total": n_total,
+            "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
+            "tp": 0, "fp": 0, "tn": 0, "fn": 0,
+            "accuracy": float("nan"), "ppv": float("nan"),
+            "npv": float("nan"), "fpr": float("nan"), "fnr": float("nan"),
+            "coverage": 0.0,
+        }
+
+    # Among confident pairs, the call is ON if ci_lo >= threshold, OFF if ci_hi < threshold
+    pred_on_conf = conf_on[confident]
+    truth_on_conf = truth_on[confident]
+    tp = int(((pred_on_conf) & (truth_on_conf)).sum())
+    fp = int(((pred_on_conf) & (~truth_on_conf)).sum())
+    fn = int(((~pred_on_conf) & (truth_on_conf)).sum())
+    tn = int(((~pred_on_conf) & (~truth_on_conf)).sum())
+
+    return {
+        "n_total": n_total,
+        "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "accuracy": (tp + tn) / max(n_conf, 1),
+        "ppv": tp / max(tp + fp, 1),
+        "npv": tn / max(tn + fn, 1),
+        "fpr": fp / max(fp + tn, 1),
+        "fnr": fn / max(fn + tp, 1),
+        "coverage": n_conf / max(n_total, 1),
+    }
+
+
+# ---------------------------------------------------------------------------
 # PAM50 centroid classifier (Parker et al. 2009, JCO 27:1160-1167)
 # ---------------------------------------------------------------------------
 

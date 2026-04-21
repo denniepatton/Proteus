@@ -66,33 +66,51 @@ def print_model_summary(model: nn.Module, model_name: str = "Model") -> None:
     print(f"{'='*60}\n")
 
 
-def get_model_instance(model_name: str = 'BioDVN') -> nn.Module:
-    """
-    Get a model class by name.
-    
-    Args:
-        model_name: Name of the model class
-        
+def get_model_instance(model_name: str = 'BioDVN') -> type:
+    """Get the model class for *model_name*.
+
+    Variant names (``BioDVN_NoSeq``, ``BioDVN_OnlySeq``) are mapped to the
+    unified ``BioDVN`` class — the caller should set
+    ``BioDVNConfig.channel_mode`` to ``'no_seq'`` or ``'only_seq'``
+    accordingly.
+
     Returns:
-        Model class (not instantiated)
+        Model **class** (not instantiated).
     """
-    models = {
-        'BioDVN': BioDVN,
-        'BioDVN_NoSeq': BioDVN_NoSeq,
-        'BioDVN_OnlySeq': BioDVN_OnlySeq,
-        'BioDVN_PAN-FT': BioDVN,
-    }
-    
-    if model_name not in models:
-        raise ValueError(f"No model found with name: {model_name}. Available: {list(models.keys())}")
-    
-    return models[model_name]
+    if model_name not in _MODEL_NAMES:
+        raise ValueError(
+            f"No model found with name: {model_name}. "
+            f"Available: {sorted(_MODEL_NAMES)}"
+        )
+    return BioDVN
+
+
+# Maps model_name → channel_mode for BioDVNConfig.
+_MODEL_CHANNEL_MODE: Dict[str, str] = {
+    'BioDVN': 'all',
+    'BioDVN_NoSeq': 'no_seq',
+    'BioDVN_OnlySeq': 'only_seq',
+    'BioDVN_PAN-FT': 'all',
+}
+
+_MODEL_NAMES = set(_MODEL_CHANNEL_MODE)
+
+
+def channel_mode_for_model(model_name: str) -> str:
+    """Return the ``channel_mode`` that corresponds to *model_name*."""
+    if model_name not in _MODEL_CHANNEL_MODE:
+        raise ValueError(
+            f"Unknown model_name '{model_name}'. "
+            f"Available: {sorted(_MODEL_CHANNEL_MODE)}"
+        )
+    return _MODEL_CHANNEL_MODE[model_name]
 
 
 @dataclass
 class BioDVNConfig:
     """Configuration for BioDVN model architecture and training."""
     # Architecture hyperparameters
+    channel_mode: str = 'all'  # 'all', 'no_seq', or 'only_seq'
     signal_filters: int = 16
     signal_ksize: int = 6
     interaction_ksize: int = 3
@@ -128,71 +146,91 @@ class BioDVNConfig:
 
 class SignalProcessingBlock(nn.Module):
     """
-    Signal processing block for initial feature extraction from TSS signals.
-    
-    Processes the biological signal channels and 4 nucleotide channels:
-    - per-channel biological signals (depthwise Conv1D)
-    - 4 one-hot encoded nucleotide signals (Conv2D to capture trimer context)
-    """
-    
-    def __init__(self, n_signal_channels: int, signal_filters: int = 16, signal_ksize: int = 6):
-        super().__init__()
-        if int(n_signal_channels) <= 0:
-            raise ValueError(f"n_signal_channels must be positive, got {n_signal_channels}")
+    Signal processing block for initial feature extraction from TSS data.
 
+    Depending on *channel_mode*, builds:
+      ``'all'``      — grouped Conv1D (9 bio signals) + Conv2D (4 nucleotides)
+      ``'no_seq'``   — grouped Conv1D only (9 bio signals)
+      ``'only_seq'`` — Conv2D only (4 nucleotides)
+    """
+
+    _VALID_MODES = ('all', 'no_seq', 'only_seq')
+
+    def __init__(
+        self,
+        channel_mode: str = 'all',
+        n_signal_channels: int = 9,
+        signal_filters: int = 16,
+        signal_ksize: int = 6,
+    ):
+        super().__init__()
+        if channel_mode not in self._VALID_MODES:
+            raise ValueError(
+                f"channel_mode must be one of {self._VALID_MODES}, "
+                f"got '{channel_mode}'"
+            )
+        self.channel_mode = channel_mode
         self.n_signal_channels = int(n_signal_channels)
         self.signal_filters = signal_filters
         self.signal_ksize = signal_ksize
 
-        # Grouped Conv1D: equivalent to N independent Conv1D(1->signal_filters)
-        # but implemented as a single kernel launch.
-        out_channels_1d = self.n_signal_channels * signal_filters
-        self.conv1d_signals = nn.Sequential(
-            nn.Conv1d(
-                in_channels=self.n_signal_channels,
-                out_channels=out_channels_1d,
-                kernel_size=signal_ksize,
-                padding=0,
-                groups=self.n_signal_channels,
-            ),
-            get_norm_layer_conv1d(out_channels_1d),
-            nn.ReLU(),
-        )
-        
-        # Conv2D layer for nucleotide channels (4 channels -> signal_filters)
-        # Input: (batch, 1, 4, 2000-padding), Output: (batch, signal_filters, 1, 2000-padding)
-        self.conv2d_nt = nn.Sequential(
-            nn.Conv2d(1, signal_filters, kernel_size=(4, signal_ksize), padding=0),
-            get_norm_layer_2d(signal_filters),
-            nn.ReLU()
-        )
-    
-    def forward(self, x_signals: torch.Tensor, x_nucleotides: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x_signals: tensor of shape (batch, 2000, n_signal_channels)
-            x_nucleotides: TSS_nucleotides tensor of shape (batch, 2000, 4)
-            
-        Returns:
-            Processed signal tensor of shape (batch, ~1995, (n_signal_channels + 1) * signal_filters)
-        """
-        # Process biological signals with grouped Conv1D
-        # (batch, 2000, C) -> (batch, C, 2000) -> (batch, C*signal_filters, ~1995)
-        x_sig = self.conv1d_signals(x_signals.permute(0, 2, 1))
-        
-        # Process nucleotide channels with Conv2D
-        # Transpose to make nucleotides the height: (batch, 4, 2000) -> (batch, 1, 4, 2000)
-        x_nt_2d = x_nucleotides.permute(0, 2, 1).unsqueeze(1)  # (batch, 1, 4, 2000)
-        x_nt_conv = self.conv2d_nt(x_nt_2d)  # (batch, signal_filters, 1, ~1995)
-        x_nt_conv = x_nt_conv.squeeze(2)  # (batch, signal_filters, ~1995)
+        # Grouped Conv1D for biological signal channels.
+        if channel_mode in ('all', 'no_seq'):
+            out_channels_1d = self.n_signal_channels * signal_filters
+            self.conv1d_signals = nn.Sequential(
+                nn.Conv1d(
+                    in_channels=self.n_signal_channels,
+                    out_channels=out_channels_1d,
+                    kernel_size=signal_ksize,
+                    padding=0,
+                    groups=self.n_signal_channels,
+                ),
+                get_norm_layer_conv1d(out_channels_1d),
+                nn.ReLU(),
+            )
+        else:
+            self.conv1d_signals = None
 
-        # Concatenate all channels: (batch, (C + 1) * signal_filters, ~1995)
-        x = torch.cat([x_sig, x_nt_conv], dim=1)
-        
-        # Permute to (batch, length, channels) for downstream processing
-        x = x.permute(0, 2, 1)
-        
-        return x
+        # Conv2D for nucleotide channels.
+        if channel_mode in ('all', 'only_seq'):
+            self.conv2d_nt = nn.Sequential(
+                nn.Conv2d(1, signal_filters, kernel_size=(4, signal_ksize), padding=0),
+                get_norm_layer_2d(signal_filters),
+                nn.ReLU(),
+            )
+        else:
+            self.conv2d_nt = None
+
+    @property
+    def out_channels(self) -> int:
+        """Number of output channels after concatenation."""
+        n = 0
+        if self.conv1d_signals is not None:
+            n += self.n_signal_channels * self.signal_filters
+        if self.conv2d_nt is not None:
+            n += self.signal_filters
+        return n
+
+    def forward(
+        self,
+        x_signals: Optional[torch.Tensor],
+        x_nucleotides: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        parts: List[torch.Tensor] = []
+
+        if self.conv1d_signals is not None and x_signals is not None:
+            parts.append(self.conv1d_signals(x_signals.permute(0, 2, 1)))
+
+        if self.conv2d_nt is not None and x_nucleotides is not None:
+            x_nt_2d = x_nucleotides.permute(0, 2, 1).unsqueeze(1)
+            x_nt_conv = self.conv2d_nt(x_nt_2d).squeeze(2)
+            parts.append(x_nt_conv)
+
+        if not parts:
+            raise ValueError("SignalProcessingBlock received no valid input")
+
+        x = torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
+        return x.permute(0, 2, 1)  # (batch, length, channels)
 
 
 class ReductionBlock(nn.Module):
@@ -451,16 +489,17 @@ class BioDVN(nn.Module):
             config = BioDVNConfig()
         self.config = config
         
-        # Signal processing block (always use all 9 biological signal channels).
+        # Signal processing block — channel_mode controls which
+        # convolutions are built (bio signals, nucleotides, or both).
         n_signal_channels = 9
         self.signal_processor = SignalProcessingBlock(
+            channel_mode=config.channel_mode,
             n_signal_channels=n_signal_channels,
             signal_filters=config.signal_filters,
             signal_ksize=config.signal_ksize,
         )
         
-        # After signal processing: (n_signal_channels + 1) * signal_filters channels
-        signal_channels = (n_signal_channels + 1) * config.signal_filters
+        signal_channels = self.signal_processor.out_channels
         
         # Spatial reduction block: Conv2D cross-channel interaction with
         # residual skip connections, followed by AvgPool.  Skip connections
@@ -492,11 +531,12 @@ class BioDVN(nn.Module):
             nn.Dropout(config.dropout_rate),
         )
         self.scalar_input_dim = 0
-        # TSS scalar features (11 shared Triton features, matching GB).
-        self.scalar_input_dim += 11
 
-        # GB features (11 scalars).
-        self.scalar_input_dim += 11
+        # only_seq excludes sample-derived scalar features (TSS/GB)
+        # to ensure a true sequence-only ablation.
+        if config.channel_mode != 'only_seq':
+            self.scalar_input_dim += 11  # TSS scalar features
+            self.scalar_input_dim += 11  # GB features
 
         # Reference scalars always included.
         self.scalar_input_dim += 3
@@ -644,21 +684,25 @@ class BioDVN(nn.Module):
                 - background_exp: (batch, 1) mixture mean point estimate
             internal_loss: Tuple of (loss_tensor, metrics_dict) if return_internal_loss=True
         """
-        # Extract features
-        x_signals = features['TSS_signals']
-        x_nucleotides = features['TSS_nucleotides']
-        # Defensive slice: current Zarr stores write exactly 11 TSS features,
-        # but we clip to 11 to guard against any older stores with extra columns.
-        tss_features = features['TSS_features'][:, :11]
-        gb_features = features['GB_features']
-        ref_scalars = features['ref_scalars']
+        # Extract features based on channel_mode.
+        x_signals: Optional[torch.Tensor] = None
+        x_nucleotides: Optional[torch.Tensor] = None
 
-        # Biological signals: the model always consumes all 9 channels.
-        if int(x_signals.shape[-1]) < 9:
-            raise ValueError(f"Expected at least 9 biological signal channels, got {int(x_signals.shape[-1])}")
-        x_signals = x_signals[:, :, :9]
+        if self.config.channel_mode in ('all', 'no_seq'):
+            x_signals = features['TSS_signals']
+            if int(x_signals.shape[-1]) < 9:
+                raise ValueError(
+                    f"Expected at least 9 biological signal channels, "
+                    f"got {int(x_signals.shape[-1])}"
+                )
+            x_signals = x_signals[:, :, :9]
+
+        if self.config.channel_mode in ('all', 'only_seq'):
+            x_nucleotides = features['TSS_nucleotides']
+
+        ref_scalars = features['ref_scalars']
         
-        # Signal processing (separate signals and nucleotides)
+        # Signal processing
         x = self.signal_processor(x_signals, x_nucleotides)
         
         # Spatial reduction (skip connections integrate multi-scale features)
@@ -670,15 +714,16 @@ class BioDVN(nn.Module):
         x_encoded = self.signal_encoder(x)
         
         # Combine with scalar features.
-        # Build encoder input.  TFX is never included — the encoder learns
-        # TFX-invariant representations.  TFX enters only through the merge
-        # weight predictor (via GRL discriminator prediction).
-        encoder_inputs: List[torch.Tensor] = [
-            x_encoded,
-            tss_features,
-            gb_features,
-            ref_scalars,
-        ]
+        # TFX is never included — the encoder learns TFX-invariant
+        # representations.  TFX enters only through the merge weight
+        # predictor (via GRL discriminator prediction).
+        encoder_inputs: List[torch.Tensor] = [x_encoded]
+        if self.config.channel_mode != 'only_seq':
+            # Defensive slice: clip TSS features to 11 to guard against
+            # any older stores with extra columns.
+            encoder_inputs.append(features['TSS_features'][:, :11])
+            encoder_inputs.append(features['GB_features'])
+        encoder_inputs.append(ref_scalars)
         y = torch.cat(encoder_inputs, dim=1)
         
         # Dual encoding
@@ -877,295 +922,3 @@ class BioDVN(nn.Module):
                         break
                 if not is_norm:
                     param.requires_grad = False
-
-
-class BioDVN_NoSeq(BioDVN):
-    """
-    BioDVN variant without sequence (nucleotide) information.
-    Only uses the 9 biological signal channels, ignoring TSS_nucleotides.
-    """
-    
-    def __init__(self, config: Optional[BioDVNConfig] = None):
-        # Modify signal processing to exclude nucleotide channels
-        super().__init__(config)
-        
-        # Override signal processor to only use 9 signal channels
-        self.signal_processor = SignalProcessingBlock_NoSeq(
-            signal_filters=self.config.signal_filters,
-            signal_ksize=self.config.signal_ksize,
-        )
-        
-        # Update signal_channels to 9 * filters (no nucleotide block)
-        signal_channels = 9 * self.config.signal_filters
-        
-        # Recreate reduction block with correct input channels
-        self.reduction = ReductionBlock(
-            in_channels=signal_channels,
-            initial_reduction_channels=self.config.initial_reduction_channels,
-            n_reductions=self.config.n_reductions,
-            interaction_ksize=self.config.interaction_ksize,
-            dilation=self.config.reduction_dilation,
-        )
-        
-        # Rebuild signal encoder to match new reduction output channels.
-        reduction_out_channels = self.reduction.out_channels
-        self.signal_encoder = nn.Sequential(
-            nn.Conv1d(reduction_out_channels, self.signal_encoded_dim, kernel_size=1),
-            get_norm_layer_conv1d(self.signal_encoded_dim),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(1),
-            nn.Dropout(self.config.dropout_rate),
-        )
-        
-        # Re-apply weight initialization to newly created layers
-        self.signal_processor.apply(self._init_weights)
-        self.reduction.apply(self._init_weights)
-        self.signal_encoder.apply(self._init_weights)
-
-
-class SignalProcessingBlock_NoSeq(nn.Module):
-    """
-    Signal processing without nucleotide channels.
-    Only processes the 9 biological signal channels.
-    """
-    
-    def __init__(self, signal_filters: int = 16, signal_ksize: int = 6):
-        super().__init__()
-        self.signal_filters = signal_filters
-
-        out_channels = 9 * signal_filters
-        self.conv1d_signals = nn.Sequential(
-            nn.Conv1d(
-                in_channels=9,
-                out_channels=out_channels,
-                kernel_size=signal_ksize,
-                padding=0,
-                groups=9,
-            ),
-            get_norm_layer_conv1d(out_channels),
-            nn.ReLU(),
-        )
-    
-    def forward(self, x_signals: torch.Tensor, x_nucleotides: torch.Tensor = None) -> torch.Tensor:
-        """
-        Process only biological signal channels (ignore nucleotides).
-        
-        Args:
-            x_signals: TSS_signals tensor of shape (batch, 2000, 9)
-            x_nucleotides: Ignored (for interface compatibility)
-            
-        Returns:
-            Processed signal tensor of shape (batch, ~1995, 8 * signal_filters)
-        """
-        x = self.conv1d_signals(x_signals.permute(0, 2, 1))
-        x = x.permute(0, 2, 1)
-        
-        return x
-
-
-class BioDVN_OnlySeq(BioDVN):
-    """
-    BioDVN variant using only nucleotide sequence information.
-    Drops all 9 biological signal channels, keeping only the 4 one-hot
-    encoded nucleotide channels processed via Conv2D.
-
-    To ensure a true sequence-only ablation, this variant also excludes
-    sample-derived scalar features (TSS_features, GB_features) from the
-    encoder input.  Only reference scalars (gene-level annotation constants
-    that do not vary across samples) are retained alongside the encoded
-    nucleotide signal.
-    """
-
-    def __init__(self, config: Optional[BioDVNConfig] = None):
-        super().__init__(config)
-
-        # Override signal processor to only use nucleotide channels
-        self.signal_processor = SignalProcessingBlock_OnlySeq(
-            signal_filters=self.config.signal_filters,
-            signal_ksize=self.config.signal_ksize,
-        )
-
-        # Only nucleotide-derived channels: 1 * signal_filters
-        signal_channels = 1 * self.config.signal_filters
-
-        # Recreate reduction block with correct input channels
-        self.reduction = ReductionBlock(
-            in_channels=signal_channels,
-            initial_reduction_channels=self.config.initial_reduction_channels,
-            n_reductions=self.config.n_reductions,
-            interaction_ksize=self.config.interaction_ksize,
-            dilation=self.config.reduction_dilation,
-        )
-
-        # Rebuild signal encoder to match new reduction output channels.
-        reduction_out_channels = self.reduction.out_channels
-        self.signal_encoder = nn.Sequential(
-            nn.Conv1d(reduction_out_channels, self.signal_encoded_dim, kernel_size=1),
-            get_norm_layer_conv1d(self.signal_encoded_dim),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(1),
-            nn.Dropout(self.config.dropout_rate),
-        )
-
-        # Exclude sample-derived scalar features (TSS_features=11, GB_features=11).
-        # Only reference scalars (3) are retained — these are gene-level
-        # constants (NumExons, transcript_length, mRNA_size) that do not
-        # vary across samples.
-        self.scalar_input_dim = 3  # ref_scalars only
-        self.encoder_input_dim = int(self.signal_encoded_dim + self.scalar_input_dim)
-
-        # Rebuild all layers downstream of the encoder input dimension change.
-        self.tumor_encoder = Encoder(
-            input_dim=self.encoder_input_dim,
-            latent_dim=self.config.latent_size,
-            start_dim=self.config.encoder_start,
-            dropout_rate=self.config.dropout_rate,
-        )
-        self.background_encoder = Encoder(
-            input_dim=self.encoder_input_dim,
-            latent_dim=self.config.latent_size,
-            start_dim=self.config.encoder_start,
-            dropout_rate=self.config.dropout_rate,
-        )
-        self.decoder = Decoder(
-            input_dim=self.config.latent_size,
-            output_dim=self.encoder_input_dim,
-            start_dim=self.config.decoder_start,
-            dropout_rate=0.0,
-        )
-
-        # Re-apply weight initialization to all newly created layers
-        self.signal_processor.apply(self._init_weights)
-        self.reduction.apply(self._init_weights)
-        self.signal_encoder.apply(self._init_weights)
-        self.tumor_encoder.apply(self._init_weights)
-        self.background_encoder.apply(self._init_weights)
-        self.decoder.apply(self._init_weights)
-
-    def forward(
-        self,
-        features: Dict[str, torch.Tensor],
-        return_internal_loss: bool = True,
-        tfx: Optional[torch.Tensor] = None,
-    ) -> Tuple[Dict[str, torch.Tensor], Optional[Tuple[torch.Tensor, Dict]]]:
-        """Forward pass using only nucleotide sequence + reference scalars."""
-        x_nucleotides = features['TSS_nucleotides']
-        ref_scalars = features['ref_scalars']
-
-        # Signal processing (nucleotide-only)
-        x = self.signal_processor(None, x_nucleotides)
-
-        # Spatial reduction
-        x = self.reduction(x)
-
-        # Signal encoding: permute to (batch, channels, length) for Conv1d,
-        # then the adaptive-pooling signal encoder squashes spatial dim.
-        x = x.permute(0, 2, 1)
-        x_encoded = self.signal_encoder(x)
-
-        # Encoder input: signal encoding + reference scalars only.
-        # TSS_features and GB_features are deliberately excluded — they
-        # are sample-derived fragmentomic summaries that would leak
-        # biological signal information into the sequence-only ablation.
-        y = torch.cat([x_encoded, ref_scalars], dim=1)
-
-        # Dual encoding
-        z_tumor_mean, z_tumor_log_var = self.tumor_encoder(y)
-        z_background_mean, z_background_log_var = self.background_encoder(y)
-
-        # Sampling
-        z_tumor = self.sampling(z_tumor_mean, z_tumor_log_var)
-        z_background = self.sampling(z_background_mean, z_background_log_var)
-
-        # TFX discriminator + merge
-        predicted_tfx = self.tfx_discriminator(z_tumor_mean, z_background_mean)
-
-        grl_loss = None
-        if self.training:
-            if tfx is None:
-                raise ValueError(
-                    "tfx (ground-truth tumor fraction) must be provided "
-                    "during training for the GRL discriminator loss."
-                )
-            grl_loss = F.mse_loss(predicted_tfx.float(), tfx.float())
-
-        merge_input = torch.cat([
-            predicted_tfx, z_tumor_mean, z_tumor_log_var,
-            z_background_mean, z_background_log_var,
-        ], dim=1)
-        weights = self.weight_predictor(merge_input)
-
-        z_merged_mean, z_merged_log_var = self.merge_latents(
-            weights, z_tumor_mean, z_tumor_log_var,
-            z_background_mean, z_background_log_var,
-        )
-        z_merged = self.sampling(z_merged_mean, z_merged_log_var)
-
-        # Reconstruction
-        y_reconstructed = self.decoder(z_merged)
-
-        # MDN output heads
-        tumor_mdn = self.tumor_mdn_head(z_tumor)
-        background_mdn = self.background_mdn_head(z_background)
-
-        tumor_exp = mixture_mean(tumor_mdn)
-        background_exp = mixture_mean(background_mdn)
-
-        predictions = {
-            'tumor_mdn': tumor_mdn,
-            'background_mdn': background_mdn,
-            'tumor_exp': tumor_exp,
-            'background_exp': background_exp,
-        }
-
-        if return_internal_loss and self.training:
-            internal_loss, internal_metrics = self.internal_loss_fn(
-                z_tumor, z_background,
-                z_tumor_mean, z_tumor_log_var,
-                z_background_mean, z_background_log_var,
-                y, y_reconstructed,
-                grl_loss=grl_loss,
-            )
-            return predictions, (internal_loss, internal_metrics)
-
-        return predictions, None
-
-
-class SignalProcessingBlock_OnlySeq(nn.Module):
-    """
-    Signal processing using only nucleotide sequence channels.
-    Processes the 4 one-hot nucleotide channels via Conv2D, ignoring
-    biological signal channels entirely.
-    """
-
-    def __init__(self, signal_filters: int = 16, signal_ksize: int = 6):
-        super().__init__()
-        self.signal_filters = signal_filters
-
-        # Conv2D for nucleotide channels: (batch, 1, 4, 2000) -> (batch, filters, 1, ~1995)
-        self.conv2d_nt = nn.Sequential(
-            nn.Conv2d(1, signal_filters, kernel_size=(4, signal_ksize), padding=0),
-            get_norm_layer_2d(signal_filters),
-            nn.ReLU(),
-        )
-
-    def forward(self, x_signals: torch.Tensor = None, x_nucleotides: torch.Tensor = None) -> torch.Tensor:
-        """
-        Process only nucleotide channels (ignore biological signals).
-
-        Args:
-            x_signals: Ignored (for interface compatibility).
-            x_nucleotides: TSS_nucleotides tensor of shape (batch, 2000, 4)
-
-        Returns:
-            Processed tensor of shape (batch, ~1995, signal_filters)
-        """
-        # (batch, 2000, 4) -> (batch, 4, 2000) -> (batch, 1, 4, 2000)
-        x_nt_2d = x_nucleotides.permute(0, 2, 1).unsqueeze(1)
-        x_nt_conv = self.conv2d_nt(x_nt_2d)   # (batch, signal_filters, 1, ~1995)
-        x_nt_conv = x_nt_conv.squeeze(2)       # (batch, signal_filters, ~1995)
-        x = x_nt_conv.permute(0, 2, 1)         # (batch, ~1995, signal_filters)
-
-        return x

@@ -57,7 +57,7 @@ from torch.utils.data import DataLoader
 torch.backends.cudnn.benchmark = True
 
 # Local imports
-from models import BioDVN, BioDVNConfig, get_model_instance
+from models import BioDVN, BioDVNConfig, get_model_instance, channel_mode_for_model
 from proteus_utils.trainer import TrainingConfig, Trainer
 from proteus_utils import (
     get_samples, get_zarr_output_dir, process_dataset,
@@ -72,11 +72,13 @@ from proteus_utils.metrics import (
     group_spearman_r2, group_pearson_r_named,
     coverage, gvw_r, scatter_stats,
 )
-from config.config_loader import ConfigLoader
-
-# Loader sizing invariants
-FIXED_GENES_PER_BATCH = 32
-FIXED_CHUNK_SIZE = 256  # Must match Zarr store chunking in compile_sample_data.py
+from proteus_utils.evaluation import save_fold_predictions
+from proteus_utils.data_helpers import (
+    zarr_name_for_sample, zarr_path_for_sample,
+    resolve_pht_source, invert_source_groups, collect_pdx_names,
+    collect_zarr_paths, build_source_map_from_tsv, compute_source_variance,
+)
+from config.dataset_config import load_dataset_config, list_datasets
 
 # Resolve project-relative paths robustly (do not depend on current working directory)
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -108,7 +110,6 @@ def _loader_workers() -> int:
 
 
 def ensure_datasets_exist(
-    config_loader: 'ConfigLoader',
     dataset_names: List[str],
     zarr_base: str,
     raw_data_base: str,
@@ -119,11 +120,10 @@ def ensure_datasets_exist(
     """
     Check that all configured datasets have Zarr stores, regenerate if missing.
     
-    This is useful because Zarr stores are kept in fast-access temporary storage
-    that may be cleared periodically (e.g., every 30 days).
+    Zarr stores live on fast-access temporary storage that may be cleared
+    periodically (e.g., every 30 days).
     
     Args:
-        config_loader: ConfigLoader instance for loading dataset configs
         dataset_names: List of dataset names to check
         zarr_base: Base directory for Zarr stores
         raw_data_base: Base directory for raw Triton outputs
@@ -149,7 +149,7 @@ def ensure_datasets_exist(
     for dataset_name in dataset_names:
         # Load dataset config from YAML
         try:
-            dataset_config = config_loader.load_dataset(dataset_name)
+            dataset_config = load_dataset_config(dataset_name)
         except FileNotFoundError:
             print(f"[Auto-regenerate] Warning: No config for '{dataset_name}', skipping")
             continue
@@ -320,44 +320,6 @@ def generate_data(
     return created_paths
 
 
-def _collect_zarr_paths(
-    training_set_tsv: str,
-    zarr_base: str,
-    exclude_fold: Optional[int] = None,
-    exclude_cohorts: Optional[set] = None,
-) -> List[str]:
-    """Collect Zarr paths from a training-set TSV.
-
-    Args:
-        training_set_tsv: TSV with Cohort/Sample/Fold columns.
-        zarr_base: Root directory for Zarr stores.
-        exclude_fold: If set, skip samples whose Fold == this value.
-            If None, include ALL samples (no fold filter).
-        exclude_cohorts: If set, skip samples whose Cohort is in this set.
-
-    Path construction strips the cohort prefix from TSV sample names for
-    Zarr file access only (files on disk use bare names), mirroring
-    build_loaders_from_splits.
-    """
-    paths: List[str] = []
-    with open(training_set_tsv, 'r', newline='') as f:
-        reader = csv.DictReader(f, delimiter='\t')
-        for row in reader:
-            if exclude_fold is not None and int(row['Fold']) == exclude_fold:
-                continue
-            cohort = row['Cohort'].strip()
-            if exclude_cohorts and cohort in exclude_cohorts:
-                continue
-            sample = row['Sample'].strip()
-            zarr_name = sample
-            if sample.startswith(f"{cohort}_"):
-                zarr_name = sample[len(cohort) + 1:]
-            zarr_path = os.path.join(zarr_base, cohort, 'zarr_files', f"{zarr_name}.zarr")
-            if os.path.isdir(zarr_path):
-                paths.append(zarr_path)
-    return paths
-
-
 def train_model_cv(
     model_name: str,
     training_set_tsv: str,
@@ -366,9 +328,6 @@ def train_model_cv(
     out_dir: Optional[str] = None,
     model_config: Optional[BioDVNConfig] = None,
     training_config: Optional[TrainingConfig] = None,
-    genes_per_batch: int = 32,
-    chunk_size: int = 256,
-    shuffle_genes_in_batch: bool = True,
     seed: int = 42,
     subsample_frac: Optional[float] = None,
     epoch_end_callback: Optional[Callable[..., None]] = None,
@@ -382,16 +341,13 @@ def train_model_cv(
     """Train a model using cross-validation with deterministic fold assignment.
 
     Args:
-        model_name: Name of the model class.
+        model_name: Name of the model class (e.g. 'BioDVN', 'BioDVN_NoSeq').
         training_set_tsv: Path to TSV file with Cohort/Sample/Fold columns.
         zarr_base: Base directory for Zarr stores ({zarr_base}/{cohort}/{sample}.zarr).
         test_fold: If set, only train this fold (for HPC parallelization).
         out_dir: Output directory for checkpoints/predictions.
         model_config: Fully-specified BioDVNConfig.
         training_config: Fully-specified TrainingConfig.
-        genes_per_batch: Genes per batch (32 invariant).
-        chunk_size: Genes per chunk (256 invariant).
-        shuffle_genes_in_batch: Whether to shuffle genes within batch.
         seed: Random seed for reproducibility.
         subsample_frac: Optional fraction (0.0-1.0) of genes for fast sanity checks.
 
@@ -433,7 +389,7 @@ def train_model_cv(
     # samples, so including them would inflate sample counts and bias variance.
     from proteus_utils.proteus_utils import compute_gene_weights_from_zarr, compute_gene_variances_unclipped
     print('Computing full-dataset gene variance for GVW evaluation (excluding PHT)...')
-    all_zarr_paths = _collect_zarr_paths(training_set_tsv, zarr_base, exclude_cohorts={'PHT'})
+    all_zarr_paths = collect_zarr_paths(training_set_tsv, zarr_base, exclude_cohorts={'PHT'})
     full_tumor_variance = compute_gene_variances_unclipped(
         all_zarr_paths, label_key='flat/tumor_exp',
     )
@@ -452,7 +408,7 @@ def train_model_cv(
     # We use ALL samples here (not the PHT-excluded set) so PHT's HD-L
     # background labels contribute.  Background variance is used only for
     # validation GVW metrics, not for training gene weights.
-    all_zarr_paths_with_pht = _collect_zarr_paths(training_set_tsv, zarr_base)
+    all_zarr_paths_with_pht = collect_zarr_paths(training_set_tsv, zarr_base)
     full_background_variance: Optional[Dict[str, float]] = compute_gene_variances_unclipped(
         all_zarr_paths_with_pht, label_key='flat/background_exp',
     ) or None
@@ -475,96 +431,16 @@ def train_model_cv(
 
     # When source_groups is set, build sample→source mapping and compute
     # per-source gene variance for GVW-CRPS / GVW-r evaluation.
-    # PHT samples are assigned to their parent PDX source using the same
-    # regex logic as build_loaders_from_splits.
     sample_to_source: Optional[Dict[str, str]] = None
     source_tumor_variance: Optional[Dict[str, Dict[str, float]]] = None
     if source_groups:
-        import re
-        # Invert source_groups: cohort → source name.
-        _cohort_to_source: Dict[str, str] = {}
-        for src_name, cohorts in source_groups.items():
-            for coh in cohorts:
-                _cohort_to_source[coh] = src_name
-
-        # Collect known PDX sample names per cohort (for matching PHT names).
-        _pdx_sample_to_cohort: Dict[str, str] = {}
-        with open(training_set_tsv, 'r', newline='') as f:
-            reader = csv.DictReader(f, delimiter='\t')
-            for row in reader:
-                coh = row['Cohort'].strip()
-                samp = row['Sample'].strip()
-                if samp.startswith(f"{coh}_"):
-                    samp = samp[len(coh) + 1:]
-                if coh in _cohort_to_source:
-                    _pdx_sample_to_cohort[samp] = coh
-
-        _pht_re = re.compile(r'^PHT-Fold-\d+_(.+)-BP\d+')
-        sample_to_source = {}
-        _source_zarr_paths: Dict[str, List[str]] = {src: [] for src in source_groups}
-
-        with open(training_set_tsv, 'r', newline='') as f:
-            reader = csv.DictReader(f, delimiter='\t')
-            for row in reader:
-                cohort = row['Cohort'].strip()
-                sample = row['Sample'].strip()
-
-                # Zarr files on disk use bare names (without cohort prefix).
-                zarr_name = sample
-                if sample.startswith(f"{cohort}_"):
-                    zarr_name = sample[len(cohort) + 1:]
-
-                if cohort in _cohort_to_source:
-                    source = _cohort_to_source[cohort]
-                elif cohort == 'PHT':
-                    m = _pht_re.match(sample)
-                    if m:
-                        pdx_name = m.group(1)
-                        pdx_coh = _pdx_sample_to_cohort.get(pdx_name)
-                        if pdx_coh is not None:
-                            source = _cohort_to_source[pdx_coh]
-                        else:
-                            raise ValueError(
-                                f"PHT sample '{sample}' has PDX name '{pdx_name}' "
-                                f"that does not match any known PDX sample. "
-                                f"Known: {sorted(_pdx_sample_to_cohort.keys())}"
-                            )
-                    else:
-                        raise ValueError(
-                            f"Could not parse PDX name from PHT sample: '{sample}'. "
-                            f"Expected format: PHT-Fold-X_<PDX_NAME>-BP..."
-                        )
-                else:
-                    continue  # cohort not in any source group
-
-                sample_to_source[sample] = source
-                zarr_path = os.path.join(
-                    zarr_base, cohort, 'zarr_files', f"{zarr_name}.zarr",
-                )
-                if os.path.isdir(zarr_path):
-                    # Only non-PHT samples contribute to per-source variance.
-                    # PHT truth labels duplicate their parent PDX, so
-                    # including them would double-count and bias variance.
-                    if cohort != 'PHT':
-                        _source_zarr_paths[source].append(zarr_path)
-
-        # Compute per-source unclipped tumor variance (all 5 folds).
-        print('Computing per-source gene variance for GVW evaluation...')
-        source_tumor_variance = {}
-        for src_name in sorted(source_groups):
-            src_paths = _source_zarr_paths[src_name]
-            if src_paths:
-                source_tumor_variance[src_name] = compute_gene_variances_unclipped(
-                    src_paths, label_key='flat/tumor_exp',
-                )
-                vals = list(source_tumor_variance[src_name].values())
-                print(
-                    f'  Source "{src_name}": {len(vals)} genes, '
-                    f'variance range [{min(vals):.3f}, {max(vals):.3f}], '
-                    f'{len(src_paths)} samples'
-                )
-            else:
-                print(f'  Source "{src_name}": no zarr paths found — skipping')
+        sample_to_source, _source_variance_paths = build_source_map_from_tsv(
+            training_set_tsv, source_groups, zarr_base,
+        )
+        source_tumor_variance = compute_source_variance(
+            source_groups, _source_variance_paths,
+            compute_gene_variances_unclipped,
+        )
 
     for fold_num in fold_list:
         if test_fold is not None and fold_num != test_fold:
@@ -585,7 +461,7 @@ def train_model_cv(
         # (excluding the held-out validation fold).  Clipped variance weights
         # scale the CRPS loss so high-variance genes contribute more.
         print(f'Computing gene variance weights from training folds (excluding fold {fold_num}, excluding PHT)...')
-        train_zarr_paths = _collect_zarr_paths(
+        train_zarr_paths = collect_zarr_paths(
             training_set_tsv, zarr_base, exclude_fold=fold_num,
             exclude_cohorts={'PHT'},
         )
@@ -625,10 +501,6 @@ def train_model_cv(
                 zarr_base=zarr_base,
                 val_fold=fold_num,
                 num_workers=_loader_workers(),
-                loader_mode='chunk',
-                chunk_size=chunk_size,
-                genes_per_batch=genes_per_batch,
-                shuffle_genes_in_batch=shuffle_genes_in_batch,
                 seed=seed,
                 subsample_frac=subsample_frac,
                 gene_weights=gene_weights,
@@ -687,7 +559,7 @@ def train_model_cv(
         torch.save(model_for_save.state_dict(), os.path.join(fold_dir, f'validation-fold_{fold_num}_weights.pt'))
         
         # Generate and save predictions
-        _save_fold_predictions(
+        save_fold_predictions(
             model_for_eval,
             val_loader,
             fold_dir,
@@ -839,569 +711,6 @@ def _summarize_cv_results(out_dir: str) -> None:
         json.dump(agg, f, indent=2)
 
 
-def _save_fold_predictions(
-    model: nn.Module,
-    val_loader: DataLoader,
-    fold_dir: str,
-    fold_num: int,
-    device: torch.device,
-    full_tumor_variance: Optional[Dict[str, float]] = None,
-    full_background_variance: Optional[Dict[str, float]] = None,
-    sample_to_cohort: Optional[Dict[str, str]] = None,
-    sample_to_source: Optional[Dict[str, str]] = None,
-    source_tumor_variance: Optional[Dict[str, Dict[str, float]]] = None,
-):
-    """Save MDN predictions, full distribution params, and quantile CIs for a validation fold.
-
-    For each observation the output TSV contains:
-        truth, prediction_mean, ci_q5, ci_q95,
-        pi_delta, pi_gamma, gamma_beta, pi_normal, normal_mean,
-        normal_stdev, sample.
-
-    ci_q5 / ci_q95 are CDF-based quantiles F^{-1}(0.05) / F^{-1}(0.95),
-    clamped to [0, Y_MAX].
-    """
-    from models.model_utils import (
-        mixture_quantile, mixture_crps, Y_MAX,
-    )
-
-    model.eval()
-
-    # ---- Accumulators (tumor) ----
-    all_t_pred_mean = []
-    all_t_q5 = []
-    all_t_q95 = []
-    all_t_true = []
-    all_t_pi_delta = []
-    all_t_pi_gamma = []
-    all_t_pi_normal = []
-    all_t_gamma_beta = []
-    all_t_normal_mu = []
-    all_t_normal_sigma = []
-
-    # ---- Accumulators (background) ----
-    all_b_pred_mean = []
-    all_b_q5 = []
-    all_b_q95 = []
-    all_b_true = []
-    all_b_pi_delta = []
-    all_b_pi_gamma = []
-    all_b_pi_normal = []
-    all_b_gamma_beta = []
-    all_b_normal_mu = []
-    all_b_normal_sigma = []
-
-    # Metadata
-    all_samples = []
-    all_genes = []
-
-    # CRPS accumulators
-    tumor_crps_sum = torch.tensor(0.0)
-    tumor_crps_denom = torch.tensor(0.0)
-    bg_crps_sum = torch.tensor(0.0)
-    bg_crps_denom = torch.tensor(0.0)
-
-    # Per-cohort CRPS accumulators (for balanced fine-tuning objective)
-    _cohort_crps: Dict[str, List[torch.Tensor]] = {}  # cohort -> [t_sum, t_den]
-
-    # Per-source CRPS accumulators (when source_groups is active).
-    # Each source uses its own per-source variance as CRPS weights.
-    _source_crps: Dict[str, List[torch.Tensor]] = {}  # source -> [t_sum, t_den]
-
-    with torch.no_grad():
-        for features, labels in val_loader:
-            if 'sample_name' not in features or 'gene_name' not in features:
-                raise KeyError(
-                    "Validation batches are missing 'sample_name'/'gene_name'. "
-                    "This typically means the validation DataLoader was created without include_metadata=True."
-                )
-
-            features_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                               for k, v in features.items()}
-            labels_device = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                             for k, v in labels.items()}
-
-            predictions, _ = model(features_device, return_internal_loss=False)
-
-            # ---- Tumor head ----
-            t_mdn = predictions['tumor_mdn']
-            t_q = mixture_quantile(t_mdn, quantiles=(0.05, 0.95))  # (batch, 2)
-            t_pi = t_mdn['log_pi'].exp().cpu().numpy()
-
-            all_t_pred_mean.extend(predictions['tumor_exp'].cpu().numpy().flatten())
-            all_t_q5.extend(t_q[:, 0].cpu().numpy().flatten())
-            all_t_q95.extend(t_q[:, 1].cpu().numpy().flatten())
-            all_t_true.extend(labels_device['tumor_exp'].cpu().numpy().flatten())
-            all_t_pi_delta.extend(t_pi[:, 0].flatten())
-            all_t_pi_gamma.extend(t_pi[:, 1].flatten())
-            all_t_pi_normal.extend(t_pi[:, 2].flatten())
-            all_t_gamma_beta.extend(t_mdn['gamma_beta'].cpu().numpy().flatten())
-            all_t_normal_mu.extend(t_mdn['normal_mu'].cpu().numpy().flatten())
-            all_t_normal_sigma.extend(t_mdn['normal_sigma'].cpu().numpy().flatten())
-
-            # ---- Background head ----
-            b_mdn = predictions['background_mdn']
-            b_q = mixture_quantile(b_mdn, quantiles=(0.05, 0.95))  # (batch, 2)
-            b_pi = b_mdn['log_pi'].exp().cpu().numpy()
-
-            all_b_pred_mean.extend(predictions['background_exp'].cpu().numpy().flatten())
-            all_b_q5.extend(b_q[:, 0].cpu().numpy().flatten())
-            all_b_q95.extend(b_q[:, 1].cpu().numpy().flatten())
-            all_b_true.extend(labels_device['background_exp'].cpu().numpy().flatten())
-            all_b_pi_delta.extend(b_pi[:, 0].flatten())
-            all_b_pi_gamma.extend(b_pi[:, 1].flatten())
-            all_b_pi_normal.extend(b_pi[:, 2].flatten())
-            all_b_gamma_beta.extend(b_mdn['gamma_beta'].cpu().numpy().flatten())
-            all_b_normal_mu.extend(b_mdn['normal_mu'].cpu().numpy().flatten())
-            all_b_normal_sigma.extend(b_mdn['normal_sigma'].cpu().numpy().flatten())
-
-            # ---- GVW-CRPS (tumor) ----
-            w_tumor = None
-            if full_tumor_variance is not None and 'gene_name' in features:
-                gnames = features['gene_name']
-                if isinstance(gnames, (list, tuple)):
-                    w_tumor = torch.tensor(
-                        [float(full_tumor_variance.get(str(g), 1.0)) for g in gnames],
-                        dtype=torch.float32, device=device,
-                    ).unsqueeze(-1)
-                else:
-                    w_tumor = torch.tensor(
-                        [[float(full_tumor_variance.get(str(gnames), 1.0))]],
-                        dtype=torch.float32, device=device,
-                    )
-            crps_s, crps_d = mixture_crps(t_mdn, labels_device['tumor_exp'], sample_weight=w_tumor)
-            tumor_crps_sum += crps_s.cpu()
-            tumor_crps_denom += crps_d.cpu()
-
-            # ---- GVW-CRPS (background) ----
-            w_bg = None
-            if full_background_variance is not None and 'gene_name' in features:
-                gnames = features['gene_name']
-                if isinstance(gnames, (list, tuple)):
-                    w_bg = torch.tensor(
-                        [float(full_background_variance.get(str(g), 1.0)) for g in gnames],
-                        dtype=torch.float32, device=device,
-                    ).unsqueeze(-1)
-                else:
-                    w_bg = torch.tensor(
-                        [[float(full_background_variance.get(str(gnames), 1.0))]],
-                        dtype=torch.float32, device=device,
-                    )
-            bg_crps_s, bg_crps_d = mixture_crps(b_mdn, labels_device['background_exp'], sample_weight=w_bg)
-            bg_crps_sum += bg_crps_s.cpu()
-            bg_crps_denom += bg_crps_d.cpu()
-
-            # ---- Per-cohort GVW-CRPS (tumor) ----
-            if sample_to_cohort and 'sample_name' in features:
-                batch_samples = features['sample_name']
-                if not isinstance(batch_samples, (list, tuple)):
-                    batch_samples = [batch_samples]
-                cohort_labels = [sample_to_cohort.get(str(s), 'unknown')
-                                 for s in batch_samples]
-                for coh in set(cohort_labels):
-                    idx = torch.tensor(
-                        [i for i, c in enumerate(cohort_labels) if c == coh],
-                        dtype=torch.long, device=device,
-                    )
-                    c_mdn = {k: v[idx] for k, v in t_mdn.items()}
-                    c_w = w_tumor[idx] if w_tumor is not None else None
-                    cs, cd = mixture_crps(
-                        c_mdn, labels_device['tumor_exp'][idx],
-                        sample_weight=c_w,
-                    )
-                    if coh not in _cohort_crps:
-                        _cohort_crps[coh] = [torch.tensor(0.0),
-                                              torch.tensor(0.0)]
-                    _cohort_crps[coh][0] += cs.cpu()
-                    _cohort_crps[coh][1] += cd.cpu()
-
-            # ---- Per-source GVW-CRPS (tumor, per-source variance weights) ----
-            if sample_to_source and source_tumor_variance and 'sample_name' in features:
-                batch_samples = features['sample_name']
-                if not isinstance(batch_samples, (list, tuple)):
-                    batch_samples = [batch_samples]
-                src_label = sample_to_source.get(str(batch_samples[0]))
-                if src_label is not None and src_label in source_tumor_variance:
-                    src_var = source_tumor_variance[src_label]
-                    gnames = features['gene_name']
-                    if isinstance(gnames, (list, tuple)):
-                        w_src = torch.tensor(
-                            [float(src_var.get(str(g), 1.0)) for g in gnames],
-                            dtype=torch.float32, device=device,
-                        ).unsqueeze(-1)
-                    else:
-                        w_src = torch.tensor(
-                            [[float(src_var.get(str(gnames), 1.0))]],
-                            dtype=torch.float32, device=device,
-                        )
-                    src_cs, src_cd = mixture_crps(
-                        t_mdn, labels_device['tumor_exp'],
-                        sample_weight=w_src,
-                    )
-                    if src_label not in _source_crps:
-                        _source_crps[src_label] = [
-                            torch.tensor(0.0), torch.tensor(0.0),
-                        ]
-                    _source_crps[src_label][0] += src_cs.cpu()
-                    _source_crps[src_label][1] += src_cd.cpu()
-
-            # Metadata
-            sample_names = features['sample_name']
-            gene_names = features['gene_name']
-            if isinstance(sample_names, (list, tuple)):
-                all_samples.extend([str(s) for s in sample_names])
-            else:
-                all_samples.append(str(sample_names))
-            if isinstance(gene_names, (list, tuple)):
-                all_genes.extend([str(g) for g in gene_names])
-            else:
-                all_genes.append(str(gene_names))
-
-    # ---- Convert to arrays ----
-    truth_t = np.asarray(all_t_true, dtype=np.float64)
-    pred_mean_t = np.asarray(all_t_pred_mean, dtype=np.float64)
-    q5_t = np.asarray(all_t_q5, dtype=np.float64)
-    q95_t = np.asarray(all_t_q95, dtype=np.float64)
-
-    truth_b = np.asarray(all_b_true, dtype=np.float64)
-    pred_mean_b = np.asarray(all_b_pred_mean, dtype=np.float64)
-    q5_b = np.asarray(all_b_q5, dtype=np.float64)
-    q95_b = np.asarray(all_b_q95, dtype=np.float64)
-
-    # ---- Build and save TSVs ----
-    df_tumor = pd.DataFrame({
-        'truth': truth_t,
-        'prediction_mean': pred_mean_t,
-        'ci_q5': q5_t,
-        'ci_q95': q95_t,
-        'pi_delta': all_t_pi_delta,
-        'pi_gamma': all_t_pi_gamma,
-        'gamma_beta': all_t_gamma_beta,
-        'pi_normal': all_t_pi_normal,
-        'normal_mean': all_t_normal_mu,
-        'normal_stdev': all_t_normal_sigma,
-        'sample': all_samples,
-    }, index=all_genes)
-
-    df_background = pd.DataFrame({
-        'truth': truth_b,
-        'prediction_mean': pred_mean_b,
-        'ci_q5': q5_b,
-        'ci_q95': q95_b,
-        'pi_delta': all_b_pi_delta,
-        'pi_gamma': all_b_pi_gamma,
-        'gamma_beta': all_b_gamma_beta,
-        'pi_normal': all_b_pi_normal,
-        'normal_mean': all_b_normal_mu,
-        'normal_stdev': all_b_normal_sigma,
-        'sample': all_samples,
-    }, index=all_genes)
-
-    df_tumor.to_csv(os.path.join(fold_dir, f'validation-fold_{fold_num}_predictions_tumor.tsv'), sep='\t')
-    df_background.to_csv(os.path.join(fold_dir, f'validation-fold_{fold_num}_predictions_background.tsv'), sep='\t')
-
-    # ---- Fold-level metrics ----
-    t_metrics = compute_regression_metrics(truth_t, pred_mean_t)
-    b_metrics = compute_regression_metrics(truth_b, pred_mean_b)
-
-    # GVW-CRPS
-    t_metrics['gvw_crps'] = float((tumor_crps_sum / tumor_crps_denom).item()) if float(tumor_crps_denom.item()) > 0 else float('nan')
-    b_metrics['gvw_crps'] = float((bg_crps_sum / bg_crps_denom).item()) if float(bg_crps_denom.item()) > 0 else float('nan')
-
-    # Tumor gene/sample summaries
-    df_t_tmp = df_tumor.copy()
-    df_t_tmp['gene'] = df_t_tmp.index.astype(str)
-    gene_r2_t = group_spearman_r2(df_t_tmp, group_col='gene', pred_col='prediction_mean')
-    sample_r2_t = group_spearman_r2(df_tumor, group_col='sample', pred_col='prediction_mean')
-    t_metrics['gene_r2_mean'] = float(np.nanmean(gene_r2_t)) if gene_r2_t.size else float('nan')
-    t_metrics['gene_r2_median'] = float(np.nanmedian(gene_r2_t)) if gene_r2_t.size else float('nan')
-    t_metrics['gene_r2_n'] = int(gene_r2_t.size)
-    t_metrics['sample_r2_mean'] = float(np.nanmean(sample_r2_t)) if sample_r2_t.size else float('nan')
-    t_metrics['sample_r2_median'] = float(np.nanmedian(sample_r2_t)) if sample_r2_t.size else float('nan')
-    t_metrics['sample_r2_n'] = int(sample_r2_t.size)
-
-    t_metrics['quantile_coverage'] = coverage(truth_t, q5_t, q95_t)
-    b_metrics['quantile_coverage'] = coverage(truth_b, q5_b, q95_b)
-
-    # ---- Per-cohort metrics (for balanced tuning objectives) ----
-    per_cohort: Dict[str, Dict[str, Any]] = {}
-    if sample_to_cohort:
-        samples_arr = np.asarray(all_samples, dtype=object)
-        cohort_arr = np.array(
-            [sample_to_cohort.get(str(s), 'unknown') for s in samples_arr],
-            dtype=object,
-        )
-        for cohort_name in sorted(set(cohort_arr)):
-            mask_c = cohort_arr == cohort_name
-            if mask_c.sum() == 0:
-                continue
-            c_tumor = compute_regression_metrics(
-                truth_t[mask_c], pred_mean_t[mask_c],
-            )
-            c_bg = compute_regression_metrics(
-                truth_b[mask_c], pred_mean_b[mask_c],
-            )
-
-            # Per-cohort GVW-r: per-gene Pearson r, variance-weighted
-            # average using per-cohort truth variance (computed from
-            # the genes present in this cohort's validation data).
-            c_genes = [g for g, m in zip(all_genes, mask_c) if m]
-            c_truth_t = truth_t[mask_c]
-            c_pred_t = pred_mean_t[mask_c]
-            c_truth_b = truth_b[mask_c]
-            c_pred_b = pred_mean_b[mask_c]
-
-            c_tumor['gvw_r'] = gvw_r(c_truth_t, c_pred_t, c_genes)
-            c_bg['gvw_r'] = gvw_r(c_truth_b, c_pred_b, c_genes)
-
-            # Per-cohort GVW-CRPS from streaming accumulators
-            if cohort_name in _cohort_crps:
-                s, d = _cohort_crps[cohort_name]
-                c_tumor['gvw_crps'] = (
-                    float((s / d).item()) if float(d.item()) > 0
-                    else float('nan')
-                )
-            per_cohort[cohort_name] = {
-                'tumor': c_tumor,
-                'background': c_bg,
-            }
-
-    # ---- Per-source metrics (when source_groups active) ----
-    per_source: Dict[str, Dict[str, Any]] = {}
-    if sample_to_source and source_tumor_variance:
-        samples_arr = np.asarray(all_samples, dtype=object)
-        source_arr = np.array(
-            [sample_to_source.get(str(s), 'unknown') for s in samples_arr],
-            dtype=object,
-        )
-        for source_name in sorted(set(source_arr)):
-            if source_name == 'unknown':
-                continue
-            mask_s = source_arr == source_name
-            if mask_s.sum() == 0:
-                continue
-            s_tumor = compute_regression_metrics(
-                truth_t[mask_s], pred_mean_t[mask_s],
-            )
-            s_bg = compute_regression_metrics(
-                truth_b[mask_s], pred_mean_b[mask_s],
-            )
-
-            s_genes = [g for g, m in zip(all_genes, mask_s) if m]
-            s_truth_t = truth_t[mask_s]
-            s_pred_t = pred_mean_t[mask_s]
-            s_truth_b = truth_b[mask_s]
-            s_pred_b = pred_mean_b[mask_s]
-
-            # Per-source GVW-r: variance weights from all 5 folds for
-            # this source (precomputed in source_tumor_variance).
-            src_var = source_tumor_variance.get(source_name)
-            s_tumor['gvw_r'] = gvw_r(s_truth_t, s_pred_t, s_genes, external_var=src_var)
-            s_bg['gvw_r'] = gvw_r(s_truth_b, s_pred_b, s_genes)
-
-            # Per-source GVW-CRPS from streaming accumulators
-            # (accumulated with per-source variance weights).
-            if source_name in _source_crps:
-                s_sum, s_den = _source_crps[source_name]
-                s_tumor['gvw_crps'] = (
-                    float((s_sum / s_den).item()) if float(s_den.item()) > 0
-                    else float('nan')
-                )
-            per_source[source_name] = {
-                'tumor': s_tumor,
-                'background': s_bg,
-            }
-
-    metrics = {
-        'fold': int(fold_num),
-        'tumor': t_metrics,
-        'background': b_metrics,
-    }
-    if per_cohort:
-        metrics['per_cohort'] = per_cohort
-    if per_source:
-        metrics['per_source'] = per_source
-
-    # Balanced metrics: when source mode is active, average across sources
-    # (all sources count, including those containing PHT samples).
-    # Otherwise, fall back to cohort-level averaging with PH* exclusion.
-    if per_source:
-        source_gvw_crps = [
-            v['tumor'].get('gvw_crps', float('nan'))
-            for v in per_source.values()
-        ]
-        source_gvw_r = [
-            v['tumor'].get('gvw_r', float('nan'))
-            for v in per_source.values()
-        ]
-        finite_crps = [x for x in source_gvw_crps if np.isfinite(x)]
-        finite_r = [x for x in source_gvw_r if np.isfinite(x)]
-        metrics['balanced_tumor_gvw_crps'] = (
-            float(np.mean(finite_crps)) if finite_crps else float('nan')
-        )
-        metrics['balanced_tumor_gvw_crps_std'] = (
-            float(np.std(finite_crps)) if len(finite_crps) > 1 else float('nan')
-        )
-        metrics['balanced_tumor_gvw_r'] = (
-            float(np.mean(finite_r)) if finite_r else float('nan')
-        )
-        metrics['balanced_tumor_gvw_r_std'] = (
-            float(np.std(finite_r)) if len(finite_r) > 1 else float('nan')
-        )
-        metrics['min_tumor_gvw_r'] = (
-            float(np.min(finite_r)) if finite_r else float('nan')
-        )
-    elif per_cohort:
-        patient_gvw_crps = [
-            v['tumor'].get('gvw_crps', float('nan'))
-            for k, v in per_cohort.items()
-            if not k.startswith('PH')
-        ]
-        patient_gvw_r = [
-            v['tumor'].get('gvw_r', float('nan'))
-            for k, v in per_cohort.items()
-            if not k.startswith('PH')
-        ]
-        finite_crps = [x for x in patient_gvw_crps if np.isfinite(x)]
-        finite_r = [x for x in patient_gvw_r if np.isfinite(x)]
-        metrics['balanced_tumor_gvw_crps'] = (
-            float(np.mean(finite_crps)) if finite_crps else float('nan')
-        )
-        metrics['balanced_tumor_gvw_crps_std'] = (
-            float(np.std(finite_crps)) if len(finite_crps) > 1 else float('nan')
-        )
-        metrics['balanced_tumor_gvw_r'] = (
-            float(np.mean(finite_r)) if finite_r else float('nan')
-        )
-        metrics['balanced_tumor_gvw_r_std'] = (
-            float(np.std(finite_r)) if len(finite_r) > 1 else float('nan')
-        )
-        metrics['min_tumor_gvw_r'] = (
-            float(np.min(finite_r)) if finite_r else float('nan')
-        )
-
-    with open(os.path.join(fold_dir, f'validation-fold_{fold_num}_metrics.json'), 'w') as f:
-        json.dump(metrics, f, indent=2)
-
-    print(
-        f'Fold {fold_num} tumor metrics: '
-        f'gvw_crps={t_metrics.get("gvw_crps", float("nan")):.4f} '
-        f'gene_r2(mean/med)={t_metrics.get("gene_r2_mean", float("nan")):.4f}/'
-        f'{t_metrics.get("gene_r2_median", float("nan")):.4f} '
-        f'sample_r2(mean/med)={t_metrics.get("sample_r2_mean", float("nan")):.4f}/'
-        f'{t_metrics.get("sample_r2_median", float("nan")):.4f}'
-    )
-    if per_source:
-        for src_name, src_data in sorted(per_source.items()):
-            crps_str = f'{src_data["tumor"].get("gvw_crps", float("nan")):.4f}'
-            r_str = f'{src_data["tumor"].get("gvw_r", float("nan")):.4f}'
-            print(f'  source {src_name}: gvw_crps={crps_str} gvw_r={r_str}')
-        balanced_crps_str = f'{metrics.get("balanced_tumor_gvw_crps", float("nan")):.4f}'
-        balanced_r_str = f'{metrics.get("balanced_tumor_gvw_r", float("nan")):.4f}'
-        print(f'  balanced_gvw_crps={balanced_crps_str} balanced_gvw_r={balanced_r_str}')
-    elif per_cohort:
-        balanced_crps_str = f'{metrics.get("balanced_tumor_gvw_crps", float("nan")):.4f}'
-        balanced_r_str = f'{metrics.get("balanced_tumor_gvw_r", float("nan")):.4f}'
-        print(f'  balanced_gvw_crps={balanced_crps_str} balanced_gvw_r={balanced_r_str}')
-
-    # ---- Plots (per fold) ----
-    try:
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-
-        plot_dir = os.path.join(fold_dir, 'plots')
-        os.makedirs(plot_dir, exist_ok=True)
-
-        # Helper: true vs predicted scatter plot.
-        def _plot_true_vs_pred(truth, pred, head_label, est_label, fname):
-            mask = np.isfinite(truth) & np.isfinite(pred)
-            x, y_pts = truth[mask], pred[mask]
-            if x.size == 0:
-                return
-            stats = scatter_stats(truth, pred)
-            rng = np.random.RandomState(0)
-            if x.size > 20000:
-                idx = rng.choice(x.size, size=20000, replace=False)
-                x, y_pts = x[idx], y_pts[idx]
-            fig = plt.figure(figsize=(5, 5))
-            plt.scatter(x, y_pts, s=3, alpha=0.25, linewidths=0)
-            plt.plot([0.0, Y_MAX], [0.0, Y_MAX], color='black', linewidth=1)
-            plt.xlim(0.0, Y_MAX)
-            plt.ylim(0.0, Y_MAX)
-            plt.xlabel('truth')
-            plt.ylabel(f'prediction ({est_label})')
-            plt.title(f'Fold {fold_num} {head_label}: true vs pred ({est_label})')
-            if stats:
-                ann = '\n'.join(f'{k} = {v:.4f}' for k, v in stats.items())
-                plt.text(
-                    0.03, 0.97, ann, transform=plt.gca().transAxes, fontsize=8,
-                    verticalalignment='top',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.85, edgecolor='#cccccc'),
-                    family='monospace',
-                )
-            plt.tight_layout()
-            fig.savefig(os.path.join(plot_dir, fname), dpi=150)
-            plt.close(fig)
-
-        # Helper: gene-level Pearson r density histogram by variance group.
-        def _plot_gene_r_hist(df, pred_col, var_map, head_label, est_label, fname):
-            df_tmp = df.copy()
-            df_tmp['gene'] = df_tmp.index.astype(str)
-            gene_r, gene_names_r = group_pearson_r_named(df_tmp, 'gene', pred_col)
-            if gene_r.size == 0:
-                return
-            # Assign genes to biologically-meaningful variance groups.
-            gene_var = np.array(
-                [float(var_map.get(g, 0.0)) for g in gene_names_r], dtype=np.float64,
-            ) if var_map else np.zeros(len(gene_names_r), dtype=np.float64)
-            low_mask = gene_var < 1.0
-            mid_mask = (gene_var >= 1.0) & (gene_var < 3.0)
-            high_mask = gene_var >= 3.0
-            n_total = gene_r.size
-
-            groups = [
-                (low_mask, 'Low [0, 1)', '#3b82f6'),
-                (mid_mask, 'Med [1, 3)', '#f59e0b'),
-                (high_mask, 'High [3, \u221e)', '#ef4444'),
-            ]
-
-            fig, ax = plt.subplots(figsize=(5, 5))
-            bins = np.linspace(-1.0, 1.0, 61)
-            for gmask, glabel, gcolor in groups:
-                r_sub = gene_r[gmask]
-                if r_sub.size == 0:
-                    continue
-                pct = 100.0 * r_sub.size / n_total
-                ax.hist(
-                    r_sub, bins=bins, alpha=0.55, color=gcolor, density=True,
-                    label=f'{glabel} ({pct:.0f}%)', edgecolor='white', linewidth=0.3,
-                )
-            ax.axvline(0.0, color='black', linestyle='--', linewidth=0.8)
-            ax.set_xlim(-1.0, 1.0)
-            ax.set_xlabel('gene-level Pearson r')
-            ax.set_ylabel('density')
-            ax.set_title(f'Fold {fold_num} {head_label}: gene Pearson r ({est_label})')
-            ax.legend(loc='upper left', fontsize=8, frameon=True)
-            ax.set_box_aspect(1)
-            fig.tight_layout()
-            fig.savefig(os.path.join(plot_dir, fname), dpi=150)
-            plt.close(fig)
-
-        # Generate all plots for both heads.
-        for head, df, truth, pmean, var_map in [
-            ('tumor', df_tumor, truth_t, pred_mean_t, full_tumor_variance),
-            ('background', df_background, truth_b, pred_mean_b, full_background_variance),
-        ]:
-            _plot_true_vs_pred(truth, pmean, head, 'mean',
-                               f'{head}_true_vs_pred-mean.png')
-            _plot_gene_r_hist(df, 'prediction_mean', var_map, head, 'mean',
-                              f'{head}-mean_gene_r_hist.png')
-
-    except (ImportError, OSError, ValueError, RuntimeError) as e:
-        print(f'  Warning: failed to generate evaluation plots for fold {fold_num}: {e}')
-
-
 def full_train_from_splits(
     model_name: str = 'BioDVN',
     training_set_tsv: str = '',
@@ -1409,9 +718,6 @@ def full_train_from_splits(
     out_dir: str = 'final_models/',
     model_config: Optional[BioDVNConfig] = None,
     training_config: Optional[TrainingConfig] = None,
-    genes_per_batch: int = 32,
-    chunk_size: int = 256,
-    shuffle_genes_in_batch: bool = True,
     seed: int = 42,
     subsample_frac: Optional[float] = None,
     train_only_cohorts: Optional[List[str]] = None,
@@ -1442,9 +748,6 @@ def full_train_from_splits(
         out_dir: Output directory for final model.
         model_config: Fully-specified BioDVNConfig.
         training_config: Fully-specified TrainingConfig.
-        genes_per_batch: Genes per batch (32 invariant).
-        chunk_size: Genes per chunk (256 invariant).
-        shuffle_genes_in_batch: Whether to shuffle genes within batch.
         seed: Random seed for reproducibility.
         subsample_frac: Optional fraction (0.0-1.0) of genes for fast sanity checks.
         train_only_cohorts: Cohorts used only for training (excluded from val).
@@ -1484,23 +787,19 @@ def full_train_from_splits(
             cohort = row['Cohort'].strip()
             sample = row['Sample'].strip()
 
-            # Zarr files on disk use bare names (without cohort prefix).
-            zarr_name = sample
-            if sample.startswith(f"{cohort}_"):
-                zarr_name = sample[len(cohort) + 1:]
-
-            zarr_path = os.path.join(zarr_base, cohort, 'zarr_files', f"{zarr_name}.zarr")
-            if not os.path.isdir(zarr_path):
+            zpath = zarr_path_for_sample(sample, cohort, zarr_base)
+            if not os.path.isdir(zpath):
+                bare = zarr_name_for_sample(sample, cohort)
                 missing_samples.append(
-                    f"  {cohort}/zarr_files/{zarr_name}.zarr  (TSV sample={sample})"
+                    f"  {cohort}/zarr_files/{bare}.zarr  (TSV sample={sample})"
                 )
                 continue
-            all_paths.append(zarr_path)
-            zarr_cohort_map[zarr_path] = cohort
-            zarr_sample_name_map[zarr_path] = sample
+            all_paths.append(zpath)
+            zarr_cohort_map[zpath] = cohort
+            zarr_sample_name_map[zpath] = sample
             sample_cohort_map[sample] = cohort
             if cohort not in _train_only:
-                patient_paths.append(zarr_path)
+                patient_paths.append(zpath)
 
     if missing_samples:
         raise FileNotFoundError(
@@ -1548,26 +847,10 @@ def full_train_from_splits(
     source_tumor_variance: Optional[Dict[str, Dict[str, float]]] = None
     _sample_paths_by_source: Optional[Dict[str, List[str]]] = None
     if source_groups:
-        import re
-        # Invert source_groups: cohort → source name.
-        _cohort_to_source: Dict[str, str] = {}
-        for src_name, cohorts in source_groups.items():
-            for coh in cohorts:
-                _cohort_to_source[coh] = src_name
+        from proteus_utils.data_helpers import assign_source
+        _cohort_to_source = invert_source_groups(source_groups)
+        _pdx_names = collect_pdx_names(training_set_tsv, _cohort_to_source)
 
-        # Collect known PDX sample names per cohort (for matching PHT names).
-        _pdx_sample_to_cohort: Dict[str, str] = {}
-        with open(training_set_tsv, 'r', newline='') as f:
-            reader = csv.DictReader(f, delimiter='\t')
-            for row in reader:
-                coh = row['Cohort'].strip()
-                samp = row['Sample'].strip()
-                if samp.startswith(f"{coh}_"):
-                    samp = samp[len(coh) + 1:]
-                if coh in _cohort_to_source:
-                    _pdx_sample_to_cohort[samp] = coh
-
-        _pht_re = re.compile(r'^PHT-Fold-\d+_(.+)-BP\d+')
         sample_to_source = {}
         _sample_paths_by_source = {src: [] for src in source_groups}
         _source_variance_paths: Dict[str, List[str]] = {src: [] for src in source_groups}
@@ -1575,53 +858,19 @@ def full_train_from_splits(
         for zarr_path in all_paths:
             cohort = zarr_cohort_map[zarr_path]
             sample = zarr_sample_name_map[zarr_path]
-
-            if cohort in _cohort_to_source:
-                source = _cohort_to_source[cohort]
-            elif cohort == 'PHT':
-                m = _pht_re.match(sample)
-                if m:
-                    pdx_name = m.group(1)
-                    pdx_coh = _pdx_sample_to_cohort.get(pdx_name)
-                    if pdx_coh is not None:
-                        source = _cohort_to_source[pdx_coh]
-                    else:
-                        raise ValueError(
-                            f"PHT sample '{sample}' has PDX name '{pdx_name}' "
-                            f"that does not match any known PDX sample. "
-                            f"Known: {sorted(_pdx_sample_to_cohort.keys())}"
-                        )
-                else:
-                    raise ValueError(
-                        f"Could not parse PDX name from PHT sample: '{sample}'. "
-                        f"Expected format: PHT-Fold-X_<PDX_NAME>-BP..."
-                    )
-            else:
-                continue  # cohort not in any source group
-
+            source = assign_source(cohort, sample, _cohort_to_source,
+                                   _pdx_names)
+            if source is None:
+                continue
             sample_to_source[sample] = source
             _sample_paths_by_source[source].append(zarr_path)
-            # Only non-PHT samples contribute to per-source variance.
             if cohort != 'PHT':
                 _source_variance_paths[source].append(zarr_path)
 
-        # Compute per-source unclipped tumor variance.
-        print('Computing per-source gene variance for GVW evaluation...')
-        source_tumor_variance = {}
-        for src_name in sorted(source_groups):
-            src_paths = _source_variance_paths[src_name]
-            if src_paths:
-                source_tumor_variance[src_name] = compute_gene_variances_unclipped(
-                    src_paths, label_key='flat/tumor_exp',
-                )
-                vals = list(source_tumor_variance[src_name].values())
-                print(
-                    f'  Source "{src_name}": {len(vals)} genes, '
-                    f'variance range [{min(vals):.3f}, {max(vals):.3f}], '
-                    f'{len(src_paths)} samples'
-                )
-            else:
-                print(f'  Source "{src_name}": no zarr paths found — skipping')
+        source_tumor_variance = compute_source_variance(
+            source_groups, _source_variance_paths,
+            compute_gene_variances_unclipped,
+        )
 
     # Create loaders.
     # Val: PATIENT-ONLY samples with 10% gene chunk split, metadata enabled
@@ -1632,12 +881,14 @@ def full_train_from_splits(
         # Multi-source training loader: gene-conditioned batches balanced
         # across source groups.  ALL samples participate (no fold holdout).
         from proteus_utils.proteus_utils import (
-            ProteusMultiSourceBatchDataset, _collate_identity,
+            ProteusMultiSourceBatchDataset, ProteusHoldoutValDataset,
+            _collate_identity,
         )
         if _sample_paths_by_source is None:
             raise ValueError(
                 "batch_mode='multi_source' requires source_groups")
 
+        # Build training dataset (preloads all samples).
         train_dataset = ProteusMultiSourceBatchDataset(
             sample_paths_by_source=_sample_paths_by_source,
             gene_variance=train_fold_variance_raw,
@@ -1647,6 +898,51 @@ def full_train_from_splits(
             sample_name_map=zarr_sample_name_map,
             include_metadata=False,
             subsample_frac=subsample_frac,
+        )
+
+        # Build deterministic 10% random sample-gene pair holdout mask.
+        # Only marks pairs where the gene actually exists for the sample's
+        # source (i.e., source_gene_mask is True).
+        n_samples = len(train_dataset._all_sample_paths)
+        n_union = len(train_dataset._union_genes)
+        rng_mask = np.random.RandomState(seed + 12345)
+        # Start with all-False mask.
+        val_mask = np.zeros((n_samples, n_union), dtype=np.bool_)
+        # Build sample → source map for existence check.
+        _path_to_src: Dict[str, str] = {}
+        for src, paths in _sample_paths_by_source.items():
+            for p in paths:
+                _path_to_src[p] = src
+        for s_idx, zpath in enumerate(train_dataset._all_sample_paths):
+            src = _path_to_src.get(zpath)
+            if src is None:
+                continue
+            src_mask = train_dataset._source_gene_mask[src]
+            # Indices where this sample has a valid gene.
+            valid_gene_indices = np.where(src_mask)[0]
+            n_valid = len(valid_gene_indices)
+            n_holdout = max(1, int(n_valid * val_frac))
+            chosen = rng_mask.choice(valid_gene_indices, size=n_holdout, replace=False)
+            val_mask[s_idx, chosen] = True
+
+        total_pairs = int(val_mask.sum())
+        total_valid = sum(
+            int(train_dataset._source_gene_mask[_path_to_src[p]].sum())
+            for p in train_dataset._all_sample_paths
+            if p in _path_to_src
+        )
+        print(f'  [HoldoutVal] {total_pairs} val pairs / {total_valid} total '
+              f'({100.0 * total_pairs / total_valid:.1f}%)')
+
+        # Attach val_mask to training dataset so it skips held-out pairs.
+        train_dataset.val_mask = val_mask
+
+        # Build holdout validation dataset (shares preloaded arrays).
+        val_dataset = ProteusHoldoutValDataset(
+            train_dataset=train_dataset,
+            val_mask=val_mask,
+            batch_size=32,
+            seed=seed,
         )
 
         base_generator = torch.Generator()
@@ -1673,20 +969,28 @@ def full_train_from_splits(
             pin_memory=True,
         )
         train_steps = len(train_dataset)
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=_nw,
+            collate_fn=_collate_identity,
+            persistent_workers=_nw > 0,
+            prefetch_factor=4 if _nw > 0 else None,
+            worker_init_fn=_seed_worker if _nw > 0 else None,
+            generator=base_generator,
+            drop_last=False,
+            pin_memory=True,
+        )
+        val_steps = len(val_dataset)
     else:
         # Standard chunk-based training loader with optional cohort balancing.
         # Uses 90% of gene chunks (10% reserved for val).
         train_loader, train_steps = create_data_loader(
             index_file=all_index,
             num_workers=_loader_workers(),
-            shuffle=False,
-            labeled=True,
-            loader_mode='chunk',
-            chunk_size=chunk_size,
-            genes_per_batch=genes_per_batch,
-            shuffle_genes_in_batch=shuffle_genes_in_batch,
             seed=seed,
-            drop_last=False,
             subsample_frac=subsample_frac,
             gene_weights=gene_weights,
             val_frac=val_frac,
@@ -1695,24 +999,17 @@ def full_train_from_splits(
             balance_cohorts=balance_cohorts,
         )
 
-    val_loader, val_steps = create_data_loader(
-        index_file=patient_index,
-        num_workers=_loader_workers(),
-        shuffle=False,
-        labeled=True,
-        loader_mode='chunk',
-        chunk_size=chunk_size,
-        genes_per_batch=genes_per_batch,
-        shuffle_genes_in_batch=False,
-        seed=seed,
-        include_metadata=True,
-        drop_last=False,
-        subsample_frac=subsample_frac,
-        gene_weights=gene_weights,
-        val_frac=val_frac,
-        val_split=True,
-        sample_name_map=zarr_sample_name_map,
-    )
+        val_loader, val_steps = create_data_loader(
+            index_file=patient_index,
+            num_workers=_loader_workers(),
+            seed=seed,
+            include_metadata=True,
+            subsample_frac=subsample_frac,
+            gene_weights=gene_weights,
+            val_frac=val_frac,
+            val_split=True,
+            sample_name_map=zarr_sample_name_map,
+        )
 
     print(f'Training batches: {train_steps}, Validation batches: {val_steps}')
 
@@ -1789,10 +1086,14 @@ def run_model(
             cfg_raw = json.load(f)
         allowed = set(BioDVNConfig.__dataclass_fields__.keys())
         cfg = {k: v for k, v in cfg_raw.items() if k in allowed}
+        # Ensure channel_mode matches the model variant name.
+        cfg['channel_mode'] = channel_mode_for_model(model_name)
         model_config = BioDVNConfig(**cfg)
         print(f'Loaded model config from: {cfg_path}')
     else:
-        model_config = BioDVNConfig()
+        model_config = BioDVNConfig(
+            channel_mode=channel_mode_for_model(model_name),
+        )
         print('WARNING: No model_config.json found; using BioDVNConfig defaults for inference.')
 
     ModelClass = get_model_instance(model_name)
@@ -1868,12 +1169,13 @@ def run_model(
     print('Finished running model on all samples.')
 
 
-def _build_configs_from_spec(experiment_spec, args) -> tuple:
+def _build_configs_from_spec(experiment_spec, args, model_name: str = 'BioDVN') -> tuple:
     """Build BioDVNConfig and TrainingConfig from an experiment spec.
 
     Returns (model_cfg, train_cfg).
     """
     model_cfg = BioDVNConfig(
+        channel_mode=channel_mode_for_model(model_name),
         encoder_start=int(experiment_spec.scale.encoder_start.fixed),
         latent_size=int(experiment_spec.scale.latent_size.fixed),
         decoder_start=int(experiment_spec.scale.decoder_start.fixed),
@@ -1918,6 +1220,7 @@ def _build_configs_from_spec(experiment_spec, args) -> tuple:
         patience=int(experiment_spec.training.patience.fixed),
         use_amp=bool(experiment_spec.training.use_amp.fixed),
         ema_decay=float(experiment_spec.training.ema_decay.fixed),
+        selection_metric=str(experiment_spec.data.selection_metric),
         runtime_device_banner=bool(args.runtime_device_banner),
         base_weights=experiment_spec.transfer.base_weights,
         freeze_level=experiment_spec.transfer.freeze_level,
@@ -2001,14 +1304,11 @@ def main():
     # For data processing and inference, use_set is still used
     active_use_set = args.use_set
     
-    # Initialize ConfigLoader for YAML-based dataset configurations
-    config_loader = ConfigLoader()
-    
     # Helper function to load dataset config.
     def get_dataset_config(dataset_name: str):
         """Load dataset config from YAML or return None if not found."""
         try:
-            return config_loader.load_dataset(dataset_name)
+            return load_dataset_config(dataset_name)
         except FileNotFoundError:
             return None
     
@@ -2039,7 +1339,7 @@ def main():
     if args.process_data:
         # Resolve dataset list: 'all' expands to every configured YAML.
         if args.use_set.lower() == 'all':
-            datasets_to_process = sorted(f.stem for f in config_loader.datasets_dir.glob('*.yaml'))
+            datasets_to_process = list_datasets()
             if not datasets_to_process:
                 print("No dataset configs found in config/datasets/")
                 sys.exit(1)
@@ -2052,7 +1352,7 @@ def main():
         for dataset_name in datasets_to_process:
             dataset_config = get_dataset_config(dataset_name)
             if dataset_config is None:
-                available = [f.stem for f in config_loader.datasets_dir.glob('*.yaml')]
+                available = list_datasets()
                 print(f"Dataset '{dataset_name}' is not configured.")
                 print(f"Available datasets: {available}")
                 print(f"Add a YAML config file at: config/datasets/{dataset_name}.yaml")
@@ -2093,7 +1393,6 @@ def main():
 
         if datasets_to_check:
             ensure_datasets_exist(
-                config_loader=config_loader,
                 dataset_names=datasets_to_check,
                 zarr_base=zarr_base,
                 raw_data_base=raw_data_dir,
@@ -2114,7 +1413,9 @@ def main():
             )
 
         # Resolve fixed parameters from experiment spec
-        model_cfg, train_cfg = _build_configs_from_spec(experiment_spec, args)
+        model_cfg, train_cfg = _build_configs_from_spec(
+            experiment_spec, args, model_name=args.model_name,
+        )
 
         out_dir = experiment_spec.output_dir
         test_fold = args.test_fold  # CLI override for HPC parallelization
@@ -2132,9 +1433,6 @@ def main():
             out_dir=out_dir,
             model_config=model_cfg,
             training_config=train_cfg,
-            genes_per_batch=FIXED_GENES_PER_BATCH,
-            chunk_size=FIXED_CHUNK_SIZE,
-            shuffle_genes_in_batch=True,
             seed=experiment_spec.data.seed,
             subsample_frac=args.subsample,
             train_only_cohorts=experiment_spec.data.train_only_cohorts,
@@ -2153,7 +1451,9 @@ def main():
 
         # For full-train, we train on ALL samples in the TSV (no fold held out)
         # This produces a single model using all available data.
-        model_cfg, train_cfg = _build_configs_from_spec(experiment_spec, args)
+        model_cfg, train_cfg = _build_configs_from_spec(
+            experiment_spec, args, model_name=args.model_name,
+        )
 
         out_dir = os.path.join(experiment_spec.output_dir, 'full_train')
 
@@ -2164,9 +1464,6 @@ def main():
             out_dir=out_dir,
             model_config=model_cfg,
             training_config=train_cfg,
-            genes_per_batch=FIXED_GENES_PER_BATCH,
-            chunk_size=FIXED_CHUNK_SIZE,
-            shuffle_genes_in_batch=True,
             seed=experiment_spec.data.seed,
             subsample_frac=args.subsample,
             train_only_cohorts=experiment_spec.data.train_only_cohorts,

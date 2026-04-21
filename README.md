@@ -202,24 +202,30 @@ python Proteus.py --run_mode run --model_name BioDVN --use_set <dataset>
 Proteus/
 ├── Proteus.py                    # CLI entry point: data prep, train, tune, inference
 ├── models/
-│   ├── models.py                 # BioDVN architecture + BioDVNConfig
-│   └── model_utils.py            # MDN heads, CRPS loss, VAE losses, custom layers
+│   ├── models.py                 # BioDVN architecture + BioDVNConfig (channel-mode parameterized)
+│   └── model_utils.py            # MDN heads, CRPS loss, β-TCVAE losses, custom layers
 ├── proteus_utils/
 │   ├── proteus_utils.py          # Datasets, DataLoaders, gene-weight computation
 │   ├── compile_sample_data.py    # Triton → Zarr compilation pipeline
-│   ├── trainer.py                # Training loop: AMP, cosine LR, early stopping, checkpointing
-│   ├── logging_config.py         # Centralized logging setup
-│   └── debug_utils.py            # Input tensor diagnostics
+│   ├── trainer.py                # Training loop: AMP, cosine LR, EMA, early stopping
+│   ├── evaluation.py             # Fold-level prediction accumulation, metrics, scatter plots
+│   ├── data_helpers.py           # Shared helpers: Zarr paths, PHT parsing, source mapping
+│   ├── metrics.py                # Statistical functions: Pearson/Spearman r, GVW-r, coverage
+│   └── logging_config.py         # Centralized logging setup
 ├── config/
-│   ├── config_loader.py          # YAML config loading + validation
-│   ├── experiment_spec.py        # Experiment schema (ParamSpec, HP groups)
+│   ├── dataset_config.py         # Dataset YAML loading + DatasetConfig dataclass
+│   ├── experiment_spec.py        # Experiment schema (ExperimentSpec, TuningSpec, ParamSpec)
 │   ├── paths.yaml                # Base paths (gitignored, machine-specific)
 │   ├── datasets/                 # Per-dataset YAML configs (Triton paths, label files)
 │   └── experiments/              # Experiment YAML configs (HP search spaces, training specs)
 ├── tuning/
-│   └── optuna_tuner.py           # Optuna CV/fold-parallel tuning with cross-fold promotion
-├── analysis/                     # Downstream analysis (gene-set scoring, GSEA, patient-level)
-├── interpretation/               # Interpretability (SHAP, gradient ascent, kernel visualization)
+│   ├── optuna_tuner.py           # Optuna CV/fold-parallel tuning entry points
+│   ├── param_resolution.py       # Trial HP suggestion, config resolution, replay
+│   ├── metrics.py                # Fold-metric collection, CV objective computation
+│   ├── promotion.py              # Cross-fold top-config promotion
+│   └── reporting.py              # Study reports, fold stability, search space narrowing
+├── analysis/                     # Downstream analysis (gene-set scoring, patient-level metrics)
+├── interpretation/               # Interpretability (Captum attribution, kernel visualization)
 ├── runs/                         # SLURM job scripts for HPC execution
 ├── labels/                       # Expression matrices + TFX/subtype labels
 ├── data/                         # Training split TSVs + fold index files
