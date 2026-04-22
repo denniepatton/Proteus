@@ -77,6 +77,7 @@ from proteus_utils.data_helpers import (
     zarr_name_for_sample, zarr_path_for_sample,
     resolve_pht_source, invert_source_groups, collect_pdx_names,
     collect_zarr_paths, build_source_map_from_tsv, compute_source_variance,
+    get_plca_selection_group_weights, validate_plca_selection_groups,
 )
 from config.dataset_config import load_dataset_config, list_datasets
 
@@ -337,6 +338,7 @@ def train_model_cv(
     source_groups: Optional[Dict[str, List[str]]] = None,
     target_n_per_source: Optional[int] = None,
     batch_mode: str = 'chunk',
+    fixed_schedule_oof: bool = False,
 ):
     """Train a model using cross-validation with deterministic fold assignment.
 
@@ -350,11 +352,25 @@ def train_model_cv(
         training_config: Fully-specified TrainingConfig.
         seed: Random seed for reproducibility.
         subsample_frac: Optional fraction (0.0-1.0) of genes for fast sanity checks.
+        fixed_schedule_oof: If True, train each fold on a fixed schedule
+            without passing the held-out fold into trainer.fit(). The held-out
+            fold is then used exactly once at the end to generate OOF
+            predictions from ``final_model.pt`` with EMA weights, mirroring
+            full-train and avoiding validation-driven checkpoint selection.
 
     Raises:
         FileNotFoundError: If training_set_tsv or Zarr stores don't exist.
         ValueError: If TSV format is invalid or no samples in folds.
     """
+
+    if fixed_schedule_oof and (
+        epoch_end_callback is not None or external_stop_check is not None
+    ):
+        raise ValueError(
+            'fixed_schedule_oof=True is incompatible with per-epoch validation '
+            'callbacks because leak-proof OOF generation must not consume the '
+            'held-out fold during training.'
+        )
 
     # Determine folds from TSV
     if not os.path.exists(training_set_tsv):
@@ -428,6 +444,14 @@ def train_model_cv(
             cohort = row['Cohort'].strip()
             sample = row['Sample'].strip()
             sample_to_cohort[sample] = cohort
+
+    selection_group_weights = get_plca_selection_group_weights(source_groups)
+    if training_config.selection_metric == 'min_weighted_source_crps':
+        if source_groups is None:
+            raise ValueError(
+                "selection_metric='min_weighted_source_crps' requires source_groups"
+            )
+        validate_plca_selection_groups(source_groups)
 
     # When source_groups is set, build sample→source mapping and compute
     # per-source gene variance for GVW-CRPS / GVW-r evaluation.
@@ -529,16 +553,18 @@ def train_model_cv(
         
         # Train
         trainer = Trainer(model, fold_training_config, model_config, device)
-        trainer.val_gene_weight_map = full_tumor_variance
-        trainer.val_background_gene_weight_map = full_background_variance
-        # Per-source gene variance for epoch-level per-source GVW-CRPS/GVW-r.
-        trainer.val_source_gene_weight_map = source_tumor_variance
-        # Enable epoch-level per-group CRPS monitoring.  When source_groups
-        # is active, group by source (4 groups); otherwise by cohort.
-        trainer.val_sample_cohort_map = sample_to_source or sample_to_cohort or None
+        if not fixed_schedule_oof:
+            trainer.val_gene_weight_map = full_tumor_variance
+            trainer.val_background_gene_weight_map = full_background_variance
+            # Per-source gene variance for epoch-level per-source GVW-CRPS/GVW-r.
+            trainer.val_source_gene_weight_map = source_tumor_variance
+            # Enable epoch-level per-group CRPS monitoring.  When source_groups
+            # is active, group by source (4 groups); otherwise by cohort.
+            trainer.val_sample_group_map = sample_to_source or sample_to_cohort or None
+            trainer.val_selection_group_weights = selection_group_weights
         history = trainer.fit(
             train_loader,
-            val_loader,
+            None if fixed_schedule_oof else val_loader,
             epochs=fold_training_config.epochs,
             epoch_end_callback=epoch_end_callback,
             external_stop_check=external_stop_check,
@@ -550,6 +576,25 @@ def train_model_cv(
                 json.dump(history, f, indent=2)
         except TypeError as e:
             raise TypeError(f'Failed to JSON-serialize training history for fold {fold_num}: {e}')
+
+        if fixed_schedule_oof:
+            final_checkpoint_path = os.path.join(fold_dir, 'final_model.pt')
+            ema_backup = None
+            if trainer._ema is not None:
+                ema_backup = trainer._ema.apply(trainer.model)
+            trainer._save_checkpoint(
+                fold_training_config.epochs,
+                is_best=False,
+                filename='final_model.pt',
+            )
+            if ema_backup is not None:
+                trainer._ema.restore(trainer.model, ema_backup)
+            trainer.load_checkpoint(final_checkpoint_path)
+            print(f'Saved fixed-schedule CV checkpoint to: {final_checkpoint_path}')
+        else:
+            best_checkpoint_path = os.path.join(fold_dir, 'best_model.pt')
+            if os.path.exists(best_checkpoint_path):
+                trainer.load_checkpoint(best_checkpoint_path)
 
         # Prefer the trainer's model reference (may be compiled).
         model_for_eval = trainer.model
@@ -570,6 +615,7 @@ def train_model_cv(
             sample_to_cohort=sample_to_cohort if sample_to_cohort else None,
             sample_to_source=sample_to_source,
             source_tumor_variance=source_tumor_variance,
+            selection_group_weights=selection_group_weights,
         )
 
         # Per-fold plots
@@ -654,10 +700,19 @@ def _summarize_cv_results(out_dir: str) -> None:
             t_metrics = compute_regression_metrics(df_t['truth'].to_numpy(), df_t['prediction_mean'].to_numpy())
             b_metrics = compute_regression_metrics(df_b['truth'].to_numpy(), df_b['prediction_mean'].to_numpy())
 
+        weighted_tumor_gvw_crps = (
+            float(fold_metrics_json.get('weighted_tumor_gvw_crps', float('nan')))
+            if fold_metrics_json is not None else float('nan')
+        )
+        score = weighted_tumor_gvw_crps
+        if not np.isfinite(score):
+            score = float(t_metrics.get('gvw_crps', float('nan')))
+
         row = {
             'fold': int(fold_num),
             # Primary selection metric
-            'score': float(t_metrics.get('gvw_crps', float('nan'))),
+            'score': score,
+            'weighted_tumor_gvw_crps': weighted_tumor_gvw_crps,
             'tumor_gvw_crps': float(t_metrics.get('gvw_crps', float('nan'))),
 
             # Tumor regression summary
@@ -687,8 +742,12 @@ def _summarize_cv_results(out_dir: str) -> None:
 
     # Also write a small JSON with mean/std across folds for quick comparison.
     numeric_cols = [c for c in summary_df.columns if c not in ('fold',)]
+    primary_metric_name = 'weighted_tumor_gvw_crps'
+    if not np.isfinite(pd.to_numeric(summary_df[primary_metric_name], errors='coerce').to_numpy(dtype=np.float64)).any():
+        primary_metric_name = 'tumor_gvw_crps'
+
     agg: Dict[str, Any] = {
-        'primary_metric': {'name': 'tumor_gvw_crps', 'direction': 'minimize'},
+        'primary_metric': {'name': primary_metric_name, 'direction': 'minimize'},
     }
     for c in numeric_cols:
         vals = pd.to_numeric(summary_df[c], errors='coerce').to_numpy(dtype=np.float64)
@@ -698,14 +757,14 @@ def _summarize_cv_results(out_dir: str) -> None:
         }
 
     # Best fold by primary metric
-    if 'tumor_gvw_crps' in summary_df.columns:
-        s = pd.to_numeric(summary_df['tumor_gvw_crps'], errors='coerce')
+    if primary_metric_name in summary_df.columns:
+        s = pd.to_numeric(summary_df[primary_metric_name], errors='coerce')
         if np.isfinite(s.to_numpy(dtype=np.float64)).any():
             best_idx = int(np.nanargmin(s.to_numpy(dtype=np.float64)))
             best_row = summary_df.iloc[best_idx].to_dict()
             agg['best'] = {
                 'fold': int(best_row.get('fold', -1)),
-                'tumor_gvw_crps': float(best_row.get('tumor_gvw_crps', float('nan'))),
+                primary_metric_name: float(best_row.get(primary_metric_name, float('nan'))),
             }
     with open(os.path.join(out_dir, 'cv_metrics_summary.json'), 'w') as f:
         json.dump(agg, f, indent=2)
@@ -729,17 +788,23 @@ def full_train_from_splits(
     """Train a single model on ALL samples in the training_set TSV (no fold holdout).
 
     This is for producing a final production model after CV tuning has selected
-    hyperparameters.  All samples are used for training.  A deterministic
-    gene-level chunk split (10% of 256-gene chunks) provides the early-stopping
-    validation signal — every sample and every gene contributes to both train
-    and val.  Gene-variance weights are computed from 100% of the data before
-    the split.
+    hyperparameters.  All samples are used for training.
+
+    Full-train now defaults to a fixed schedule: the epoch count and HPs come
+    from CV, the model trains on 100% of the data, and the terminal EMA weights
+    are saved as the canonical ``final_model.pt`` artifact.  We intentionally do
+    not checkpoint-select against a same-sample 10% monitoring split by default,
+    because that holdout is not a true unseen-sample validation set.
+
+    A clearly marked internal branch remains below for a future patient-only
+    10% monitoring holdout if CV later shows that full-train still needs
+    checkpoint selection.  If that path is re-enabled, the monitored branch can
+    keep using ``best_model.pt`` without changing the fixed-schedule default.
 
     When ``train_only_cohorts`` is set, those cohorts (e.g. PHT admixtures)
-    are used for training only.  The validation loader draws exclusively from
-    patient cohorts so that early-stopping reflects clinical performance.
-    When multiple patient cohorts exist, the Trainer computes a balanced
-    (equal-weight) per-cohort CRPS for model selection.
+    are used for training only.  The optional monitoring holdout loader draws
+    exclusively from patient cohorts so that checkpoint selection, if later
+    re-enabled, reflects clinical performance.
 
     Args:
         model_name: Name of the model class (e.g. 'BioDVN', 'BioDVN_NoSeq').
@@ -842,7 +907,15 @@ def full_train_from_splits(
           f'raw variance [{min(_raw_vals):.4f}, {max(_raw_vals):.4f}], '
           f'clipped to [0.100, 10.000]')
 
-    # -- Source groups handling (for multi-source batch mode) --
+    selection_group_weights = get_plca_selection_group_weights(source_groups)
+    if training_config.selection_metric == 'min_weighted_source_crps':
+        if source_groups is None:
+            raise ValueError(
+                "selection_metric='min_weighted_source_crps' requires source_groups"
+            )
+        validate_plca_selection_groups(source_groups)
+
+    # -- Source groups handling (for multi-source batch mode / weighted metrics) --
     sample_to_source: Optional[Dict[str, str]] = None
     source_tumor_variance: Optional[Dict[str, Dict[str, float]]] = None
     _sample_paths_by_source: Optional[Dict[str, List[str]]] = None
@@ -872,14 +945,20 @@ def full_train_from_splits(
             compute_gene_variances_unclipped,
         )
 
-    # Create loaders.
-    # Val: PATIENT-ONLY samples with 10% gene chunk split, metadata enabled
-    # so the Trainer can compute per-cohort/source balanced CRPS.
+    # Full-train defaults to the CV-chosen fixed epoch budget.  If CV later
+    # suggests that the final model still benefits from monitored checkpoint
+    # selection, flip this internal switch and keep the patient-only holdout
+    # path below.  We keep it local instead of exposing a new CLI/config knob
+    # so the production training contract stays explicit and stable.
+    use_checkpoint_holdout = False
     val_frac = 0.10
+    val_loader: Optional[DataLoader] = None
+    val_steps = 0
 
     if batch_mode == 'multi_source':
         # Multi-source training loader: gene-conditioned batches balanced
-        # across source groups.  ALL samples participate (no fold holdout).
+        # across source groups.  This branch is retained for direct comparison
+        # runs, but PLCAv2 should prefer the chunk path above it.
         from proteus_utils.proteus_utils import (
             ProteusMultiSourceBatchDataset, ProteusHoldoutValDataset,
             _collate_identity,
@@ -900,51 +979,7 @@ def full_train_from_splits(
             subsample_frac=subsample_frac,
         )
 
-        # Build deterministic 10% random sample-gene pair holdout mask.
-        # Only marks pairs where the gene actually exists for the sample's
-        # source (i.e., source_gene_mask is True).
-        n_samples = len(train_dataset._all_sample_paths)
-        n_union = len(train_dataset._union_genes)
-        rng_mask = np.random.RandomState(seed + 12345)
-        # Start with all-False mask.
-        val_mask = np.zeros((n_samples, n_union), dtype=np.bool_)
-        # Build sample → source map for existence check.
-        _path_to_src: Dict[str, str] = {}
-        for src, paths in _sample_paths_by_source.items():
-            for p in paths:
-                _path_to_src[p] = src
-        for s_idx, zpath in enumerate(train_dataset._all_sample_paths):
-            src = _path_to_src.get(zpath)
-            if src is None:
-                continue
-            src_mask = train_dataset._source_gene_mask[src]
-            # Indices where this sample has a valid gene.
-            valid_gene_indices = np.where(src_mask)[0]
-            n_valid = len(valid_gene_indices)
-            n_holdout = max(1, int(n_valid * val_frac))
-            chosen = rng_mask.choice(valid_gene_indices, size=n_holdout, replace=False)
-            val_mask[s_idx, chosen] = True
-
-        total_pairs = int(val_mask.sum())
-        total_valid = sum(
-            int(train_dataset._source_gene_mask[_path_to_src[p]].sum())
-            for p in train_dataset._all_sample_paths
-            if p in _path_to_src
-        )
-        print(f'  [HoldoutVal] {total_pairs} val pairs / {total_valid} total '
-              f'({100.0 * total_pairs / total_valid:.1f}%)')
-
-        # Attach val_mask to training dataset so it skips held-out pairs.
-        train_dataset.val_mask = val_mask
-
         # Build holdout validation dataset (shares preloaded arrays).
-        val_dataset = ProteusHoldoutValDataset(
-            train_dataset=train_dataset,
-            val_mask=val_mask,
-            batch_size=32,
-            seed=seed,
-        )
-
         base_generator = torch.Generator()
         base_generator.manual_seed(seed)
 
@@ -970,46 +1005,88 @@ def full_train_from_splits(
         )
         train_steps = len(train_dataset)
 
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=1,
-            shuffle=False,
-            num_workers=_nw,
-            collate_fn=_collate_identity,
-            persistent_workers=_nw > 0,
-            prefetch_factor=4 if _nw > 0 else None,
-            worker_init_fn=_seed_worker if _nw > 0 else None,
-            generator=base_generator,
-            drop_last=False,
-            pin_memory=True,
-        )
-        val_steps = len(val_dataset)
+        if use_checkpoint_holdout:
+            # This same-sample random holdout path is intentionally disabled by
+            # default.  If we re-enable checkpoint monitoring here after CV,
+            # keep the patient/source-weighted validation metrics as the sole
+            # selection signal and continue saving a monitored best_model.pt.
+            n_samples = len(train_dataset._all_sample_paths)
+            n_union = len(train_dataset._union_genes)
+            rng_mask = np.random.RandomState(seed + 12345)
+            val_mask = np.zeros((n_samples, n_union), dtype=np.bool_)
+            _path_to_src: Dict[str, str] = {}
+            for src, paths in _sample_paths_by_source.items():
+                for p in paths:
+                    _path_to_src[p] = src
+            for s_idx, zpath in enumerate(train_dataset._all_sample_paths):
+                src = _path_to_src.get(zpath)
+                if src is None:
+                    continue
+                src_mask = train_dataset._source_gene_mask[src]
+                valid_gene_indices = np.where(src_mask)[0]
+                n_valid = len(valid_gene_indices)
+                n_holdout = max(1, int(n_valid * val_frac))
+                chosen = rng_mask.choice(valid_gene_indices, size=n_holdout, replace=False)
+                val_mask[s_idx, chosen] = True
+
+            total_pairs = int(val_mask.sum())
+            total_valid = sum(
+                int(train_dataset._source_gene_mask[_path_to_src[p]].sum())
+                for p in train_dataset._all_sample_paths
+                if p in _path_to_src
+            )
+            print(f'  [HoldoutVal] {total_pairs} val pairs / {total_valid} total '
+                  f'({100.0 * total_pairs / total_valid:.1f}%)')
+
+            train_dataset.val_mask = val_mask
+            val_dataset = ProteusHoldoutValDataset(
+                train_dataset=train_dataset,
+                val_mask=val_mask,
+                batch_size=32,
+                seed=seed,
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=1,
+                shuffle=False,
+                num_workers=_nw,
+                collate_fn=_collate_identity,
+                persistent_workers=_nw > 0,
+                prefetch_factor=4 if _nw > 0 else None,
+                worker_init_fn=_seed_worker if _nw > 0 else None,
+                generator=base_generator,
+                drop_last=False,
+                pin_memory=True,
+            )
+            val_steps = len(val_dataset)
     else:
-        # Standard chunk-based training loader with optional cohort balancing.
-        # Uses 90% of gene chunks (10% reserved for val).
+        # Standard chunk-based training loader with actual epoch shuffling and
+        # bounded cross-sample mixing in the worker-local microbatch buffer.
+        # This is the preferred PLCAv2 full-train path.
         train_loader, train_steps = create_data_loader(
             index_file=all_index,
             num_workers=_loader_workers(),
             seed=seed,
             subsample_frac=subsample_frac,
             gene_weights=gene_weights,
-            val_frac=val_frac,
+            val_frac=val_frac if use_checkpoint_holdout else None,
             val_split=False,
             cohort_map=zarr_cohort_map if balance_cohorts else None,
             balance_cohorts=balance_cohorts,
         )
 
-        val_loader, val_steps = create_data_loader(
-            index_file=patient_index,
-            num_workers=_loader_workers(),
-            seed=seed,
-            include_metadata=True,
-            subsample_frac=subsample_frac,
-            gene_weights=gene_weights,
-            val_frac=val_frac,
-            val_split=True,
-            sample_name_map=zarr_sample_name_map,
-        )
+        if use_checkpoint_holdout:
+            val_loader, val_steps = create_data_loader(
+                index_file=patient_index,
+                num_workers=_loader_workers(),
+                seed=seed,
+                include_metadata=True,
+                subsample_frac=subsample_frac,
+                gene_weights=gene_weights,
+                val_frac=val_frac,
+                val_split=True,
+                sample_name_map=zarr_sample_name_map,
+            )
 
     print(f'Training batches: {train_steps}, Validation batches: {val_steps}')
 
@@ -1028,25 +1105,38 @@ def full_train_from_splits(
 
     # Train
     trainer = Trainer(model, training_config, model_config, device)
-    trainer.val_gene_weight_map = train_fold_variance_raw
-    # Per-source gene variance for epoch-level per-source GVW-CRPS/GVW-r.
-    trainer.val_source_gene_weight_map = source_tumor_variance
-    # Enable epoch-level per-group CRPS monitoring.  When source_groups
-    # is active, group by source; otherwise by cohort (patient-only).
-    if sample_to_source:
-        trainer.val_sample_cohort_map = sample_to_source
-    elif sample_cohort_map and _train_only:
-        patient_cohort_map = {
-            k: v for k, v in sample_cohort_map.items() if v not in _train_only
-        }
-        trainer.val_sample_cohort_map = patient_cohort_map
-    history = trainer.fit(train_loader, val_loader, epochs=training_config.epochs)
+    if val_loader is not None:
+        trainer.val_gene_weight_map = train_fold_variance_raw
+        trainer.val_source_gene_weight_map = source_tumor_variance
+        trainer.val_selection_group_weights = selection_group_weights
+        if sample_to_source:
+            trainer.val_sample_group_map = sample_to_source
+        elif sample_cohort_map and _train_only:
+            patient_cohort_map = {
+                k: v for k, v in sample_cohort_map.items() if v not in _train_only
+            }
+            trainer.val_sample_group_map = patient_cohort_map
 
-    # Save final model
-    model_for_save = getattr(trainer.model, '_orig_mod', trainer.model)
+    history = trainer.fit(train_loader, val_loader, epochs=training_config.epochs)
+    with open(os.path.join(out_dir, 'training_history.json'), 'w') as f:
+        json.dump(history, f, indent=2)
+
     final_path = os.path.join(out_dir, 'final_model.pt')
-    torch.save(model_for_save.state_dict(), final_path)
-    print(f'Saved final model to: {final_path}')
+    if val_loader is None:
+        ema_backup = None
+        if trainer._ema is not None:
+            ema_backup = trainer._ema.apply(trainer.model)
+        trainer._save_checkpoint(
+            training_config.epochs,
+            is_best=False,
+            filename='final_model.pt',
+        )
+        if ema_backup is not None:
+            trainer._ema.restore(trainer.model, ema_backup)
+        print(f'Saved fixed-schedule full-train checkpoint to: {final_path}')
+    else:
+        best_path = os.path.join(out_dir, 'best_model.pt')
+        print(f'Best monitored full-train checkpoint available at: {best_path}')
 
 
 def run_model(
@@ -1269,7 +1359,7 @@ def main():
     
     # Training arguments
     parser.add_argument("--model_name", type=str, default="BioDVN", help="Model architecture name")
-    parser.add_argument("--run_mode", type=str, default='train', choices=['train', 'full-train', 'tune', 'tune-ask', 'tune-tell', 'tune-fold', 'run'], help="train=CV training, full-train=final model, tune=Optuna CV tuning, tune-ask/tune-tell/tune-fold=coordinated fold-parallel tuning, run=inference")
+    parser.add_argument("--run_mode", type=str, default='train', choices=['train', 'full-train', 'tune', 'tune-ask', 'tune-tell', 'tune-fold', 'tune-proxy-ask', 'tune-proxy-tell', 'tune-proxy-finalize', 'run'], help="train=CV training, full-train=final model, tune=Optuna CV tuning, tune-ask/tune-tell/tune-fold=coordinated fold-parallel tuning, tune-proxy-ask/tune-proxy-tell/tune-proxy-finalize=proxy-fold racing, run=inference")
     parser.add_argument("--test_fold", type=int, default=None, help="Specific fold to train (for HPC parallelization)")
     parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
 
@@ -1440,6 +1530,7 @@ def main():
             source_groups=experiment_spec.data.source_groups,
             target_n_per_source=experiment_spec.data.target_n_per_source,
             batch_mode=experiment_spec.data.batch_mode,
+            fixed_schedule_oof=True,
         )
     
     elif args.run_mode == 'full-train':
@@ -1534,6 +1625,56 @@ def main():
             sampler_seed=int(args.sampler_seed),
         )
 
+    elif args.run_mode == 'tune-proxy-ask':
+        if args.experiment is None:
+            raise ValueError("--run_mode tune-proxy-ask requires --experiment <path/to/experiment.yaml>")
+
+        from tuning.optuna_tuner import coordinated_proxy_ask
+
+        trial_numbers = coordinated_proxy_ask(
+            experiment_path=str(args.experiment),
+            n_configs=int(args.n_configs),
+            storage=str(args.optuna_storage),
+            study_name=(None if args.study_name is None else str(args.study_name)),
+            sampler_seed=int(args.sampler_seed),
+        )
+        print(f"TRIAL_NUMBERS={','.join(str(t) for t in trial_numbers)}", flush=True)
+
+    elif args.run_mode == 'tune-proxy-tell':
+        if args.experiment is None:
+            raise ValueError("--run_mode tune-proxy-tell requires --experiment <path/to/experiment.yaml>")
+
+        from tuning.optuna_tuner import coordinated_proxy_tell
+
+        trial_nums = None
+        if args.trial_numbers is not None:
+            trial_nums = [int(x.strip()) for x in args.trial_numbers.split(",")]
+
+        reported_trials = coordinated_proxy_tell(
+            experiment_path=str(args.experiment),
+            trial_numbers=trial_nums,
+            storage=str(args.optuna_storage),
+            study_name=(None if args.study_name is None else str(args.study_name)),
+            sampler_seed=int(args.sampler_seed),
+        )
+        print(f"REPORTED_TRIAL_NUMBERS={','.join(str(t) for t in reported_trials)}", flush=True)
+
+    elif args.run_mode == 'tune-proxy-finalize':
+        if args.experiment is None:
+            raise ValueError("--run_mode tune-proxy-finalize requires --experiment <path/to/experiment.yaml>")
+
+        from tuning.optuna_tuner import coordinated_proxy_finalize
+
+        trial_nums = None
+        if args.trial_numbers is not None:
+            trial_nums = [int(x.strip()) for x in args.trial_numbers.split(",")]
+
+        finalized_trials = coordinated_proxy_finalize(
+            experiment_path=str(args.experiment),
+            trial_numbers=trial_nums,
+        )
+        print(f"FINALIZED_TRIAL_NUMBERS={','.join(str(t) for t in finalized_trials)}", flush=True)
+
     elif args.run_mode == 'tune-fold':
         if args.experiment is None:
             raise ValueError("--run_mode tune-fold requires --experiment <path/to/experiment.yaml>")
@@ -1573,10 +1714,10 @@ def main():
                 )
             model_dir = os.path.join('trained_models', dir_name, 'full_train')
 
-        model_path = os.path.join(model_dir, 'best_model.pt')
+        model_path = os.path.join(model_dir, 'final_model.pt')
         if not os.path.isfile(model_path):
             raise FileNotFoundError(
-                f"Trained model not found at: {model_path}\n"
+                f"Final full-train model not found at: {model_path}\n"
                 f"Run --run_mode full-train first, or provide --experiment <yaml> "
                 f"to point to the correct model directory."
             )

@@ -2,7 +2,7 @@
 #
 # All HPs cemented from phase3-2R tuning.
 # patience=3 with gene-level 10% chunk split for early stopping.
-# Output: trained_models/proteus_base-model/full_train/final_model.pt
+# Output: trained_models/proteus_base-model/full_train/best_model.pt
 
 name: proteus_base-model
 output_dir: trained_models/proteus_base-model

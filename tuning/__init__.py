@@ -17,6 +17,9 @@ optuna_tuner
 
 from .optuna_tuner import (
     coordinated_ask,
+    coordinated_proxy_ask,
+    coordinated_proxy_finalize,
+    coordinated_proxy_tell,
     coordinated_tell,
     run_coordinated_fold,
     run_optuna_cv_tuning,
@@ -27,6 +30,9 @@ __all__ = [
     "run_optuna_cv_tuning",
     "run_optuna_fold_tuning",
     "coordinated_ask",
+    "coordinated_proxy_ask",
+    "coordinated_proxy_tell",
+    "coordinated_proxy_finalize",
     "coordinated_tell",
     "run_coordinated_fold",
 ]

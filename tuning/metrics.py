@@ -114,6 +114,15 @@ def compute_cv_objective(run_dir: str) -> Dict[str, Any]:
         obj["balanced_tumor_gvw_crps_mean"] = nanmean(balanced_crps)
         obj["balanced_tumor_gvw_crps_std"] = nanstd(balanced_crps)
 
+    weighted_crps = [
+        float(r["weighted_tumor_gvw_crps"])
+        for r in rows
+        if r.get("weighted_tumor_gvw_crps") is not None
+    ]
+    if weighted_crps:
+        obj["weighted_tumor_gvw_crps_mean"] = nanmean(weighted_crps)
+        obj["weighted_tumor_gvw_crps_std"] = nanstd(weighted_crps)
+
     # Balanced GVW-r: per-fold balanced_tumor_gvw_r
     # (equal-weight average of per-source GVW-r when source_groups is
     # active, or per-cohort GVW-r otherwise).

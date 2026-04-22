@@ -1293,7 +1293,7 @@ def compute_subset_metrics(
 # Study-defined sample sets (BTS / PHT / PHS)
 # ---------------------------------------------------------------------------
 
-# The 25 PC-PDX samples in the study: 20 in BTS-CV + 5 holdout
+# The 25 PC-PDX samples in the study: 20 CV/development + 5 holdout
 _PC_PDX_CV = [
     "LuCaP_145-1", "LuCaP_189-4", "LuCaP_70CR", "LuCaP_96",       # F1
     "LuCaP_173-1", "LuCaP_136CR", "LuCaP_167CR", "LuCaP_170-3",   # F2
@@ -1304,7 +1304,7 @@ _PC_PDX_CV = [
 _PC_PDX_HO = ["LuCaP_136", "LuCaP_167", "LuCaP_176CR", "LuCaP_92", "LuCaP_93"]
 PC_PDX_STUDY = sorted(_PC_PDX_CV + _PC_PDX_HO)
 
-# The 25 SCLC-PDX samples in the study: 20 in BTS-CV + 5 holdout
+# The 25 SCLC-PDX samples in the study: 20 CV/development + 5 holdout
 _SCLC_PDX_CV = [
     "SCLC152", "LU86", "DIVE_CDX30P", "FHSC14",                    # F1
     "MSK_LX631", "MSK_LX1042", "DIVE_CDX25", "LX110",             # F2

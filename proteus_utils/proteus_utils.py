@@ -92,6 +92,10 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         self.target_n_per_source = target_n_per_source
         self.sample_name_map = sample_name_map  # zarr_path -> display name (TSV sample)
         self._balance_iter = 0
+        self._shuffle_buffer_batches = max(
+            16,
+            2 * (self.chunk_size // self.genes_per_batch),
+        )
 
         if self.genes_per_batch <= 0:
             raise ValueError('genes_per_batch must be > 0')
@@ -399,6 +403,90 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         self._gene_names_cache[zarr_path] = names
         return names
 
+    def _build_chunk_microbatches(
+        self,
+        zarr_path: str,
+        start: int,
+        end: int,
+        rng: random.Random,
+    ) -> List[Tuple[Dict[str, Any], Dict[str, torch.Tensor]]]:
+        """Load one contiguous chunk and return shuffled fixed-size microbatches.
+
+        Zarr reads stay chunk-friendly because the full 256-gene window is read
+        contiguously.  We then shuffle the 32-gene microbatches from that chunk
+        before they enter the worker-local mix buffer so training does not see
+        8 back-to-back batches from the same sample unless the buffer is fully
+        drained.
+        """
+        store = self._get_store(zarr_path)
+        data_grp = self._get_flat_grp(zarr_path)
+
+        tss_signals = torch.from_numpy(data_grp['TSS_signals'][start:end])
+        tss_nt = torch.from_numpy(data_grp['TSS_nucleotides'][start:end].astype(np.float32))
+        tss_feat = torch.from_numpy(data_grp['TSS_features'][start:end])
+        gb_feat = torch.from_numpy(data_grp['GB_features'][start:end])
+        ref_scalars = torch.from_numpy(data_grp['ref_scalars'][start:end])
+        tfx = torch.from_numpy(data_grp['TFX_label'][start:end]).to(torch.float32).reshape(-1)
+
+        if self.gene_weights is not None:
+            gene_names_chunk = self._get_gene_names(store, zarr_path)
+            gene_weight = torch.tensor(
+                [self.gene_weights.get(gene_names_chunk[i], 1.0) for i in range(start, end)],
+                dtype=torch.float32,
+            )
+        elif 'gene_weight' in data_grp:
+            gene_weight = torch.from_numpy(data_grp['gene_weight'][start:end]).to(torch.float32).reshape(-1)
+        else:
+            gene_weight = torch.ones(int(end - start), dtype=torch.float32)
+
+        if self.labeled:
+            tumor_exp = torch.from_numpy(data_grp['tumor_exp'][start:end]).to(torch.float32).reshape(-1)
+            background_exp = torch.from_numpy(data_grp['background_exp'][start:end]).to(torch.float32).reshape(-1)
+
+        if self.include_metadata:
+            sample_name = self._get_sample_name(store, zarr_path)
+            gene_names = self._get_gene_names(store, zarr_path)
+
+        chunk_len = int(end - start)
+        batch_offsets = [
+            off for off in range(0, chunk_len, self.genes_per_batch)
+            if off + self.genes_per_batch <= chunk_len
+        ]
+        rng.shuffle(batch_offsets)
+
+        microbatches: List[Tuple[Dict[str, Any], Dict[str, torch.Tensor]]] = []
+        for off in batch_offsets:
+            mb_end = off + self.genes_per_batch
+            sl = slice(int(off), int(mb_end))
+            features: Dict[str, Any] = {
+                'TSS_signals': tss_signals[sl],
+                'TSS_nucleotides': tss_nt[sl],
+                'TSS_features': tss_feat[sl],
+                'GB_features': gb_feat[sl],
+                'ref_scalars': ref_scalars[sl],
+            }
+
+            if self.include_metadata:
+                features['sample_name'] = [sample_name] * self.genes_per_batch
+                features['gene_name'] = [str(g) for g in gene_names[int(start + off):int(start + mb_end)]]
+
+            if self.labeled:
+                labels: Dict[str, torch.Tensor] = {
+                    'tumor_exp': tumor_exp[sl].unsqueeze(-1),
+                    'background_exp': background_exp[sl].unsqueeze(-1),
+                    'sample_weight': gene_weight[sl].unsqueeze(-1),
+                    'TFX_label': tfx[sl].unsqueeze(-1),
+                }
+            else:
+                labels = {
+                    'sample_weight': gene_weight[sl].unsqueeze(-1),
+                    'TFX_label': tfx[sl].unsqueeze(-1),
+                }
+
+            microbatches.append((features, labels))
+
+        return microbatches
+
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
         if worker_info is None:
@@ -408,85 +496,40 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
             worker_id = int(worker_info.id)
             num_workers = int(worker_info.num_workers)
 
-        # Per-epoch balanced filtering (source-group or cohort-level).
-        # _balance_iter increments on every __iter__() call so each
-        # worker deterministically varies the selected samples.
-        active_chunks = self._chunks
+        # Per-epoch deterministic chunk reshuffling.  This preserves exact
+        # once-per-epoch example exposure while preventing the model from
+        # seeing the same sample-local chunk order every epoch.
+        self._balance_iter += 1
+        epoch_seed = self.seed + self._balance_iter * 997
+        active_chunks = list(self._chunks)
         if self.source_map and self.target_n_per_source:
-            self._balance_iter += 1
             active_chunks = self._balanced_chunks(self._balance_iter)
         elif self.cohort_map and self.balance_cohorts:
-            self._balance_iter += 1
             active_chunks = self._balanced_chunks(self._balance_iter)
+        else:
+            random.Random(epoch_seed).shuffle(active_chunks)
+
+        worker_rng = random.Random(epoch_seed + 104729 * (worker_id + 1))
+        microbatch_buffer: List[Tuple[Dict[str, Any], Dict[str, torch.Tensor]]] = []
 
         # Deterministic sharding of chunks across workers.
         for chunk_idx in range(worker_id, len(active_chunks), num_workers):
             zarr_path, start, end = active_chunks[chunk_idx]
-            store = self._get_store(zarr_path)
-            data_grp = self._get_flat_grp(zarr_path)
-
-            # Load one contiguous chunk into memory.
-            tss_signals = torch.from_numpy(data_grp['TSS_signals'][start:end])
-            tss_nt = torch.from_numpy(data_grp['TSS_nucleotides'][start:end].astype(np.float32))
-            tss_feat = torch.from_numpy(data_grp['TSS_features'][start:end])
-            gb_feat = torch.from_numpy(data_grp['GB_features'][start:end])
-            ref_scalars = torch.from_numpy(data_grp['ref_scalars'][start:end])
-            # Force shape (n_genes,) then we will unsqueeze(-1) for (n_genes,1)
-            tfx = torch.from_numpy(data_grp['TFX_label'][start:end]).to(torch.float32).reshape(-1)
-
-            if self.gene_weights is not None:
-                gene_names_chunk = self._get_gene_names(store, zarr_path)
-                gene_weight = torch.tensor(
-                    [self.gene_weights.get(gene_names_chunk[i], 1.0) for i in range(start, end)],
-                    dtype=torch.float32,
+            microbatch_buffer.extend(
+                self._build_chunk_microbatches(
+                    zarr_path,
+                    int(start),
+                    int(end),
+                    worker_rng,
                 )
-            elif 'gene_weight' in data_grp:
-                gene_weight = torch.from_numpy(data_grp['gene_weight'][start:end]).to(torch.float32).reshape(-1)
-            else:
-                gene_weight = torch.ones(int(end - start), dtype=torch.float32)
+            )
+            while len(microbatch_buffer) >= self._shuffle_buffer_batches:
+                pop_idx = worker_rng.randrange(len(microbatch_buffer))
+                yield microbatch_buffer.pop(pop_idx)
 
-            if self.labeled:
-                tumor_exp = torch.from_numpy(data_grp['tumor_exp'][start:end]).to(torch.float32).reshape(-1)
-                background_exp = torch.from_numpy(data_grp['background_exp'][start:end]).to(torch.float32).reshape(-1)
-
-            if self.include_metadata:
-                sample_name = self._get_sample_name(store, zarr_path)
-                gene_names = self._get_gene_names(store, zarr_path)
-
-            # Yield fixed-size microbatches.
-            chunk_len = int(end - start)
-            for off in range(0, chunk_len, self.genes_per_batch):
-                mb_end = off + self.genes_per_batch
-                if mb_end > chunk_len:
-                    break  # keep fixed size
-
-                sl = slice(int(off), int(mb_end))
-                features: Dict[str, Any] = {
-                    'TSS_signals': tss_signals[sl],
-                    'TSS_nucleotides': tss_nt[sl],
-                    'TSS_features': tss_feat[sl],
-                    'GB_features': gb_feat[sl],
-                    'ref_scalars': ref_scalars[sl],
-                }
-
-                if self.include_metadata:
-                    features['sample_name'] = [sample_name] * self.genes_per_batch
-                    features['gene_name'] = [str(g) for g in gene_names[int(start + off):int(start + mb_end)]]
-
-                if self.labeled:
-                    labels: Dict[str, torch.Tensor] = {
-                        'tumor_exp': tumor_exp[sl].unsqueeze(-1),
-                        'background_exp': background_exp[sl].unsqueeze(-1),
-                        'sample_weight': gene_weight[sl].unsqueeze(-1),
-                        'TFX_label': tfx[sl].unsqueeze(-1),
-                    }
-                else:
-                    labels = {
-                        'sample_weight': gene_weight[sl].unsqueeze(-1),
-                        'TFX_label': tfx[sl].unsqueeze(-1),
-                    }
-
-                yield features, labels
+        while microbatch_buffer:
+            pop_idx = worker_rng.randrange(len(microbatch_buffer))
+            yield microbatch_buffer.pop(pop_idx)
 
 
 class ProteusInferenceDataset(Dataset):
@@ -1370,9 +1413,11 @@ def build_loaders_from_splits(
         train_only_cohorts: Cohorts that always go to training (never
                             validation), regardless of fold assignment.
         balance_cohorts: Cohorts to balance by per-epoch undersampling.
-        source_groups: Source-level batch balancing (maps source → cohort list).
-                       Mutually exclusive with ``balance_cohorts``.
-        target_n_per_source: Target samples per source group per epoch.
+        source_groups: Source grouping for validation/evaluation metrics.
+                   When ``batch_mode='chunk'`` this no longer changes
+                   training sample exposure.
+        target_n_per_source: Legacy source-balance control for the dedicated
+                   ``multi_source`` loader path only.
 
     Returns:
         (train_loader, val_loader, train_steps, val_steps)
@@ -1389,7 +1434,7 @@ def build_loaders_from_splits(
     rng = np.random.RandomState(seed)
     rng.shuffle(train_paths)
 
-    # Build source_map: zarr_path -> source group name.
+    # Build source assignments for validation / reporting.
     zarr_path_to_source: Optional[Dict[str, str]] = None
     if source_groups:
         _cohort_to_source = invert_source_groups(source_groups)
@@ -1435,8 +1480,6 @@ def build_loaders_from_splits(
         gene_weights=gene_weights,
         cohort_map=zarr_path_to_cohort if balance_cohorts else None,
         balance_cohorts=balance_cohorts,
-        source_map=zarr_path_to_source,
-        target_n_per_source=target_n_per_source,
     )
 
     val_loader, val_steps = create_data_loader(

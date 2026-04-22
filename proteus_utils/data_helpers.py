@@ -14,12 +14,23 @@ across multiple call sites:
 from __future__ import annotations
 
 import csv
+import math
 import os
 import re
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 # Pre-compiled PHT regex: PHT-Fold-<N>_<PDX_NAME>-BP<N>
 _PHT_RE = re.compile(r'^PHT-Fold-\d+_(.+)-BP\d+')
+
+
+# Fixed PLCAv2 selection weights.  These are intentionally hard-coded so
+# the weighted objective stays stable across trainer, evaluation, and tuning.
+PLCA_WEIGHTED_SOURCE_WEIGHTS: Dict[str, float] = {
+    'CRPC-RA': 0.30,
+    'SCLC': 0.30,
+    'Prostate-Synthetic': 0.20,
+    'SCLC-Synthetic': 0.20,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +154,60 @@ def collect_zarr_paths(
             if os.path.isdir(zpath):
                 paths.append(zpath)
     return paths
+
+
+def get_plca_selection_group_weights(
+    source_groups: Optional[Dict[str, List[str]]],
+) -> Optional[Dict[str, float]]:
+    """Return the fixed PLCAv2 source weights when the source groups match.
+
+    The PLCAv2 weighted objective is only defined for the four-bucket
+    patient/synthetic grouping.  Other source-group layouts keep the usual
+    balanced metrics but do not get a weighted selection metric.
+    """
+    if source_groups is None:
+        return None
+    if set(source_groups) != set(PLCA_WEIGHTED_SOURCE_WEIGHTS):
+        return None
+    return dict(PLCA_WEIGHTED_SOURCE_WEIGHTS)
+
+
+def validate_plca_selection_groups(source_groups: Dict[str, List[str]]) -> None:
+    """Fail loudly if a weighted PLCAv2 run does not use the fixed 4 buckets."""
+    expected = set(PLCA_WEIGHTED_SOURCE_WEIGHTS)
+    actual = set(source_groups)
+    if actual != expected:
+        raise ValueError(
+            "Weighted PLCA selection requires source_groups with exactly "
+            f"these keys: {sorted(expected)}. Got: {sorted(actual)}"
+        )
+
+
+def weighted_group_mean(
+    group_values: Dict[str, float],
+    group_weights: Dict[str, float],
+) -> float:
+    """Compute a weighted mean over named groups.
+
+    Returns NaN when any required group is missing or non-finite so the
+    caller can fail loudly instead of silently renormalizing the objective.
+    """
+    missing = [
+        name for name in group_weights
+        if name not in group_values or not math.isfinite(float(group_values[name]))
+    ]
+    if missing:
+        return float('nan')
+
+    total_weight = sum(float(w) for w in group_weights.values())
+    if total_weight <= 0.0:
+        return float('nan')
+
+    weighted_sum = sum(
+        float(group_values[name]) * float(weight)
+        for name, weight in group_weights.items()
+    )
+    return float(weighted_sum / total_weight)
 
 
 # ---------------------------------------------------------------------------

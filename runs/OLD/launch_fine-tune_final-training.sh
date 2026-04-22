@@ -6,7 +6,7 @@ set -euo pipefail
 # Fine-tunes base model on ALL 80 PAN-FT samples (44 CRPC-RA + 16 SCLC
 # + 20 PHT).  Gene-level 10% chunk split for early stopping (patience=3).
 # Output: trained_models/proteus_PAN-FT/full_train/best_model.pt
-#         trained_models/proteus_PAN-FT/full_train/final_model.pt
+#         trained_models/proteus_PAN-FT/full_train/best_model.pt
 # =====================================================================
 
 YAML="config/experiments/fine-tuning/PAN-FT_final-training.yaml"

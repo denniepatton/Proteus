@@ -407,8 +407,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Output directory (defaults depend on mode)",
     )
     parser.add_argument(
-        "--nthread", type=int, default=16,
-        help="Threads per XGBoost model",
+        "--nthread", type=int, default=None,
+        help="Threads per XGBoost model (default: use all available CPUs)",
     )
     parser.add_argument(
         "--val_frac", type=float, default=0.10,
@@ -435,7 +435,11 @@ def main(argv: Optional[List[str]] = None) -> None:
             "Train the BTS base model first with train_final.py."
         )
 
-    nthread = min(args.nthread, os.cpu_count() or 1)
+    cpu_count = os.cpu_count() or 1
+    if args.nthread is None or args.nthread <= 0:
+        nthread = cpu_count
+    else:
+        nthread = min(args.nthread, cpu_count)
 
     # Resolve fine-tuning HPs
     ft_params = _load_ft_params(args.params_json)

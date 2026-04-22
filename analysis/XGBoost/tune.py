@@ -43,6 +43,9 @@ from .train import EARLY_STOPPING_ROUNDS, run_cv
 DEFAULT_N_TRIALS = 200
 DEFAULT_STORAGE = f"sqlite:///{PROJECT_ROOT / 'analysis' / 'XGBoost' / 'optuna_xgb.db'}"
 DEFAULT_STUDY_NAME = "xgboost_baseline"
+DEFAULT_RESULTS_DIR = str(
+    PROJECT_ROOT / "analysis" / "XGBoost" / "tuning_results"
+)
 FOLDS = [1, 2, 3, 4, 5]
 
 
@@ -55,6 +58,7 @@ def _build_objective(
     zarr_base: str,
     seed: int,
     nthread: int,
+    n_estimators: int,
 ):
     """Return an Optuna objective closure.
 
@@ -104,7 +108,6 @@ def _build_objective(
             "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 10.0, log=True),
             "gamma": trial.suggest_float("gamma", 1e-8, 5.0, log=True),
         }
-        n_estimators = 1000  # upper bound; early stopping decides
 
         fold_scores: List[float] = []
         fold_iters: List[int] = []
@@ -161,15 +164,23 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--study_name", type=str, default=DEFAULT_STUDY_NAME)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
-        "--nthread", type=int, default=16,
-        help="Threads per XGBoost model (default: 16; avoid using all cores on NUMA nodes)",
+        "--nthread", type=int, default=None,
+        help="Threads per XGBoost model (default: use all available CPUs)",
     )
     parser.add_argument(
         "--n_jobs", type=int, default=1,
         help="Parallel Optuna trials (default: 1). Safe because XGBoost releases the GIL.",
     )
+    parser.add_argument(
+        "--n_estimators", type=int, default=1000,
+        help="Max boosting rounds per trial (early stopping decides actual count)",
+    )
     parser.add_argument("--tsv", type=str, default=None)
     parser.add_argument("--zarr_base", type=str, default=None)
+    parser.add_argument(
+        "--results_dir", type=str, default=DEFAULT_RESULTS_DIR,
+        help="Directory for best_params.json and optional best_cv_eval outputs",
+    )
     parser.add_argument(
         "--skip_final_eval",
         action="store_true",
@@ -194,16 +205,27 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     # ---- Run trials ----
     cpu_count = os.cpu_count() or 1
-    nthread = min(args.nthread, cpu_count)
+    if args.nthread is None or args.nthread <= 0:
+        nthread = cpu_count
+    else:
+        nthread = min(args.nthread, cpu_count)
     n_jobs = max(1, args.n_jobs)
     print(f"Starting Optuna study '{args.study_name}' with {args.n_trials} trials")
     print(f"  Storage: {args.storage}")
     print(f"  Data: {tsv_path}")
     print(f"  Zarr: {zarr_base}")
+    print(f"  Results dir: {args.results_dir}")
+    print(f"  Max rounds per trial: {args.n_estimators}")
     print(f"  CPUs available: {cpu_count}, nthread={nthread}, n_jobs={n_jobs} "
           f"(total threads: {nthread * n_jobs})")
 
-    objective = _build_objective(tsv_path, zarr_base, args.seed, nthread)
+    objective = _build_objective(
+        tsv_path,
+        zarr_base,
+        args.seed,
+        nthread,
+        args.n_estimators,
+    )
     study.optimize(
         objective,
         n_trials=args.n_trials,
@@ -220,13 +242,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         print(f"    {k}: {v}")
 
     # Save study summary
-    out_dir = str(PROJECT_ROOT / "analysis" / "XGBoost" / "tuning_results")
+    out_dir = args.results_dir
     os.makedirs(out_dir, exist_ok=True)
     summary = {
         "best_trial": study.best_trial.number,
         "best_value": study.best_trial.value,
         "best_params": study.best_trial.params,
         "n_trials": len(study.trials),
+        "n_estimators_max": args.n_estimators,
     }
     with open(os.path.join(out_dir, "best_params.json"), "w") as f:
         json.dump(summary, f, indent=2)
@@ -244,7 +267,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         eval_dir = os.path.join(out_dir, "best_cv_eval")
         cv_summary = run_cv(
             xgb_params=best_params,
-            n_estimators=1000,
+            n_estimators=args.n_estimators,
             out_dir=eval_dir,
             tsv_path=tsv_path,
             zarr_base=zarr_base,

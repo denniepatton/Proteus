@@ -163,7 +163,7 @@ def main() -> None:
     )
     parser.add_argument(
         '--model_dir', type=str, required=True,
-        help='Directory containing best_model.pt and model_config.json',
+        help='Directory containing final_model.pt and model_config.json',
     )
     # Data source: either --use_set or --zarr_paths (at least one required)
     data_group = parser.add_mutually_exclusive_group(required=True)
@@ -265,7 +265,7 @@ def main() -> None:
     # Load model
     # ------------------------------------------------------------------
     model_dir = Path(args.model_dir)
-    model_path = model_dir / 'best_model.pt'
+    model_path = model_dir / 'final_model.pt'
     if not model_path.exists():
         raise FileNotFoundError(f'No checkpoint found at {model_path}')
 

@@ -1300,12 +1300,12 @@ def benchmark_grid_boxplots(
     tfx_order: Sequence[str],
     depth_order: Sequence[str],
     model_order: Sequence[str],
-    naive_model: str = "Na\u00efve",
+    naive_model: str = "Naive",
 ) -> None:
     """TFx x Depth grid of box plots, one box per model/score.
 
     ``metrics_table`` must have columns: tfx, depth, model, and ``metric_col``.
-    A dashed gray horizontal line is drawn at the Na\u00efve model's mean value
+    A dashed gray horizontal line is drawn at the Naive model's mean value
     (or single value) in each panel for reference.
     """
     _ensure_dir(name)
@@ -1328,7 +1328,7 @@ def benchmark_grid_boxplots(
                 ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
                         ha="center", va="center", fontsize=9, color="gray")
             else:
-                # Naïve reference line — dashed gray spanning full x-extent
+                # Naive reference line — dashed gray spanning full x-extent
                 naive_vals = sub.loc[sub["model"] == naive_model, metric_col].dropna().values
                 if len(naive_vals) > 0:
                     naive_ref = float(np.mean(naive_vals))
@@ -1601,7 +1601,7 @@ def benchmark_cohort_boxplots(
     title: str,
     cohort_order: Sequence[str],
     model_order: Sequence[str],
-    naive_model: str = "Naïve",
+    naive_model: str = "Naive",
 ) -> None:
     """Single-panel cohort-paired box/dot plots, one group per model.
 
@@ -1609,7 +1609,7 @@ def benchmark_cohort_boxplots(
     Both cohorts are shown side-by-side within each model group.  For
     scalar data (one value per model per cohort), different marker symbols
     distinguish cohorts (square / triangle).  A dashed gray line marks the
-    Naïve model's grand mean for reference.
+    Naive model's grand mean for reference.
     """
     _ensure_dir(name)
     cmap = _bench_color_map(model_order)
@@ -1639,7 +1639,7 @@ def benchmark_cohort_boxplots(
     fig_width = max(5, 0.7 * n_models + 2)
     fig, ax = plt.subplots(figsize=(fig_width, 5))
 
-    # Naïve reference line
+    # Naive reference line
     naive_vals = metrics_table.loc[
         metrics_table["model"] == naive_model, metric_col
     ].dropna().values

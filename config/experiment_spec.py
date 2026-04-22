@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Union
 
 import yaml
 
+from proteus_utils.data_helpers import PLCA_WEIGHTED_SOURCE_WEIGHTS
+
 
 JSONScalar = Union[str, int, float, bool, None]
 JSONValue = Union[JSONScalar, List["JSONValue"], Dict[str, "JSONValue"]]
@@ -266,7 +268,7 @@ class ScaleSpec:
             "initial_reduction_channels", "n_reductions",
             "reduction_dilation",
             "dropout_rate",
-            "signal_encoder_width",  # Legacy key; ignored (pooling replaced MLP)
+            "signal_encoder_width",  # Legacy key; ignored by the current compact spatial encoder
         ]
         _check_no_unknown_keys(d, allowed=allowed, ctx="scale")
 
@@ -368,28 +370,35 @@ class DataSpec:
         None means use 100% of the data (default for production runs).
 
     source_groups (optional, Dict[str, List[str]]):
-        Source-level batch balancing.  Maps a source name to the list
-        of cohort names that belong to that source.  PHT samples are
-        automatically assigned to the source whose PDX cohort they
-        derive from (parsed from sample name).  When set, each epoch
-        draws ``target_n_per_source`` samples from every source group
-        (oversampling small sources, undersampling large ones).
+        Source grouping for evaluation and weighted selection metrics.
+        Maps a source name to the list of cohort names that belong to
+        that source.  PHT samples are automatically assigned to the
+        source whose PDX cohort they derive from (parsed from sample
+        name).  In the preferred chunk-based PLCAv2 path this does not
+        alter training exposure; it defines how validation metrics are
+        aggregated.  The legacy ``multi_source`` batch mode still uses
+        these groups for explicit source-balanced sampling.
         Mutually exclusive with ``balance_cohorts``.
 
     target_n_per_source (optional, int):
         Target number of samples per source group per training epoch.
-        Only used when ``source_groups`` is set.  In ``multi_source``
-        batch mode this controls the effective pool size (N_eff).
+        Only used by the legacy ``multi_source`` batch mode, where it
+        controls the effective per-source pool size (N_eff).
 
     batch_mode (optional, str: 'chunk' | 'multi_source'):
-        Batch construction strategy.  ``'chunk'`` (default) uses the
-        existing per-sample contiguous-chunk loader.  ``'multi_source'``
-        uses multi-source gene-conditioned batches (2 genes × N sources
-        × 4 samples/source = 32 items per batch).
+        Batch construction strategy.  ``'chunk'`` (default and preferred)
+        uses the per-sample contiguous-chunk loader with per-epoch chunk
+        reshuffling and worker-local cross-sample microbatch mixing.
+        ``'multi_source'`` keeps the older gene-conditioned source-balanced
+        batcher for direct comparisons only.
 
-    selection_metric (optional, str: 'min_balanced_crps' | 'max_gvw_r_lower_bound'):
+    selection_metric (optional, str: 'min_balanced_crps' |
+                                     'min_weighted_source_crps' |
+                                     'max_gvw_r_lower_bound'):
         Model selection / early-stopping metric.  ``'min_balanced_crps'``
         (default) selects the epoch with lowest balanced GVW-CRPS.
+        ``'min_weighted_source_crps'`` selects the epoch with lowest
+        fixed-weight PLCAv2 source GVW-CRPS using the 4 source buckets.
         ``'max_gvw_r_lower_bound'`` selects the epoch with highest
         balanced GVW-r lower bound (mean − std across sources).
     """
@@ -472,10 +481,26 @@ class DataSpec:
             "data.selection_metric",
         ).lower()
         if selection_metric_raw not in (
-            "min_balanced_crps", "max_gvw_r_lower_bound",
+            "min_balanced_crps", "min_weighted_source_crps",
+            "max_gvw_r_lower_bound",
         ):
             _fail(f"data.selection_metric must be 'min_balanced_crps' "
-                  f"or 'max_gvw_r_lower_bound', got '{selection_metric_raw}'")
+                  f"or 'min_weighted_source_crps' or 'max_gvw_r_lower_bound', "
+                  f"got '{selection_metric_raw}'")
+
+        if selection_metric_raw == 'min_weighted_source_crps':
+            if source_groups is None:
+                _fail(
+                    "data.selection_metric='min_weighted_source_crps' requires "
+                    "data.source_groups"
+                )
+            expected = set(PLCA_WEIGHTED_SOURCE_WEIGHTS)
+            actual = set(source_groups)
+            if actual != expected:
+                _fail(
+                    "Weighted PLCA selection requires source_groups with keys "
+                    f"{sorted(expected)}, got {sorted(actual)}"
+                )
 
         return DataSpec(
             training_set=_as_str(d["training_set"], "data.training_set"),

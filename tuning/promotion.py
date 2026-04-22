@@ -398,6 +398,8 @@ def run_promotion_phase(
             if fold_metrics.get("balanced_tumor_gvw_crps") is not None:
                 obj["balanced_tumor_gvw_crps_mean"] = float(fold_metrics["balanced_tumor_gvw_crps"])
                 obj["balanced_tumor_gvw_crps_std"] = float(fold_metrics.get("balanced_tumor_gvw_crps_std", float("nan")))
+            if fold_metrics.get("weighted_tumor_gvw_crps") is not None:
+                obj["weighted_tumor_gvw_crps_mean"] = float(fold_metrics["weighted_tumor_gvw_crps"])
             if fold_metrics.get("balanced_tumor_gvw_r") is not None:
                 obj["balanced_tumor_gvw_r_mean"] = float(fold_metrics["balanced_tumor_gvw_r"])
                 obj["balanced_tumor_gvw_r_std"] = float(fold_metrics.get("balanced_tumor_gvw_r_std", float("nan")))

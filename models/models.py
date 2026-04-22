@@ -333,6 +333,47 @@ class ReductionBlock(nn.Module):
         return x
 
 
+class SpatialSignalEncoder(nn.Module):
+    """Compact position-aware encoder over the reduced TSS representation.
+
+    The old encoder globally averaged the reduced spatial axis, making the
+    final signal summary translation-invariant over the whole 2 kb window.
+    This encoder keeps a small number of ordered spatial bins, then learns a
+    compact projection from those coarse positional summaries.
+    """
+
+    def __init__(
+        self,
+        input_channels: int,
+        output_dim: int = 64,
+        spatial_bins: int = 16,
+        dropout_rate: float = 0.0,
+    ):
+        super().__init__()
+        if spatial_bins <= 0:
+            raise ValueError(f'spatial_bins must be > 0, got {spatial_bins}')
+        self.spatial_bins = int(spatial_bins)
+        self.output_dim = int(output_dim)
+        hidden_dim = max(self.output_dim * 2, int(input_channels) * 4)
+
+        self.spatial_pool = nn.AdaptiveAvgPool1d(self.spatial_bins)
+        self.projection = nn.Sequential(
+            nn.Flatten(1),
+            nn.Linear(int(input_channels) * self.spatial_bins, hidden_dim),
+            get_norm_layer(hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, self.output_dim),
+            get_norm_layer(self.output_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.spatial_pool(x)
+        return self.projection(x)
+
+
 class Encoder(nn.Module):
     """VAE encoder network (funnel-shaped MLP)."""
     
@@ -472,7 +513,7 @@ class BioDVN(nn.Module):
     Architecture:
     1. Signal Processing Block: Conv1D per fragmentomic channel + Conv2D for nucleotides
     2. Reduction Block: Conv2D cross-channel interaction with residual skips + AvgPool
-    3. Signal Encoding: Dense halving-funnel to compress spatial representation
+    3. Signal Encoding: Adaptive coarse spatial binning + compact MLP projection
     4. Dual Encoder Block: Parallel VAE encoders for tumor and background
     5. Latent Merging: Learned TFx-conditional combination of latent spaces
     6. Reconstruction: Decoder for scalar reconstruction (internal loss)
@@ -513,22 +554,20 @@ class BioDVN(nn.Module):
             dilation=config.reduction_dilation,
         )
         
-        # Signal encoding: channel projection + adaptive average pooling.
-        # Conv1d(k=1) learns a linear combination of reduction output channels,
-        # then AdaptiveAvgPool1d squashes the spatial dimension — imposing
-        # translation invariance along the 2kb TSS window.
+        # Signal encoding: preserve coarse spatial structure after reduction.
+        # We adaptively pool the reduced representation into a small number of
+        # ordered bins, then project those bin summaries with a compact MLP.
+        # This keeps position information at a coarse scale without reviving
+        # the very large flattened encoder used historically.
         self._tss_input_length = 2000
         self.signal_encoded_dim = 64  # Signal encoder output dim
+        self.signal_spatial_bins = 16
         reduction_out_channels = self.reduction.out_channels
-        self.signal_encoder = nn.Sequential(
-            # (batch, length, C) → permute → (batch, C, length)
-            # Conv1d projects channels: C → signal_encoded_dim
-            nn.Conv1d(reduction_out_channels, self.signal_encoded_dim, kernel_size=1),
-            get_norm_layer_conv1d(self.signal_encoded_dim),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool1d(1),  # (batch, signal_encoded_dim, 1)
-            nn.Flatten(1),            # (batch, signal_encoded_dim)
-            nn.Dropout(config.dropout_rate),
+        self.signal_encoder = SpatialSignalEncoder(
+            input_channels=reduction_out_channels,
+            output_dim=self.signal_encoded_dim,
+            spatial_bins=self.signal_spatial_bins,
+            dropout_rate=config.dropout_rate,
         )
         self.scalar_input_dim = 0
 
@@ -708,8 +747,9 @@ class BioDVN(nn.Module):
         # Spatial reduction (skip connections integrate multi-scale features)
         x = self.reduction(x)
         
-        # Signal encoding: permute to (batch, channels, length) for Conv1d,
-        # then the adaptive-pooling signal encoder squashes spatial dim.
+        # Signal encoding: permute to (batch, channels, length), keep a small
+        # number of ordered spatial bins, then project to the fixed-width
+        # signal summary used by the downstream encoders.
         x = x.permute(0, 2, 1)
         x_encoded = self.signal_encoder(x)
         

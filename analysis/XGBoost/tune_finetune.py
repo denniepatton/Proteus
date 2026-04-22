@@ -203,8 +203,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Directory containing the pre-trained base model.ubj",
     )
     parser.add_argument(
-        "--nthread", type=int, default=16,
-        help="Threads per XGBoost model",
+        "--nthread", type=int, default=None,
+        help="Threads per XGBoost model (default: use all available CPUs)",
     )
     parser.add_argument(
         "--n_jobs", type=int, default=1,
@@ -235,7 +235,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
 
     cpu_count = os.cpu_count() or 1
-    nthread = min(args.nthread, cpu_count)
+    if args.nthread is None or args.nthread <= 0:
+        nthread = cpu_count
+    else:
+        nthread = min(args.nthread, cpu_count)
     n_jobs = max(1, args.n_jobs)
     print(f"Starting Optuna fine-tune study '{args.study_name}' "
           f"with {args.n_trials} trials")

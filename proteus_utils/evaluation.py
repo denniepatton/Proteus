@@ -26,6 +26,7 @@ from proteus_utils.metrics import (
     gvw_r,
     scatter_stats,
 )
+from proteus_utils.data_helpers import weighted_group_mean
 
 
 # ---------------------------------------------------------------------------
@@ -154,20 +155,17 @@ def _run_inference(
 
             # ---- Per-source GVW-CRPS (tumor, per-source variance weights) ----
             if sample_to_source and source_tumor_variance:
-                batch_samples = features['sample_name']
-                if not isinstance(batch_samples, (list, tuple)):
-                    batch_samples = [batch_samples]
-                src_label = sample_to_source.get(str(batch_samples[0]))
-                if src_label is not None and src_label in source_tumor_variance:
-                    src_var = source_tumor_variance[src_label]
-                    w_src = _variance_weights(gnames, src_var, device)
-                    src_cs, src_cd = mixture_crps(
-                        t_mdn, lab_dev['tumor_exp'], sample_weight=w_src,
-                    )
-                    if src_label not in source_crps:
-                        source_crps[src_label] = [torch.tensor(0.0), torch.tensor(0.0)]
-                    source_crps[src_label][0] += src_cs.cpu()
-                    source_crps[src_label][1] += src_cd.cpu()
+                _accumulate_group_crps(
+                    source_crps,
+                    features,
+                    'sample_name',
+                    sample_to_source,
+                    t_mdn,
+                    lab_dev['tumor_exp'],
+                    None,
+                    device,
+                    group_var_maps=source_tumor_variance,
+                )
 
             # ---- Metadata ----
             sample_names = features['sample_name']
@@ -216,8 +214,9 @@ def _accumulate_group_crps(
     group_map: Optional[Dict[str, str]],
     mdn_params: Dict[str, torch.Tensor],
     truth: torch.Tensor,
-    weights: Optional[torch.Tensor],
+    default_weights: Optional[torch.Tensor],
     device: torch.device,
+    group_var_maps: Optional[Dict[str, Dict[str, float]]] = None,
 ) -> None:
     """Accumulate per-group (cohort or source) GVW-CRPS in-place."""
     from models.model_utils import mixture_crps
@@ -227,14 +226,31 @@ def _accumulate_group_crps(
     batch_samples = features[sample_key]
     if not isinstance(batch_samples, (list, tuple)):
         batch_samples = [batch_samples]
+    batch_gene_names = features.get('gene_name')
     group_labels = [group_map.get(str(s), 'unknown') for s in batch_samples]
     for grp in set(group_labels):
+        if grp == 'unknown':
+            continue
+        idx_list = [i for i, g in enumerate(group_labels) if g == grp]
         idx = torch.tensor(
-            [i for i, g in enumerate(group_labels) if g == grp],
+            idx_list,
             dtype=torch.long, device=device,
         )
         g_mdn = {k: v[idx] for k, v in mdn_params.items()}
-        g_w = weights[idx] if weights is not None else None
+        if group_var_maps is not None and grp in group_var_maps:
+            if isinstance(batch_gene_names, (list, tuple)):
+                selected_genes = [str(batch_gene_names[i]) for i in idx_list]
+            elif batch_gene_names is not None:
+                selected_genes = [str(batch_gene_names)] * len(idx_list)
+            else:
+                selected_genes = []
+            g_w = torch.tensor(
+                [float(group_var_maps[grp].get(gene_name, 1.0)) for gene_name in selected_genes],
+                dtype=torch.float32,
+                device=device,
+            ).unsqueeze(-1) if selected_genes else None
+        else:
+            g_w = default_weights[idx] if default_weights is not None else None
         cs, cd = mixture_crps(g_mdn, truth[idx], sample_weight=g_w)
         if grp not in accum:
             accum[grp] = [torch.tensor(0.0), torch.tensor(0.0)]
@@ -355,11 +371,12 @@ def _compute_group_metrics(
     return per_group
 
 
-def _compute_balanced_metrics(
+def _compute_group_summary_metrics(
     per_group: Dict[str, Dict[str, Any]],
     exclude_prefix: Optional[str] = None,
+    group_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
-    """Average GVW-CRPS and GVW-r across groups with equal weight."""
+    """Summarize GVW-CRPS and GVW-r across groups."""
     items = per_group.items()
     if exclude_prefix:
         items = [(k, v) for k, v in items if not k.startswith(exclude_prefix)]
@@ -369,13 +386,26 @@ def _compute_balanced_metrics(
     finite_crps = [x for x in gvw_crps_vals if np.isfinite(x)]
     finite_r = [x for x in gvw_r_vals if np.isfinite(x)]
 
-    return {
+    summary = {
         'balanced_tumor_gvw_crps': float(np.mean(finite_crps)) if finite_crps else float('nan'),
         'balanced_tumor_gvw_crps_std': float(np.std(finite_crps)) if len(finite_crps) > 1 else float('nan'),
         'balanced_tumor_gvw_r': float(np.mean(finite_r)) if finite_r else float('nan'),
         'balanced_tumor_gvw_r_std': float(np.std(finite_r)) if len(finite_r) > 1 else float('nan'),
         'min_tumor_gvw_r': float(np.min(finite_r)) if finite_r else float('nan'),
     }
+
+    if group_weights:
+        source_crps = {
+            name: float(group_data['tumor']['gvw_crps'])
+            for name, group_data in items
+            if np.isfinite(group_data['tumor'].get('gvw_crps', float('nan')))
+        }
+        summary['weighted_tumor_gvw_crps'] = weighted_group_mean(
+            source_crps,
+            group_weights,
+        )
+
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +541,7 @@ def save_fold_predictions(
     sample_to_cohort: Optional[Dict[str, str]] = None,
     sample_to_source: Optional[Dict[str, str]] = None,
     source_tumor_variance: Optional[Dict[str, Dict[str, float]]] = None,
+    selection_group_weights: Optional[Dict[str, float]] = None,
 ) -> None:
     """Save MDN predictions, distribution params, quantile CIs, and metrics.
 
@@ -592,9 +623,14 @@ def save_fold_predictions(
 
     # ---- 7. Balanced metrics ----
     if per_source:
-        metrics.update(_compute_balanced_metrics(per_source))
+        metrics.update(
+            _compute_group_summary_metrics(
+                per_source,
+                group_weights=selection_group_weights,
+            )
+        )
     elif per_cohort:
-        metrics.update(_compute_balanced_metrics(per_cohort, exclude_prefix='PH'))
+        metrics.update(_compute_group_summary_metrics(per_cohort, exclude_prefix='PH'))
 
     # ---- 8. Save metrics JSON ----
     with open(os.path.join(fold_dir, f'validation-fold_{fold_num}_metrics.json'), 'w') as f:
@@ -616,7 +652,14 @@ def save_fold_predictions(
             print(f'  source {src_name}: gvw_crps={crps_str} gvw_r={r_str}')
         balanced_crps_str = f'{metrics.get("balanced_tumor_gvw_crps", float("nan")):.4f}'
         balanced_r_str = f'{metrics.get("balanced_tumor_gvw_r", float("nan")):.4f}'
-        print(f'  balanced_gvw_crps={balanced_crps_str} balanced_gvw_r={balanced_r_str}')
+        weighted_crps = metrics.get('weighted_tumor_gvw_crps')
+        weighted_str = ''
+        if weighted_crps is not None:
+            weighted_str = f' weighted_gvw_crps={float(weighted_crps):.4f}'
+        print(
+            f'  balanced_gvw_crps={balanced_crps_str} '
+            f'balanced_gvw_r={balanced_r_str}{weighted_str}'
+        )
     elif per_cohort:
         balanced_crps_str = f'{metrics.get("balanced_tumor_gvw_crps", float("nan")):.4f}'
         balanced_r_str = f'{metrics.get("balanced_tumor_gvw_r", float("nan")):.4f}'

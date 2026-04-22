@@ -4,7 +4,7 @@ set -euo pipefail
 # =====================================================================
 # Base-model no-seq final training (BioDVN_NoSeq) — single L40S GPU
 # Trains on ALL samples with gene-level 10% chunk split for early stopping.
-# Output: trained_models/proteus_base-model_no-seq/full_train/final_model.pt
+# Output: trained_models/proteus_base-model_no-seq/full_train/best_model.pt
 # =====================================================================
 
 YAML="config/experiments/base-no-seq_final-training.yaml"

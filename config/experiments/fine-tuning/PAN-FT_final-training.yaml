@@ -7,7 +7,7 @@
 #
 # HPs identical to PAN-FT_cv except: epochs=25, patience=5.
 # Output: trained_models/proteus_PAN-FT/full_train/best_model.pt
-#                                                  /final_model.pt
+#                                                  /best_model.pt
 
 name: proteus_PAN-FT
 output_dir: trained_models/proteus_PAN-FT

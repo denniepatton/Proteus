@@ -2,331 +2,162 @@
 
 ## Overview
 
-The analysis framework evaluates Proteus predictions against ground-truth RNA expression (log₂(CPM+1) scale, range $[0.0,\; 19.93]$) across cross-validation folds, held-out PDX samples, patient biopsies, and benchmarking against alternative methods. It produces per-gene and per-sample metrics, conformal interval calibration, gene-level reliability scoring, and publication-quality PDF figures.
+The analysis package is organized around six reproducible top-level sections under `analysis/results/`:
 
----
+- `Examples`
+- `Benchmarking_Synthetic`
+- `Benchmarking_Patient`
+- `Validation_PDX`
+- `Validation_Patient`
+- `Discovery_Patient`
+
+Outside benchmarking, the pipeline defaults to the main PLCA Proteus model (`BioDVN`). The `NoSeq` and `OnlySeq` variants are retained only for benchmarking comparisons.
 
 ## Quick Start
 
 ```bash
-# BTS cross-validation + holdout (primary analysis)
-python analysis/run_full_analysis.py --group BTS-CV
+# Illustrative examples and RNA-seq mixture fit
+python analysis/run_full_analysis.py --group Examples
 
-# Benchmarking against EPIC-Seq / XGBoost / ablations
-python analysis/run_full_analysis.py --group Benchmarking --n_bootstraps 100
+# Synthetic benchmarking (PHS grid)
+python analysis/run_full_analysis.py --group Benchmarking_Synthetic
 
-# Patient holdout cohorts (CRPC-WCDT, BLCA-RA)
-python analysis/run_full_analysis.py --group Patient-HO
+# Patient benchmarking (CRPC-WCDT, BLCA-RA)
+python analysis/run_full_analysis.py --group Benchmarking_Patient
 
-# Fine-tune CV
-python analysis/run_full_analysis.py --group PAN-FT-CV
-python analysis/run_full_analysis.py --group CRPC-FT-CV
+# PDX validation (20 CV + 5 holdout per cohort)
+python analysis/run_full_analysis.py --group Validation_PDX
 
-# Patient discovery (no truth — heatmaps/KDEs only)
-python analysis/run_full_analysis.py --group Patient-Discovery \
-    --proteus_holdout results_holdout/BioDVN/<COHORT>
+# Patient validation with pooled CrossCohort output
+python analysis/run_full_analysis.py --group Validation_Patient
 
-# Everything
+# Discovery-only cohorts with no RNA-seq truth
+python analysis/run_full_analysis.py --group Discovery_Patient
+
+# Run the full analysis tree
 python analysis/run_full_analysis.py --group all
 ```
 
-### CLI Flags
+## CLI Flags
 
-| Flag | Default | Description |
+| Flag | Default | Notes |
 |---|---|---|
-| `--group` | *(required)* | `BTS-CV`, `Benchmarking`, `PAN-FT-CV`, `CRPC-FT-CV`, `Patient-HO`, `Patient-Discovery`, `all` |
-| `--proteus_holdout` | — | Path to holdout directory containing `predictions_tumor.tsv` |
-| `--xgb_holdout` | — | Path to XGBoost holdout directory |
-| `--truth_cohort` | — | Cohort name for truth labels (e.g. `CRPC-WCDT`) |
-| `--overwrite` | `False` | Regenerate plots even if PDFs already exist |
-| `--n_workers` | `0` (all CPUs) | Number of parallel workers |
-| `--n_bootstraps` | `100` | Number of bootstrap resamples for confidence intervals |
+| `--group` | *(required)* | One of `Examples`, `Benchmarking_Synthetic`, `Benchmarking_Patient`, `Validation_PDX`, `Validation_Patient`, `Discovery_Patient`, `all` |
+| `--overwrite` | `False` | Regenerate outputs even if target PDFs already exist |
+| `--n_bootstraps` | `100` | Retained for compatibility, but inactive in the current six-section workflows |
+| `--scatter_ci` | `False` | Add CI error bars to scatter plots when CI data exist |
 
----
+`Discovery_Patient` always runs the configured discovery cohorts from `analysis/pipeline_config.py`; there is no per-run override path in the current CLI.
 
-## File Organisation
+## Package Layout
 
 | File | Role |
 |---|---|
-| `analysis_utils.py` | Data loading, core statistics, metric computation, constants |
-| `calibration.py` | Conformalized quantile regression (CQR) interval calibration |
-| `reliability.py` | Post-hoc gene-level reliability scoring via ridge regression |
-| `plot_utils.py` | All PDF figure generation (parallelised where applicable) |
-| `run_full_analysis.py` | CLI orchestrator for all analysis groups |
+| `analysis/run_full_analysis.py` | Thin orchestrator and section routing |
+| `analysis/pipeline_config.py` | Canonical section names, model registries, and path policy |
+| `analysis/examples.py` | Example plots and expression-mixture fitting workflow |
+| `analysis/analysis_utils.py` | Data loading, metrics, cohort utilities, and statistical helpers |
+| `analysis/calibration.py` | Regime-based conformal interval calibration |
+| `analysis/reliability.py` | Post-hoc gene reliability modelling |
+| `analysis/plot_utils.py` | Plotting helpers used across all sections |
 
----
+## Active Sections
 
-## Study Design
+### Examples
 
-The base training set (BTS) comprises **50 patient-derived xenograft** (PDX) tumor samples:
-- **PC-PDX** (prostate cancer): 20 cross-validation + 5 holdout
-- **SCLC-PDX** (small-cell lung cancer): 20 cross-validation + 5 holdout
+Produces the illustrative “NaiveExample” plots and the RNA-seq mixture fit used for method exposition. The mixture fit now uses in-workspace PLCA truth data instead of an external RNA-seq path.
 
-Cross-validation uses **5 pre-determined folds** specified in `data/BTS_sample-splits.tsv`. Out-of-fold (OOF) predictions from all 5 folds produce predictions for all 40 CV samples. The 10 holdout samples are predicted by the base model directly.
+### Benchmarking_Synthetic
 
----
+Benchmarks Proteus, `Proteus_NoSeq`, `Proteus_OnlySeq`, XGBoost, EPIC-Seq, and a shuffled-truth `Naive` baseline on the PHS TFx/depth grid. Outputs are split into two plot views:
 
-## Metrics
+- `COMPLETE`: `Proteus`, `Proteus_NoSeq`, `Proteus_OnlySeq`, `XGBoost`, `EPIC_GEP`, `EPIC_NDR`, `EPIC_PFE`, `Naive`
+- `SUBSET`: `Proteus`, `XGBoost`, `EPIC_GEP`, `Naive`
 
-### Per-Gene Metrics
+### Benchmarking_Patient
 
-For each gene $g$, computed across all samples $i = 1, \ldots, n$:
+Benchmarks the same model family on patient cohorts with truth labels (`CRPC-WCDT`, `BLCA-RA`). Outputs are also split into `COMPLETE` and `SUBSET` plot views.
 
-| Metric | Formula |
-|---|---|
-| Pearson $r$ | $r_g = \frac{\sum_i (y_{ig} - \bar{y}_g)(\hat{y}_{ig} - \bar{\hat{y}}_g)}{\sqrt{\sum_i (y_{ig} - \bar{y}_g)^2 \sum_i (\hat{y}_{ig} - \bar{\hat{y}}_g)^2}}$ |
-| Spearman $\rho$ | Pearson $r$ of rank-transformed $y_{ig}$ and $\hat{y}_{ig}$ |
-| RMSE | $\text{RMSE}_g = \sqrt{\frac{1}{n} \sum_i (y_{ig} - \hat{y}_{ig})^2}$ |
-| MAE | $\text{MAE}_g = \frac{1}{n} \sum_i |y_{ig} - \hat{y}_{ig}|$ |
+### Validation_PDX
 
-Requires $n \geq 3$ finite observation pairs; otherwise NaN.
+Evaluates the main PLCA Proteus model on `PC-PDX` and `SCLC-PDX` using combined `20 CV + 5 holdout` samples per cohort. This section also carries the PLCA calibration and reliability outputs because those are anchored to the same OOF development predictions.
 
-### Per-Sample (Transcriptome) Metrics
+### Validation_Patient
 
-For each sample $i$, computed across all genes $g = 1, \ldots, G$:
+Evaluates the main PLCA Proteus model on patient cohorts with truth:
 
-Same four metrics (Pearson $r$, Spearman $\rho$, RMSE, MAE) with the summation axis transposed.
+- Holdout cohorts: `CRPC-WCDT`, `BLCA-RA`
+- CV cohorts: `CRPC-RA`, `SCLC`
 
-### Gene-Variance-Weighted Pearson $r$ (GVW-$r$)
+This section includes a pooled `CrossCohort` subdirectory that merges all truth-bearing patient cohorts and preserves CV-versus-holdout marker styling.
 
-A global correlation statistic that up-weights genes with higher biological variance, penalising models that only predict low-variance (near-zero) genes well.
+### Discovery_Patient
 
-Let $w_g = \text{Var}(y_g)$ be the variance of gene $g$ computed across the full 50-sample truth pool. For the flattened (gene × sample) observation vector:
+Runs truth-free downstream analysis on discovery cohorts (`CRPC-Pluvicto`, `CRPC-UW`, `BC-Ghana`) using the main PLCA Proteus model only. Outputs include expression profiles, curated heatmaps, and cohort-specific downstream analyses such as limma/GSEA, PAM50, ssGSEA, and survival where applicable.
 
-$$r_{\text{GVW}} = \frac{\sum_{ig} w_g\,(y_{ig} - \bar{y}_w)(\hat{y}_{ig} - \bar{\hat{y}}_w)}{\sqrt{\sum_{ig} w_g\,(y_{ig} - \bar{y}_w)^2 \;\sum_{ig} w_g\,(\hat{y}_{ig} - \bar{\hat{y}}_w)^2}}$$
+## Output Structure
 
-where $\bar{y}_w = \frac{\sum_{ig} w_g\, y_{ig}}{\sum_{ig} w_g}$ is the weighted mean.
-
-### Gene-Variance-Weighted Spearman $\rho$ (GVW-$\rho$)
-
-GVW-$r$ applied to **within-gene ranks**: for each gene, truth and predictions are ranked across samples independently, then the GVW-weighted Pearson $r$ is computed on those ranks. Within-gene ranking removes cross-gene mean shifts so the metric reflects only rank concordance per gene, weighted by biological importance.
-
-### Variance Group Breakdown
-
-Genes are partitioned into three variance groups based on their truth variance $\sigma^2_g$ across the full study truth pool:
-
-| Group | Range |
-|---|---|
-| Low | $0 \leq \sigma^2_g < 1$ |
-| Medium | $1 \leq \sigma^2_g < 3$ |
-| High | $\sigma^2_g \geq 3$ |
-
-Per-group mean/median Pearson $r$, Spearman $\rho$, and RMSE are reported.
-
-### Bootstrap Confidence Intervals
-
-Confidence intervals for scalar metrics use the **percentile bootstrap** method with **sample resampling**:
-
-1. Resample $n$ samples (columns) with replacement, $B$ times (default $B = 100$).
-2. Compute the metric on each bootstrap replicate.
-3. Report the $\alpha/2$ and $1 - \alpha/2$ percentiles where $\alpha = 0.10$.
-
-Metrics with CIs: GVW-$\rho$, RMSE, mean sample $\rho$, mean gene $\rho$, mean top-10% gene $\rho$.
-
----
-
-## Conformalized Quantile Regression (CQR) Calibration
-
-The model's MDN output provides per-observation prediction intervals $[L_{ig},\, U_{ig}]$. These base intervals are post-hoc calibrated using **CQR** (Romano, Patterson & Candès, NeurIPS 2019) with regime-based stratification.
-
-### Gene Regimes
-
-Genes are stratified into regimes based on two truth-derived properties:
-
-1. **Variance quantile** ($q_v$): $\text{Var}_i(y_{ig})$ ranked → partitioned into $K_v = 4$ equal-frequency bins.
-2. **Zero-rate quantile** ($q_z$): $\Pr(y_{ig} = 0)$ ranked → partitioned into $K_z = 4$ equal-frequency bins.
-
-Each gene receives a regime label $(q_v, q_z)$, yielding up to $K_v \times K_z = 16$ regimes. Regimes are computed on the full 50-sample truth pool (CV + holdout).
-
-### Non-Conformity Scores
-
-For calibration observation $(i, g)$:
-
-$$S_{ig} = U_{ig} - L_{ig} \quad \text{(interval width)}$$
-
-$$A_{ig} = \max\!\bigl(L_{ig} - y_{ig},\; y_{ig} - U_{ig},\; 0\bigr) \quad \text{(raw CQR score)}$$
-
-$$\hat{A}_{ig} = \frac{A_{ig}}{S_{ig} + \epsilon} \quad \text{where } \epsilon = 10^{-6}$$
-
-### Per-Regime Quantile
-
-For regime $r$ with $n_r$ valid observations and target miscoverage $\alpha$ (default 0.10):
-
-$$q_r = \left\lceil \frac{(1 - \alpha)(n_r + 1)}{n_r} \right\rceil\text{-th quantile of } \{\hat{A}_{ig}\}_{(i,g) \in r}$$
-
-If $n_r < 10$, the regime is assigned $\hat{q}_r = 0$ (no adjustment).
-
-### Interval Adjustment
-
-$$L'_{ig} = L_{ig} - \hat{q}_r \cdot S_{ig}, \qquad U'_{ig} = U_{ig} + \hat{q}_r \cdot S_{ig}$$
-
-with safeguards:
-- If $L'_{ig} > U'_{ig}$, both collapse to $(L'_{ig} + U'_{ig})/2$.
-- Clamped to $[0.0,\; 19.93]$ (expression floor/ceiling).
-
-### Calibration Evaluation
-
-Empirical coverage at nominal level $\gamma$:
-
-$$\hat{C}(\gamma) = \frac{1}{N} \sum_{i,g} \mathbf{1}\!\left[y_{ig} \in [L'_{ig}(\gamma),\; U'_{ig}(\gamma)]\right]$$
-
-where intervals at level $\gamma < 0.95$ are obtained by linearly scaling the half-widths:
-
-$$L'_{ig}(\gamma) = \hat{y}_{ig} - \frac{\gamma}{0.95}(\hat{y}_{ig} - L'_{ig}), \qquad U'_{ig}(\gamma) = \hat{y}_{ig} + \frac{\gamma}{0.95}(U'_{ig} - \hat{y}_{ig})$$
-
-Coverage is reported at nominal levels $\{0.50, 0.60, 0.70, 0.80, 0.90, 0.95\}$.
-
-### Pipeline
-
-1. **Fit** on OOF (40 CV) predictions: compute gene regimes, compute $\hat{q}_r$ per regime.
-2. **Apply** to holdout CIs: widen intervals by $\hat{q}_r \cdot S_{ig}$.
-3. **Evaluate**: coverage curves, per-regime coverage heatmaps, error-vs-width diagnostics.
-
----
-
-## Gene-Level Reliability Scoring
-
-A post-hoc ridge regression model predicts per-gene Pearson $r$ from gene-level features, enabling users to rank genes by expected prediction quality and retain only reliable genes.
-
-### Features (per gene)
-
-| Feature | Symbol | Definition |
-|---|---|---|
-| Mean CI width | $f_1$ | $\text{mean}_i(U_{ig} - L_{ig})$ |
-| Median CI width | $f_2$ | $\text{median}_i(U_{ig} - L_{ig})$ |
-| Prediction dynamic range | $f_3$ | $\text{SD}_i(\hat{y}_{ig})$ across samples (ddof=1) |
-| Fold disagreement | $f_4$ | Mean (across samples) of SD (across folds) of fold-specific predictions |
-| Hurdle ambiguity | $f_5$ | $\text{mean}_i(p_{0,ig} \times (1 - p_{0,ig}))$ — from the MDN zero-inflation head |
-| Gene zero-rate | $f_6$ | $\Pr(y_g = 0)$ in the development truth set |
-| Gene variance | $f_7$ | $\text{Var}(y_g)$ in the development truth set |
-
-### Target
-
-The regression target is the **Fisher z-transform** of per-gene Pearson $r$ (Fisher, 1921):
-
-$$z_g = \text{arctanh}(r_g) = \frac{1}{2}\ln\!\left(\frac{1 + r_g}{1 - r_g}\right)$$
-
-$|r_g|$ is clamped to $< 0.9999$ to avoid $\pm\infty$.
-
-### Ridge Regression
-
-Standard closed-form ridge (Hoerl & Kennard, 1970) with centred features:
-
-$$\mathbf{w} = \bigl(\mathbf{X}_c^\top \mathbf{X}_c + \alpha \mathbf{I}\bigr)^{-1} \mathbf{X}_c^\top \mathbf{z}$$
-
-Default regularisation: $\alpha = 1.0$. Requires $\geq 10$ genes with complete features.
-
-### Prediction
-
-$$\hat{z}_g = \mathbf{x}_g^\top \mathbf{w} + b \qquad \Longrightarrow \qquad \hat{r}_g = \tanh(\hat{z}_g)$$
-
-### Retention Curve
-
-Genes are sorted by predicted reliability $\hat{r}_g$ (descending). For fractions $f \in \{0.10, 0.20, \ldots, 1.00\}$, the mean true $r$ of the top-$\lceil f \cdot G \rceil$ genes is reported. If the model is informative, retaining fewer (higher-confidence) genes yields higher mean true $r$.
-
-### Pipeline
-
-1. **Fit** on OOF: compute gene features from OOF predictions; target = per-gene Pearson $r$ across CV samples.
-2. **Predict** on holdout: compute features from holdout predictions; predict $\hat{r}_g$.
-3. **Evaluate**: Spearman $\rho(\hat{r}_g, r_g)$, RMSE, retention curve.
-
----
-
-## Analysis Groups
-
-### BTS-CV (Base Training Set Cross-Validation)
-
-**Input**: OOF predictions from 5-fold CV on 40 PDX samples + 10 holdout PDX predictions.
-
-**Pipeline**:
-1. Load OOF predictions (full MDN output: point predictions + CIs + $p_0$ + per-fold predictions).
-2. Compute gene regimes from 50-sample canonical truth pool.
-3. Fit CQR calibrator on all OOF samples.
-4. Fit reliability model on OOF gene features.
-5. Exclude PHT (healthy-donor admixture) samples from downstream analysis.
-6. Per cohort (PC-PDX, SCLC-PDX):
-   - Report metrics for CV-only, HO-only, and Combined.
-   - Generate per-gene metric distributions, heatmaps, sample/gene scatters.
-7. Apply CQR calibration to holdout CIs; evaluate coverage.
-8. Predict gene reliability on holdout; evaluate retention.
-
-**Outputs** (`analysis/results/BTS-CV/`):
-- Summary TSVs (metrics per cohort/split)
-- Per-gene and per-sample metric distributions (PDF)
-- Double/single heatmaps for curated gene sets
-- Sample scatter plots (truth vs pred per sample)
-- Gene target scatter plots (truth vs pred per gene, coloured by subtype)
-- Calibration coverage curves and regime heatmaps
-- Reliability scatter and retention curves
-- Gene reliability scores TSV
-
-### Benchmarking
-
-**Input**: PHS (patient-healthy surrogate) holdout predictions across a grid of tumor fractions (TFx) and sequencing depths.
-
-**Models compared**:
-- Proteus-Base, Proteus-NoSeq, Proteus-OnlySeq
-- XGBoost (optional)
-- EPIC-Seq (GEP, PFE, NDR, Gini, Shannon, GC scores)
-- Null (column-wise shuffled truth)
-
-**TFx grid**: {0.50, 0.30, 0.10, 0.05, 0.03, 0.01}
-**Depths**: {10x, 5x} (1x, 30x, 50x excluded)
-
-**Metrics per (TFx, depth, model)**: sample $\rho$ (mean), GVW-$\rho$, mean/median gene $\rho$, RMSE, mean top-10% gene $\rho$, count of genes with $\rho \geq 0.70$, with bootstrap CIs.
-
-**Outputs** (`analysis/results/Benchmarking/`):
-- Grid boxplots and histograms per metric
-- Line plots with CI bands
-- Summary TSVs
-
-### Patient-HO (Patient Holdout)
-
-**Default cohorts**: CRPC-WCDT, BLCA-RA.
-
-Predictions are evaluated against biopsy-derived truth expression. Same metrics and plots as BTS-CV but without calibration/reliability (no calibration set matched to these cohorts).
-
-### Patient-Discovery
-
-Holdout predictions with no truth available. Produces only heatmaps and per-sample expression KDEs.
-
----
-
-## Parallelisation
-
-Compute-intensive operations use `ProcessPoolExecutor`:
-
-| Operation | Parallelised Over | Worker Threshold |
-|---|---|---|
-| `gene_level_metrics` | Genes | $> 100$ genes and `n_workers > 1` |
-| `sample_level_metrics` | Samples | $> 10$ samples and `n_workers > 1` |
-| `batch_sample_scatters` | Sample scatter PDFs | Always (if `n_workers > 1`) |
-| `batch_gene_scatters` | Gene scatter PDFs | Always (if `n_workers > 1`) |
-
-`--n_workers 0` (default) uses all available CPUs.
-
----
-
-## Output Directory Structure
-
-```
+```text
 analysis/results/
-├── BTS-CV/
-│   ├── PC-PDX/            # Per-cohort plots + metrics
-│   │   ├── CV/
-│   │   ├── HO/
-│   │   ├── Combined/
-│   │   ├── calibration/
-│   │   ├── reliability/
-│   │   └── gene_scatters/
+├── Examples/
+│   └── NaiveExample/
+├── Benchmarking_Synthetic/
+│   ├── COMPLETE/
+│   ├── SUBSET/
+│   └── summary_benchmarking_all.tsv
+├── Benchmarking_Patient/
+│   ├── COMPLETE/
+│   ├── SUBSET/
+│   └── summary_benchmarking_all.tsv
+├── Validation_PDX/
+│   ├── Calibration/
+│   ├── PC-PDX/
 │   ├── SCLC-PDX/
-│   └── summary_{cohort}.tsv
-├── Benchmarking/
-│   ├── benchmark_grid_*.pdf
-│   ├── benchmark_ecdna_lines.pdf
-│   └── summary_benchmarking.tsv
-├── Patient-HO/
+│   ├── reliability_feature_weights.pdf
+│   └── summary_metrics.tsv
+├── Validation_Patient/
+│   ├── BLCA-RA/
+│   ├── CRPC-RA/
 │   ├── CRPC-WCDT/
-│   └── BLCA-RA/
-└── Patient-Discovery/
+│   ├── SCLC/
+│   ├── CrossCohort/
+│   └── summary_metrics.tsv
+└── Discovery_Patient/
+    ├── BC-Ghana/
+    ├── CRPC-Pluvicto/
+    └── CRPC-UW/
 ```
+
+## Metric Notes
+
+### Per-gene and per-sample metrics
+
+The pipeline reports Pearson $r$, Spearman $\rho$, RMSE, and MAE on both the gene axis and the sample axis, plus derived summaries such as top-variance gene performance and counts of genes exceeding a target correlation threshold.
+
+### GVW metrics
+
+GVW in the current codebase is not implemented as one flattened weighted correlation across all gene-sample pairs. Instead, it is computed as a variance-weighted average of per-gene correlations, using gene variance as the weight. That is the definition to treat as canonical for interpreting reported `GVW-r` and `GVW-ρ` outputs.
+
+### Benchmarking uncertainty
+
+The active benchmarking sections currently report point estimates only. The CLI still exposes `--n_bootstraps`, but the refactored benchmarking outputs do not currently compute or plot bootstrap confidence intervals.
+
+### Calibration
+
+`Validation_PDX` fits a regime-based conformal calibrator on PLCA OOF intervals and evaluates it on the true holdout PDX samples. Coverage curves are produced by rescaling the calibrated 95% interval widths to lower nominal levels, matching the current implementation in `analysis/calibration.py` and `analysis/run_full_analysis.py`.
+
+### Reliability
+
+The post-hoc reliability model is trained on fold-wise OOF features and evaluated on holdout PDX data. Static gene features come from the PLCA development truth pool; holdout truth is used only for the evaluation target.
+
+## Inputs and Assumptions
+
+- Ground-truth expression tables are expected in `labels/<COHORT>_Log2CPMplus1.tsv`.
+- Subtype annotations are expected in `labels/<COHORT>_TFX_Subtype.tsv` when cohort-level plots need them.
+- The Hallmark GMT is expected at `reference/h.all.v2026.1.Hs.symbols.gmt`.
+- The shortlist GMT is expected at `reference/gsva_genesets_shortlist.gmt`.
+- EPIC-Seq benchmarking uses the raw `PFE` column directly; it is not renamed to a normalized GEP-derived quantity.
+
+## Parallelism
+
+The heavy plotting and metric kernels use `ProcessPoolExecutor` where appropriate. The orchestrator now always uses all available CPUs automatically.

@@ -66,6 +66,7 @@ def run_inference(
     model_dir: str,
     zarr_paths: List[str],
     out_dir: str,
+    nthread: Optional[int] = None,
 ) -> str:
     """Run inference over a list of zarr samples.
 
@@ -76,6 +77,8 @@ def run_inference(
     """
     model = xgb.Booster()
     model.load_model(os.path.join(model_dir, "model.ubj"))
+    if nthread is not None:
+        model.set_param({"nthread": nthread})
 
     dfs: List[pd.DataFrame] = []
     for zp in zarr_paths:
@@ -135,6 +138,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     )
     parser.add_argument("--zarr_base", type=str, default=None)
     parser.add_argument(
+        "--nthread", type=int, default=None,
+        help="Threads for XGBoost inference (default: use all available CPUs)",
+    )
+    parser.add_argument(
         "--out_dir", type=str, default=None,
         help="Output directory (default: results_holdout/XGBoost/<use_set>/)",
     )
@@ -144,11 +151,18 @@ def main(argv: Optional[List[str]] = None) -> None:
     zarr_paths = _discover_zarr_paths(args.use_set, zarr_base)
     print(f"Found {len(zarr_paths)} zarr stores for {args.use_set}")
 
+    cpu_count = os.cpu_count() or 1
+    if args.nthread is None or args.nthread <= 0:
+        nthread = cpu_count
+    else:
+        nthread = min(args.nthread, cpu_count)
+    print(f"Using nthread={nthread}")
+
     out_dir = args.out_dir or str(
         PROJECT_ROOT / "results_holdout" / "XGBoost" / args.use_set
     )
 
-    run_inference(args.model_dir, zarr_paths, out_dir)
+    run_inference(args.model_dir, zarr_paths, out_dir, nthread=nthread)
 
 
 if __name__ == "__main__":

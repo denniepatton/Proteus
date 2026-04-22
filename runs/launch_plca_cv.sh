@@ -3,9 +3,9 @@ set -euo pipefail
 
 # =====================================================================
 # PLCA model CV — 5-fold cross-validation (BioDVN)
-# Submits 5 SLURM jobs, one per fold, each on an RTX 2080 Ti.
-# patience=999 → all 20 epochs run; final-epoch predictions for CV.
-# Multi-source batch mode: 4 source groups × 24 samples/source.
+# Submits 5 independent RTX jobs, one per fold.
+# OOF predictions are written under each fold directory after monitored
+# checkpoint selection with the fixed PLCAv2 trial-3 recipe.
 # =====================================================================
 
 YAML="config/experiments/plca_cv.yaml"

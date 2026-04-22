@@ -413,7 +413,7 @@ def evaluate_calibration(
 class RegimeCalibrator:
     """Stateful calibration object that bundles regime definitions and q̂ values.
 
-    Typical usage (BTS-CV example)::
+    Typical usage with out-of-fold development intervals::
 
         # 1. Fit on OOF development data
         regime_df = compute_gene_regimes(dev_truth)

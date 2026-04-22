@@ -3,9 +3,9 @@ set -euo pipefail
 
 # =====================================================================
 # PLCA model final training (BioDVN) — single L40S GPU
-# Trains on ALL samples with gene-level 10% chunk split for early stopping.
-# Multi-source batch mode: 4 source groups × 24 samples/source.
-# Output: trained_models/proteus_plca-model/full_train/final_model.pt
+# Trains on all PLCA samples with the fixed PLCAv2 trial-3 recipe.
+# Full-train runs a fixed 25-epoch chunk-based schedule and saves
+# trained_models/proteus_plca-model/full_train/final_model.pt.
 # =====================================================================
 
 YAML="config/experiments/plca_final-training.yaml"

@@ -3,8 +3,9 @@ set -euo pipefail
 
 # =====================================================================
 # PLCA model no-seq final training (BioDVN_NoSeq) — single L40S GPU
-# Trains on ALL samples with gene-level 10% chunk split for early stopping.
-# Output: trained_models/proteus_plca-model_no-seq/full_train/final_model.pt
+# Trains on all PLCA samples with the fixed PLCAv2 trial-3 recipe.
+# Full-train runs a fixed 25-epoch chunk-based schedule and saves
+# trained_models/proteus_plca-model_no-seq/full_train/final_model.pt.
 # =====================================================================
 
 YAML="config/experiments/plca-no-seq_final-training.yaml"

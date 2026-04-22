@@ -1,9 +1,8 @@
 # Proteus PLCA model no-seq — final full training (BioDVN_NoSeq)
 #
-# Identical HPs to plca_final-training.yaml. Uses BioDVN_NoSeq (drops nucleotide channels).
-# HPs from PLCA phase 2.1 best trial (t2) with dropout corrected to 0.30.
-# patience=3 with gene-level 10% chunk split for early stopping.
-# Output: trained_models/proteus_plca-model_no-seq/full_train/final_model.pt
+# Uses the PLCAv2 trial-3 recipe with rounded optimizer values and the
+# no-seq channel mode. Full-train uses the chunk-based all-data loader on
+# 100% of the PLCA TSV and saves full_train/final_model.pt.
 
 name: proteus_plca-model_no-seq
 output_dir: trained_models/proteus_plca-model_no-seq
@@ -11,7 +10,7 @@ output_dir: trained_models/proteus_plca-model_no-seq
 transfer: ~
 
 objective:
-  metric: tumor_gvw_crps_mean
+  metric: weighted_tumor_gvw_crps_mean
   direction: minimize
 
 tuning: ~
@@ -21,28 +20,27 @@ data:
   zarr_base: /hpc/temp/ha_g/user/rpatton/ProteusZarrs
   subsample_frac: 1.00
   seed: 23
-  batch_mode: multi_source
-  selection_metric: max_gvw_r_lower_bound
+  batch_mode: chunk
+  selection_metric: min_weighted_source_crps
   source_groups:
     CRPC-RA: [CRPC-RA]
     SCLC: [SCLC]
     Prostate-Synthetic: [PC-PDX]
     SCLC-Synthetic: [SCLC-PDX]
-  target_n_per_source: 24
 
 structural:
-  beta_point_mse: 0.15
+  beta_point_mse: 0.25
   beta_background: 1.0
-  beta_tcvae: 1.0
+  beta_tcvae: 1.5
   beta_contrastive: 1.0
-  beta_grl: 0.3
+  beta_grl: 0.2
   beta_reconstruction: 0.25
   cl_margin: 1.0
-  internal_weight: 0.5
+  internal_weight: 0.25
 
 training:
-  epochs: 20
-  patience: 3
+  epochs: 25
+  patience: 25
   use_amp: true
   ema_decay: 0.9999
   min_lr_ratio: 0.01
@@ -50,8 +48,8 @@ training:
   warmup_frac: 0.05
   schedule_frac: 0.90
   max_grad_norm: 10.0
-  max_lr: 7.31e-5
-  weight_decay: 3.82e-6
+  max_lr: 1.5e-4
+  weight_decay: 1.0e-6
 
 scale:
   signal_ksize: 6
@@ -65,4 +63,4 @@ scale:
   mdn_final: 16
   signal_filters: 16
   initial_reduction_channels: 64
-  dropout_rate: 0.30
+  dropout_rate: 0.10

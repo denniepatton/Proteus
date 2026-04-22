@@ -1,7 +1,7 @@
 # Proteus base-model only-seq — final full training (BioDVN_OnlySeq)
 #
 # Identical HPs to base_final-training.yaml. Uses BioDVN_OnlySeq.
-# Output: trained_models/proteus_base-model_only-seq/full_train/final_model.pt
+# Output: trained_models/proteus_base-model_only-seq/full_train/best_model.pt
 
 name: proteus_base-model_only-seq
 output_dir: trained_models/proteus_base-model_only-seq

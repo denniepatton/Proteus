@@ -44,9 +44,11 @@ from tuning.metrics import (
     collect_fold_metrics,
     compute_cv_objective,
     nanmean,
+    nanstd,
     objective_value,
 )
 from tuning.param_resolution import (
+    config_hash,
     configs_from_trial_json,
     resolve_trial_configs,
 )
@@ -60,9 +62,17 @@ __all__ = [
     "run_optuna_cv_tuning",
     "run_optuna_fold_tuning",
     "coordinated_ask",
+    "coordinated_proxy_ask",
+    "coordinated_proxy_tell",
+    "coordinated_proxy_finalize",
     "coordinated_tell",
     "run_coordinated_fold",
 ]
+
+
+PROXY_OBJECTIVE_FILENAME = "proxy_objective.json"
+PROMOTED_CV_SUMMARY_FILENAME = "promoted_cv_summary.json"
+DEFAULT_PROXY_FOLDS = (3, 5)
 
 
 # =============================================================================
@@ -144,6 +154,104 @@ def _write_json_atomic(path: str, obj: Any) -> None:
     with open(tmp, 'w') as f:
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
+
+
+def _fold_metrics_path(run_dir: str, fold_num: int) -> str:
+    return os.path.join(
+        run_dir,
+        f"CV-fold_{int(fold_num)}",
+        f"validation-fold_{int(fold_num)}_metrics.json",
+    )
+
+
+def _primary_fold_weighted_crps(fold_metrics: Dict[str, Any]) -> float:
+    value = fold_metrics.get("weighted_tumor_gvw_crps")
+    if value is None:
+        value = fold_metrics.get("balanced_tumor_gvw_crps")
+    if value is None:
+        raise KeyError("fold metrics are missing weighted_tumor_gvw_crps")
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError("fold weighted_tumor_gvw_crps is non-finite")
+    return value
+
+
+def _existing_config_hashes(output_dir: str) -> set[str]:
+    hashes: set[str] = set()
+    if not os.path.isdir(output_dir):
+        return hashes
+
+    for entry in os.listdir(output_dir):
+        if not entry.startswith("trial_"):
+            continue
+        cfg_path = os.path.join(output_dir, entry, "trial_config.json")
+        if not os.path.exists(cfg_path):
+            continue
+        try:
+            with open(cfg_path, "r") as f:
+                cfg = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            continue
+        hashes.add(config_hash(cfg))
+
+    return hashes
+
+
+def compute_proxy_objective(
+    run_dir: str,
+    proxy_folds: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    """Compute the scout objective from a fixed set of proxy folds.
+
+    The proxy objective is the mean weighted tumor GVW-CRPS across the
+    designated proxy folds. A proxy trial is only eligible for Optuna tell
+    once every proxy fold has produced a metrics JSON.
+    """
+    folds = list(proxy_folds) if proxy_folds is not None else list(DEFAULT_PROXY_FOLDS)
+    if not folds:
+        raise ValueError("proxy_folds must be non-empty")
+
+    proxy_scores: List[float] = []
+    proxy_balanced_r: List[float] = []
+    proxy_fold_metrics: Dict[str, Dict[str, float]] = {}
+
+    for fold_num in folds:
+        metrics_path = _fold_metrics_path(run_dir, int(fold_num))
+        if not os.path.exists(metrics_path):
+            raise FileNotFoundError(f"Proxy fold metrics not found: {metrics_path}")
+
+        with open(metrics_path, "r") as f:
+            fold_metrics = json.load(f)
+
+        weighted_crps = _primary_fold_weighted_crps(fold_metrics)
+        proxy_scores.append(weighted_crps)
+
+        entry: Dict[str, float] = {
+            "weighted_tumor_gvw_crps": weighted_crps,
+        }
+        balanced_r = fold_metrics.get("balanced_tumor_gvw_r")
+        if balanced_r is not None and math.isfinite(float(balanced_r)):
+            entry["balanced_tumor_gvw_r"] = float(balanced_r)
+            proxy_balanced_r.append(float(balanced_r))
+
+        proxy_fold_metrics[str(int(fold_num))] = entry
+
+    obj: Dict[str, Any] = {
+        "proxy_folds": [int(fold) for fold in folds],
+        "proxy_folds_with_metrics": len(proxy_fold_metrics),
+        "proxy_weighted_tumor_gvw_crps_mean": nanmean(proxy_scores),
+        "proxy_weighted_tumor_gvw_crps_std": nanstd(proxy_scores),
+        "proxy_fold_metrics": proxy_fold_metrics,
+    }
+    if proxy_balanced_r:
+        obj["proxy_balanced_tumor_gvw_r_mean"] = nanmean(proxy_balanced_r)
+        obj["proxy_balanced_tumor_gvw_r_std"] = nanstd(proxy_balanced_r)
+
+    out_path = os.path.join(run_dir, PROXY_OBJECTIVE_FILENAME)
+    with open(out_path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+    return obj
 
 
 def _create_study_with_seeding(
@@ -397,7 +505,9 @@ def run_optuna_fold_tuning(
 
             For maximize: prefer val_min_tumor_gvw_r (min across sources,
             higher = better), fall back to val_balanced_tumor_gvw_r, then
-            val_score.  For minimize: val_tumor_gvw_crps.
+            val_score.  For minimize: prefer the weighted source metric when
+            that is the study objective, else fall back to balanced / pooled
+            GVW-CRPS.
 
             Pruning is suppressed for the first ``patience`` epochs so the
             model has time to complete warmup and stabilize.
@@ -410,7 +520,16 @@ def run_optuna_fold_tuning(
                     val_metrics.get('val_balanced_tumor_gvw_r', val_score),
                 )
             else:
-                metric_val = val_metrics.get('val_tumor_gvw_crps', val_score)
+                if exp.objective.metric == 'weighted_tumor_gvw_crps_mean':
+                    metric_val = val_metrics.get(
+                        'val_weighted_tumor_gvw_crps',
+                        val_metrics.get('val_balanced_tumor_gvw_crps', val_score),
+                    )
+                else:
+                    metric_val = val_metrics.get(
+                        'val_balanced_tumor_gvw_crps',
+                        val_metrics.get('val_tumor_gvw_crps', val_score),
+                    )
             if metric_val is not None and isinstance(metric_val, (int, float)):
                 trial.report(float(metric_val), step=int(epoch))
                 if epoch >= int(train_cfg.patience) and trial.should_prune():
@@ -480,6 +599,9 @@ def run_optuna_fold_tuning(
         if balanced_val is not None:
             obj["balanced_tumor_gvw_crps_mean"] = float(balanced_val)
             obj["balanced_tumor_gvw_crps_std"] = float(fold_metrics.get("balanced_tumor_gvw_crps_std", float("nan")))
+        weighted_val = fold_metrics.get("weighted_tumor_gvw_crps", None)
+        if weighted_val is not None:
+            obj["weighted_tumor_gvw_crps_mean"] = float(weighted_val)
         balanced_r = fold_metrics.get("balanced_tumor_gvw_r", None)
         if balanced_r is not None:
             obj["balanced_tumor_gvw_r_mean"] = float(balanced_r)
@@ -619,6 +741,294 @@ def coordinated_ask(
     return trial_numbers
 
 
+def coordinated_proxy_ask(
+    experiment_path: str,
+    n_configs: int,
+    storage: str,
+    study_name: Optional[str] = None,
+    sampler_seed: int = 42,
+) -> List[int]:
+    """Ask Optuna for proxy-fold trial configs.
+
+    Proxy trials are canonical for the proxy racing scheduler: the same trial
+    directory is later reused for any promoted full-CV completion folds.
+    Duplicate configs are pruned before they reach the queue.
+    """
+    exp = load_experiment_spec(experiment_path)
+    study_name = str(study_name) if study_name is not None else exp.name
+    direction = exp.objective.direction
+
+    _probe_store = _make_storage(storage)
+    try:
+        _probe = optuna.load_study(study_name=study_name, storage=_probe_store)
+        n_existing = len(_probe.trials)
+    except KeyError:
+        n_existing = 0
+    effective_seed = int(sampler_seed) + n_existing
+
+    sampler = optuna.samplers.TPESampler(
+        seed=effective_seed,
+        multivariate=True,
+        constant_liar=True,
+        warn_independent_sampling=False,
+        n_startup_trials=max(8, int(n_configs)),
+    )
+    pruner = optuna.pruners.NopPruner()
+
+    study = _create_study_with_seeding(
+        exp, study_name, direction, storage, sampler, pruner,
+    )
+
+    existing_hashes = _existing_config_hashes(exp.output_dir)
+    trial_numbers: List[int] = []
+
+    for _ in range(int(n_configs)):
+        accepted = False
+        for _attempt in range(32):
+            trial = study.ask()
+            try:
+                _, _, trial_cfg = resolve_trial_configs(exp, trial)
+            except optuna.TrialPruned as exc:
+                study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+                print(f"[Proxy-ask] Trial {trial.number} pruned: {exc}", flush=True)
+                continue
+
+            cfg_hash = config_hash(trial_cfg)
+            if cfg_hash in existing_hashes:
+                study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+                print(
+                    f"[Proxy-ask] Trial {trial.number:05d} duplicates an existing config "
+                    f"({cfg_hash}); pruning.",
+                    flush=True,
+                )
+                continue
+
+            trial.set_user_attr("config_hash", cfg_hash)
+            trial.set_user_attr("proxy_folds", list(DEFAULT_PROXY_FOLDS))
+
+            run_dir = os.path.join(exp.output_dir, f"trial_{trial.number:05d}")
+            os.makedirs(run_dir, exist_ok=True)
+
+            _write_json_atomic(os.path.join(run_dir, "trial_config.json"), trial_cfg)
+            _write_json_atomic(
+                os.path.join(run_dir, "coordinated_pending.json"),
+                {
+                    "trial_number": trial.number,
+                    "status": "proxy_pending",
+                    "proxy_folds": list(DEFAULT_PROXY_FOLDS),
+                },
+            )
+
+            existing_hashes.add(cfg_hash)
+            trial_numbers.append(trial.number)
+            print(f"[Proxy-ask] Asked trial {trial.number:05d} → {run_dir}", flush=True)
+            accepted = True
+            break
+
+        if not accepted:
+            print("[Proxy-ask] Exhausted attempts to find a non-duplicate config.", flush=True)
+
+    _write_json_atomic(
+        os.path.join(exp.output_dir, "coordinated_active.json"),
+        {"trial_numbers": trial_numbers},
+    )
+
+    return trial_numbers
+
+
+def coordinated_proxy_tell(
+    experiment_path: str,
+    trial_numbers: Optional[List[int]] = None,
+    storage: str = "sqlite:///results_training/optuna.db",
+    study_name: Optional[str] = None,
+    sampler_seed: int = 42,
+    proxy_folds: Optional[List[int]] = None,
+) -> List[int]:
+    """Report completed proxy-fold results to the proxy Optuna study.
+
+    Unlike coordinated_tell(), incomplete trials are *not* failed here. They
+    are simply skipped until every proxy fold has written its metrics JSON.
+    """
+    exp = load_experiment_spec(experiment_path)
+    study_name = str(study_name) if study_name is not None else exp.name
+    direction = exp.objective.direction
+    folds = list(proxy_folds) if proxy_folds is not None else list(DEFAULT_PROXY_FOLDS)
+
+    sampler = optuna.samplers.TPESampler(
+        seed=int(sampler_seed),
+        multivariate=True,
+        constant_liar=True,
+        warn_independent_sampling=False,
+    )
+    study = optuna.create_study(
+        study_name=study_name,
+        direction=direction,
+        storage=_make_storage(storage),
+        load_if_exists=True,
+        sampler=sampler,
+        pruner=optuna.pruners.NopPruner(),
+    )
+
+    if trial_numbers is None:
+        active_path = os.path.join(exp.output_dir, "coordinated_active.json")
+        if not os.path.exists(active_path):
+            print("[Proxy-tell] No coordinated_active.json found.", flush=True)
+            return
+        with open(active_path, "r") as f:
+            trial_numbers = json.load(f)["trial_numbers"]
+
+    frozen_id_map: Dict[int, int] = {
+        trial.number: trial._trial_id for trial in study.trials  # type: ignore[attr-defined]
+    }
+
+    reported: List[int] = []
+    for trial_num in trial_numbers:
+        run_dir = os.path.join(exp.output_dir, f"trial_{trial_num:05d}")
+        try:
+            obj = compute_proxy_objective(run_dir, folds)
+        except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[Proxy-tell] Trial {trial_num:05d}: proxy folds not ready ({exc}).", flush=True)
+            continue
+
+        value = obj.get("proxy_weighted_tumor_gvw_crps_mean")
+        if value is None or not math.isfinite(float(value)):
+            print(f"[Proxy-tell] Trial {trial_num:05d}: proxy objective is non-finite.", flush=True)
+            continue
+
+        try:
+            if trial_num in frozen_id_map:
+                trial_id = frozen_id_map[trial_num]
+                for step, fold_num in enumerate(folds):
+                    fold_entry = obj["proxy_fold_metrics"].get(str(int(fold_num)), {})
+                    fold_value = fold_entry.get("weighted_tumor_gvw_crps")
+                    if fold_value is not None and math.isfinite(float(fold_value)):
+                        study._storage.set_trial_intermediate_value(
+                            trial_id, step, float(fold_value),
+                        )
+        except (RuntimeError, AttributeError, KeyError) as exc:
+            print(
+                f"[Proxy-tell] Trial {trial_num:05d}: could not set proxy intermediate values: {exc}",
+                flush=True,
+            )
+
+        try:
+            study.tell(trial_num, float(value))
+        except (RuntimeError, ValueError) as exc:
+            frozen = next((trial for trial in study.trials if trial.number == trial_num), None)
+            if frozen is not None and frozen.state == optuna.trial.TrialState.COMPLETE:
+                print(
+                    f"[Proxy-tell] Trial {trial_num:05d}: already reported in study; "
+                    f"marking as complete.",
+                    flush=True,
+                )
+                reported.append(int(trial_num))
+                continue
+            print(f"[Proxy-tell] Trial {trial_num:05d}: tell failed: {exc}", flush=True)
+            continue
+
+        reported.append(int(trial_num))
+        print(
+            f"[Proxy-tell] Trial {trial_num:05d}: "
+            f"proxy_weighted_tumor_gvw_crps_mean={float(value):.4f}",
+            flush=True,
+        )
+
+    write_study_report(study, exp.output_dir)
+    print(f"[Proxy-tell] Reported {len(reported)} proxy trial(s).", flush=True)
+    return reported
+
+
+def coordinated_proxy_finalize(
+    experiment_path: str,
+    trial_numbers: Optional[List[int]] = None,
+) -> List[int]:
+    """Finalize promoted trials by writing cross-fold CV objective summaries.
+
+    This does not report to Optuna. It computes the full CV objective for any
+    promoted trial with all folds complete and updates a sorted summary JSON.
+    """
+    exp = load_experiment_spec(experiment_path)
+    folds = _folds_from_tsv(exp.data.training_set)
+
+    if trial_numbers is None:
+        active_path = os.path.join(exp.output_dir, "coordinated_active.json")
+        if not os.path.exists(active_path):
+            print("[Proxy-finalize] No coordinated_active.json found.", flush=True)
+            return
+        with open(active_path, "r") as f:
+            trial_numbers = json.load(f)["trial_numbers"]
+
+    summary_path = os.path.join(exp.output_dir, PROMOTED_CV_SUMMARY_FILENAME)
+    existing: Dict[int, Dict[str, Any]] = {}
+    if os.path.exists(summary_path):
+        try:
+            with open(summary_path, "r") as f:
+                summary = json.load(f)
+            for row in summary.get("records", []):
+                trial_num = int(row["trial_number"])
+                existing[trial_num] = row
+        except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+            existing = {}
+
+    finalized: List[int] = []
+    for trial_num in trial_numbers:
+        run_dir = os.path.join(exp.output_dir, f"trial_{trial_num:05d}")
+        if not all(os.path.exists(_fold_metrics_path(run_dir, fold_num)) for fold_num in folds):
+            print(f"[Proxy-finalize] Trial {trial_num:05d}: full CV not complete — skipping.", flush=True)
+            continue
+
+        try:
+            obj = compute_cv_objective(run_dir)
+        except (RuntimeError, FileNotFoundError, KeyError, ValueError) as exc:
+            print(f"[Proxy-finalize] Trial {trial_num:05d}: CV objective failed: {exc}", flush=True)
+            continue
+
+        record: Dict[str, Any] = {"trial_number": int(trial_num), **obj}
+        proxy_path = os.path.join(run_dir, PROXY_OBJECTIVE_FILENAME)
+        if os.path.exists(proxy_path):
+            try:
+                with open(proxy_path, "r") as f:
+                    proxy_obj = json.load(f)
+                proxy_score = proxy_obj.get("proxy_weighted_tumor_gvw_crps_mean")
+                if proxy_score is not None and math.isfinite(float(proxy_score)):
+                    record["proxy_weighted_tumor_gvw_crps_mean"] = float(proxy_score)
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                pass
+
+        existing[int(trial_num)] = record
+        finalized.append(int(trial_num))
+
+        metric_value = record.get(exp.objective.metric)
+        if metric_value is not None and math.isfinite(float(metric_value)):
+            print(
+                f"[Proxy-finalize] Trial {trial_num:05d}: "
+                f"{exp.objective.metric}={float(metric_value):.4f}",
+                flush=True,
+            )
+
+    def sort_key(row: Dict[str, Any]) -> Tuple[float, int]:
+        value = row.get(exp.objective.metric)
+        if value is None or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            fallback = float("inf") if exp.objective.direction == "minimize" else float("-inf")
+            return fallback, int(row["trial_number"])
+        return float(value), int(row["trial_number"])
+
+    records = list(existing.values())
+    reverse = exp.objective.direction == "maximize"
+    records.sort(key=sort_key, reverse=reverse)
+
+    _write_json_atomic(
+        summary_path,
+        {
+            "objective_metric": exp.objective.metric,
+            "direction": exp.objective.direction,
+            "records": records,
+        },
+    )
+    print(f"[Proxy-finalize] Finalized {len(finalized)} trial(s).", flush=True)
+    return finalized
+
+
 def coordinated_tell(
     experiment_path: str,
     trial_numbers: Optional[List[int]] = None,
@@ -708,19 +1118,24 @@ def coordinated_tell(
             study.tell(trial_num, state=optuna.trial.TrialState.FAIL)
             continue
 
-        # Report per-fold balanced_tumor_gvw_r as intermediate values so
-        # the Optuna Dashboard can display fold-level performance plots.
+        # Report per-fold objective-aligned intermediate values so the Optuna
+        # Dashboard can display fold-level progress plots.
         try:
             if trial_num in _frozen_id_map:
                 _tid = _frozen_id_map[trial_num]
                 fold_rows = collect_fold_metrics(run_dir)
                 for step, row in enumerate(fold_rows):
-                    fold_r = row.get("balanced_tumor_gvw_r")
-                    if (fold_r is not None
-                            and isinstance(fold_r, (int, float))
-                            and math.isfinite(float(fold_r))):
+                    if metric == 'weighted_tumor_gvw_crps_mean':
+                        fold_value = row.get('weighted_tumor_gvw_crps')
+                    elif direction == 'maximize':
+                        fold_value = row.get('balanced_tumor_gvw_r')
+                    else:
+                        fold_value = row.get('balanced_tumor_gvw_crps')
+                    if (fold_value is not None
+                            and isinstance(fold_value, (int, float))
+                            and math.isfinite(float(fold_value))):
                         study._storage.set_trial_intermediate_value(
-                            _tid, step, float(fold_r))
+                            _tid, step, float(fold_value))
         except (RuntimeError, AttributeError) as exc:
             print(f"[Coordinated-tell] Trial {trial_num:05d}: "
                   f"could not set intermediate values: {exc}", flush=True)

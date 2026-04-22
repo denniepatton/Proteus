@@ -158,8 +158,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="Fraction of gene-level rows for early-stopping validation (default: 0.10)",
     )
     parser.add_argument(
-        "--nthread", type=int, default=16,
-        help="Threads for XGBoost (default: 16)",
+        "--nthread", type=int, default=None,
+        help="Threads for XGBoost (default: use all available CPUs)",
     )
     parser.add_argument("--tsv", type=str, default=None)
     parser.add_argument("--zarr_base", type=str, default=None)
@@ -177,7 +177,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         best_params = CEMENTED_PARAMS
         print("Using cemented HPs (Optuna trial 186)")
 
-    nthread = min(args.nthread, os.cpu_count() or 1)
+    cpu_count = os.cpu_count() or 1
+    if args.nthread is None or args.nthread <= 0:
+        nthread = cpu_count
+    else:
+        nthread = min(args.nthread, cpu_count)
     xgb_params: Dict[str, Any] = {
         **best_params,
         "tree_method": "hist",

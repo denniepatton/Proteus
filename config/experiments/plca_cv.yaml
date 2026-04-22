@@ -1,9 +1,8 @@
 # Proteus PLCA model — 5-fold cross-validation (BioDVN)
 #
-# HPs from PLCA phase 2.1 best trial (t2, objective μ−σ = 0.2673) with
-# dropout corrected to 0.30 (2.1 analysis: 0.3–0.4 optimal, not 0.50).
-# patience=999 ensures all 20 epochs run (final-epoch predictions for CV).
-# Multi-source batch mode: 4 source groups × 24 samples/source per epoch.
+# Fixed to the current PLCAv2 trial-3 recipe with rounded optimizer values.
+# CV uses the chunk-based all-data loader and the fixed weighted-source
+# GVW-CRPS selection metric used in the current proxy study.
 
 name: proteus_plca-model_cv
 output_dir: results_training/proteus_plca-model_cv
@@ -11,7 +10,7 @@ output_dir: results_training/proteus_plca-model_cv
 transfer: ~
 
 objective:
-  metric: tumor_gvw_crps_mean
+  metric: weighted_tumor_gvw_crps_mean
   direction: minimize
 
 tuning: ~
@@ -21,27 +20,27 @@ data:
   zarr_base: /hpc/temp/ha_g/user/rpatton/ProteusZarrs
   subsample_frac: 1.00
   seed: 23
-  batch_mode: multi_source
+  batch_mode: chunk
+  selection_metric: min_weighted_source_crps
   source_groups:
     CRPC-RA: [CRPC-RA]
     SCLC: [SCLC]
     Prostate-Synthetic: [PC-PDX]
     SCLC-Synthetic: [SCLC-PDX]
-  target_n_per_source: 24
 
 structural:
-  beta_point_mse: 0.15
+  beta_point_mse: 0.25
   beta_background: 1.0
-  beta_tcvae: 1.0
+  beta_tcvae: 1.5
   beta_contrastive: 1.0
-  beta_grl: 0.3
+  beta_grl: 0.2
   beta_reconstruction: 0.25
   cl_margin: 1.0
-  internal_weight: 0.5
+  internal_weight: 0.25
 
 training:
-  epochs: 20
-  patience: 999
+  epochs: 25
+  patience: 25
   use_amp: true
   ema_decay: 0.9999
   min_lr_ratio: 0.01
@@ -49,8 +48,8 @@ training:
   warmup_frac: 0.05
   schedule_frac: 0.90
   max_grad_norm: 10.0
-  max_lr: 7.31e-5
-  weight_decay: 3.82e-6
+  max_lr: 1.5e-4
+  weight_decay: 1.0e-6
 
 scale:
   signal_ksize: 6
@@ -64,4 +63,4 @@ scale:
   mdn_final: 16
   signal_filters: 16
   initial_reduction_channels: 64
-  dropout_rate: 0.30
+  dropout_rate: 0.10

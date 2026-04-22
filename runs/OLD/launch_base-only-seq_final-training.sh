@@ -2,14 +2,14 @@
 set -euo pipefail
 
 # =====================================================================
-# Base-model final training (BioDVN) — single L40S GPU
+# Base-model only-seq final training (BioDVN_OnlySeq) — single L40S GPU
 # Trains on ALL samples with gene-level 10% chunk split for early stopping.
-# Output: trained_models/proteus_base-model/full_train/final_model.pt
+# Output: trained_models/proteus_base-model_only-seq/full_train/best_model.pt
 # =====================================================================
 
-YAML="config/experiments/base_final-training.yaml"
-MODEL="BioDVN"
-TAG="base_final"
+YAML="config/experiments/base-only-seq_final-training.yaml"
+MODEL="BioDVN_OnlySeq"
+TAG="onlyseq_final"
 ENV_NAME="proteus"
 
 job_script=$(mktemp "job_${TAG}_XXXXXX.sh")

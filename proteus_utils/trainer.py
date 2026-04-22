@@ -39,6 +39,7 @@ from models.model_utils import (
     MaskedR2Metric, MetricsTracker,
     BioDVNMDNLoss
 )
+from proteus_utils.data_helpers import weighted_group_mean
 
 
 @dataclass
@@ -83,9 +84,11 @@ class TrainingConfig:
     min_delta: float = 0.0
 
     # Model selection metric.
-    # 'min_balanced_crps': select epoch with lowest balanced GVW-CRPS (default)
+    # 'min_balanced_crps': select epoch with lowest balanced GVW-CRPS.
+    # 'min_weighted_source_crps': select epoch with lowest fixed-weight
+    #   PLCAv2 source GVW-CRPS (0.3/0.3/0.2/0.2 across the 4 source buckets).
     # 'max_gvw_r_lower_bound': select epoch with highest
-    #   balanced_tumor_gvw_r_lower_bound (mean − std across sources)
+    #   balanced_tumor_gvw_r_lower_bound (mean − std across sources).
     selection_metric: str = 'min_balanced_crps'
     
     # Checkpointing
@@ -854,9 +857,13 @@ class Trainer:
         bg_crps_sum = torch.tensor(0.0)
         bg_crps_denom = torch.tensor(0.0)
 
-        # Per-cohort/source CRPS accumulators for balanced metric.
-        cohort_map = getattr(self, 'val_sample_cohort_map', None)
-        cohort_crps: Dict[str, List[torch.Tensor]] = {}  # cohort -> [sum, denom]
+        # Per-group CRPS accumulators for balanced / weighted validation.
+        group_map = getattr(
+            self,
+            'val_sample_group_map',
+            getattr(self, 'val_sample_cohort_map', None),
+        )
+        group_crps: Dict[str, List[torch.Tensor]] = {}  # group -> [sum, denom]
 
         # Per-source variance maps for source-level GVW-CRPS/GVW-r.
         # When set, each source's CRPS uses its own gene variance weights
@@ -962,52 +969,67 @@ class Trainer:
             tumor_crps_sum += crps_sum_b.cpu()
             tumor_crps_denom += crps_denom_b.cpu()
 
-            # Per-cohort/source CRPS accumulation (requires sample_name metadata).
-            # When source_var_maps is set, each source uses its own gene
-            # variance weights — aligning epoch-level checkpoint selection
-            # with the final fold metric.
-            if isinstance(cohort_map, dict) and cohort_map and 'sample_name' in features:
+            # Per-group CRPS accumulation (cohort or source).  Mixed-sample
+            # validation batches can happen in full-train holdout mode, so
+            # grouping must be done per element rather than by batch header.
+            if isinstance(group_map, dict) and group_map and 'sample_name' in features:
                 snames = features['sample_name']
-                batch_sname = str(snames[0] if isinstance(snames, (list, tuple)) else snames)
-                cohort = cohort_map.get(batch_sname)
-                if cohort is not None:
-                    # Determine per-source/cohort variance weights.
-                    if isinstance(source_var_maps, dict) and cohort in source_var_maps and gnames_list:
-                        svar = source_var_maps[cohort]
-                        w_cohort = torch.tensor(
-                            [float(svar.get(str(g), 1.0)) for g in gnames_list],
+                if isinstance(snames, (list, tuple)):
+                    batch_groups = [group_map.get(str(s), 'unknown') for s in snames]
+                else:
+                    batch_groups = [group_map.get(str(snames), 'unknown')] * len(gnames_list)
+
+                for grp in sorted(set(batch_groups)):
+                    if grp == 'unknown':
+                        continue
+                    idx_list = [i for i, group_name in enumerate(batch_groups) if group_name == grp]
+                    idx = torch.tensor(idx_list, dtype=torch.long, device=self.device)
+                    if isinstance(source_var_maps, dict) and grp in source_var_maps and gnames_list:
+                        svar = source_var_maps[grp]
+                        group_gene_names = [str(gnames_list[i]) for i in idx_list]
+                        w_group = torch.tensor(
+                            [float(svar.get(gene_name, 1.0)) for gene_name in group_gene_names],
                             dtype=torch.float32,
                             device=self.device,
                         ).unsqueeze(-1)
                     else:
-                        w_cohort = w_val
+                        w_group = w_val[idx] if w_val is not None else None
+                    group_mdn = {k: v[idx] for k, v in predictions['tumor_mdn'].items()}
                     cs, cd = mixture_crps(
-                        predictions['tumor_mdn'],
-                        labels['tumor_exp'],
-                        sample_weight=w_cohort,
+                        group_mdn,
+                        labels['tumor_exp'][idx],
+                        sample_weight=w_group,
                     )
-                    if cohort not in cohort_crps:
-                        cohort_crps[cohort] = [torch.tensor(0.0), torch.tensor(0.0)]
-                    cohort_crps[cohort][0] += cs.cpu()
-                    cohort_crps[cohort][1] += cd.cpu()
+                    if grp not in group_crps:
+                        group_crps[grp] = [torch.tensor(0.0), torch.tensor(0.0)]
+                    group_crps[grp][0] += cs.cpu()
+                    group_crps[grp][1] += cd.cpu()
 
             # Accumulate per-gene (truth, pred) for GVW Pearson r.
             if gnames_list:
                 truth_np = labels['tumor_exp'].detach().cpu().float().squeeze(-1).numpy()
                 pred_np = predictions['tumor_exp'].detach().cpu().float().squeeze(-1).numpy()
-                # Determine which source this batch belongs to.
-                _src_key = '__pooled__'
-                if isinstance(cohort_map, dict) and 'sample_name' in features:
+                if isinstance(group_map, dict) and group_map and 'sample_name' in features:
                     snames_r = features['sample_name']
-                    _sname = str(snames_r[0] if isinstance(snames_r, (list, tuple)) else snames_r)
-                    _src_key = cohort_map.get(_sname, '__pooled__')
+                    if isinstance(snames_r, (list, tuple)):
+                        batch_group_keys = [group_map.get(str(s), 'unknown') for s in snames_r]
+                    else:
+                        batch_group_keys = [group_map.get(str(snames_r), 'unknown')] * len(gnames_list)
+                else:
+                    batch_group_keys = ['__pooled__'] * len(gnames_list)
+
                 for idx_g, gname in enumerate(gnames_list):
                     g = str(gname)
                     x_val = float(truth_np[idx_g])
                     y_val = float(pred_np[idx_g])
                     if not (math.isfinite(x_val) and math.isfinite(y_val)):
                         continue
-                    for key in (_src_key, '__pooled__'):
+                    group_key = batch_group_keys[idx_g] if idx_g < len(batch_group_keys) else '__pooled__'
+                    if group_key in (None, 'unknown'):
+                        keys = ('__pooled__',)
+                    else:
+                        keys = (str(group_key), '__pooled__')
+                    for key in keys:
                         if key not in _gvw_r_accum:
                             _gvw_r_accum[key] = {}
                         if g not in _gvw_r_accum[key]:
@@ -1095,17 +1117,32 @@ class Trainer:
         else:
             metrics['val_background_gvw_crps'] = float('nan')
 
-        # Balanced tumor GVW-CRPS: equal-weight average across patient cohorts.
-        if cohort_crps:
-            per_cohort_vals = []
-            for cname, (cs, cd) in sorted(cohort_crps.items()):
+        # Group-level tumor GVW-CRPS: always expose the equal-weight mean,
+        # and optionally the fixed PLCAv2 weighted source objective.
+        if group_crps:
+            per_group_vals: Dict[str, float] = {}
+            for cname, (cs, cd) in sorted(group_crps.items()):
                 if float(cd.item()) > 0:
                     val = float((cs / cd).item())
-                    per_cohort_vals.append(val)
+                    per_group_vals[cname] = val
                     metrics[f'val_tumor_gvw_crps_{cname}'] = val
-            if per_cohort_vals:
-                balanced = sum(per_cohort_vals) / len(per_cohort_vals)
+            if per_group_vals:
+                per_group_list = list(per_group_vals.values())
+                balanced = sum(per_group_list) / len(per_group_list)
                 metrics['val_balanced_tumor_gvw_crps'] = balanced
+                if len(per_group_list) > 1:
+                    mean_group_crps = balanced
+                    metrics['val_balanced_tumor_gvw_crps_std'] = math.sqrt(
+                        sum((value - mean_group_crps) ** 2 for value in per_group_list)
+                        / len(per_group_list)
+                    )
+
+                selection_group_weights = getattr(self, 'val_selection_group_weights', None)
+                if selection_group_weights:
+                    metrics['val_weighted_tumor_gvw_crps'] = weighted_group_mean(
+                        per_group_vals,
+                        selection_group_weights,
+                    )
 
         # GVW Pearson r: variance-weighted per-gene r across sources.
         if _gvw_r_accum:
@@ -1212,15 +1249,18 @@ class Trainer:
             'train_loss': [],
             'val_loss': [],
             'val_tumor_gvw_crps': [],
+            'val_weighted_tumor_gvw_crps': [],
             'val_tumor_aggregate_r2': [],
             'val_balanced_tumor_gvw_r': [],
             'learning_rate': [],
         }
 
         best_val_score = float('inf')
+        selection_metric = str(self.config.selection_metric)
         # For maximize metrics, we track negative-of-score so that
         # "lower is better" logic works uniformly.
-        _maximize = self.config.selection_metric == 'max_gvw_r_lower_bound'
+        _maximize = selection_metric == 'max_gvw_r_lower_bound'
+        _use_weighted_crps = selection_metric == 'min_weighted_source_crps'
         
         print(f'Starting training for {epochs} epochs')
         print(f'Device: {self.device}')
@@ -1268,16 +1308,27 @@ class Trainer:
                 
                 history['val_loss'].append(val_metrics['val_loss'])
                 history['val_tumor_gvw_crps'].append(val_metrics.get('val_tumor_gvw_crps', float('nan')))
+                history['val_weighted_tumor_gvw_crps'].append(
+                    val_metrics.get('val_weighted_tumor_gvw_crps', float('nan')))
                 history['val_tumor_aggregate_r2'].append(val_metrics.get('val_tumor_aggregate_r2', 0))
                 history['val_balanced_tumor_gvw_r'].append(val_metrics.get('val_balanced_tumor_gvw_r', float('nan')))
                 if 'val_balanced_tumor_gvw_crps' in val_metrics:
                     history.setdefault('val_balanced_tumor_gvw_crps', []).append(
                         val_metrics['val_balanced_tumor_gvw_crps'])
 
-                # Log line: show balanced CRPS + GVW-r when available.
+                # Log line: prefer the weighted PLCAv2 objective, then the
+                # balanced group metric, then the pooled metric.
+                weighted_crps = val_metrics.get('val_weighted_tumor_gvw_crps')
                 bal_crps = val_metrics.get('val_balanced_tumor_gvw_crps')
-                crps_label = 'Bal-CRPS' if bal_crps is not None else 'GVW-CRPS'
-                crps_value = bal_crps if bal_crps is not None else val_metrics.get('val_tumor_gvw_crps', float('nan'))
+                if weighted_crps is not None:
+                    crps_label = 'Weighted-CRPS'
+                    crps_value = weighted_crps
+                elif bal_crps is not None:
+                    crps_label = 'Bal-CRPS'
+                    crps_value = bal_crps
+                else:
+                    crps_label = 'GVW-CRPS'
+                    crps_value = val_metrics.get('val_tumor_gvw_crps', float('nan'))
                 bal_r = val_metrics.get('val_balanced_tumor_gvw_r')
                 pooled_r = val_metrics.get('val_tumor_gvw_r')
                 r_str = ''
@@ -1312,6 +1363,9 @@ class Trainer:
                         val_score = -_br
                     else:
                         val_score = val_metrics['val_loss']
+                elif _use_weighted_crps:
+                    _weighted = val_metrics.get('val_weighted_tumor_gvw_crps')
+                    val_score = _weighted if _weighted is not None else float('nan')
                 else:
                     # min_balanced_crps (default): lower is better.
                     _bal = val_metrics.get('val_balanced_tumor_gvw_crps')
@@ -1356,9 +1410,16 @@ class Trainer:
                 if _ema_backup is not None:
                     self._ema.restore(self.model, _ema_backup)
         
+        if val_loader is None:
+            print('\nTraining complete (fixed schedule; no validation checkpoint selection).')
+            return history
+
         if _maximize:
             metric_label = 'GVW-r-LB'
             display_score = -best_val_score
+        elif _use_weighted_crps:
+            metric_label = 'Weighted-CRPS'
+            display_score = best_val_score
         else:
             metric_label = 'Balanced-CRPS' if 'val_balanced_tumor_gvw_crps' in (history or {}) else 'GVW-CRPS'
             display_score = best_val_score
@@ -1366,7 +1427,12 @@ class Trainer:
         
         return history
     
-    def _save_checkpoint(self, epoch: int, is_best: bool = False):
+    def _save_checkpoint(
+        self,
+        epoch: int,
+        is_best: bool = False,
+        filename: Optional[str] = None,
+    ):
         """Save model checkpoint."""
         if self.optimizer is None:
             raise RuntimeError('Cannot save checkpoint before optimizer is initialized.')
@@ -1386,7 +1452,9 @@ class Trainer:
         if self._ema is not None:
             checkpoint['ema_state_dict'] = self._ema.state_dict()
         
-        if is_best:
+        if filename is not None:
+            path = os.path.join(self.config.checkpoint_dir, filename)
+        elif is_best:
             path = os.path.join(self.config.checkpoint_dir, 'best_model.pt')
         else:
             path = os.path.join(self.config.checkpoint_dir, f'checkpoint_epoch_{epoch}.pt')
