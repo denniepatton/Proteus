@@ -93,6 +93,8 @@ This section includes a pooled `CrossCohort` subdirectory that merges all truth-
 
 ### Discovery_Patient
 
+Configured discovery cohorts currently include `CRPC-Pfizer`, `CRPC-Pluvicto`, `CRPC-UW`, and `BC-Ghana`.
+
 Runs truth-free downstream analysis on discovery cohorts (`CRPC-Pluvicto`, `CRPC-UW`, `BC-Ghana`) using the main PLCA Proteus model only. Outputs include expression profiles, curated heatmaps, and cohort-specific downstream analyses such as limma/GSEA, PAM50, ssGSEA, and survival where applicable.
 
 ## Output Structure

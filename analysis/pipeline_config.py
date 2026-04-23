@@ -7,6 +7,7 @@ SECTION_OUTPUT_DIRS: Dict[str, str] = {
     "Examples": "Examples",
     "Benchmarking_Synthetic": "Benchmarking_Synthetic",
     "Benchmarking_Patient": "Benchmarking_Patient",
+    "Calibration": "Calibration",
     "Validation_PDX": "Validation_PDX",
     "Validation_Patient": "Validation_Patient",
     "Discovery_Patient": "Discovery_Patient",
@@ -89,8 +90,8 @@ VALIDATION_PDX_COHORTS: List[str] = ["PC-PDX", "SCLC-PDX"]
 VALIDATION_PATIENT_HOLDOUT_PATH_TEMPLATE: str = (
     "results_holdout/BioDVN/{cohort}/predictions_tumor.tsv"
 )
-VALIDATION_PATIENT_CV_RESULTS_DIR: str = "results_training/proteus_plca-model_cv"
-VALIDATION_PDX_CV_RESULTS_DIR: str = "results_training/proteus_plca-model_cv"
+VALIDATION_PATIENT_CV_RESULTS_DIR: str = "results_training/proteus_base-model_cv"
+VALIDATION_PDX_CV_RESULTS_DIR: str = "results_training/proteus_base-model_cv"
 
 
 VALIDATION_PDX_HOLDOUT_PATHS: Dict[str, str] = {
@@ -100,6 +101,7 @@ VALIDATION_PDX_HOLDOUT_PATHS: Dict[str, str] = {
 
 
 DISCOVERY_COHORTS: List[Tuple[str, str | None]] = [
+    ("CRPC-Pfizer", None),
     ("CRPC-Pluvicto", "CRPC-Pluvicto"),
     ("CRPC-UW", "CRPC-UW"),
     ("BC-Ghana", None),

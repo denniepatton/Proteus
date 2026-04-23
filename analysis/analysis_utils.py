@@ -21,6 +21,43 @@ from concurrent.futures import ProcessPoolExecutor
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+_GENE_ALIAS_FALLBACKS: Dict[str, str] = {
+    "TARP": "CD3G",
+}
+
+_MDN_GAMMA_SHAPE: float = 0.80
+
+
+def _augment_missing_gene_aliases(expr_df: pd.DataFrame) -> pd.DataFrame:
+    """Add targeted alias rows only when the requested symbol is absent."""
+    if expr_df.empty:
+        return expr_df
+
+    augmented = expr_df
+    for target_symbol, source_symbol in _GENE_ALIAS_FALLBACKS.items():
+        if target_symbol in augmented.index or source_symbol not in augmented.index:
+            continue
+        alias_row = augmented.loc[[source_symbol]].rename(index={source_symbol: target_symbol})
+        augmented = pd.concat([augmented, alias_row], axis=0)
+    return augmented
+
+
+def _resolve_expression_gene_rows(
+    expr_df: pd.DataFrame,
+    gene_list: Sequence[str],
+) -> List[str]:
+    """Resolve gene rows against the expression matrix with targeted alias fallback."""
+    resolved_rows: List[str] = []
+    seen_rows: set[str] = set()
+    for gene_symbol in gene_list:
+        row_name = gene_symbol
+        if row_name not in expr_df.index:
+            row_name = _GENE_ALIAS_FALLBACKS.get(gene_symbol, gene_symbol)
+        if row_name in expr_df.index and row_name not in seen_rows:
+            resolved_rows.append(row_name)
+            seen_rows.add(row_name)
+    return resolved_rows
+
 # ---------------------------------------------------------------------------
 # Reference / label loaders
 # ---------------------------------------------------------------------------
@@ -32,7 +69,7 @@ def load_truth(cohort: str) -> pd.DataFrame:
     """
     path = PROJECT_ROOT / "labels" / f"{cohort}_Log2CPMplus1.tsv"
     df = pd.read_csv(path, sep="\t", index_col=0)
-    return df
+    return _augment_missing_gene_aliases(df)
 
 
 def load_subtypes(cohort: str) -> pd.DataFrame:
@@ -1176,6 +1213,31 @@ def generate_null_predictions(
     return shuffled
 
 
+def _mdn_on_probability(
+    p0_flat: np.ndarray,
+    pi_gamma_flat: np.ndarray,
+    pi_normal_flat: np.ndarray,
+    gamma_beta_flat: np.ndarray,
+    normal_mean_flat: np.ndarray,
+    normal_stdev_flat: np.ndarray,
+    threshold: float,
+) -> np.ndarray:
+    """Compute P(Y >= threshold) from the Proteus hurdle-gamma-normal MDN."""
+    from scipy.special import erf, gammainc
+
+    beta = np.clip(gamma_beta_flat.astype(np.float64), 1e-12, None)
+    sigma = np.clip(normal_stdev_flat.astype(np.float64), 1e-12, None)
+    gamma_cdf = gammainc(_MDN_GAMMA_SHAPE, beta * max(threshold, 0.0))
+    normal_cdf = 0.5 * (1.0 + erf((threshold - normal_mean_flat) / (sigma * np.sqrt(2.0))))
+    cdf_zero = 1.0 if threshold >= 0.0 else 0.0
+    cdf = (
+        p0_flat.astype(np.float64) * cdf_zero
+        + pi_gamma_flat.astype(np.float64) * gamma_cdf
+        + pi_normal_flat.astype(np.float64) * normal_cdf
+    )
+    return np.clip(1.0 - cdf, 0.0, 1.0)
+
+
 def compute_subset_metrics(
     truth_wide: pd.DataFrame,
     pred_wide: pd.DataFrame,
@@ -1413,74 +1475,180 @@ def compute_risk_coverage_data(
     pred_flat: np.ndarray,
     ci_lo_flat: Optional[np.ndarray] = None,
     ci_hi_flat: Optional[np.ndarray] = None,
+    p0_flat: Optional[np.ndarray] = None,
+    pi_gamma_flat: Optional[np.ndarray] = None,
+    pi_normal_flat: Optional[np.ndarray] = None,
+    gamma_beta_flat: Optional[np.ndarray] = None,
+    normal_mean_flat: Optional[np.ndarray] = None,
+    normal_stdev_flat: Optional[np.ndarray] = None,
     threshold: float = _ONOFF_THRESHOLD_DEFAULT,
     n_steps: int = 200,
 ) -> Dict[str, np.ndarray]:
-    """Compute coverage-vs-PPV and coverage-vs-FPR at varying CI-width cuts.
+    """Compute coverage-vs-PPV and coverage-vs-FPR as confidence varies.
 
-    For models with CIs (``ci_lo_flat`` / ``ci_hi_flat`` provided), we sweep
-    a CI-width threshold from wide (retain everything) to narrow (retain
-    only the most confident predictions).  At each threshold the retained
-    subset is evaluated for PPV and FPR of the binary on/off call
-    (truth >= ``threshold``).
+    For Proteus MDN outputs, confidence is computed from the full predictive
+    distribution: first derive ``P(Y >= threshold)`` from the hurdle-gamma-
+    normal mixture, then rank observations by posterior confidence
+    ``max(P_on, 1 - P_on)``.  At each retention level the retained subset is
+    evaluated for PPV and FPR of the binary on/off call implied by
+    ``P_on >= 0.5``.
+
+    If full MDN parameters are unavailable but CIs are present, this falls
+    back to the legacy CI-width ranking.  Models without either uncertainty
+    representation return a single point at 100% coverage.
 
     For models without CIs, returns a single (coverage=1.0) point.
 
     Returns
     -------
-    dict with keys ``coverage``, ``ppv``, ``fpr`` — 1-D arrays of equal
-    length.
+    dict with keys ``coverage``, ``ppv``, ``fpr``, ``ppv_auc``,
+    ``fpr_auc``.
     """
     valid = np.isfinite(truth_flat) & np.isfinite(pred_flat)
     if ci_lo_flat is not None and ci_hi_flat is not None:
         valid &= np.isfinite(ci_lo_flat) & np.isfinite(ci_hi_flat)
+    has_mdn = all(
+        arr is not None
+        for arr in (
+            p0_flat,
+            pi_gamma_flat,
+            pi_normal_flat,
+            gamma_beta_flat,
+            normal_mean_flat,
+            normal_stdev_flat,
+        )
+    )
+    if has_mdn:
+        valid &= (
+            np.isfinite(p0_flat)
+            & np.isfinite(pi_gamma_flat)
+            & np.isfinite(pi_normal_flat)
+            & np.isfinite(gamma_beta_flat)
+            & np.isfinite(normal_mean_flat)
+            & np.isfinite(normal_stdev_flat)
+        )
     t = truth_flat[valid]
     p = pred_flat[valid]
 
+    def _build_curve(
+        coverage_vals: np.ndarray,
+        ppv_vals: np.ndarray,
+        fpr_vals: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        order = np.argsort(coverage_vals)
+        coverage_sorted = coverage_vals[order]
+        ppv_sorted = ppv_vals[order]
+        fpr_sorted = fpr_vals[order]
+        if len(coverage_sorted) > 1:
+            ppv_auc = float(np.trapezoid(ppv_sorted, coverage_sorted))
+            fpr_auc = float(np.trapezoid(fpr_sorted, coverage_sorted))
+        else:
+            ppv_auc = float("nan")
+            fpr_auc = float("nan")
+        return {
+            "coverage": coverage_sorted,
+            "ppv": ppv_sorted,
+            "fpr": fpr_sorted,
+            "ppv_auc": ppv_auc,
+            "fpr_auc": fpr_auc,
+        }
+
     y_true = (t >= threshold).astype(int)
+
+    if has_mdn:
+        p_on = _mdn_on_probability(
+            p0_flat[valid],
+            pi_gamma_flat[valid],
+            pi_normal_flat[valid],
+            gamma_beta_flat[valid],
+            normal_mean_flat[valid],
+            normal_stdev_flat[valid],
+            threshold,
+        )
+        confidence = np.maximum(p_on, 1.0 - p_on)
+        if len(confidence) < 10:
+            pred_hard = (p_on >= 0.5).astype(np.float64)
+            ppv, fpr = _ppv_fpr(y_true, pred_hard, threshold=0.5)
+            return _build_curve(
+                np.array([1.0]),
+                np.array([ppv]),
+                np.array([fpr]),
+            )
+
+        order = np.argsort(-confidence, kind="mergesort")
+        y_true = y_true[order]
+        p_on = p_on[order]
+
+        min_count = min(10, len(y_true))
+        retained_counts = np.unique(
+            np.linspace(min_count, len(y_true), n_steps).round().astype(int)
+        )
+
+        coverages, ppvs, fprs = [], [], []
+        n_total = len(y_true)
+        for retained in retained_counts:
+            if retained < 10:
+                continue
+            ppv, fpr_val = _ppv_fpr(
+                y_true[:retained],
+                p_on[:retained],
+                threshold=0.5,
+            )
+            coverages.append(retained / n_total)
+            ppvs.append(ppv)
+            fprs.append(fpr_val)
+
+        return _build_curve(
+            np.asarray(coverages, dtype=np.float64),
+            np.asarray(ppvs, dtype=np.float64),
+            np.asarray(fprs, dtype=np.float64),
+        )
 
     # No CI → single point at full coverage
     if ci_lo_flat is None or ci_hi_flat is None:
         ppv, fpr = _ppv_fpr(y_true, p, threshold)
-        return {
-            "coverage": np.array([1.0]),
-            "ppv": np.array([ppv]),
-            "fpr": np.array([fpr]),
-        }
+        return _build_curve(
+            np.array([1.0]),
+            np.array([ppv]),
+            np.array([fpr]),
+        )
 
     lo = ci_lo_flat[valid]
     hi = ci_hi_flat[valid]
     widths = hi - lo
 
-    # Sweep from widest (retain all) to narrowest (retain most confident)
-    w_min, w_max = float(np.min(widths)), float(np.max(widths))
-    if w_max <= w_min:
+    if len(widths) < 10:
         ppv, fpr = _ppv_fpr(y_true, p, threshold)
-        return {
-            "coverage": np.array([1.0]),
-            "ppv": np.array([ppv]),
-            "fpr": np.array([fpr]),
-        }
+        return _build_curve(
+            np.array([1.0]),
+            np.array([ppv]),
+            np.array([fpr]),
+        )
 
-    thresholds = np.linspace(w_max, w_min, n_steps)
+    order = np.argsort(widths, kind="mergesort")
+    y_true = y_true[order]
+    p = p[order]
+
+    min_count = min(10, len(y_true))
+    retained_counts = np.unique(
+        np.linspace(min_count, len(y_true), n_steps).round().astype(int)
+    )
+
     coverages, ppvs, fprs = [], [], []
-
-    for wt in thresholds:
-        mask = widths <= wt
-        n_retained = mask.sum()
-        if n_retained < 10:
-            break
-        cov = n_retained / len(t)
-        ppv, fpr_val = _ppv_fpr(y_true[mask], p[mask], threshold)
-        coverages.append(cov)
+    n_total = len(y_true)
+    for retained in retained_counts:
+        if retained < 10:
+            continue
+        ppv, fpr_val = _ppv_fpr(y_true[:retained], p[:retained], threshold)
+        coverages.append(retained / n_total)
         ppvs.append(ppv)
         fprs.append(fpr_val)
 
-    return {
-        "coverage": np.array(coverages),
-        "ppv": np.array(ppvs),
-        "fpr": np.array(fprs),
-    }
+    return _build_curve(
+        np.asarray(coverages, dtype=np.float64),
+        np.asarray(ppvs, dtype=np.float64),
+        np.asarray(fprs, dtype=np.float64),
+    )
 
 
 def _ppv_fpr(
@@ -1854,10 +2022,20 @@ def compute_geneset_score(
     pd.Series
         Per-sample mean expression score, indexed by sample name.
     """
-    present = [g for g in gene_list if g in expr_df.index]
+    if expr_df.empty:
+        return pd.Series(index=expr_df.columns, dtype=float)
+
+    augmented_expr = _augment_missing_gene_aliases(expr_df)
+    present = _resolve_expression_gene_rows(augmented_expr, gene_list)
     if not present:
-        return pd.Series(dtype=float)
-    return expr_df.loc[present].mean(axis=0)
+        return pd.Series(index=augmented_expr.columns, dtype=float)
+
+    gene_frame = augmented_expr.loc[present]
+    gene_frame = gene_frame.loc[~gene_frame.isna().any(axis=1)]
+    if gene_frame.empty:
+        return pd.Series(index=augmented_expr.columns, dtype=float)
+
+    return gene_frame.mean(axis=0)
 
 
 def compute_cox_univariate(

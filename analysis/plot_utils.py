@@ -74,8 +74,6 @@ def sample_scatter(
     sample_name: str,
     name: str,
     *,
-    ci_lo: Optional[pd.Series] = None,
-    ci_hi: Optional[pd.Series] = None,
     goi: Optional[Dict[str, List[str]]] = None,
     tfx: Optional[float] = None,
     depth: Optional[float] = None,
@@ -115,7 +113,7 @@ def sample_scatter(
     )
     cb = fig.colorbar(hb, ax=ax, shrink=0.8, label=r"$\log_{10}(N+1)$")
 
-    # GOI highlights colored by subtype with CI error bars
+    # GOI highlights colored by subtype
     pal = _palette()
     if goi:
         for subtype, genes_in_subtype in goi.items():
@@ -124,18 +122,6 @@ def sample_scatter(
                 continue
             gt = t.loc[present]
             gp = p.loc[present]
-
-            # CI error bars (drawn once per subtype group)
-            if ci_lo is not None and ci_hi is not None:
-                ci_l = ci_lo.reindex(present).astype(float)
-                ci_h = ci_hi.reindex(present).astype(float)
-                yerr_lo = (gp - ci_l).clip(lower=0).values
-                yerr_hi = (ci_h - gp).clip(lower=0).values
-                yerr = np.vstack([yerr_lo, yerr_hi])
-                ax.errorbar(
-                    gt.values, gp.values, yerr=yerr,
-                    fmt="none", ecolor="black", elinewidth=0.8, capsize=2, zorder=2,
-                )
 
             color = pal.get(subtype, "#999999")
             if is_holdout:
@@ -256,13 +242,8 @@ def gene_target_scatter(
         rmse = float(np.sqrt(np.mean((t.values - p.values) ** 2)))
         t_conf, p_conf = t, p  # fall back for fit line
 
-    # Dynamic axis range (includes CI bounds so bars are fully visible).
-    # Calibrated CIs are already clamped to [0, 19.93] by the calibrator.
+    # Dynamic axis range from displayed values only.
     all_vals = np.concatenate([t.values, p.values])
-    if has_ci:
-        lo_ci_vals = ci_lo_wide.loc[gene, common].reindex(t.index).dropna().values
-        hi_ci_vals = ci_hi_wide.loc[gene, common].reindex(t.index).dropna().values
-        all_vals = np.concatenate([all_vals, lo_ci_vals, hi_ci_vals])
 
     # Background overlay data
     bg_t: Optional[pd.Series] = None
@@ -330,18 +311,6 @@ def gene_target_scatter(
 
             alpha = 0.5 if is_ambiguous[sample] else 0.75
 
-            # Error bar (CI) — drawn before marker so marker sits on top
-            if ci_lo_gene is not None and ci_hi_gene is not None:
-                lo = ci_lo_gene[sample]
-                hi = ci_hi_gene[sample]
-                if np.isfinite(lo) and np.isfinite(hi):
-                    ax.errorbar(
-                        t[sample], p[sample],
-                        yerr=[[max(p[sample] - lo, 0)], [max(hi - p[sample], 0)]],
-                        fmt="none", ecolor="black", elinewidth=0.8,
-                        capsize=2, zorder=2, alpha=alpha,
-                    )
-
             if is_holdout:
                 ax.scatter(
                     t[sample], p[sample], s=sz, c=color, marker="D",
@@ -360,18 +329,6 @@ def gene_target_scatter(
         if handles:
             ax.legend(handles=handles, title="Subtype", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
     else:
-        # Error bars (CI) for the non-subtype branch
-        if ci_lo_gene is not None and ci_hi_gene is not None:
-            yerr_lo = (p - ci_lo_gene).clip(lower=0).values
-            yerr_hi = (ci_hi_gene - p).clip(lower=0).values
-            eb_alpha = np.where(is_ambiguous.values, 0.5, 0.75)
-            for i in range(len(t)):
-                ax.errorbar(
-                    t.values[i], p.values[i],
-                    yerr=[[yerr_lo[i]], [yerr_hi[i]]],
-                    fmt="none", ecolor="black", elinewidth=0.8,
-                    capsize=2, zorder=2, alpha=float(eb_alpha[i]),
-                )
         sizes = [200] * len(t)
         if tfx_dict is not None:
             sizes = [max(30, tfx_dict.get(s, 1.0) * 300) for s in t.index]
@@ -436,6 +393,7 @@ def double_heatmap(
     *,
     subtypes: Optional[pd.DataFrame] = None,
     breaks: Optional[List[int]] = None,
+    truth_sort_genes: Optional[List[str]] = None,
     gsea: bool = False,
 ) -> None:
     """Side-by-side heatmaps: truth (left) and predictions (right)."""
@@ -455,9 +413,21 @@ def double_heatmap(
         if g not in pw.index:
             pw.loc[g] = np.nan
 
-    # Sort samples by subtype then descending TFX (matches legacy plot_double_heatmap)
+    # Optional truth-based ordering for curated panels such as PC-Phenotyping.
     sorted_samples = sorted(common_samples)
-    if subtypes is not None:
+    if truth_sort_genes:
+        truth_order_genes = [g for g in truth_sort_genes if g in tw.index]
+        if truth_order_genes:
+            truth_order_scores = tw.loc[truth_order_genes, common_samples].mean(axis=0, skipna=True)
+            sorted_samples = sorted(
+                common_samples,
+                key=lambda sample: (
+                    float(truth_order_scores.get(sample, np.inf))
+                    if np.isfinite(truth_order_scores.get(sample, np.nan)) else np.inf,
+                    str(sample),
+                ),
+            )
+    elif subtypes is not None:
         shared = subtypes.index.intersection(common_samples)
         if len(shared) > 0:
             sub_dict = subtypes["subtype"].to_dict() if "subtype" in subtypes.columns else {}
@@ -1144,10 +1114,10 @@ def plot_error_vs_width(
 def _render_sample_scatter(args: Tuple) -> str:
     """Worker function for parallel sample scatter generation."""
     (truth_col, pred_col, sample_name, out_path,
-     ci_lo, ci_hi, goi, tfx, depth, is_holdout) = args
+     goi, tfx, depth, is_holdout) = args
     sample_scatter(
         truth_col, pred_col, sample_name, out_path,
-        ci_lo=ci_lo, ci_hi=ci_hi, goi=goi, tfx=tfx, depth=depth,
+        goi=goi, tfx=tfx, depth=depth,
         is_holdout=is_holdout,
     )
     return sample_name
@@ -1158,8 +1128,6 @@ def batch_sample_scatters(
     pred_wide: pd.DataFrame,
     out_dir: str,
     *,
-    ci_lo_wide: Optional[pd.DataFrame] = None,
-    ci_hi_wide: Optional[pd.DataFrame] = None,
     goi: Optional[Dict[str, List[str]]] = None,
     subtypes_df: Optional[pd.DataFrame] = None,
     n_workers: Optional[int] = None,
@@ -1187,13 +1155,10 @@ def batch_sample_scatters(
             depth = row.get("depth")
             is_holdout = row.get("status") == "holdout"
 
-        ci_lo = ci_lo_wide[sample] if ci_lo_wide is not None and sample in ci_lo_wide.columns else None
-        ci_hi = ci_hi_wide[sample] if ci_hi_wide is not None and sample in ci_hi_wide.columns else None
-
         args_list.append((
             truth_wide[sample], pred_wide[sample], sample,
             os.path.join(out_dir, sample),
-            ci_lo, ci_hi, goi, tfx, depth, is_holdout,
+            goi, tfx, depth, is_holdout,
         ))
 
     if n_workers > 1 and len(args_list) > 4:
@@ -1276,14 +1241,36 @@ _BENCH_FALLBACK_COLORS = [
     "#332288", "#DDCC77", "#882255", "#44AA99", "#88CCEE", "#AA4499",
 ]
 
+_BENCH_EXPLICIT_COLORS = {
+    "Naive": "#8F8F8F",
+}
+
+
+def _bench_parent_model_name(model_name: str) -> str:
+    for suffix in (" (binary)", " (uncertainty-aware)"):
+        if model_name.endswith(suffix):
+            return model_name[: -len(suffix)]
+    return model_name
+
+
+def _bench_display_label(model_name: str) -> str:
+    return (
+        model_name
+        .replace(" (binary)", "\nBinary")
+        .replace(" (uncertainty-aware)", "\nUncertainty-aware")
+    )
+
 
 def _bench_color_map(model_names: Sequence[str]) -> Dict[str, str]:
     pal = _palette()
     cmap: Dict[str, str] = {}
     fb_idx = 0
     for m in model_names:
-        if m in pal:
-            cmap[m] = pal[m]
+        parent = _bench_parent_model_name(m)
+        if parent in _BENCH_EXPLICIT_COLORS:
+            cmap[m] = _BENCH_EXPLICIT_COLORS[parent]
+        elif parent in pal:
+            cmap[m] = pal[parent]
         else:
             cmap[m] = _BENCH_FALLBACK_COLORS[fb_idx % len(_BENCH_FALLBACK_COLORS)]
             fb_idx += 1
@@ -1558,7 +1545,7 @@ def benchmark_depth_lines(
                 continue
             color = cmap.get(model, "#BBBBBB")
             line, = ax.plot(msub["tfx_numeric"], msub[col], "o-",
-                            color=color, markersize=10, linewidth=1.4,
+                            color=color, markersize=16, linewidth=1.4,
                             markeredgecolor=_darken(color),
                             markeredgewidth=1.2)
             if idx == 0:
@@ -2533,17 +2520,8 @@ def roc_gene_calling(
         entry = roc_curves[model]
         fpr, tpr, auc_val = entry[0], entry[1], entry[2]
         n_tested = entry[3] if len(entry) > 3 else None
-
-        # CI-filtered lines inherit their parent model's color
-        is_ci = "CI-filtered" in model
-        if is_ci:
-            parent = model.replace(" (CI-filtered)", "")
-            color = cmap.get(parent, cmap.get(model, "#888888"))
-        else:
-            color = cmap.get(model, "#888888")
-
+        color = cmap.get(model, "#888888")
         lw = 2.5 if "Proteus" in model else 1.8
-        ls = "--" if is_ci else "-"
 
         # Legend label: AUC + n
         lbl = f"{model} (AUC={auc_val:.3f}"
@@ -2551,7 +2529,7 @@ def roc_gene_calling(
             lbl += f", n={n_tested:,}"
         lbl += ")"
 
-        ax.plot(fpr, tpr, color=color, lw=lw, ls=ls,
+        ax.plot(fpr, tpr, color=color, lw=lw,
                 label=lbl, zorder=2)
 
     ax.set_xlabel("False Positive Rate", fontsize=11)
@@ -2609,23 +2587,38 @@ def risk_coverage_plot(
 
     for model in ordered:
         d = coverage_data[model]
-        cov, ppv, fpr = d["coverage"], d["ppv"], d["fpr"]
+        cov = np.asarray(d["coverage"], dtype=np.float64)
+        ppv = np.asarray(d["ppv"], dtype=np.float64)
+        fpr = np.asarray(d["fpr"], dtype=np.float64)
+        order_idx = np.argsort(cov)
+        cov = cov[order_idx]
+        ppv = ppv[order_idx]
+        fpr = fpr[order_idx]
         color = cmap.get(model, "#888888")
         is_proteus = model in proteus_models
+        ppv_auc = d.get("ppv_auc", float("nan"))
+        fpr_auc = d.get("fpr_auc", float("nan"))
+
+        ppv_label = model
+        fpr_label = model
+        if is_proteus and np.isfinite(ppv_auc):
+            ppv_label = f"{model} (AUC={ppv_auc:.3f})"
+        if is_proteus and np.isfinite(fpr_auc):
+            fpr_label = f"{model} (AUC={fpr_auc:.3f})"
 
         if is_proteus and len(cov) > 1:
             lw = 2.5
-            ax_ppv.plot(cov, ppv, color=color, lw=lw, label=model, zorder=2)
-            ax_fpr.plot(cov, fpr, color=color, lw=lw, label=model, zorder=2)
+            ax_ppv.plot(cov, ppv, color=color, lw=lw, label=ppv_label, zorder=2)
+            ax_fpr.plot(cov, fpr, color=color, lw=lw, label=fpr_label, zorder=2)
         else:
             # Single-point comparator at 100% coverage
             ms = 10
             ax_ppv.scatter(cov, ppv, color=color, s=ms**2,
                            edgecolors="black", linewidths=0.5,
-                           marker="o", label=model, zorder=3)
+                           marker="o", label=ppv_label, zorder=3)
             ax_fpr.scatter(cov, fpr, color=color, s=ms**2,
                            edgecolors="black", linewidths=0.5,
-                           marker="o", label=model, zorder=3)
+                           marker="o", label=fpr_label, zorder=3)
 
     for ax, ylabel, ax_title in [
         (ax_ppv, "PPV (Precision)", f"{title} — PPV"),
@@ -2655,12 +2648,13 @@ def onoff_confusion_summary_plot(
     title: str = "On/Off Gene Calling — Confusion Summary",
     model_order: Sequence[str] = (),
 ) -> None:
-    """Render a comparison table of on/off/indeterminate confusion metrics.
+    """Render selective-prediction composition and quality metrics.
 
-    The figure has two parts stacked vertically:
+    The figure has two side-by-side panels:
 
-    1. **Stacked bar chart** — fraction ON / OFF / INDET per model.
-    2. **Metrics table** — Accuracy, PPV, NPV, FPR, Coverage for each model.
+    1. **Horizontal stacked bars** — confident ON / confident OFF /
+       withheld due to uncertainty.
+    2. **Dot plot** — PPV, NPV, FPR, and coverage for each model.
 
     Parameters
     ----------
@@ -2672,103 +2666,178 @@ def onoff_confusion_summary_plot(
     title : str
         Figure title.
     model_order : sequence[str]
-        Preferred left-to-right ordering.
+        Preferred ordering used only as a tie-break after quality sorting.
     """
     _ensure_dir(name)
-    cmap = _bench_color_map(model_order)
-
-    ordered = [m for m in model_order if m in confusion_data]
-    remaining = sorted(set(confusion_data) - set(ordered))
-    ordered.extend(remaining)
-
-    if not ordered:
-        return
-
-    # Collect data arrays
-    models = []
-    frac_on, frac_off, frac_indet = [], [], []
-    acc, ppv, npv, fpr_arr, cov = [], [], [], [], []
-
-    for m in ordered:
-        d = confusion_data[m]
-        n = d.get("n_total", 0)
-        if n == 0:
+    tie_break_order = {model: idx for idx, model in enumerate(model_order)}
+    rows: List[Dict[str, Any]] = []
+    for model_name, summary in confusion_data.items():
+        n_total = summary.get("n_total", 0)
+        if n_total == 0:
             continue
-        models.append(m)
-        frac_on.append(d.get("n_on", 0) / n)
-        frac_off.append(d.get("n_off", 0) / n)
-        frac_indet.append(d.get("n_indet", 0) / n)
-        acc.append(d.get("accuracy", float("nan")))
-        ppv.append(d.get("ppv", float("nan")))
-        npv.append(d.get("npv", float("nan")))
-        fpr_arr.append(d.get("fpr", float("nan")))
-        cov.append(d.get("coverage", float("nan")))
+        rows.append(
+            {
+                "model": model_name,
+                "display_label": _bench_display_label(model_name),
+                "frac_on": summary.get("n_on", 0) / n_total,
+                "frac_off": summary.get("n_off", 0) / n_total,
+                "frac_withheld": summary.get("n_indet", 0) / n_total,
+                "ppv": summary.get("ppv", float("nan")),
+                "npv": summary.get("npv", float("nan")),
+                "fpr": summary.get("fpr", float("nan")),
+                "coverage": summary.get("coverage", float("nan")),
+                "tie_break": tie_break_order.get(model_name, len(tie_break_order)),
+            }
+        )
 
-    if not models:
+    if not rows:
         return
 
-    n_models = len(models)
-    fig, (ax_bar, ax_tbl) = plt.subplots(
-        2, 1, figsize=(max(8, n_models * 1.2), 7),
-        gridspec_kw={"height_ratios": [3, 2]},
+    def _sort_value(value: Any, *, descending: bool) -> float:
+        if value is None or not np.isfinite(value):
+            return float("inf") if descending else float("inf")
+        return -float(value) if descending else float(value)
+
+    rows.sort(
+        key=lambda row: (
+            _sort_value(row["ppv"], descending=True),
+            _sort_value(row["coverage"], descending=True),
+            _sort_value(row["fpr"], descending=False),
+            row["tie_break"],
+        )
     )
 
-    # ── Stacked bar chart ──
-    x = np.arange(n_models)
-    bar_w = 0.6
-    colors_on = "#2ca02c"    # green
-    colors_off = "#1f77b4"   # blue
-    colors_ind = "#ff7f0e"   # orange
-
-    ax_bar.bar(x, frac_on, bar_w, label="ON (confident)", color=colors_on)
-    ax_bar.bar(x, frac_off, bar_w, bottom=frac_on, label="OFF (confident)",
-               color=colors_off)
-    bottoms = [a + b for a, b in zip(frac_on, frac_off)]
-    ax_bar.bar(x, frac_indet, bar_w, bottom=bottoms,
-               label="Indeterminate", color=colors_ind)
-
-    ax_bar.set_xticks(x)
-    ax_bar.set_xticklabels(models, rotation=30, ha="right", fontsize=9)
-    ax_bar.set_ylabel("Fraction of gene–sample pairs", fontsize=10)
-    ax_bar.set_ylim([0, 1.05])
-    ax_bar.legend(loc="upper right", fontsize=8, framealpha=0.9)
-    ax_bar.set_title(title, fontsize=11, fontweight="bold")
-
-    # ── Metrics table ──
-    ax_tbl.axis("off")
-    col_labels = ["Model", "Accuracy", "PPV", "NPV", "FPR", "Coverage"]
-    cell_text = []
-    for i, m in enumerate(models):
-        row = [
-            m,
-            f"{acc[i]:.3f}" if np.isfinite(acc[i]) else "—",
-            f"{ppv[i]:.3f}" if np.isfinite(ppv[i]) else "—",
-            f"{npv[i]:.3f}" if np.isfinite(npv[i]) else "—",
-            f"{fpr_arr[i]:.3f}" if np.isfinite(fpr_arr[i]) else "—",
-            f"{cov[i]:.1%}" if np.isfinite(cov[i]) else "—",
-        ]
-        cell_text.append(row)
-
-    table = ax_tbl.table(
-        cellText=cell_text, colLabels=col_labels,
-        loc="center", cellLoc="center",
+    n_models = len(rows)
+    fig, (ax_comp, ax_metrics) = plt.subplots(
+        1,
+        2,
+        figsize=(12.5, max(4.8, 0.7 * n_models + 2.2)),
+        sharey=True,
+        gridspec_kw={"width_ratios": [1.2, 1.0]},
     )
-    table.auto_set_font_size(False)
-    table.set_fontsize(9)
-    table.scale(1.0, 1.4)
 
-    # Style header row
-    for j in range(len(col_labels)):
-        table[0, j].set_facecolor("#d9d9d9")
-        table[0, j].set_text_props(fontweight="bold")
+    y = np.arange(n_models)
+    bar_height = 0.72
+    on_color = "#D17C16"
+    off_color = "#2C78B8"
+    withheld_color = "#D9D9D9"
+    withheld_edge = "#8E8E8E"
 
-    # Color model column cells
-    for i, m in enumerate(models):
-        c = cmap.get(m, "#ffffff")
-        table[i + 1, 0].set_facecolor(c + "40")  # 25% alpha hex
+    frac_on = np.array([row["frac_on"] for row in rows], dtype=np.float64)
+    frac_off = np.array([row["frac_off"] for row in rows], dtype=np.float64)
+    frac_withheld = np.array([row["frac_withheld"] for row in rows], dtype=np.float64)
 
-    fig.tight_layout()
+    ax_comp.barh(
+        y,
+        frac_on,
+        height=bar_height,
+        color=on_color,
+        edgecolor="white",
+        linewidth=0.8,
+        label="ON (confident)",
+    )
+    ax_comp.barh(
+        y,
+        frac_off,
+        left=frac_on,
+        height=bar_height,
+        color=off_color,
+        edgecolor="white",
+        linewidth=0.8,
+        label="OFF (confident)",
+    )
+    ax_comp.barh(
+        y,
+        frac_withheld,
+        left=frac_on + frac_off,
+        height=bar_height,
+        color=withheld_color,
+        edgecolor=withheld_edge,
+        linewidth=0.8,
+        hatch="///",
+        label="Withheld due to uncertainty",
+    )
+
+    def _segment_label(
+        ax: plt.Axes,
+        x_left: float,
+        width: float,
+        y_pos: float,
+        label: str,
+        color: str,
+    ) -> None:
+        if width < 0.09:
+            return
+        text = ax.text(
+            x_left + width / 2.0,
+            y_pos,
+            label,
+            ha="center",
+            va="center",
+            fontsize=8,
+            color=color,
+            fontweight="bold",
+            linespacing=0.95,
+        )
+        if color == "white":
+            text.set_path_effects([PathEffects.withStroke(linewidth=1.5, foreground="black", alpha=0.25)])
+
+    for idx, row in enumerate(rows):
+        _segment_label(ax_comp, 0.0, row["frac_on"], idx, f"ON\n{row['frac_on']:.0%}", "white")
+        _segment_label(ax_comp, row["frac_on"], row["frac_off"], idx, f"OFF\n{row['frac_off']:.0%}", "white")
+        _segment_label(
+            ax_comp,
+            row["frac_on"] + row["frac_off"],
+            row["frac_withheld"],
+            idx,
+            f"Withheld\n{row['frac_withheld']:.0%}",
+            "#4F4F4F",
+        )
+
+    ax_comp.set_yticks(y)
+    ax_comp.set_yticklabels([row["display_label"] for row in rows], fontsize=10)
+    ax_comp.invert_yaxis()
+    ax_comp.set_xlim(0.0, 1.0)
+    ax_comp.set_xlabel("Fraction of gene-sample pairs", fontsize=11)
+    ax_comp.set_title(
+        "Selective prediction composition\nCalls withheld due to uncertainty shown as neutral mass",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax_comp.grid(True, axis="x", alpha=0.2)
+    ax_comp.legend(loc="lower right", fontsize=8, framealpha=0.9)
+
+    metric_specs = [
+        ("PPV", "ppv", "#1B9E77", "o"),
+        ("NPV", "npv", "#7570B3", "s"),
+        ("FPR", "fpr", "#D95F02", "D"),
+        ("Coverage", "coverage", "#4C78A8", "^"),
+    ]
+    offsets = np.linspace(-0.24, 0.24, len(metric_specs))
+    for offset, (metric_label, metric_key, color, marker) in zip(offsets, metric_specs):
+        metric_vals = np.array([row[metric_key] for row in rows], dtype=np.float64)
+        valid = np.isfinite(metric_vals)
+        ax_metrics.scatter(
+            metric_vals[valid],
+            y[valid] + offset,
+            s=58,
+            color=color,
+            marker=marker,
+            edgecolors="black",
+            linewidths=0.45,
+            label=metric_label,
+            zorder=3,
+        )
+
+    ax_metrics.set_xlim(0.0, 1.0)
+    ax_metrics.set_xlabel("Metric value", fontsize=11)
+    ax_metrics.set_title("Decision quality metrics", fontsize=11, fontweight="bold")
+    ax_metrics.grid(True, axis="x", alpha=0.2)
+    ax_metrics.tick_params(axis="y", left=False, labelleft=False)
+    ax_metrics.legend(loc="lower right", fontsize=8, framealpha=0.9)
+
+    fig.suptitle(title, fontsize=13, fontweight="bold", y=0.99)
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.96])
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
-    plt.close(fig)
     plt.close(fig)
 

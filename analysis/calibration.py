@@ -60,6 +60,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -110,22 +111,45 @@ def compute_gene_regimes(
     gene_var = truth_wide.var(axis=1, ddof=1)
     gene_zero_rate = (truth_wide == 0.0).mean(axis=1)
 
-    var_q = pd.qcut(gene_var.rank(method="first"), n_var_bins,
-                     labels=range(n_var_bins)).astype(int)
-    zero_q = pd.qcut(gene_zero_rate.rank(method="first"), n_zero_bins,
-                      labels=range(n_zero_bins)).astype(int)
+    valid_mask = gene_var.notna() & np.isfinite(gene_var) & gene_zero_rate.notna() & np.isfinite(gene_zero_rate)
+    if not bool(valid_mask.any()):
+        raise ValueError(
+            "compute_gene_regimes: no genes have finite variance and zero-rate on the development set"
+        )
+
+    gene_var = gene_var.loc[valid_mask]
+    gene_zero_rate = gene_zero_rate.loc[valid_mask]
+    n_valid_genes = len(gene_var)
+    var_bins = min(n_var_bins, n_valid_genes)
+    zero_bins = min(n_zero_bins, n_valid_genes)
+
+    var_q = pd.qcut(gene_var.rank(method="first"), var_bins,
+                    labels=range(var_bins)).astype(int)
+    zero_q = pd.qcut(gene_zero_rate.rank(method="first"), zero_bins,
+                     labels=range(zero_bins)).astype(int)
 
     regime_df = pd.DataFrame({
         "variance": gene_var,
         "zero_rate": gene_zero_rate,
         "var_q": var_q,
         "zero_q": zero_q,
-    }, index=truth_wide.index)
+    }, index=gene_var.index)
     regime_df["regime"] = (
         "(" + regime_df["var_q"].astype(str) + ", "
         + regime_df["zero_q"].astype(str) + ")"
     )
     return regime_df
+
+
+def _intersect_regime_genes(
+    genes: pd.Index,
+    regime_index: pd.Index,
+    *,
+    context: str,
+) -> pd.Index:
+    """Return genes covered by the regime table."""
+    common_genes = genes.intersection(regime_index)
+    return common_genes
 
 
 # ── Normalized CQR Scores ────────────────────────────────────────────────
@@ -186,10 +210,11 @@ def compute_regime_qhats(
     Dict mapping regime label → q̂ (float).  Regimes with fewer than 10
     valid observations get q̂ = 0.0 (no correction).
     """
-    common_genes = (truth_wide.index
-                    .intersection(ci_lo_wide.index)
-                    .intersection(ci_hi_wide.index)
-                    .intersection(regime_df.index))
+    common_genes = _intersect_regime_genes(
+        truth_wide.index.intersection(ci_lo_wide.index).intersection(ci_hi_wide.index),
+        regime_df.index,
+        context="compute_regime_qhats",
+    )
     common_samples = (truth_wide.columns
                       .intersection(ci_lo_wide.columns)
                       .intersection(ci_hi_wide.columns))
@@ -246,7 +271,11 @@ def calibrate_intervals(
     -------
     (calibrated_lo, calibrated_hi) — same shape as inputs.
     """
-    common_genes = ci_lo_wide.index.intersection(regime_df.index)
+    common_genes = _intersect_regime_genes(
+        ci_lo_wide.index.intersection(ci_hi_wide.index),
+        regime_df.index,
+        context="calibrate_intervals",
+    )
     lo = ci_lo_wide.loc[common_genes]
     hi = ci_hi_wide.loc[common_genes]
 
@@ -343,8 +372,13 @@ def evaluate_calibration(
     cal_lo, cal_hi = calibrate_intervals(ci_lo_wide, ci_hi_wide, regime_df, q_hats)
 
     # Align everything
-    common_genes = (truth_wide.index.intersection(pred_wide.index)
-                    .intersection(cal_lo.index).intersection(cal_hi.index))
+    common_genes = _intersect_regime_genes(
+        truth_wide.index.intersection(pred_wide.index)
+        .intersection(cal_lo.index)
+        .intersection(cal_hi.index),
+        regime_df.index,
+        context="evaluate_calibration",
+    )
     common_samples = (truth_wide.columns.intersection(pred_wide.columns)
                       .intersection(cal_lo.columns).intersection(cal_hi.columns))
 
