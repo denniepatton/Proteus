@@ -90,7 +90,7 @@ VALIDATION_PDX_COHORTS: List[str] = ["PC-PDX", "SCLC-PDX"]
 VALIDATION_PATIENT_HOLDOUT_PATH_TEMPLATE: str = (
     "results_holdout/BioDVN/{cohort}/predictions_tumor.tsv"
 )
-VALIDATION_PATIENT_CV_RESULTS_DIR: str = "results_training/proteus_base-model_cv"
+VALIDATION_PATIENT_CV_RESULTS_DIR: str = "results_training/proteus_plca-model_cv"
 VALIDATION_PDX_CV_RESULTS_DIR: str = "results_training/proteus_base-model_cv"
 
 

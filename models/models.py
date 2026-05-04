@@ -7,7 +7,7 @@ Model inputs (per-gene):
     - TSS nucleotides (one-hot)
     - Scalar feature blocks (11 shared Triton features per region)
     - Reference scalars
-    - Tumor fraction (TFX) — training label only
+                - Tumor fraction (TFX) — training label only
 
 Labels:
     - tumor/background expression (regression)
@@ -24,9 +24,8 @@ from .model_utils import (
     Sampling, MergeLatents, TrainingChoice,
     InternalLossComputer,
     MixtureDensityHead, mixture_mean,
-    TFXDiscriminator,
+    TFXPredictor,
     get_norm_layer, get_norm_layer_conv1d, get_norm_layer_2d,
-    Y_MAX, K_GAMMA,
 )
 
 
@@ -111,37 +110,40 @@ class BioDVNConfig:
     """Configuration for BioDVN model architecture and training."""
     # Architecture hyperparameters
     channel_mode: str = 'all'  # 'all', 'no_seq', or 'only_seq'
-    signal_filters: int = 16
+    signal_filters: int = 8
     signal_ksize: int = 6
     interaction_ksize: int = 3
-    initial_reduction_channels: int = 64
+    initial_reduction_channels: int = 32
     n_reductions: int = 3
+    funnel_reduction_factor: int = 4
     reduction_dilation: int = 3
-    encoder_start: int = 128
-    latent_size: int = 64
+    encoder_start: int = 256
+    latent_size: int = 128
     decoder_start: int = 64
-    dropout_rate: float = 0.20
+    dropout_rate: float = 0.25
     
     # MDN output head hyperparameters
     mdn_hidden: int = 64       # Hidden dim inside MixtureDensityHead
-    mdn_final: int = 32        # Final hidden dim before 6-output projection
+    mdn_final: int = 16        # Final hidden dim before 6-output projection
     
     # Loss function hyperparameters
-    beta_tcvae: float = 2.0    # β-TCVAE TC weight: loss = KL + (beta_tcvae − 1) × TC
+    beta_kl: float = 1.0
     beta_contrastive: float = 1.0
-    beta_reconstruction: float = 0.50
-    beta_background: float = 2.0
-    internal_weight: float = 1.0
+    beta_reconstruction: float = 1.25
+    beta_background: float = 1.0
+    internal_weight: float = 0.5
     cl_margin: float = 1.0
-    beta_grl: float = 0.15
-    beta_point_mse: float = 0.30  # Auxiliary MSE on mixture_mean; 0 = off
+    beta_tfx: float = 2.0
+    beta_ccc: float = 1.0
+    beta_pht_consistency: float = 0.0
+    beta_pht_uncertainty: float = 1.5
     
     # Training hyperparameters
-    weight_decay: float = 1e-5
-    max_lr: float = 0.0015  # Peak learning rate
+    weight_decay: float = 2e-8
+    max_lr: float = 4e-4  # Peak learning rate
 
     # Gradient clipping
-    max_grad_norm: float = 18.0
+    max_grad_norm: float = 10.0
 
 
 class SignalProcessingBlock(nn.Module):
@@ -160,7 +162,7 @@ class SignalProcessingBlock(nn.Module):
         self,
         channel_mode: str = 'all',
         n_signal_channels: int = 9,
-        signal_filters: int = 16,
+        signal_filters: int = 8,
         signal_ksize: int = 6,
     ):
         super().__init__()
@@ -254,7 +256,7 @@ class ReductionBlock(nn.Module):
     def __init__(
         self,
         in_channels: int,
-        initial_reduction_channels: int = 64,
+        initial_reduction_channels: int = 32,
         n_reductions: int = 3,
         interaction_ksize: int = 3,
         dilation: int = 1,
@@ -333,45 +335,76 @@ class ReductionBlock(nn.Module):
         return x
 
 
-class SpatialSignalEncoder(nn.Module):
-    """Compact position-aware encoder over the reduced TSS representation.
+class ReducedSequenceSignalEncoder(nn.Module):
+    """Flatten the reduced promoter map through a configurable dense funnel.
 
-    The old encoder globally averaged the reduced spatial axis, making the
-    final signal summary translation-invariant over the whole 2 kb window.
-    This encoder keeps a small number of ordered spatial bins, then learns a
-    compact projection from those coarse positional summaries.
+    The reduction block preserves the full reduced promoter axis. This module
+    flattens that reduced map, compresses it through a staged dense funnel,
+    and emits the fixed 64-d signal summary used by the dual encoders.
+
+    Each funnel starts with a 1024-d hidden layer. ``funnel_reduction_factor=4``
+    yields ``1024 -> 256 -> 64``, while ``funnel_reduction_factor=2`` yields
+    ``1024 -> 512 -> 256 -> 128 -> 64``.
     """
 
     def __init__(
         self,
         input_channels: int,
+        input_length: int,
         output_dim: int = 64,
-        spatial_bins: int = 16,
-        dropout_rate: float = 0.0,
+        dropout_rate: float = 0.25,
+        funnel_reduction_factor: int = 4,
     ):
         super().__init__()
-        if spatial_bins <= 0:
-            raise ValueError(f'spatial_bins must be > 0, got {spatial_bins}')
-        self.spatial_bins = int(spatial_bins)
-        self.output_dim = int(output_dim)
-        hidden_dim = max(self.output_dim * 2, int(input_channels) * 4)
+        if input_channels <= 0:
+            raise ValueError(f'input_channels must be > 0, got {input_channels}')
+        if input_length <= 0:
+            raise ValueError(f'input_length must be > 0, got {input_length}')
+        if funnel_reduction_factor not in (2, 4):
+            raise ValueError(
+                'funnel_reduction_factor must be 2 or 4, '
+                f'got {funnel_reduction_factor}'
+            )
 
-        self.spatial_pool = nn.AdaptiveAvgPool1d(self.spatial_bins)
-        self.projection = nn.Sequential(
-            nn.Flatten(1),
-            nn.Linear(int(input_channels) * self.spatial_bins, hidden_dim),
-            get_norm_layer(hidden_dim),
+        self.input_channels = int(input_channels)
+        self.input_length = int(input_length)
+        self.output_dim = int(output_dim)
+        self.funnel_reduction_factor = int(funnel_reduction_factor)
+        self.flattened_dim = self.input_length * self.input_channels
+        self.funnel_start_dim = 1024
+
+        readout_layers: List[nn.Module] = [
+            nn.Linear(self.flattened_dim, self.funnel_start_dim),
+            get_norm_layer(self.funnel_start_dim),
             nn.ReLU(),
             nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, self.output_dim),
-            get_norm_layer(self.output_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-        )
+        ]
+
+        current_dim = self.funnel_start_dim
+        while current_dim // self.funnel_reduction_factor > self.output_dim:
+            next_dim = current_dim // self.funnel_reduction_factor
+            readout_layers.extend([
+                nn.Linear(current_dim, next_dim),
+                get_norm_layer(next_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate),
+            ])
+            current_dim = next_dim
+
+        readout_layers.append(nn.Linear(current_dim, self.output_dim))
+        self.readout = nn.Sequential(*readout_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.spatial_pool(x)
-        return self.projection(x)
+        if x.ndim != 3:
+            raise ValueError(f'Expected x to have shape (batch, length, channels), got {tuple(x.shape)}')
+        if int(x.shape[1]) != self.input_length or int(x.shape[2]) != self.input_channels:
+            raise ValueError(
+                'ReducedSequenceSignalEncoder received '
+                f'length/channels {(int(x.shape[1]), int(x.shape[2]))}, '
+                f'expected {(self.input_length, self.input_channels)}'
+            )
+
+        return self.readout(torch.flatten(x, start_dim=1))
 
 
 class Encoder(nn.Module):
@@ -381,8 +414,8 @@ class Encoder(nn.Module):
         self,
         input_dim: int,
         latent_dim: int,
-        start_dim: int = 128,
-        dropout_rate: float = 0.15,
+        start_dim: int = 256,
+        dropout_rate: float = 0.25,
     ):
         super().__init__()
         
@@ -451,7 +484,7 @@ class Decoder(nn.Module):
         input_dim: int,
         output_dim: int,
         start_dim: int,
-        dropout_rate: float = 0.0,
+        dropout_rate: float = 0.25,
         final_activation: Optional[nn.Module] = None,
     ):
         super().__init__()
@@ -513,9 +546,9 @@ class BioDVN(nn.Module):
     Architecture:
     1. Signal Processing Block: Conv1D per fragmentomic channel + Conv2D for nucleotides
     2. Reduction Block: Conv2D cross-channel interaction with residual skips + AvgPool
-    3. Signal Encoding: Adaptive coarse spatial binning + compact MLP projection
+    3. Signal Encoding: Full reduced-sequence funnel to 64 dims
     4. Dual Encoder Block: Parallel VAE encoders for tumor and background
-    5. Latent Merging: Learned TFx-conditional combination of latent spaces
+    5. Latent Merging: Learned internally predicted TFx-conditional combination of latent spaces
     6. Reconstruction: Decoder for scalar reconstruction (internal loss)
     7. Prediction Block: MDN mixture-density regression heads
     
@@ -554,31 +587,47 @@ class BioDVN(nn.Module):
             dilation=config.reduction_dilation,
         )
         
-        # Signal encoding: preserve coarse spatial structure after reduction.
-        # We adaptively pool the reduced representation into a small number of
-        # ordered bins, then project those bin summaries with a compact MLP.
-        # This keeps position information at a coarse scale without reviving
-        # the very large flattened encoder used historically.
-        self._tss_input_length = 2000
-        self.signal_encoded_dim = 64  # Signal encoder output dim
-        self.signal_spatial_bins = 16
-        reduction_out_channels = self.reduction.out_channels
-        self.signal_encoder = SpatialSignalEncoder(
-            input_channels=reduction_out_channels,
-            output_dim=self.signal_encoded_dim,
-            spatial_bins=self.signal_spatial_bins,
-            dropout_rate=config.dropout_rate,
-        )
         self.scalar_input_dim = 0
 
-        # only_seq excludes sample-derived scalar features (TSS/GB)
-        # to ensure a true sequence-only ablation.
+        # only_seq excludes all scalar covariates so the ablation is a true
+        # sequence-only path.
         if config.channel_mode != 'only_seq':
             self.scalar_input_dim += 11  # TSS scalar features
             self.scalar_input_dim += 11  # GB features
+            self.scalar_input_dim += 3   # Reference scalars
 
-        # Reference scalars always included.
-        self.scalar_input_dim += 3
+        # Signal encoding keeps the full reduced sequence and flattens it
+        # through a configurable dense funnel to a 64-d summary.
+        self._tss_input_length = 2000
+        self.signal_encoded_dim = 64
+        reduction_input_length = self._tss_input_length - int(config.signal_ksize) + 1
+        if reduction_input_length <= 0:
+            raise ValueError(
+                f'signal_ksize={int(config.signal_ksize)} is too large for '
+                f'TSS length {self._tss_input_length}'
+            )
+        reduction_out_channels = self.reduction.out_channels
+        reduction_output_length = self._compute_reduction_output_length(
+            reduction_input_length,
+            interaction_ksize=config.interaction_ksize,
+            dilation=config.reduction_dilation,
+            n_reductions=config.n_reductions,
+        )
+        if reduction_output_length <= 0:
+            raise ValueError(
+                'Reduction configuration collapses the TSS sequence: '
+                f'input_length={reduction_input_length}, '
+                f'interaction_ksize={int(config.interaction_ksize)}, '
+                f'dilation={int(config.reduction_dilation)}, '
+                f'n_reductions={int(config.n_reductions)}'
+            )
+        self.signal_encoder = ReducedSequenceSignalEncoder(
+            input_channels=reduction_out_channels,
+            input_length=reduction_output_length,
+            output_dim=self.signal_encoded_dim,
+            dropout_rate=config.dropout_rate,
+            funnel_reduction_factor=config.funnel_reduction_factor,
+        )
 
         self.encoder_input_dim = int(self.signal_encoded_dim + self.scalar_input_dim)
         
@@ -601,13 +650,7 @@ class BioDVN(nn.Module):
         self.merge_latents = MergeLatents()
         self.training_choice = TrainingChoice()
         
-        # TFX discriminator with gradient reversal for TFX-invariant latents.
-        # The discriminator predicts TFX from the latents; the predicted TFX
-        # feeds the merge weight predictor.  The gradient reversal layer
-        # pushes the encoders toward TFX-invariant representations.
-        self.tfx_discriminator = TFXDiscriminator(
-            latent_size=config.latent_size, lam=1.0,
-        )
+        self.tfx_predictor = TFXPredictor(latent_size=config.latent_size)
 
         # Weight prediction for merging: TFX (predicted or raw) + latent stats.
         # Small nonlinear MLP gives capacity to learn non-trivial
@@ -648,9 +691,9 @@ class BioDVN(nn.Module):
         # Internal loss computer
         self.internal_loss_fn = InternalLossComputer(
             beta_contrastive=config.beta_contrastive,
-            beta_tcvae=config.beta_tcvae,
+            beta_kl=config.beta_kl,
             beta_reconstruction=config.beta_reconstruction,
-            beta_grl=config.beta_grl,
+            beta_tfx=config.beta_tfx,
             cl_margin=config.cl_margin,
             internal_weight=config.internal_weight,
         )
@@ -712,8 +755,8 @@ class BioDVN(nn.Module):
                 - ref_scalars: (batch, 3) reference gene info
             return_internal_loss: Whether to compute and return internal loss
             tfx: (batch, 1) ground-truth tumor fraction.  Required during
-                training for the GRL discriminator loss; ignored at inference
-                (the discriminator predicts TFX from the latents).
+                training for auxiliary TFx supervision; ignored at inference
+                because TFx is predicted internally from the latents.
             
         Returns:
             predictions: Dictionary with keys:
@@ -739,57 +782,51 @@ class BioDVN(nn.Module):
         if self.config.channel_mode in ('all', 'only_seq'):
             x_nucleotides = features['TSS_nucleotides']
 
-        ref_scalars = features['ref_scalars']
-        
         # Signal processing
         x = self.signal_processor(x_signals, x_nucleotides)
         
         # Spatial reduction (skip connections integrate multi-scale features)
         x = self.reduction(x)
         
-        # Signal encoding: permute to (batch, channels, length), keep a small
-        # number of ordered spatial bins, then project to the fixed-width
-        # signal summary used by the downstream encoders.
-        x = x.permute(0, 2, 1)
+        scalar_inputs: List[torch.Tensor] = []
+        if self.config.channel_mode != 'only_seq':
+            scalar_inputs.append(features['TSS_features'][:, :11])
+            scalar_inputs.append(features['GB_features'])
+            scalar_inputs.append(features['ref_scalars'])
+
+        # Signal encoding operates directly on the reduced (length, channel)
+        # map so the full promoter axis is preserved through the dense funnel.
         x_encoded = self.signal_encoder(x)
         
         # Combine with scalar features.
-        # TFX is never included — the encoder learns TFX-invariant
-        # representations.  TFX enters only through the merge weight
-        # predictor (via GRL discriminator prediction).
+        # TFX is never included as an input.  A supervised internal TFx
+        # prediction conditions the merge weights during training/inference.
         encoder_inputs: List[torch.Tensor] = [x_encoded]
-        if self.config.channel_mode != 'only_seq':
-            # Defensive slice: clip TSS features to 11 to guard against
-            # any older stores with extra columns.
-            encoder_inputs.append(features['TSS_features'][:, :11])
-            encoder_inputs.append(features['GB_features'])
-        encoder_inputs.append(ref_scalars)
-        y = torch.cat(encoder_inputs, dim=1)
+        if scalar_inputs:
+            encoder_inputs.extend(scalar_inputs)
+        y = torch.cat(encoder_inputs, dim=1) if len(encoder_inputs) > 1 else encoder_inputs[0]
         
         # Dual encoding
         z_tumor_mean, z_tumor_log_var = self.tumor_encoder(y)
         z_background_mean, z_background_log_var = self.background_encoder(y)
         
-        # Sampling
-        z_tumor = self.sampling(z_tumor_mean, z_tumor_log_var)
-        z_background = self.sampling(z_background_mean, z_background_log_var)
+        # Training uses sampled latents; inference uses the means so
+        # repeated forward passes are deterministic.
+        z_tumor_sample = self.sampling(z_tumor_mean, z_tumor_log_var)
+        z_background_sample = self.sampling(z_background_mean, z_background_log_var)
+        z_tumor = self.training_choice(z_tumor_sample, z_tumor_mean)
+        z_background = self.training_choice(z_background_sample, z_background_mean)
         
-        # Latent merging for reconstruction.
-        # The TFX discriminator predicts TFX from the latent means (with
-        # gradient reversal pushing encoders toward TFX-invariant
-        # representations).  The predicted TFX conditions the merge weights.
-        predicted_tfx = self.tfx_discriminator(z_tumor_mean, z_background_mean)
+        predicted_tfx = self.tfx_predictor(z_tumor_mean, z_background_mean)
 
-        # Discriminator loss: MSE between predicted and actual TFX.
-        # Only computed during training (requires the ground-truth label).
-        grl_loss = None
+        tfx_loss = None
         if self.training:
             if tfx is None:
                 raise ValueError(
                     "tfx (ground-truth tumor fraction) must be provided "
-                    "during training for the GRL discriminator loss."
+                    "during training for auxiliary TFx supervision."
                 )
-            grl_loss = F.mse_loss(predicted_tfx.float(), tfx.float())
+            tfx_loss = F.mse_loss(predicted_tfx.float(), tfx.float())
 
         tfx_for_merge = predicted_tfx
 
@@ -802,13 +839,14 @@ class BioDVN(nn.Module):
         z_merged_mean, z_merged_log_var = self.merge_latents(
             weights, z_tumor_mean, z_tumor_log_var, z_background_mean, z_background_log_var
         )
-        z_merged = self.sampling(z_merged_mean, z_merged_log_var)
+        z_merged_sample = self.sampling(z_merged_mean, z_merged_log_var)
+        z_merged = self.training_choice(z_merged_sample, z_merged_mean)
         
         # Reconstruction
         y_reconstructed = self.decoder(z_merged)
         
-        # MDN output heads: feed the reparameterized latent sample —
-        # the same representation the decoder path receives.
+        # MDN output heads follow the same training/inference choice as the
+        # decoder path: samples during training, means during inference.
         tumor_mdn = self.tumor_mdn_head(z_tumor)
         background_mdn = self.background_mdn_head(z_background)
         
@@ -821,6 +859,7 @@ class BioDVN(nn.Module):
             'background_mdn': background_mdn,
             'tumor_exp': tumor_exp,
             'background_exp': background_exp,
+            'predicted_tfx': predicted_tfx,
         }
         
         # Internal loss
@@ -830,135 +869,8 @@ class BioDVN(nn.Module):
                 z_tumor_mean, z_tumor_log_var,
                 z_background_mean, z_background_log_var,
                 y, y_reconstructed,
-                grl_loss=grl_loss,
+                tfx_loss=tfx_loss,
             )
             return predictions, (internal_loss, internal_metrics)
         
         return predictions, None
-
-    def freeze_signal_processing(self):
-        """Freeze signal processing layers for transfer learning."""
-        for param in self.signal_processor.parameters():
-            param.requires_grad = False
-        for param in self.reduction.parameters():
-            param.requires_grad = False
-        for param in self.signal_encoder.parameters():
-            param.requires_grad = False
-    
-    def freeze_encoders(self):
-        """Freeze encoder layers for transfer learning."""
-        self.freeze_signal_processing()
-        for param in self.tumor_encoder.parameters():
-            param.requires_grad = False
-        for param in self.background_encoder.parameters():
-            param.requires_grad = False
-    
-    def get_freeze_level_params(self, level: str) -> List[str]:
-        """
-        Get parameter names for different freeze levels.
-        
-        Levels:
-        - 'Medium-Heavy': Signal processing + first encoding layer
-        - 'Heavy': Complete signal processing
-        - 'Extra-Heavy': Signal processing + first encoder layer
-        - 'Extreme': Everything through encoders
-        """
-        frozen = []
-        
-        if level in ['Medium-Heavy', 'Heavy', 'Extra-Heavy', 'Extreme']:
-            frozen.extend([n for n, _ in self.signal_processor.named_parameters()])
-            frozen.extend([n for n, _ in self.reduction.named_parameters()])
-        
-        if level in ['Heavy', 'Extra-Heavy', 'Extreme']:
-            frozen.extend([n for n, _ in self.signal_encoder.named_parameters()])
-        
-        if level in ['Extra-Heavy', 'Extreme']:
-            # First layers of encoders
-            for name, _ in self.tumor_encoder.named_parameters():
-                if 'layers.0' in name or 'layers.1' in name or 'layers.2' in name or 'layers.3' in name:
-                    frozen.append(f'tumor_encoder.{name}')
-            for name, _ in self.background_encoder.named_parameters():
-                if 'layers.0' in name or 'layers.1' in name or 'layers.2' in name or 'layers.3' in name:
-                    frozen.append(f'background_encoder.{name}')
-        
-        if level == 'Extreme':
-            frozen.extend([f'tumor_encoder.{n}' for n, _ in self.tumor_encoder.named_parameters()])
-            frozen.extend([f'background_encoder.{n}' for n, _ in self.background_encoder.named_parameters()])
-        
-        return frozen
-
-    # ------------------------------------------------------------------
-    # Freeze mode dispatch (fine-tuning)
-    # ------------------------------------------------------------------
-
-    _FREEZE_MODES = (
-        'full_unfreeze',
-        'backbone_only',
-        'backbone_plus_encoders',
-        'decoder_plus_heads',
-        'heads_only',
-    )
-
-    def apply_freeze_mode(self, mode: str) -> None:
-        """Apply a named freeze configuration for fine-tuning.
-
-        Normalization layers (GroupNorm, LayerNorm) keep their affine
-        parameters trainable in all modes so that running statistics can
-        adapt to the new data distribution (norm adaptation).
-
-        Modes (from least to most constrained):
-            full_unfreeze          All parameters trainable.
-            backbone_only          Freeze signal_processor + reduction +
-                                   signal_encoder.
-            backbone_plus_encoders Freeze backbone + both VAE encoders.
-            decoder_plus_heads     Freeze everything except decoder +
-                                   MDN heads.
-            heads_only             Only MDN output heads are trainable.
-        """
-        if mode not in self._FREEZE_MODES:
-            raise ValueError(
-                f"Unknown freeze_mode '{mode}'. "
-                f"Valid modes: {self._FREEZE_MODES}"
-            )
-
-        if mode == 'full_unfreeze':
-            return  # Nothing to freeze
-
-        # Define which top-level modules to freeze for each mode.
-        backbone_modules = [self.signal_processor, self.reduction,
-                            self.signal_encoder]
-        encoder_modules = [self.tumor_encoder, self.background_encoder]
-        latent_modules = [self.tfx_discriminator, self.weight_predictor,
-                          self.merge_latents]
-        decoder_modules = [self.decoder]
-        head_modules = [self.tumor_mdn_head, self.background_mdn_head]
-
-        freeze_map = {
-            'backbone_only': backbone_modules,
-            'backbone_plus_encoders': backbone_modules + encoder_modules,
-            'decoder_plus_heads': (backbone_modules + encoder_modules
-                                   + latent_modules),
-            'heads_only': (backbone_modules + encoder_modules
-                           + latent_modules + decoder_modules),
-        }
-
-        modules_to_freeze = freeze_map[mode]
-        norm_types = (nn.GroupNorm, nn.LayerNorm, nn.BatchNorm1d,
-                      nn.BatchNorm2d)
-
-        for mod in modules_to_freeze:
-            for name, param in mod.named_parameters():
-                # Keep normalization affine params trainable for distribution
-                # adaptation, freeze everything else.
-                is_norm = False
-                for sub_name, sub_mod in mod.named_modules():
-                    if isinstance(sub_mod, norm_types):
-                        for pname, _ in sub_mod.named_parameters():
-                            full = f"{sub_name}.{pname}" if sub_name else pname
-                            if name == full:
-                                is_norm = True
-                                break
-                    if is_norm:
-                        break
-                if not is_norm:
-                    param.requires_grad = False

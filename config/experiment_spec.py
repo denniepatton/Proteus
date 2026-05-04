@@ -145,11 +145,13 @@ class StructuralSpec:
     Covers architecture choices, loss-function weights, and contrastive margin.
     """
     beta_background: ParamSpec
-    beta_tcvae: ParamSpec
+    beta_kl: ParamSpec
     beta_contrastive: ParamSpec
     beta_reconstruction: ParamSpec
-    beta_grl: ParamSpec
-    beta_point_mse: ParamSpec
+    beta_tfx: ParamSpec
+    beta_ccc: ParamSpec
+    beta_pht_consistency: ParamSpec
+    beta_pht_uncertainty: ParamSpec
     cl_margin: ParamSpec
     internal_weight: ParamSpec
 
@@ -157,9 +159,10 @@ class StructuralSpec:
     def from_yaml(x: Any) -> "StructuralSpec":
         d = _expect_dict(x, "structural")
         allowed = [
-            "beta_background", "beta_tcvae", "beta_contrastive",
-            "beta_reconstruction", "beta_grl", "beta_point_mse",
-            "cl_margin", "internal_weight",
+            "beta_background", "beta_kl", "beta_contrastive",
+            "beta_reconstruction", "beta_tfx", "beta_ccc",
+            "beta_pht_consistency", "beta_pht_uncertainty", "cl_margin",
+            "internal_weight",
         ]
         _check_no_unknown_keys(d, allowed=allowed, ctx="structural")
 
@@ -168,11 +171,13 @@ class StructuralSpec:
 
         return StructuralSpec(
             beta_background=p("beta_background", 2.0),
-            beta_tcvae=p("beta_tcvae", 2.0),
+            beta_kl=p("beta_kl", 1.0),
             beta_contrastive=p("beta_contrastive", 1.0),
             beta_reconstruction=p("beta_reconstruction", 0.50),
-            beta_grl=p("beta_grl", 0.15),
-            beta_point_mse=p("beta_point_mse", 0.30),
+            beta_tfx=p("beta_tfx", 0.20),
+            beta_ccc=p("beta_ccc", 0.25),
+            beta_pht_consistency=p("beta_pht_consistency", 0.10),
+            beta_pht_uncertainty=p("beta_pht_uncertainty", 0.05),
             cl_margin=p("cl_margin", 1.0),
             internal_weight=p("internal_weight", 1.0),
         )
@@ -202,6 +207,7 @@ class TrainingSpec:
     patience: ParamSpec
     use_amp: ParamSpec
     ema_decay: ParamSpec
+    grad_accum_steps: ParamSpec
 
     @staticmethod
     def from_yaml(x: Any) -> "TrainingSpec":
@@ -211,7 +217,7 @@ class TrainingSpec:
             "weight_decay", "max_grad_norm",
             "warmup_frac", "schedule_frac",
             "epochs", "patience", "use_amp",
-            "ema_decay",
+            "ema_decay", "grad_accum_steps",
         ]
         _check_no_unknown_keys(d, allowed=allowed, ctx="training")
 
@@ -230,6 +236,7 @@ class TrainingSpec:
             patience=p("patience", 3),
             use_amp=p("use_amp", True),
             ema_decay=p("ema_decay", 0.0),
+            grad_accum_steps=p("grad_accum_steps", 4),
         )
 
 
@@ -254,6 +261,7 @@ class ScaleSpec:
     interaction_ksize: ParamSpec
     initial_reduction_channels: ParamSpec
     n_reductions: ParamSpec
+    funnel_reduction_factor: ParamSpec
     reduction_dilation: ParamSpec
     dropout_rate: ParamSpec
 
@@ -266,6 +274,7 @@ class ScaleSpec:
             "signal_filters",
             "signal_ksize", "interaction_ksize",
             "initial_reduction_channels", "n_reductions",
+            "funnel_reduction_factor",
             "reduction_dilation",
             "dropout_rate",
             "signal_encoder_width",  # Legacy key; ignored by the current compact spatial encoder
@@ -286,6 +295,7 @@ class ScaleSpec:
             interaction_ksize=p("interaction_ksize", 3),
             initial_reduction_channels=p("initial_reduction_channels", 64),
             n_reductions=p("n_reductions", 3),
+            funnel_reduction_factor=p("funnel_reduction_factor", 4),
             reduction_dilation=p("reduction_dilation", 3),
             dropout_rate=p("dropout_rate", 0.20),
         )
@@ -297,63 +307,22 @@ class ScaleSpec:
 
 @dataclass(frozen=True)
 class TransferSpec:
-    """Transfer learning configuration.
-
-    base_weights:           Path to pre-trained checkpoint (.pt).
-    freeze_level:           Legacy fixed freeze level string.
-    freeze_mode:            Tunable freeze mode (ParamSpec).  When used as a
-                            ``suggest: categorical`` all listed modes are
-                            explored by Optuna.  Valid modes:
-                            ``full_unfreeze``, ``backbone_only``,
-                            ``backbone_plus_encoders``,
-                            ``decoder_plus_heads``, ``heads_only``.
-    backbone_lr_multiplier: Multiplier applied to backbone param group LR.
-                            Values < 1 slow adaptation of pre-trained signal
-                            processing layers relative to downstream heads.
-    """
+    """Transfer learning configuration."""
     base_weights: Optional[str]
-    freeze_level: Optional[str]
-    freeze_mode: ParamSpec
-    backbone_lr_multiplier: ParamSpec
 
     @staticmethod
     def from_yaml(x: Any) -> "TransferSpec":
         if x is None:
-            return TransferSpec(
-                base_weights=None,
-                freeze_level=None,
-                freeze_mode=ParamSpec(fixed=None),
-                backbone_lr_multiplier=ParamSpec(fixed=1.0),
-            )
+            return TransferSpec(base_weights=None)
         d = _expect_dict(x, "transfer")
-        allowed = [
-            "base_weights", "freeze_level",
-            "freeze_mode", "backbone_lr_multiplier",
-        ]
+        allowed = ["base_weights"]
         _check_no_unknown_keys(d, allowed=allowed, ctx="transfer")
 
         base_weights = d.get("base_weights", None)
         if base_weights is not None:
             base_weights = _as_str(base_weights, "transfer.base_weights")
-        
-        freeze_level = d.get("freeze_level", None)
-        if freeze_level is not None:
-            freeze_level = _as_str(freeze_level, "transfer.freeze_level")
 
-        freeze_mode = ParamSpec.from_yaml(
-            d.get("freeze_mode", None), "transfer.freeze_mode"
-        )
-        backbone_lr_multiplier = ParamSpec.from_yaml(
-            d.get("backbone_lr_multiplier", 1.0),
-            "transfer.backbone_lr_multiplier",
-        )
-
-        return TransferSpec(
-            base_weights=base_weights,
-            freeze_level=freeze_level,
-            freeze_mode=freeze_mode,
-            backbone_lr_multiplier=backbone_lr_multiplier,
-        )
+        return TransferSpec(base_weights=base_weights)
 
 
 # =============================================================================
@@ -380,17 +349,13 @@ class DataSpec:
         these groups for explicit source-balanced sampling.
         Mutually exclusive with ``balance_cohorts``.
 
-    target_n_per_source (optional, int):
-        Target number of samples per source group per training epoch.
-        Only used by the legacy ``multi_source`` batch mode, where it
-        controls the effective per-source pool size (N_eff).
+    steps_per_epoch (optional, int):
+        Number of fixed stochastic gene-conditioned micro-batches per epoch.
 
     batch_mode (optional, str: 'chunk' | 'multi_source'):
-        Batch construction strategy.  ``'chunk'`` (default and preferred)
-        uses the per-sample contiguous-chunk loader with per-epoch chunk
-        reshuffling and worker-local cross-sample microbatch mixing.
-        ``'multi_source'`` keeps the older gene-conditioned source-balanced
-        batcher for direct comparisons only.
+        Batch construction strategy.  ``'multi_source'`` is the default
+        gene-conditioned source/PHT-aware training batcher. ``'chunk'`` is
+        retained for validation/inference-style contiguous reads.
 
     selection_metric (optional, str: 'min_balanced_crps' |
                                      'min_weighted_source_crps' |
@@ -410,6 +375,7 @@ class DataSpec:
     balance_cohorts: Optional[List[str]]
     source_groups: Optional[Dict[str, List[str]]]
     target_n_per_source: Optional[int]
+    steps_per_epoch: int
     batch_mode: str
     selection_metric: str
 
@@ -419,7 +385,7 @@ class DataSpec:
         allowed = ["training_set", "zarr_base", "seed",
                     "subsample_frac", "train_only_cohorts",
                     "balance_cohorts", "source_groups",
-                    "target_n_per_source", "batch_mode",
+                    "target_n_per_source", "steps_per_epoch", "batch_mode",
                     "selection_metric"]
         _check_no_unknown_keys(d, allowed=allowed, ctx="data")
         subsample_raw = d.get("subsample_frac", None)
@@ -461,12 +427,18 @@ class DataSpec:
             if target_n <= 0:
                 _fail(f"data.target_n_per_source must be > 0, got {target_n}")
 
+        steps_per_epoch = _as_int(
+            d.get("steps_per_epoch", 4000), "data.steps_per_epoch"
+        )
+        if steps_per_epoch <= 0:
+            _fail(f"data.steps_per_epoch must be > 0, got {steps_per_epoch}")
+
         if source_groups is not None and balance is not None:
             _fail("data.source_groups and data.balance_cohorts are "
                   "mutually exclusive — use one or the other")
 
         batch_mode_raw = _as_str(
-            d.get("batch_mode", "chunk"), "data.batch_mode"
+            d.get("batch_mode", "multi_source"), "data.batch_mode"
         ).lower()
         if batch_mode_raw not in ("chunk", "multi_source"):
             _fail(f"data.batch_mode must be 'chunk' or 'multi_source', "
@@ -514,6 +486,7 @@ class DataSpec:
             balance_cohorts=balance,
             source_groups=source_groups,
             target_n_per_source=target_n,
+            steps_per_epoch=steps_per_epoch,
             batch_mode=batch_mode_raw,
             selection_metric=selection_metric_raw,
         )

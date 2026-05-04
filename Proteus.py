@@ -337,7 +337,8 @@ def train_model_cv(
     balance_cohorts: Optional[List[str]] = None,
     source_groups: Optional[Dict[str, List[str]]] = None,
     target_n_per_source: Optional[int] = None,
-    batch_mode: str = 'chunk',
+    steps_per_epoch: int = 4000,
+    batch_mode: str = 'multi_source',
     fixed_schedule_oof: bool = False,
 ):
     """Train a model using cross-validation with deterministic fold assignment.
@@ -352,11 +353,11 @@ def train_model_cv(
         training_config: Fully-specified TrainingConfig.
         seed: Random seed for reproducibility.
         subsample_frac: Optional fraction (0.0-1.0) of genes for fast sanity checks.
-        fixed_schedule_oof: If True, train each fold on a fixed schedule
-            without passing the held-out fold into trainer.fit(). The held-out
-            fold is then used exactly once at the end to generate OOF
-            predictions from ``final_model.pt`` with EMA weights, mirroring
-            full-train and avoiding validation-driven checkpoint selection.
+        fixed_schedule_oof: If True, train each fold on a fixed schedule and
+            always emit OOF predictions from ``final_model.pt`` at the terminal
+            epoch. The held-out fold may still be monitored during training for
+            diagnostics and loss curves, but it is never used for checkpoint
+            selection or early stopping.
 
     Raises:
         FileNotFoundError: If training_set_tsv or Zarr stores don't exist.
@@ -513,6 +514,7 @@ def train_model_cv(
                 source_groups=source_groups,
                 gene_variance=train_fold_variance_raw,
                 n_eff_per_source=target_n_per_source or 24,
+                steps_per_epoch=steps_per_epoch,
                 num_workers=_loader_workers(),
                 seed=seed,
                 train_only_cohorts=train_only_cohorts,
@@ -553,21 +555,21 @@ def train_model_cv(
         
         # Train
         trainer = Trainer(model, fold_training_config, model_config, device)
-        if not fixed_schedule_oof:
-            trainer.val_gene_weight_map = full_tumor_variance
-            trainer.val_background_gene_weight_map = full_background_variance
-            # Per-source gene variance for epoch-level per-source GVW-CRPS/GVW-r.
-            trainer.val_source_gene_weight_map = source_tumor_variance
-            # Enable epoch-level per-group CRPS monitoring.  When source_groups
-            # is active, group by source (4 groups); otherwise by cohort.
-            trainer.val_sample_group_map = sample_to_source or sample_to_cohort or None
-            trainer.val_selection_group_weights = selection_group_weights
+        trainer.val_gene_weight_map = full_tumor_variance
+        trainer.val_background_gene_weight_map = full_background_variance
+        # Per-source gene variance for epoch-level per-source GVW-CRPS/GVW-r.
+        trainer.val_source_gene_weight_map = source_tumor_variance
+        # Enable epoch-level per-group CRPS monitoring.  When source_groups
+        # is active, group by source (4 groups); otherwise by cohort.
+        trainer.val_sample_group_map = sample_to_source or sample_to_cohort or None
+        trainer.val_selection_group_weights = selection_group_weights
         history = trainer.fit(
             train_loader,
-            None if fixed_schedule_oof else val_loader,
+            val_loader,
             epochs=fold_training_config.epochs,
             epoch_end_callback=epoch_end_callback,
             external_stop_check=external_stop_check,
+            monitor_only_validation=fixed_schedule_oof,
         )
 
         # Save training history for plotting / audit.
@@ -783,7 +785,8 @@ def full_train_from_splits(
     balance_cohorts: Optional[List[str]] = None,
     source_groups: Optional[Dict[str, List[str]]] = None,
     target_n_per_source: Optional[int] = None,
-    batch_mode: str = 'chunk',
+    steps_per_epoch: int = 4000,
+    batch_mode: str = 'multi_source',
 ):
     """Train a single model on ALL samples in the training_set TSV (no fold holdout).
 
@@ -895,11 +898,12 @@ def full_train_from_splits(
 
     # Compute per-gene variance weights from ALL samples (before split).
     # Clipped variance weights for the loss function.
-    print('Computing gene variance weights from all samples...')
+    print('Computing gene variance weights from all non-PHT tumor samples...')
     from proteus_utils.proteus_utils import compute_gene_weights_from_zarr, compute_gene_variances_unclipped
-    train_fold_variance_raw = compute_gene_variances_unclipped(all_paths, label_key='flat/tumor_exp')
+    tumor_weight_paths = [p for p in all_paths if zarr_cohort_map[p] != 'PHT']
+    train_fold_variance_raw = compute_gene_variances_unclipped(tumor_weight_paths, label_key='flat/tumor_exp')
     gene_weights = compute_gene_weights_from_zarr(
-        all_paths,
+        tumor_weight_paths,
         label_key='flat/tumor_exp',
     )
     _raw_vals = list(train_fold_variance_raw.values())
@@ -972,10 +976,11 @@ def full_train_from_splits(
             sample_paths_by_source=_sample_paths_by_source,
             gene_variance=train_fold_variance_raw,
             n_eff_per_source=target_n_per_source or 24,
+            steps_per_epoch=steps_per_epoch,
             seed=seed,
             labeled=True,
             sample_name_map=zarr_sample_name_map,
-            include_metadata=False,
+            include_metadata=True,
             subsample_frac=subsample_frac,
         )
 
@@ -1120,6 +1125,32 @@ def full_train_from_splits(
     history = trainer.fit(train_loader, val_loader, epochs=training_config.epochs)
     with open(os.path.join(out_dir, 'training_history.json'), 'w') as f:
         json.dump(history, f, indent=2)
+
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+
+        plot_dir = os.path.join(out_dir, 'plots')
+        os.makedirs(plot_dir, exist_ok=True)
+
+        fig = plt.figure(figsize=(7, 4))
+        epochs_axis = np.arange(1, len(history.get('train_loss', [])) + 1)
+        if len(epochs_axis) > 0:
+            plt.plot(epochs_axis, history.get('train_loss', []), label='train_loss')
+            if history.get('val_loss'):
+                plt.plot(epochs_axis, history.get('val_loss', []), label='val_loss')
+            if history.get('val_tumor_gvw_crps'):
+                plt.plot(epochs_axis, history.get('val_tumor_gvw_crps', []), label='val_tumor_gvw_crps')
+            plt.xlabel('epoch')
+            plt.ylabel('metric')
+            plt.title('Training / validation curves')
+            plt.legend(frameon=False)
+            plt.tight_layout()
+            fig.savefig(os.path.join(plot_dir, 'loss_curves.png'), dpi=150)
+        plt.close(fig)
+    except (ImportError, OSError, ValueError) as e:
+        print(f'  Warning: failed to generate full-train plots: {e}')
 
     final_path = os.path.join(out_dir, 'final_model.pt')
     if val_loader is None:
@@ -1276,13 +1307,16 @@ def _build_configs_from_spec(experiment_spec, args, model_name: str = 'BioDVN') 
         interaction_ksize=int(experiment_spec.scale.interaction_ksize.fixed),
         initial_reduction_channels=int(experiment_spec.scale.initial_reduction_channels.fixed),
         n_reductions=int(experiment_spec.scale.n_reductions.fixed),
+        funnel_reduction_factor=int(experiment_spec.scale.funnel_reduction_factor.fixed),
         reduction_dilation=int(experiment_spec.scale.reduction_dilation.fixed),
         beta_background=float(experiment_spec.structural.beta_background.fixed),
-        beta_tcvae=float(experiment_spec.structural.beta_tcvae.fixed),
+        beta_kl=float(experiment_spec.structural.beta_kl.fixed),
         beta_contrastive=float(experiment_spec.structural.beta_contrastive.fixed),
         beta_reconstruction=float(experiment_spec.structural.beta_reconstruction.fixed),
-        beta_grl=float(experiment_spec.structural.beta_grl.fixed),
-        beta_point_mse=float(experiment_spec.structural.beta_point_mse.fixed),
+        beta_tfx=float(experiment_spec.structural.beta_tfx.fixed),
+        beta_ccc=float(experiment_spec.structural.beta_ccc.fixed),
+        beta_pht_consistency=float(experiment_spec.structural.beta_pht_consistency.fixed),
+        beta_pht_uncertainty=float(experiment_spec.structural.beta_pht_uncertainty.fixed),
         cl_margin=float(experiment_spec.structural.cl_margin.fixed),
         internal_weight=float(experiment_spec.structural.internal_weight.fixed),
         dropout_rate=float(experiment_spec.scale.dropout_rate.fixed),
@@ -1290,12 +1324,6 @@ def _build_configs_from_spec(experiment_spec, args, model_name: str = 'BioDVN') 
         max_lr=float(experiment_spec.training.max_lr.fixed),
         max_grad_norm=float(experiment_spec.training.max_grad_norm.fixed),
     )
-
-    # Resolve transfer-learning parameters.  freeze_mode and
-    # backbone_lr_multiplier are ParamSpec; extract their .fixed values.
-    _freeze_mode_raw = experiment_spec.transfer.freeze_mode.fixed
-    _freeze_mode = str(_freeze_mode_raw) if _freeze_mode_raw is not None else None
-    _backbone_lr_mult = float(experiment_spec.transfer.backbone_lr_multiplier.fixed)
 
     train_cfg = TrainingConfig(
         checkpoint_dir='',
@@ -1310,12 +1338,10 @@ def _build_configs_from_spec(experiment_spec, args, model_name: str = 'BioDVN') 
         patience=int(experiment_spec.training.patience.fixed),
         use_amp=bool(experiment_spec.training.use_amp.fixed),
         ema_decay=float(experiment_spec.training.ema_decay.fixed),
+        grad_accum_steps=int(experiment_spec.training.grad_accum_steps.fixed),
         selection_metric=str(experiment_spec.data.selection_metric),
         runtime_device_banner=bool(args.runtime_device_banner),
         base_weights=experiment_spec.transfer.base_weights,
-        freeze_level=experiment_spec.transfer.freeze_level,
-        freeze_mode=_freeze_mode,
-        backbone_lr_multiplier=_backbone_lr_mult,
     )
 
     return model_cfg, train_cfg
@@ -1361,7 +1387,7 @@ def main():
     parser.add_argument("--model_name", type=str, default="BioDVN", help="Model architecture name")
     parser.add_argument("--run_mode", type=str, default='train', choices=['train', 'full-train', 'tune', 'tune-ask', 'tune-tell', 'tune-fold', 'tune-proxy-ask', 'tune-proxy-tell', 'tune-proxy-finalize', 'run'], help="train=CV training, full-train=final model, tune=Optuna CV tuning, tune-ask/tune-tell/tune-fold=coordinated fold-parallel tuning, tune-proxy-ask/tune-proxy-tell/tune-proxy-finalize=proxy-fold racing, run=inference")
     parser.add_argument("--test_fold", type=int, default=None, help="Specific fold to train (for HPC parallelization)")
-    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
 
     # Experiment / tuning
     parser.add_argument("--experiment", type=str, default=None, help="Path to experiment YAML (required for train/full-train/tune modes)")
@@ -1491,7 +1517,7 @@ def main():
                 n_workers=0  # 0 = auto-detect (use all available CPUs)
             )
 
-    # NOTE: transfer learning (including freeze_level) is HP-controlled in experiment YAML.
+    # NOTE: transfer learning is controlled via base_weights in experiment YAML.
     # CLI --base_weights is a manual warm-start convenience only.
     
     # Training modes
@@ -1529,6 +1555,7 @@ def main():
             balance_cohorts=experiment_spec.data.balance_cohorts,
             source_groups=experiment_spec.data.source_groups,
             target_n_per_source=experiment_spec.data.target_n_per_source,
+            steps_per_epoch=experiment_spec.data.steps_per_epoch,
             batch_mode=experiment_spec.data.batch_mode,
             fixed_schedule_oof=True,
         )
@@ -1561,6 +1588,7 @@ def main():
             balance_cohorts=experiment_spec.data.balance_cohorts,
             source_groups=experiment_spec.data.source_groups,
             target_n_per_source=experiment_spec.data.target_n_per_source,
+            steps_per_epoch=experiment_spec.data.steps_per_epoch,
             batch_mode=experiment_spec.data.batch_mode,
         )
 

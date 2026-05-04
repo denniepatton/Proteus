@@ -103,25 +103,15 @@ def resolve_trial_configs(
     # Structural group
     # =====================================================================
     beta_background = s("beta_background", exp.structural.beta_background)
-    beta_tcvae = s("beta_tcvae", exp.structural.beta_tcvae)
+    beta_kl = s("beta_kl", exp.structural.beta_kl)
     beta_contrastive = s("beta_contrastive", exp.structural.beta_contrastive)
     beta_reconstruction = s("beta_reconstruction", exp.structural.beta_reconstruction)
     cl_margin = s("cl_margin", exp.structural.cl_margin)
     internal_weight = s("internal_weight", exp.structural.internal_weight)
-    beta_grl = s("beta_grl", exp.structural.beta_grl)
-    beta_point_mse = s("beta_point_mse", exp.structural.beta_point_mse)
-
-    # β-TCVAE guard: the TC loss term is weighted by (beta_tcvae − 1).  When
-    # beta_tcvae < 1 this coefficient is *negative*, which rewards correlated
-    # latents instead of penalising them — creating a runaway feedback loop
-    # (TC escalates to 200+ in a few hundred steps, then NaN).  Prune these
-    # trials before wasting GPU time.
-    if float(beta_tcvae) < 1.0:
-        raise optuna.TrialPruned(
-            f"beta_tcvae={float(beta_tcvae):.4f} < 1.0 produces "
-            f"a negative TC coefficient ({float(beta_tcvae) - 1:.4f}), which "
-            f"rewards latent correlation and leads to divergence."
-        )
+    beta_tfx = s("beta_tfx", exp.structural.beta_tfx)
+    beta_ccc = s("beta_ccc", exp.structural.beta_ccc)
+    beta_pht_consistency = s("beta_pht_consistency", exp.structural.beta_pht_consistency)
+    beta_pht_uncertainty = s("beta_pht_uncertainty", exp.structural.beta_pht_uncertainty)
 
     # =====================================================================
     # Training group
@@ -137,6 +127,7 @@ def resolve_trial_configs(
     patience = t("patience", exp.training.patience)
     use_amp = t("use_amp", exp.training.use_amp)
     ema_decay = t("ema_decay", exp.training.ema_decay)
+    grad_accum_steps = t("grad_accum_steps", exp.training.grad_accum_steps)
 
     # =====================================================================
     # Scale group
@@ -151,6 +142,7 @@ def resolve_trial_configs(
     interaction_ksize = sc("interaction_ksize", exp.scale.interaction_ksize)
     initial_reduction_channels = sc("initial_reduction_channels", exp.scale.initial_reduction_channels)
     n_reductions = sc("n_reductions", exp.scale.n_reductions)
+    funnel_reduction_factor = sc("funnel_reduction_factor", exp.scale.funnel_reduction_factor)
     reduction_dilation = sc("reduction_dilation", exp.scale.reduction_dilation)
     dropout_rate = sc("dropout_rate", exp.scale.dropout_rate)
 
@@ -176,17 +168,6 @@ def resolve_trial_configs(
         )
 
     # =====================================================================
-    # Transfer learning group
-    # =====================================================================
-    freeze_mode = suggest_from_param(
-        trial, "transfer.freeze_mode", exp.transfer.freeze_mode,
-    )
-    backbone_lr_multiplier = suggest_from_param(
-        trial, "transfer.backbone_lr_multiplier",
-        exp.transfer.backbone_lr_multiplier,
-    )
-
-    # =====================================================================
     # Build configs
     # =====================================================================
     model_cfg = BioDVNConfig(
@@ -201,16 +182,19 @@ def resolve_trial_configs(
         interaction_ksize=int(interaction_ksize),
         initial_reduction_channels=int(initial_reduction_channels),
         n_reductions=int(n_reductions),
+        funnel_reduction_factor=int(funnel_reduction_factor),
         reduction_dilation=int(reduction_dilation),
         # Structural
         beta_background=float(beta_background),
-        beta_tcvae=float(beta_tcvae),
+        beta_kl=float(beta_kl),
         beta_contrastive=float(beta_contrastive),
         beta_reconstruction=float(beta_reconstruction),
         cl_margin=float(cl_margin),
         internal_weight=float(internal_weight),
-        beta_grl=float(beta_grl),
-        beta_point_mse=float(beta_point_mse),
+        beta_tfx=float(beta_tfx),
+        beta_ccc=float(beta_ccc),
+        beta_pht_consistency=float(beta_pht_consistency),
+        beta_pht_uncertainty=float(beta_pht_uncertainty),
         # Training HPs stored in model config (legacy coupling)
         dropout_rate=float(dropout_rate),
         weight_decay=float(weight_decay),
@@ -231,13 +215,9 @@ def resolve_trial_configs(
         patience=int(patience),
         use_amp=bool(use_amp),
         ema_decay=float(ema_decay),
+        grad_accum_steps=int(grad_accum_steps),
+        selection_metric=str(exp.data.selection_metric),
         base_weights=exp.transfer.base_weights,
-        freeze_level=exp.transfer.freeze_level,
-        freeze_mode=str(freeze_mode) if freeze_mode is not None else None,
-        backbone_lr_multiplier=(
-            float(backbone_lr_multiplier)
-            if backbone_lr_multiplier is not None else 1.0
-        ),
     )
 
     # =====================================================================
@@ -246,13 +226,15 @@ def resolve_trial_configs(
     trial_cfg = {
         "structural": {
             "beta_background": float(beta_background),
-            "beta_tcvae": float(beta_tcvae),
+            "beta_kl": float(beta_kl),
             "beta_contrastive": float(beta_contrastive),
             "beta_reconstruction": float(beta_reconstruction),
             "cl_margin": float(cl_margin),
             "internal_weight": float(internal_weight),
-            "beta_grl": float(beta_grl),
-            "beta_point_mse": float(beta_point_mse),
+            "beta_tfx": float(beta_tfx),
+            "beta_ccc": float(beta_ccc),
+            "beta_pht_consistency": float(beta_pht_consistency),
+            "beta_pht_uncertainty": float(beta_pht_uncertainty),
         },
         "training": {
             "max_lr": float(max_lr),
@@ -266,6 +248,7 @@ def resolve_trial_configs(
             "patience": int(patience),
             "use_amp": bool(use_amp),
             "ema_decay": float(ema_decay),
+            "grad_accum_steps": int(grad_accum_steps),
         },
         "scale": {
             "encoder_start": int(encoder_start),
@@ -278,17 +261,12 @@ def resolve_trial_configs(
             "interaction_ksize": int(interaction_ksize),
             "initial_reduction_channels": int(initial_reduction_channels),
             "n_reductions": int(n_reductions),
+            "funnel_reduction_factor": int(funnel_reduction_factor),
             "reduction_dilation": int(reduction_dilation),
             "dropout_rate": float(dropout_rate),
         },
         "transfer": {
             "base_weights": exp.transfer.base_weights,
-            "freeze_level": exp.transfer.freeze_level,
-            "freeze_mode": str(freeze_mode) if freeze_mode is not None else None,
-            "backbone_lr_multiplier": (
-                float(backbone_lr_multiplier)
-                if backbone_lr_multiplier is not None else 1.0
-            ),
         },
     }
 
@@ -355,15 +333,18 @@ def configs_from_trial_json(
         interaction_ksize=int(sc["interaction_ksize"]),
         initial_reduction_channels=int(sc["initial_reduction_channels"]),
         n_reductions=int(sc["n_reductions"]),
+        funnel_reduction_factor=int(sc.get("funnel_reduction_factor", 4)),
         reduction_dilation=int(sc["reduction_dilation"]),
         beta_background=float(s["beta_background"]),
-        beta_tcvae=float(s["beta_tcvae"]),
+        beta_kl=float(s["beta_kl"]),
         beta_contrastive=float(s["beta_contrastive"]),
         beta_reconstruction=float(s["beta_reconstruction"]),
         cl_margin=float(s["cl_margin"]),
         internal_weight=float(s["internal_weight"]),
-        beta_grl=float(s["beta_grl"]),
-        beta_point_mse=float(s["beta_point_mse"]),
+        beta_tfx=float(s["beta_tfx"]),
+        beta_ccc=float(s["beta_ccc"]),
+        beta_pht_consistency=float(s["beta_pht_consistency"]),
+        beta_pht_uncertainty=float(s["beta_pht_uncertainty"]),
         dropout_rate=float(sc["dropout_rate"]),
         weight_decay=float(t["weight_decay"]),
         max_lr=float(t["max_lr"]),
@@ -383,10 +364,9 @@ def configs_from_trial_json(
         patience=int(t["patience"]),
         use_amp=bool(t["use_amp"]),
         ema_decay=float(t["ema_decay"]),
+        grad_accum_steps=int(t.get("grad_accum_steps", 4)),
+        selection_metric=str(exp.data.selection_metric),
         base_weights=tr.get("base_weights") or exp.transfer.base_weights,
-        freeze_level=tr.get("freeze_level") or exp.transfer.freeze_level,
-        freeze_mode=tr.get("freeze_mode"),
-        backbone_lr_multiplier=float(tr.get("backbone_lr_multiplier", 1.0)),
     )
 
     return model_cfg, train_cfg

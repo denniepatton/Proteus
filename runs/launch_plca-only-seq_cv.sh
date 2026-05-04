@@ -4,8 +4,9 @@ set -euo pipefail
 # =====================================================================
 # PLCA model only-seq CV — 5-fold cross-validation (BioDVN_OnlySeq)
 # Submits 5 independent RTX jobs, one per fold.
-# OOF predictions are written under each fold directory after monitored
-# checkpoint selection with the fixed PLCAv2 trial-3 recipe.
+# Uses the finalized PLCAv3 defaults, fixed 100-epoch multi-source training,
+# diagnostic validation curves, and terminal-epoch OOF predictions from
+# final_model.pt.
 # =====================================================================
 
 YAML="config/experiments/plca-only-seq_cv.yaml"
@@ -23,7 +24,7 @@ for fold in {1..5}; do
 #SBATCH --partition=campus-new
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=rtx2080ti:1
-#SBATCH --time=72:00:00
+#SBATCH --time=24:00:00
 #SBATCH -A nelson_p
 
 eval "\$(micromamba shell hook -s bash)"

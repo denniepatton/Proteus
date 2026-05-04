@@ -120,7 +120,7 @@ def _inv_fisher_z(z: float) -> float:
 # ── Constants ────────────────────────────────────────────────────────────
 
 # Fixed Gamma shape parameter (must match models/model_utils.py)
-K_GAMMA: float = 0.80
+K_GAMMA: float = 0.75
 
 # Minimum value for log to avoid log(0)
 _LOG_EPS: float = 1e-12

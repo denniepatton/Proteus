@@ -3,9 +3,9 @@ set -euo pipefail
 
 # =====================================================================
 # PLCA model only-seq final training (BioDVN_OnlySeq) — single L40S GPU
-# Trains on all PLCA samples with the fixed PLCAv2 trial-3 recipe.
-# Full-train runs a fixed 25-epoch chunk-based schedule and saves
-# trained_models/proteus_plca-model_only-seq/full_train/final_model.pt.
+# Trains on all PLCA samples with the finalized PLCAv3 defaults.
+# Full-train runs the fixed 100-epoch multi-source schedule on 100% of the
+# PLCA TSV and saves trained_models/proteus_plca-model_only-seq/full_train/final_model.pt.
 # =====================================================================
 
 YAML="config/experiments/plca-only-seq_final-training.yaml"
@@ -22,7 +22,7 @@ cat > "${job_script}" <<EOL
 #SBATCH --partition=chorus
 #SBATCH --cpus-per-task=8
 #SBATCH --gpus=l40s:1
-#SBATCH --time=72:00:00
+#SBATCH --time=24:00:00
 #SBATCH -A nelson_p
 
 eval "\$(micromamba shell hook -s bash)"

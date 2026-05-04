@@ -14,6 +14,7 @@ See ``--help`` for options.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import math
 import os
@@ -55,6 +56,49 @@ DEFAULT_RESULTS_DIR = str(
     PROJECT_ROOT / "analysis" / "XGBoost" / "tuning_results"
 )
 FOLDS = [1, 2, 3, 4, 5]
+PRUNER_STARTUP_TRIALS = 2
+PROGRESS_LOG_EVERY_ROUNDS = 100
+MIN_THREADS_PER_TRIAL = 4
+MAX_PARALLEL_TRIALS = 4
+
+
+def _available_cpu_count() -> int:
+    """Return the CPU budget available to this process on HPC or locally."""
+    slurm_cpus = os.environ.get("SLURM_CPUS_PER_TASK")
+    if slurm_cpus is not None:
+        try:
+            cpu_count = int(slurm_cpus)
+        except ValueError:
+            cpu_count = 0
+        if cpu_count > 0:
+            return cpu_count
+
+    try:
+        affinity_count = len(os.sched_getaffinity(0))
+    except AttributeError:
+        affinity_count = 0
+    except OSError:
+        affinity_count = 0
+    if affinity_count > 0:
+        return affinity_count
+
+    return max(1, os.cpu_count() or 1)
+
+
+def _resolve_parallelism(cpu_count: int) -> tuple[int, int]:
+    """Split available CPUs across a small number of concurrent Optuna trials.
+
+    For this 25-feature XGBoost workload, single-trial scaling saturates well
+    before typical CPU allocations, so throughput is usually better with a few
+    concurrent trials instead of one trial monopolizing every core.
+    """
+    safe_cpu_count = max(1, int(cpu_count))
+    n_jobs = min(
+        MAX_PARALLEL_TRIALS,
+        max(1, safe_cpu_count // MIN_THREADS_PER_TRIAL),
+    )
+    nthread = max(1, safe_cpu_count // n_jobs)
+    return n_jobs, nthread
 
 
 # ---------------------------------------------------------------------------
@@ -89,30 +133,43 @@ def _resolve_search_profile(search_profile: str, tsv_path: str) -> str:
     return "baseline"
 
 
+def _booster_metric_params(metric_name: str) -> Dict[str, Any]:
+    """Return fixed booster objective params for the selected tuning metric."""
+    if metric_name == "weighted_source_gvw_mae":
+        return {
+            "objective": "reg:absoluteerror",
+            "eval_metric": "mae",
+        }
+    return {
+        "objective": "reg:squarederror",
+        "eval_metric": "rmse",
+    }
+
+
 def _suggest_params(
     trial: optuna.Trial,
     search_profile: str,
 ) -> Dict[str, Any]:
     if search_profile == "plca":
         return {
-            "max_depth": trial.suggest_int("max_depth", 8, 14),
+            "max_depth": trial.suggest_int("max_depth", 10, 14),
             "learning_rate": trial.suggest_float(
-                "learning_rate", 0.03, 0.08, log=True,
+                "learning_rate", 0.03, 0.06, log=True,
             ),
             "min_child_weight": trial.suggest_float(
-                "min_child_weight", 5.0, 40.0, log=True,
+                "min_child_weight", 10.0, 40.0, log=True,
             ),
-            "subsample": trial.suggest_float("subsample", 0.75, 1.0),
+            "subsample": trial.suggest_float("subsample", 0.85, 1.0),
             "colsample_bytree": trial.suggest_float(
-                "colsample_bytree", 0.5, 0.8,
+                "colsample_bytree", 0.65, 0.82,
             ),
             "reg_alpha": trial.suggest_float(
-                "reg_alpha", 1e-8, 1e-2, log=True,
+                "reg_alpha", 1e-7, 1e-2, log=True,
             ),
             "reg_lambda": trial.suggest_float(
-                "reg_lambda", 1e-8, 1e-2, log=True,
+                "reg_lambda", 1e-6, 1e-2, log=True,
             ),
-            "gamma": trial.suggest_float("gamma", 1e-8, 1e-3, log=True),
+            "gamma": trial.suggest_float("gamma", 1e-5, 1e-3, log=True),
         }
 
     return {
@@ -132,7 +189,9 @@ def _weighted_mae(
     truth: np.ndarray,
     weights: np.ndarray,
 ) -> float:
-    abs_err = np.abs(pred.astype(np.float64) - truth.astype(np.float64))
+    pred64 = np.asarray(pred, dtype=np.float64)
+    truth64 = np.asarray(truth, dtype=np.float64)
+    abs_err = np.abs(pred64 - truth64)
     denom = float(np.sum(weights))
     if denom <= 0.0:
         return float("nan")
@@ -172,26 +231,200 @@ def _score_weighted_source_gvw_mae(
     sample_to_source: Dict[str, str],
     source_variance: Dict[str, Dict[str, float]],
 ) -> tuple[float, Dict[str, float]]:
+    prepared = _prepare_weighted_source_eval_data(
+        genes,
+        samples,
+        sample_to_source,
+        source_variance,
+    )
+    return _score_weighted_source_gvw_mae_prepared(pred, truth, prepared)
+
+
+def _prepare_weighted_source_eval_data(
+    genes: np.ndarray,
+    samples: np.ndarray,
+    sample_to_source: Dict[str, str],
+    source_variance: Dict[str, Dict[str, float]],
+) -> Dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Precompute row indices and source-specific gene weights for fast eval."""
+    row_sources = np.fromiter(
+        (str(sample_to_source.get(str(sample), "")) for sample in samples),
+        dtype=object,
+        count=len(samples),
+    )
+
+    prepared: Dict[str, tuple[np.ndarray, np.ndarray]] = {}
     per_source: Dict[str, float] = {}
     for source_name in PLCA_WEIGHTED_SOURCE_WEIGHTS:
-        mask = np.array(
-            [sample_to_source.get(str(sample)) == source_name for sample in samples],
-            dtype=bool,
-        )
-        if int(mask.sum()) == 0:
-            return float("nan"), {}
+        idx = np.flatnonzero(row_sources == source_name)
+        if idx.size == 0:
+            raise RuntimeError(
+                f'No validation rows found for PLCA source "{source_name}"',
+            )
 
         source_weight_map = source_variance.get(source_name)
         if source_weight_map is None:
-            return float("nan"), {}
+            raise RuntimeError(
+                f'Missing source variance map for PLCA source "{source_name}"',
+            )
 
-        w_src = np.array(
-            [float(source_weight_map.get(str(gene), 1.0)) for gene in genes[mask]],
+        w_src = np.fromiter(
+            (float(source_weight_map.get(str(gene), 1.0)) for gene in genes[idx]),
             dtype=np.float64,
+            count=idx.size,
         )
-        per_source[source_name] = _weighted_mae(pred[mask], truth[mask], w_src)
+        prepared[source_name] = (idx, w_src)
+
+    return prepared
+
+
+def _score_weighted_source_gvw_mae_prepared(
+    pred: np.ndarray,
+    truth: np.ndarray,
+    prepared: Dict[str, tuple[np.ndarray, np.ndarray]],
+) -> tuple[float, Dict[str, float]]:
+    per_source: Dict[str, float] = {}
+    for source_name, (idx, w_src) in prepared.items():
+        per_source[source_name] = _weighted_mae(pred[idx], truth[idx], w_src)
 
     return weighted_group_mean(per_source, PLCA_WEIGHTED_SOURCE_WEIGHTS), per_source
+
+
+def _weighted_source_gvw_mae_eval_fn(
+    prepared: Dict[str, tuple[np.ndarray, np.ndarray]],
+    truth: np.ndarray,
+    profiler: Optional["_MetricProfiler"] = None,
+):
+    """Build an XGBoost custom eval callable for weighted_source_gvw_mae."""
+
+    truth64 = np.asarray(truth, dtype=np.float64)
+
+    def _eval(pred: np.ndarray, dmatrix: xgb.DMatrix) -> tuple[str, float]:
+        t0 = time.perf_counter()
+        score, _ = _score_weighted_source_gvw_mae_prepared(
+            pred,
+            truth64,
+            prepared,
+        )
+        if profiler is not None:
+            profiler.record(time.perf_counter() - t0)
+        return "weighted_source_gvw_mae", float(score)
+
+    return _eval
+
+
+def _xgb_custom_metric_kwargs(metric_fn) -> Dict[str, Any]:
+    """Return the supported train() kwarg for a custom evaluation metric."""
+    train_params = inspect.signature(xgb.train).parameters
+    if "custom_metric" in train_params:
+        return {"custom_metric": metric_fn}
+    if "feval" in train_params:
+        return {"feval": metric_fn}
+    return {}
+
+
+class _MetricProfiler:
+    """Accumulate timing for Python-side custom metric evaluation."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.calls = 0
+        self.total_seconds = 0.0
+        self.last_seconds = 0.0
+
+    def record(self, duration_seconds: float) -> None:
+        self.calls += 1
+        self.total_seconds += float(duration_seconds)
+        self.last_seconds = float(duration_seconds)
+
+    def summary(self, total_elapsed_seconds: float) -> str:
+        if self.calls <= 0:
+            return f"{self.label}=0 calls"
+        mean_ms = 1000.0 * self.total_seconds / self.calls
+        share_pct = 100.0 * self.total_seconds / max(total_elapsed_seconds, 1e-9)
+        return (
+            f"{self.label}={self.total_seconds:.1f}s over {self.calls} calls "
+            f"({mean_ms:.1f} ms/call, {share_pct:.1f}% wall)"
+        )
+
+
+class _FoldProgressCallback(xgb.callback.TrainingCallback):
+    """Periodic progress logging from inside xgb.train()."""
+
+    def __init__(
+        self,
+        trial_number: int,
+        fold_num: int,
+        fold_step: int,
+        max_rounds: int,
+        metric_profiler: Optional[_MetricProfiler],
+        trial: Optional[optuna.Trial],
+        completed_fold_scores: List[float],
+        log_every_rounds: int = PROGRESS_LOG_EVERY_ROUNDS,
+    ):
+        self.trial_number = int(trial_number)
+        self.fold_num = int(fold_num)
+        self.fold_step = int(fold_step)
+        self.max_rounds = int(max_rounds)
+        self.metric_profiler = metric_profiler
+        self.trial = trial
+        self.completed_fold_scores = completed_fold_scores
+        self.log_every_rounds = int(log_every_rounds)
+        self.start_time = time.perf_counter()
+        self.progress_points_per_fold = self.max_rounds // self.log_every_rounds + 2
+
+    def after_iteration(self, model, epoch: int, evals_log) -> bool:
+        round_num = int(epoch) + 1
+        if round_num != 1 and round_num % self.log_every_rounds != 0:
+            return False
+
+        elapsed_seconds = time.perf_counter() - self.start_time
+        val_metrics = evals_log.get("val", {})
+        metric_parts: List[str] = []
+        for metric_name, history in val_metrics.items():
+            if history:
+                metric_parts.append(f"{metric_name}={float(history[-1]):.6f}")
+
+        profiler_part = ""
+        if self.metric_profiler is not None:
+            profiler_part = f", {self.metric_profiler.summary(elapsed_seconds)}"
+
+        metric_summary = ""
+        if metric_parts:
+            metric_summary = ", " + ", ".join(metric_parts)
+
+        current_metric_value: Optional[float] = None
+        if val_metrics:
+            first_metric_history = next(iter(val_metrics.values()))
+            if first_metric_history:
+                current_metric_value = float(first_metric_history[-1])
+
+        print(
+            f"      T{self.trial_number} F{self.fold_num} iter "
+            f"{round_num}/{self.max_rounds}: elapsed={elapsed_seconds:.1f}s"
+            f"{metric_summary}{profiler_part}",
+            flush=True,
+        )
+
+        if self.trial is not None and current_metric_value is not None:
+            partial_cv_scores = list(self.completed_fold_scores)
+            partial_cv_scores.append(current_metric_value)
+            partial_mean = float(np.mean(partial_cv_scores))
+            checkpoint_index = 0 if round_num == 1 else round_num // self.log_every_rounds
+            global_step = (
+                (self.fold_step - 1) * self.progress_points_per_fold
+                + checkpoint_index
+                + 1
+            )
+            self.trial.report(partial_mean, step=global_step)
+            if self.trial.should_prune():
+                print(
+                    f"      T{self.trial_number} F{self.fold_num} pruned at iter "
+                    f"{round_num}/{self.max_rounds}: partial_cv={partial_mean:.6f}",
+                    flush=True,
+                )
+                raise optuna.TrialPruned()
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +477,18 @@ def _build_objective(
 
         dtrain = xgb.DMatrix(X_train, label=y_train, weight=w_train)
         dval = xgb.DMatrix(X_val, label=y_val, weight=w_val)
+        prepared_source_eval = None
+        if metric_name == "weighted_source_gvw_mae":
+            if sample_to_source is None or source_variance is None:
+                raise RuntimeError(
+                    "weighted_source_gvw_mae requires PLCA source metadata",
+                )
+            prepared_source_eval = _prepare_weighted_source_eval_data(
+                genes_val,
+                samples_val,
+                sample_to_source,
+                source_variance,
+            )
         fold_data[fold_num] = {
             "dtrain": dtrain,
             "dval": dval,
@@ -251,52 +496,111 @@ def _build_objective(
             "y_val": y_val,
             "genes_val": genes_val,
             "samples_val": samples_val,
+            "prepared_source_eval": prepared_source_eval,
         }
     print(f"Data pre-loaded for {len(FOLDS)} folds.")
-    print(f"  Train DMatrix: {fold_data[1]['dtrain'].num_row():,} rows")
-    print(f"  Val DMatrix:   {fold_data[1]['dval'].num_row():,} rows")
+    print(
+        f"  Train DMatrix: {fold_data[1]['dtrain'].num_row():,} rows x "
+        f"{fold_data[1]['dtrain'].num_col():,} features"
+    )
+    print(
+        f"  Val DMatrix:   {fold_data[1]['dval'].num_row():,} rows x "
+        f"{fold_data[1]['dval'].num_col():,} features"
+    )
     print(f"  Search profile: {search_profile}")
     print(f"  Objective metric: {metric_name}")
 
     def objective(trial: optuna.Trial) -> float:
         t0 = time.perf_counter()
         params: Dict[str, Any] = {
-            "objective": "reg:squarederror",
             "tree_method": "hist",
             "seed": seed,
             "nthread": nthread,
             "verbosity": 0,
+            **_booster_metric_params(metric_name),
             **_suggest_params(trial, search_profile),
         }
+        print(
+            f"  Trial {trial.number:>3d} params: "
+            f"depth={params['max_depth']} lr={params['learning_rate']:.5f} "
+            f"min_child={params['min_child_weight']:.4f} "
+            f"sub={params['subsample']:.3f} col={params['colsample_bytree']:.3f} "
+            f"alpha={params['reg_alpha']:.3e} lambda={params['reg_lambda']:.3e} "
+            f"gamma={params['gamma']:.3e}",
+            flush=True,
+        )
 
         fold_scores: List[float] = []
         fold_iters: List[int] = []
         fold_source_scores: Dict[int, Dict[str, float]] = {}
-        for fold_num in FOLDS:
+        for fold_step, fold_num in enumerate(FOLDS, start=1):
             t_fold = time.perf_counter()
             fd = fold_data[fold_num]
-            model = xgb.train(
-                params,
-                fd["dtrain"],
-                num_boost_round=n_estimators,
-                evals=[(fd["dval"], "val")],
-                early_stopping_rounds=EARLY_STOPPING_ROUNDS,
-                verbose_eval=False,
+            metric_profiler: Optional[_MetricProfiler] = None
+            print(
+                f"    T{trial.number} F{fold_num}: starting",
+                flush=True,
             )
-            pred = model.predict(fd["dval"])
-
+            train_kwargs: Dict[str, Any] = {
+                "params": dict(params),
+                "dtrain": fd["dtrain"],
+                "num_boost_round": n_estimators,
+                "evals": [(fd["dval"], "val")],
+                "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
+                "verbose_eval": False,
+                "callbacks": [
+                    _FoldProgressCallback(
+                        trial_number=trial.number,
+                        fold_num=fold_num,
+                        fold_step=fold_step,
+                        max_rounds=n_estimators,
+                        metric_profiler=None,
+                        trial=trial,
+                        completed_fold_scores=fold_scores,
+                    )
+                ],
+            }
             if metric_name == "weighted_source_gvw_mae":
                 if sample_to_source is None or source_variance is None:
                     raise RuntimeError(
                         "weighted_source_gvw_mae requires PLCA source metadata",
                     )
-                fold_score, per_source = _score_weighted_source_gvw_mae(
+                metric_profiler = _MetricProfiler("python_weighted_source_eval")
+                train_kwargs["callbacks"] = [
+                    _FoldProgressCallback(
+                        trial_number=trial.number,
+                        fold_num=fold_num,
+                        fold_step=fold_step,
+                        max_rounds=n_estimators,
+                        metric_profiler=metric_profiler,
+                        trial=trial,
+                        completed_fold_scores=fold_scores,
+                    )
+                ]
+                custom_metric_kwargs = _xgb_custom_metric_kwargs(
+                    _weighted_source_gvw_mae_eval_fn(
+                        fd["prepared_source_eval"],
+                        fd["y_val"],
+                        metric_profiler,
+                    )
+                )
+                if custom_metric_kwargs:
+                    train_kwargs["params"]["disable_default_eval_metric"] = 1
+                    train_kwargs["params"].pop("eval_metric", None)
+                    train_kwargs.update(custom_metric_kwargs)
+
+            model = xgb.train(**train_kwargs)
+            pred = model.predict(fd["dval"])
+
+            if metric_name == "weighted_source_gvw_mae":
+                if fd["prepared_source_eval"] is None:
+                    raise RuntimeError(
+                        "weighted_source_gvw_mae requires prepared PLCA eval data",
+                    )
+                fold_score, per_source = _score_weighted_source_gvw_mae_prepared(
                     pred,
                     fd["y_val"],
-                    fd["genes_val"],
-                    fd["samples_val"],
-                    sample_to_source,
-                    source_variance,
+                    fd["prepared_source_eval"],
                 )
                 fold_source_scores[fold_num] = per_source
             else:
@@ -305,13 +609,36 @@ def _build_objective(
 
             fold_scores.append(fold_score)
             fold_iters.append(int(model.best_iteration))
+            partial_mean = float(np.mean(fold_scores))
+            profiler_summary = ""
+            if metric_profiler is not None:
+                profiler_summary = ", " + metric_profiler.summary(
+                    time.perf_counter() - t_fold
+                )
             print(
                 f"    T{trial.number} F{fold_num}: "
                 f"{model.best_iteration} iters, "
                 f"score={fold_score:.6f}, "
-                f"{time.perf_counter() - t_fold:.1f}s",
+                f"{time.perf_counter() - t_fold:.1f}s"
+                f"{profiler_summary}",
                 flush=True,
             )
+            fold_step_offset = (fold_step * (n_estimators // PROGRESS_LOG_EVERY_ROUNDS + 2))
+            trial.report(partial_mean, step=fold_step_offset)
+            if trial.should_prune():
+                trial.set_user_attr("fold_scores_partial", list(fold_scores))
+                trial.set_user_attr("fold_iters_partial", list(fold_iters))
+                if fold_source_scores:
+                    trial.set_user_attr(
+                        "fold_source_scores_partial",
+                        fold_source_scores,
+                    )
+                print(
+                    f"    T{trial.number} pruned after F{fold_num}: "
+                    f"partial_{metric_name}={partial_mean:.6f}",
+                    flush=True,
+                )
+                raise optuna.TrialPruned()
 
         mean_score = float(np.mean(fold_scores))
         elapsed = time.perf_counter() - t0
@@ -343,14 +670,6 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--storage", type=str, default=DEFAULT_STORAGE)
     parser.add_argument("--study_name", type=str, default=DEFAULT_STUDY_NAME)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--nthread", type=int, default=None,
-        help="Threads per XGBoost model (default: use all available CPUs)",
-    )
-    parser.add_argument(
-        "--n_jobs", type=int, default=1,
-        help="Parallel Optuna trials (default: 1). Safe because XGBoost releases the GIL.",
-    )
     parser.add_argument(
         "--n_estimators", type=int, default=1000,
         help="Max boosting rounds per trial (early stopping decides actual count)",
@@ -392,21 +711,22 @@ def main(argv: Optional[List[str]] = None) -> None:
         seed=args.seed,
         multivariate=True,
     )
+    pruner = optuna.pruners.MedianPruner(
+        n_startup_trials=PRUNER_STARTUP_TRIALS,
+        n_warmup_steps=1,
+    )
     study = optuna.create_study(
         study_name=args.study_name,
         direction="minimize",
         storage=args.storage,
         load_if_exists=True,
         sampler=sampler,
+        pruner=pruner,
     )
 
     # ---- Run trials ----
-    cpu_count = os.cpu_count() or 1
-    if args.nthread is None or args.nthread <= 0:
-        nthread = cpu_count
-    else:
-        nthread = min(args.nthread, cpu_count)
-    n_jobs = max(1, args.n_jobs)
+    cpu_count = _available_cpu_count()
+    n_jobs, nthread = _resolve_parallelism(cpu_count)
     print(f"Starting Optuna study '{args.study_name}' with {args.n_trials} trials")
     print(f"  Storage: {args.storage}")
     print(f"  Data: {tsv_path}")
@@ -415,8 +735,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     print(f"  Max rounds per trial: {args.n_estimators}")
     print(f"  Objective metric: {metric_name}")
     print(f"  Search profile: {search_profile}")
-    print(f"  CPUs available: {cpu_count}, nthread={nthread}, n_jobs={n_jobs} "
-          f"(total threads: {nthread * n_jobs})")
+    print(
+        f"  CPUs available: {cpu_count}, auto parallelism={n_jobs} concurrent "
+        f"trial(s) x {nthread} thread(s)"
+    )
+    print(
+        f"  Trial pruning: median pruner after {PRUNER_STARTUP_TRIALS} full trials "
+        "with fold-level intermediate reports"
+    )
 
     objective = _build_objective(
         tsv_path,
@@ -451,7 +777,10 @@ def main(argv: Optional[List[str]] = None) -> None:
         "best_value": study.best_trial.value,
         "objective_metric": metric_name,
         "search_profile": search_profile,
-        "best_params": study.best_trial.params,
+        "best_params": {
+            **study.best_trial.params,
+            **_booster_metric_params(metric_name),
+        },
         "n_trials": len(study.trials),
         "n_estimators_max": args.n_estimators,
     }
@@ -462,6 +791,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if not args.skip_final_eval:
         print("\nRunning full evaluation of best config...")
         best_params = {
+            **_booster_metric_params(metric_name),
             **study.best_trial.params,
             "tree_method": "hist",
             "seed": args.seed,

@@ -4,7 +4,7 @@ Author: Robert D Patton, rpatton@fredhutch.org
 
 Custom layers, loss functions, and metrics for BioDVN.
 Includes MDN heads, analytical CRPS loss, β-TCVAE decomposition,
-TFX gradient reversal, and masked regression losses.
+auxiliary TFX prediction, and masked regression losses.
 """
 
 import math
@@ -21,13 +21,37 @@ Y_MAX: float = 19.93
 
 # Fixed Gamma shape parameter for the MDN mixture component.
 # Determined by empirical fitting of RNA-seq expression distributions.
-K_GAMMA: float = 0.80
+K_GAMMA: float = 0.75
 
-# Upper bound on log(normal_sigma) in the MDN.  Caps the Normal
-# component's scale at exp(LOG_SIGMA_CEIL) ≈ 5.0, which still allows
-# a 90% CI spanning ±8.2 in log₂(CPM+1) space but prevents the
-# over-dispersed calibration basin observed in phase 3.0.
-LOG_SIGMA_CEIL: float = math.log(5.0)  # ≈ 1.609
+# Mixture prior used to seed the MDN logits so the Normal component starts
+# as the dominant active-expression branch instead of relying on symmetric
+# zero-bias initialization.
+MDN_MIXTURE_PRIORS: Tuple[float, float, float] = (0.10, 0.30, 0.60)
+
+# Smooth bounded supports for the MDN component parameters.
+NORMAL_MU_MIN: float = 2.0
+NORMAL_MU_MAX: float = 19.0
+NORMAL_SIGMA_MIN: float = 0.10
+NORMAL_SIGMA_MAX: float = 5.0
+GAMMA_MEAN_MIN: float = 0.01
+GAMMA_MEAN_MAX: float = 2.0
+MDN_PARAM_EPS: float = 1e-6
+
+# Empirically derived from training-truth summaries so the MDN starts in a
+# realistic expression regime before fold-specific adaptation.
+GAMMA_MEAN_INIT: float = 1.5
+NORMAL_MU_INIT: float = 5.5
+NORMAL_SIGMA_INIT: float = 1.5
+
+
+def _inverse_sigmoid_bounded_init(target: float, lower: float, upper: float) -> float:
+    """Return the raw bias whose sigmoid-bounded map yields *target*."""
+    if not lower < target < upper:
+        raise ValueError(
+            f"Initialization target {target} must lie strictly within ({lower}, {upper})."
+        )
+    normalized = (target - lower) / (upper - lower)
+    return math.log(normalized / (1.0 - normalized))
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +66,7 @@ _QUAD_N: int = 32  # 32-node quadrature is exact for poly degree 63; ample for o
 _gl_nodes_np, _gl_weights_np = np.polynomial.laguerre.laggauss(_QUAD_N)
 _GL_NODES_CPU = torch.from_numpy(_gl_nodes_np.copy()).float()     # (Q,)
 _GL_WEIGHTS_CPU = torch.from_numpy(_gl_weights_np.copy()).float() # (Q,)
-# tᵢ^(k-1) where k = K_GAMMA = 0.80, so exponent = -0.20.
+# tᵢ^(k-1) where k = K_GAMMA = 0.75, so exponent = -0.25.
 # Precomputed because k is a global constant.
 _GL_NODE_POWERS_CPU = _GL_NODES_CPU.pow(K_GAMMA - 1.0)           # (Q,)
 
@@ -227,198 +251,67 @@ def reconstruction_loss(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Ten
 
 
 # ==============================================================================
-# Gradient Reversal Layer (for TFX-invariant latent learning)
+# Auxiliary TFX prediction
 # ==============================================================================
 
 
-class _GradientReversalFn(torch.autograd.Function):
-    """Autograd function: identity in forward, negated & scaled in backward."""
+class TFXPredictor(nn.Module):
+    """Small MLP that predicts TFX from tumor + background latent means.
 
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, lam: float) -> torch.Tensor:  # type: ignore[override]
-        ctx.lam = lam
-        return x.clone()
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):  # type: ignore[override]
-        return -ctx.lam * grad_output, None
-
-
-class GradientReversalLayer(nn.Module):
-    """Gradient Reversal Layer (Ganin et al., 2016).
-
-    Forward pass is the identity.  Backward pass multiplies the gradient
-    by ``-lambda``, so the upstream encoder learns to produce representations
-    that *fool* the downstream discriminator.
-
-    Args:
-        lam: Reversal strength multiplier (default 1.0).
+    TFX is supervised during training but is never supplied as an input at
+    inference.  Gradients flow normally so the latent space can preserve tumor
+    fraction information needed for mixture weighting and uncertainty.
     """
 
-    def __init__(self, lam: float = 1.0):
+    def __init__(self, latent_size: int = 32):
         super().__init__()
-        self.lam = lam
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return _GradientReversalFn.apply(x, self.lam)
-
-
-class TFXDiscriminator(nn.Module):
-    """Small MLP that predicts TFX from concatenated tumor + background latents.
-
-    Used with :class:`GradientReversalLayer` so the encoder is pushed to
-    produce TFX-invariant latent representations while the discriminator
-    itself still learns to predict TFX accurately (its forward path is
-    normal; only the gradients flowing back through the GRL are negated).
-
-    Architecture: ``concat(z_tumor_mean, z_bg_mean)`` → GRL → 2·L → 16 → 1
-
-    Args:
-        latent_size: Dimensionality of each latent vector (default 32).
-        lam: GRL reversal strength (default 1.0).
-    """
-
-    def __init__(self, latent_size: int = 32, lam: float = 1.0):
-        super().__init__()
-        self.grl = GradientReversalLayer(lam=lam)
         self.net = nn.Sequential(
             nn.Linear(2 * latent_size, 16),
             nn.ReLU(),
             nn.Linear(16, 1),
-            nn.Sigmoid(),  # TFX is in [0, 1]
+            nn.Sigmoid(),
         )
 
     def forward(self, z_tumor_mean: torch.Tensor, z_bg_mean: torch.Tensor) -> torch.Tensor:
-        """Predict TFX from latents (with gradient reversal).
-
-        Returns:
-            predicted_tfx: (batch, 1)
-        """
         h = torch.cat([z_tumor_mean, z_bg_mean], dim=1)
-        h = self.grl(h)
         return self.net(h)
-
-
-def _log_density_gaussian(x: torch.Tensor, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    """
-    Log density of Gaussian distribution.
-    
-    Args:
-        x: Sample point (batch, latent_dim)
-        mu: Mean (batch, latent_dim)
-        logvar: Log variance (batch, latent_dim)
-    
-    Returns:
-        Log probability (batch, latent_dim)
-    """
-    # Clamp to prevent exp(-logvar) overflow: float32 max ~ 3.4e38 = exp(88).
-    # Without this, very negative logvar produces exp(-logvar) = inf, and
-    # (x - mu)^2 ≈ 0 (when z ≈ mu due to sampling underflow) gives 0*inf = NaN.
-    logvar = logvar.clamp(-86.0, 86.0)
-    norm = -0.5 * (math.log(2 * math.pi) + logvar)
-    log_density = norm - 0.5 * ((x - mu).pow(2) * torch.exp(-logvar))
-    return log_density
-
-
-def total_correlation(z: torch.Tensor, z_mean: torch.Tensor, z_log_var: torch.Tensor) -> torch.Tensor:
-    """
-    Estimate total correlation (TC) using minibatch-weighted sampling.
-    
-    TC measures statistical dependence between latent dimensions.
-    Based on β-TCVAE (Chen et al., 2018): Isolating Sources of Disentanglement in VAEs.
-    
-    TC = KL(q(z) || prod_j q(z_j)) where q(z_j) are marginal distributions
-    
-    Args:
-        z: Sampled latent codes (batch, latent_dim)
-        z_mean: Encoder mean (batch, latent_dim)
-        z_log_var: Encoder log variance (batch, latent_dim)
-    
-    Returns:
-        Estimated total correlation (scalar)
-    """
-    batch_size, latent_dim = z.shape
-    
-    # Compute log q(z) using minibatch weighted sampling
-    # For each sample z_i, compute log q(z_i) ≈ log(1/N * sum_j q(z_i | x_j))
-    # Expand dims: z (batch, 1, latent_dim), mu/logvar (1, batch, latent_dim)
-    z_expand = z.unsqueeze(1)
-    mu_expand = z_mean.unsqueeze(0)
-    logvar_expand = z_log_var.unsqueeze(0)
-    
-    # log q(z_i | x_j) for all pairs, shape: (batch, batch, latent_dim)
-    log_qz_ij = _log_density_gaussian(z_expand, mu_expand, logvar_expand)
-    
-    # log q(z) = logsumexp over j, minus log(N) for each dimension
-    # Then sum over latent dimensions for joint log q(z)
-    # Shape: (batch, latent_dim)
-    log_qz_j = torch.logsumexp(log_qz_ij, dim=1) - math.log(batch_size)
-    
-    # log prod_j q(z_j) - treat dimensions as independent marginals
-    log_prod_qzj = log_qz_j.sum(dim=1)
-    
-    # log q(z) joint - proper joint density using summed per-dim log densities
-    log_qz_joint = torch.logsumexp(log_qz_ij.sum(dim=2), dim=1) - math.log(batch_size)
-    
-    tc = (log_qz_joint - log_prod_qzj).mean()
-    # Clamp to prevent pathologically large TC from destabilising training.
-    # Healthy TC is O(1–10); values above ~50 indicate near-degenerate
-    # latent correlation and produce gradients that overwhelm grad clipping.
-    return tc.clamp(-100.0, 100.0)
 
 
 class InternalLossComputer:
     """
     Computes internal losses (KL, contrastive, reconstruction) for the VAE.
-    Uses β-TCVAE objective: decomposes KL and upweights total correlation.
     """
     def __init__(
         self,
-        beta_contrastive: float = 0.5,
-        beta_tcvae: float = 3.0,
-        beta_reconstruction: float = 1.5,
-        beta_grl: float = 1.0,
-        cl_margin: float = 0.5,
-        internal_weight: float = 2.5,
+        beta_contrastive: float = 1.0,
+        beta_kl: float = 1.0,
+        beta_reconstruction: float = 1.25,
+        beta_tfx: float = 2.0,
+        cl_margin: float = 1.0,
+        internal_weight: float = 0.5,
     ):
         self.beta_contrastive = beta_contrastive
-        self.beta_tcvae = beta_tcvae
+        self.beta_kl = beta_kl
         self.beta_reconstruction = beta_reconstruction
-        self.beta_grl = beta_grl
+        self.beta_tfx = beta_tfx
         self.cl_margin = cl_margin
         self.internal_weight = internal_weight
     
-    def _compute_vae_loss(
+    def _compute_kl_loss(
         self,
-        z_tumor: torch.Tensor,
         z_tumor_mean: torch.Tensor,
         z_tumor_log_var: torch.Tensor,
-        z_background: torch.Tensor,
         z_background_mean: torch.Tensor,
         z_background_log_var: torch.Tensor,
     ) -> Tuple[torch.Tensor, dict]:
-        """Compute β-TCVAE regularization loss.
-        
-        Decomposes KL and upweights total correlation:
-        loss = KL + (beta_tcvae − 1) × TC
-        """
-        # Standard KL (weight 1.0 for MI and dim-wise KL terms)
+        """Compute KL regularization loss for the two latent branches."""
         l_kl_tumor = kl_divergence(z_tumor_mean, z_tumor_log_var)
         l_kl_background = kl_divergence(z_background_mean, z_background_log_var)
-        
-        # Total correlation (weight beta_tcvae)
-        tc_tumor = total_correlation(z_tumor, z_tumor_mean, z_tumor_log_var)
-        tc_background = total_correlation(z_background, z_background_mean, z_background_log_var)
-        
-        # Final loss: KL + (beta - 1) * TC (so TC is weighted by beta total)
-        vae_loss = (l_kl_tumor + l_kl_background) + (self.beta_tcvae - 1.0) * (tc_tumor + tc_background)
-        
+        kl_loss = l_kl_tumor + l_kl_background
         metrics = {
-            'kl_loss': (l_kl_tumor + l_kl_background).detach(),
-            'tc_loss': (tc_tumor + tc_background).detach(),
+            'kl_loss': kl_loss.detach(),
         }
-        
-        return vae_loss, metrics
+        return self.beta_kl * kl_loss, metrics
     
     def __call__(
         self,
@@ -430,7 +323,7 @@ class InternalLossComputer:
         z_background_log_var: torch.Tensor,
         y: torch.Tensor,
         y_reconstructed: torch.Tensor,
-        grl_loss: Optional[torch.Tensor] = None,
+        tfx_loss: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Returns:
@@ -452,10 +345,10 @@ class InternalLossComputer:
         l_contrastive = contrastive_loss(z_tumor, z_background, self.cl_margin)
         l_reconstruction = reconstruction_loss(y, y_reconstructed)
         
-        # Compute VAE loss (β-TCVAE)
-        vae_loss, vae_metrics = self._compute_vae_loss(
-            z_tumor, z_tumor_mean, z_tumor_log_var,
-            z_background, z_background_mean, z_background_log_var,
+        # Compute KL regularization for both latent branches.
+        vae_loss, vae_metrics = self._compute_kl_loss(
+            z_tumor_mean, z_tumor_log_var,
+            z_background_mean, z_background_log_var,
         )
         
         total_loss = (
@@ -464,10 +357,9 @@ class InternalLossComputer:
             self.beta_reconstruction * l_reconstruction
         )
 
-        # Adversarial TFX-invariance loss (gradient reversal discriminator).
-        if grl_loss is not None:
-            grl_loss = grl_loss.float()
-            total_loss = total_loss + self.beta_grl * grl_loss
+        if tfx_loss is not None:
+            tfx_loss = tfx_loss.float()
+            total_loss = total_loss + self.beta_tfx * tfx_loss
         
         scaled_loss = self.internal_weight * total_loss
         
@@ -480,8 +372,8 @@ class InternalLossComputer:
             'recon_loss': l_reconstruction.detach(),
             **vae_metrics,
         }
-        if grl_loss is not None:
-            metrics['grl_loss'] = grl_loss.detach()
+        if tfx_loss is not None:
+            metrics['tfx_mse_loss'] = tfx_loss.detach()
         
         return scaled_loss, metrics
 
@@ -567,8 +459,8 @@ class MixtureDensityHead(nn.Module):
 
     Components:
         1. Zero (hurdle) — true point mass at 0 (zero-expression genes)
-        2. Gamma — Gamma(k=K_GAMMA, rate=beta), shape fixed, rate predicted
-        3. Normal — N(mu, sigma^2), unconstrained Gaussian bulk
+        2. Gamma — Gamma(k=K_GAMMA, rate=beta), shape fixed, mean predicted
+        3. Normal — N(mu, sigma^2), both parameters smoothly bounded
 
     Notes:
         - Targets are in RNA-Seq log2(CPM+1) space and are expected to be in [0, y_max].
@@ -576,9 +468,9 @@ class MixtureDensityHead(nn.Module):
 
     The head outputs:
         - log_pi: (batch, 3) log-softmax mixture weights [pi_zero, pi_gamma, pi_normal]
-        - gamma_beta: (batch, 1) Gamma rate parameter beta > 0
-        - normal_mu: (batch, 1) Normal location, clamped to [0, y_max]
-        - normal_sigma: (batch, 1) Normal scale sigma in (0, exp(LOG_SIGMA_CEIL)]
+        - gamma_beta: (batch, 1) Gamma rate parameter derived from bounded mean
+        - normal_mu: (batch, 1) Normal location in [NORMAL_MU_MIN, NORMAL_MU_MAX]
+        - normal_sigma: (batch, 1) Normal scale in [NORMAL_SIGMA_MIN, NORMAL_SIGMA_MAX]
 
     Args:
         input_dim: Dimension of the input feature vector.
@@ -588,7 +480,7 @@ class MixtureDensityHead(nn.Module):
             *hidden_dim* down to *final_dim*.  Example with
             hidden_dim=64, final_dim=16::
 
-                input_dim → 64 → ReLU → 32 → ReLU → 16 → ReLU → 6
+                input_dim → 64 → ReLU → 32 → ReLU → 16 → ReLU → heads
     """
 
     def __init__(
@@ -609,18 +501,54 @@ class MixtureDensityHead(nn.Module):
             dim = next_dim
         self.shared = nn.Sequential(*layers)
 
-        # 3 logits + 1 log(gamma_beta) + 1 normal_mu + 1 log(normal_sigma) = 6 outputs
-        self.proj = nn.Linear(dim, 6)
+        self.linear_pi = nn.Linear(dim, 3)
+        self.linear_gamma_mean = nn.Linear(dim, 1)
+        self.linear_mu = nn.Linear(dim, 1)
+        self.linear_sigma = nn.Linear(dim, 1)
 
-        # Xavier init + zero-bias on every Linear in the shared trunk and on
-        # the projection, so that the initial mixture is roughly uniform and
-        # component params are moderate.
+        # Xavier init + explicit bias initialization on every Linear so the
+        # head starts in a biologically plausible regime while preserving the
+        # requested prior over mixture usage.
         for module in self.shared:
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
                 nn.init.zeros_(module.bias)
-        nn.init.xavier_uniform_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        for module in (
+            self.linear_pi,
+            self.linear_gamma_mean,
+            self.linear_mu,
+            self.linear_sigma,
+        ):
+            nn.init.xavier_uniform_(module.weight)
+            nn.init.zeros_(module.bias)
+        with torch.no_grad():
+            prior_tensor = torch.tensor(
+                MDN_MIXTURE_PRIORS,
+                dtype=self.linear_pi.bias.dtype,
+                device=self.linear_pi.bias.device,
+            )
+            self.linear_pi.bias.copy_(torch.log(prior_tensor))
+            self.linear_gamma_mean.bias.fill_(
+                _inverse_sigmoid_bounded_init(
+                    GAMMA_MEAN_INIT,
+                    GAMMA_MEAN_MIN,
+                    GAMMA_MEAN_MAX,
+                )
+            )
+            self.linear_mu.bias.fill_(
+                _inverse_sigmoid_bounded_init(
+                    NORMAL_MU_INIT,
+                    NORMAL_MU_MIN,
+                    NORMAL_MU_MAX,
+                )
+            )
+            self.linear_sigma.bias.fill_(
+                _inverse_sigmoid_bounded_init(
+                    NORMAL_SIGMA_INIT,
+                    NORMAL_SIGMA_MIN,
+                    NORMAL_SIGMA_MAX,
+                )
+            )
 
     def forward(self, x: torch.Tensor) -> dict:
         """
@@ -631,32 +559,25 @@ class MixtureDensityHead(nn.Module):
             Dictionary with keys:
                 log_pi: (batch, 3) log-softmax of mixture weights
                 gamma_beta: (batch, 1) Gamma rate (>0)
-                normal_mu: (batch, 1) clamped to [0, y_max]
-                normal_sigma: (batch, 1) (>0)
+                normal_mu: (batch, 1) bounded to the active-expression range
+                normal_sigma: (batch, 1) bounded away from zero and blow-up
         """
         h = self.shared(x)
-        out = self.proj(h)  # (batch, 6)
 
         # Force float32 before parameterization.  Under AMP autocast the
-        # Linear layers above produce float16 tensors.  torch.exp() preserves
-        # dtype, and exp(v) overflows float16 (~65504) for v > ~11.09.  The
-        # clamp range below is chosen so that gamma_mean = K/exp(-6) ≈ 806
-        # (still above typical Y_MAX ≈ 20) and gamma_mean at +4 gives
-        # K/exp(4) ≈ 0.037 — covering the biologically relevant range while
-        # preventing the >10^8 gamma_mean that caused CRPS overflow.
-        out = out.float()
+        # Linear layers above produce float16 tensors.  The smooth sigmoid
+        # maps below keep every parameter inside a validated support while
+        # preserving gradient flow across the full raw range.
+        logits = self.linear_pi(h).float()
+        raw_gamma_mean = self.linear_gamma_mean(h).float()
+        raw_mu = self.linear_mu(h).float()
+        raw_sigma = self.linear_sigma(h).float()
         with torch.amp.autocast('cuda', enabled=False):
-            logits = out[:, :3]          # mixture weight logits
-            log_gamma_beta = out[:, 3:4]
-            normal_mu_raw = out[:, 4:5]
-            log_normal_sigma = out[:, 5:6]
-
-            # Log/exp parameterization with clamping for numerical stability.
-            gamma_beta = torch.exp(log_gamma_beta.clamp(-6.0, 4.0))
-            normal_mu = normal_mu_raw.clamp(0.0, Y_MAX)
-            normal_sigma = torch.exp(log_normal_sigma.clamp(-6.0, LOG_SIGMA_CEIL))
-
             log_pi = F.log_softmax(logits, dim=-1)  # (batch, 3)
+            gamma_mean = GAMMA_MEAN_MIN + (GAMMA_MEAN_MAX - GAMMA_MEAN_MIN) * torch.sigmoid(raw_gamma_mean)
+            gamma_beta = K_GAMMA / (gamma_mean + MDN_PARAM_EPS)
+            normal_mu = NORMAL_MU_MIN + (NORMAL_MU_MAX - NORMAL_MU_MIN) * torch.sigmoid(raw_mu)
+            normal_sigma = NORMAL_SIGMA_MIN + (NORMAL_SIGMA_MAX - NORMAL_SIGMA_MIN) * torch.sigmoid(raw_sigma)
 
         return {
             'log_pi': log_pi,
@@ -689,6 +610,26 @@ def mixture_mean(
     gamma_mean = (K_GAMMA / beta).clamp(max=Y_MAX)
     mean = pi_gamma * gamma_mean + pi_normal * mu
     return mean.clamp(0.0, Y_MAX)  # (batch, 1)
+
+
+def mixture_variance(
+    mdn_params: dict,
+) -> torch.Tensor:
+    """Compute predictive variance of the 3-component MDN mixture."""
+    pi = mdn_params['log_pi'].float().exp()
+    pi_gamma = pi[:, 1:2]
+    pi_normal = pi[:, 2:3]
+
+    beta = mdn_params['gamma_beta'].float().clamp(min=1e-6)
+    mu = mdn_params['normal_mu'].float()
+    sigma = mdn_params['normal_sigma'].float().clamp(min=1e-6)
+
+    gamma_mean = (K_GAMMA / beta).clamp(max=Y_MAX)
+    gamma_second = (K_GAMMA * (K_GAMMA + 1.0) / beta.pow(2)).clamp(max=Y_MAX ** 2)
+    normal_second = sigma.pow(2) + mu.pow(2)
+    second_moment = pi_gamma * gamma_second + pi_normal * normal_second
+    mean = pi_gamma * gamma_mean + pi_normal * mu
+    return (second_moment - mean.pow(2)).clamp(min=0.0)
 
 
 def _mixture_cdf_at_points(
@@ -846,7 +787,7 @@ def _gamma_abs_dev(
 
     Numerical note:
         The backward of ``gammainc(a, x)`` involves ``x^(a-1)``.  For
-        k = 0.80 < 1 this exponent is −0.20, giving ``0^(−0.2) = ∞``
+        k = 0.75 < 1 this exponent is −0.25, giving ``0^(−0.25) = ∞``
         when ``βy = 0`` (i.e. unexpressed genes with y = 0).  The chain
         rule then produces ``0 × ∞ = NaN``.  Clamping ``βy`` to a tiny
         positive epsilon avoids the singularity: the clamp gates the
@@ -933,7 +874,7 @@ def mixture_crps(
 
     where  Aᵢ(y) = E|Xᵢ − y|  and  Bᵢⱼ = E|Xᵢ − X′ⱼ|.
 
-    Term summary (k = K_GAMMA = 0.80):
+    Term summary (k = K_GAMMA = 0.75):
         A₀(y)  = |y|                            (point mass — trivial)
         Aᵍ(y)  = y(2P(k,βy)−1) + (k/β)(1−2P(k+1,βy))   (closed form)
         Aₙ(y)  = σ[z(2Φ(z)−1) + 2φ(z)]         (closed form)
@@ -1038,30 +979,37 @@ def mixture_crps(
 class MixtureDensityCRPSLoss(nn.Module):
     """Masked, gene-weighted analytical CRPS loss for the 3-component mixture.
 
-    Loss per head = weighted mean CRPS over valid observations.
-    Optional auxiliary MSE on the mixture-mean point estimate.
-
-    Args:
-        beta_background: Weight on the background expression CRPS (default 1.0).
-        beta_point_mse:  Weight on auxiliary MSE(mixture_mean, truth) (default 0.0 = off).
+    The external objective keeps CRPS as the distributional likelihood-aligned
+    term, then adds batch-local gene-wise CCC and PHT structure losses when
+    metadata are available from the gene-conditioned loader.
     """
 
-    def __init__(self, beta_background: float = 1.0, beta_point_mse: float = 0.0):
+    def __init__(
+        self,
+        beta_background: float = 1.0,
+        beta_ccc: float = 1.0,
+        beta_pht_consistency: float = 0.0,
+        beta_pht_uncertainty: float = 1.5,
+    ):
         super().__init__()
         self.beta_background = beta_background
-        self.beta_point_mse = beta_point_mse
+        self.beta_ccc = beta_ccc
+        self.beta_pht_consistency = beta_pht_consistency
+        self.beta_pht_uncertainty = beta_pht_uncertainty
 
     def forward(
         self,
         predictions: dict,
         targets: dict,
         sample_weight: Optional[torch.Tensor] = None,
+        features: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Args:
             predictions: dict with 'tumor_mdn' and 'background_mdn'.
             targets: dict with 'tumor_exp' (batch,1) and 'background_exp' (batch,1).
             sample_weight: optional (batch,1) or (batch,) per-gene weights.
+            features: optional metadata from the gene-conditioned loader.
 
         Returns:
             total_loss: scalar
@@ -1082,21 +1030,28 @@ class MixtureDensityCRPSLoss(nn.Module):
             'total_external_loss': total_loss.item(),
         }
 
-        # Auxiliary MSE on mixture-mean point estimates.
-        # This gives direct backprop gradients through the mixture weights
-        # and component parameters, pushing E[Y] toward truth at the
-        # extremes where CRPS alone tends to under-/over-predict.
-        if self.beta_point_mse > 0.0:
-            tumor_mse = self._head_point_mse(
-                predictions['tumor_exp'], targets['tumor_exp'], sample_weight
+        if self.beta_ccc > 0.0 and features is not None:
+            ccc_loss = self._gene_ccc_loss(
+                predictions['tumor_exp'], targets['tumor_exp'],
+                features, targets, sample_weight,
             )
-            bg_mse = self._head_point_mse(
-                predictions['background_exp'], targets['background_exp'], sample_weight
+            total_loss = total_loss + self.beta_ccc * ccc_loss
+            loss_dict['gene_ccc_loss'] = ccc_loss.item()
+            loss_dict['total_external_loss'] = total_loss.item()
+
+        if features is not None and (
+            self.beta_pht_consistency > 0.0 or self.beta_pht_uncertainty > 0.0
+        ):
+            pht_consistency, pht_uncertainty = self._pht_losses(
+                predictions, targets, features,
             )
-            point_mse = tumor_mse + self.beta_background * bg_mse
-            total_loss = total_loss + self.beta_point_mse * point_mse
-            loss_dict['tumor_point_mse'] = tumor_mse.item()
-            loss_dict['background_point_mse'] = bg_mse.item()
+            total_loss = (
+                total_loss
+                + self.beta_pht_consistency * pht_consistency
+                + self.beta_pht_uncertainty * pht_uncertainty
+            )
+            loss_dict['pht_consistency_loss'] = pht_consistency.item()
+            loss_dict['pht_uncertainty_loss'] = pht_uncertainty.item()
             loss_dict['total_external_loss'] = total_loss.item()
 
         return total_loss, loss_dict
@@ -1114,33 +1069,219 @@ class MixtureDensityCRPSLoss(nn.Module):
         return crps_sum / denom
 
     @staticmethod
-    def _head_point_mse(
+    def _metadata_list(features: dict, key: str, n: int) -> Optional[list]:
+        values = features.get(key)
+        if values is None:
+            return None
+        if isinstance(values, torch.Tensor):
+            return [str(v) for v in values.detach().cpu().view(-1).tolist()]
+        if isinstance(values, (list, tuple)):
+            return [str(v) for v in values]
+        return [str(values)] * n
+
+    @staticmethod
+    def _group_ids(values: list, device: torch.device) -> Optional[torch.Tensor]:
+        if not values:
+            return None
+        group_ids = torch.empty(len(values), dtype=torch.long, device=device)
+        id_map = {}
+        next_id = 0
+        for idx, value in enumerate(values):
+            group_id = id_map.get(value)
+            if group_id is None:
+                group_id = next_id
+                id_map[value] = group_id
+                next_id += 1
+            group_ids[idx] = group_id
+        return group_ids
+
+    @staticmethod
+    def _group_variance_loss(values: torch.Tensor, group_ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        valid = mask.view(-1).bool()
+        if not valid.any():
+            return values.new_tensor(0.0)
+
+        valid_groups = group_ids[valid]
+        valid_values = values[valid]
+        n_groups = int(group_ids.max().item()) + 1
+
+        counts = values.new_zeros(n_groups)
+        counts.index_add_(0, valid_groups, torch.ones_like(valid_values))
+
+        sums = values.new_zeros(n_groups)
+        sums.index_add_(0, valid_groups, valid_values)
+        means = sums / counts.clamp(min=1.0)
+
+        centered = valid_values - means[valid_groups]
+        sq_sums = values.new_zeros(n_groups)
+        sq_sums.index_add_(0, valid_groups, centered.pow(2))
+
+        eligible = counts >= 2.0
+        if not eligible.any():
+            return values.new_tensor(0.0)
+        return (sq_sums[eligible] / counts[eligible]).mean()
+
+    @staticmethod
+    def _gene_ccc_loss(
         pred: torch.Tensor,
         target: torch.Tensor,
+        features: dict,
+        targets: dict,
         gene_weight: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Weighted MSE between mixture-mean point estimate and truth."""
         pred = pred.float().view(-1)
         target = target.float().view(-1)
-        mask = torch.isfinite(target)
-        if not mask.any():
+        n = pred.shape[0]
+        gene_names = MixtureDensityCRPSLoss._metadata_list(features, 'gene_name', n)
+        if not gene_names:
             return pred.new_tensor(0.0)
-        p = pred[mask]
-        t = target[mask]
-        sq_err = (p - t).pow(2)
-        if gene_weight is not None:
-            w = gene_weight.float().view(-1)
-            w = w[mask] if w.shape[0] == mask.shape[0] else w[:sq_err.shape[0]]
-            # Renormalise so mean weight = 1 (same convention as CRPS).
-            w = w / (w.mean() + 1e-12)
-            sq_err = sq_err * w
-        return sq_err.mean()
+        group_ids = MixtureDensityCRPSLoss._group_ids(gene_names, pred.device)
+        if group_ids is None:
+            return pred.new_tensor(0.0)
+
+        ccc_weight = targets.get('ccc_weight')
+        if ccc_weight is None:
+            ccc_weight = gene_weight
+        if ccc_weight is None:
+            item_weight = torch.ones_like(pred)
+        else:
+            item_weight = ccc_weight.float().view(-1).to(device=pred.device)
+            if item_weight.shape[0] != n:
+                item_weight = item_weight[:n]
+
+        finite = torch.isfinite(pred) & torch.isfinite(target) & (item_weight > 0)
+        if not finite.any():
+            return pred.new_tensor(0.0)
+
+        valid_groups = group_ids[finite]
+        valid_pred = pred[finite]
+        valid_target = target[finite]
+        valid_weight = item_weight[finite]
+        n_groups = int(group_ids.max().item()) + 1
+
+        counts = pred.new_zeros(n_groups)
+        counts.index_add_(0, valid_groups, torch.ones_like(valid_pred))
+
+        weight_sum = pred.new_zeros(n_groups)
+        weight_sum.index_add_(0, valid_groups, valid_weight)
+
+        pred_sum = pred.new_zeros(n_groups)
+        pred_sum.index_add_(0, valid_groups, valid_weight * valid_pred)
+        target_sum = pred.new_zeros(n_groups)
+        target_sum.index_add_(0, valid_groups, valid_weight * valid_target)
+
+        mean_p = pred_sum / weight_sum.clamp(min=1e-8)
+        mean_y = target_sum / weight_sum.clamp(min=1e-8)
+
+        centered_pred = valid_pred - mean_p[valid_groups]
+        centered_target = valid_target - mean_y[valid_groups]
+
+        var_p_sum = pred.new_zeros(n_groups)
+        var_p_sum.index_add_(0, valid_groups, valid_weight * centered_pred.pow(2))
+        var_y_sum = pred.new_zeros(n_groups)
+        var_y_sum.index_add_(0, valid_groups, valid_weight * centered_target.pow(2))
+        cov_sum = pred.new_zeros(n_groups)
+        cov_sum.index_add_(0, valid_groups, valid_weight * centered_pred * centered_target)
+
+        var_p = var_p_sum / weight_sum.clamp(min=1e-8)
+        var_y = var_y_sum / weight_sum.clamp(min=1e-8)
+        cov = cov_sum / weight_sum.clamp(min=1e-8)
+        denom = var_p + var_y + (mean_p - mean_y).pow(2)
+
+        eligible = (counts >= 3.0) & (denom > 1e-8)
+        if not eligible.any():
+            return pred.new_tensor(0.0)
+
+        ccc = (2.0 * cov[eligible] / denom[eligible]).clamp(min=-1.0, max=1.0)
+        loss_t = 1.0 - ccc
+        weight_t = (weight_sum[eligible] / counts[eligible].clamp(min=1.0))
+        weight_t = weight_t / weight_t.mean().clamp(min=1e-8)
+        return (loss_t * weight_t).mean()
+
+    @staticmethod
+    def _pht_losses(
+        predictions: dict,
+        targets: dict,
+        features: dict,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        tumor_pred = predictions['tumor_exp'].float().view(-1)
+        bg_pred = predictions['background_exp'].float().view(-1)
+        n = tumor_pred.shape[0]
+        device = tumor_pred.device
+
+        is_pht = features.get('is_pht')
+        if is_pht is None:
+            zero = tumor_pred.new_tensor(0.0)
+            return zero, zero
+        if isinstance(is_pht, torch.Tensor):
+            pht_mask = is_pht.to(device=device).view(-1).bool()
+        else:
+            pht_mask = torch.tensor([bool(v) for v in is_pht], device=device)
+        if pht_mask.numel() != n or not pht_mask.any():
+            zero = tumor_pred.new_tensor(0.0)
+            return zero, zero
+
+        genes = MixtureDensityCRPSLoss._metadata_list(features, 'gene_name', n)
+        parents = MixtureDensityCRPSLoss._metadata_list(features, 'pht_parent_id', n)
+        donors = MixtureDensityCRPSLoss._metadata_list(features, 'pht_donor_id', n)
+        if not genes or not parents or not donors:
+            zero = tumor_pred.new_tensor(0.0)
+            return zero, zero
+
+        parent_group_ids = MixtureDensityCRPSLoss._group_ids(
+            list(zip(genes, parents)), device,
+        )
+        donor_group_ids = MixtureDensityCRPSLoss._group_ids(
+            list(zip(genes, donors)), device,
+        )
+        if parent_group_ids is None or donor_group_ids is None:
+            zero = tumor_pred.new_tensor(0.0)
+            return zero, zero
+
+        finite_tumor = pht_mask & torch.isfinite(targets['tumor_exp'].float().view(-1))
+        finite_bg = pht_mask & torch.isfinite(targets['background_exp'].float().view(-1))
+        tumor_consistency = MixtureDensityCRPSLoss._group_variance_loss(
+            tumor_pred, parent_group_ids, finite_tumor,
+        )
+        background_consistency = MixtureDensityCRPSLoss._group_variance_loss(
+            bg_pred, donor_group_ids, finite_bg,
+        )
+        consistency = tumor_consistency + background_consistency
+
+        tfx = targets['TFX_label'].float().view(-1).to(device=device)
+        uncertainty = mixture_variance(predictions['tumor_mdn']).view(-1)
+        valid_tfx = pht_mask & torch.isfinite(tfx)
+        if valid_tfx.sum() < 2:
+            uncertainty_loss = tumor_pred.new_tensor(0.0)
+        else:
+            valid_group_ids = parent_group_ids[valid_tfx]
+            valid_tfx_values = tfx[valid_tfx]
+            valid_uncertainty = uncertainty[valid_tfx]
+            m = int(valid_tfx_values.shape[0])
+
+            group_eq = valid_group_ids.unsqueeze(1) == valid_group_ids.unsqueeze(0)
+            upper = torch.triu(
+                torch.ones((m, m), dtype=torch.bool, device=device),
+                diagonal=1,
+            )
+            delta_tfx = valid_tfx_values.unsqueeze(1) - valid_tfx_values.unsqueeze(0)
+            delta_uncertainty = (
+                valid_uncertainty.unsqueeze(1) - valid_uncertainty.unsqueeze(0)
+            )
+            valid_pairs = group_eq & upper & (delta_tfx.abs() >= 0.05)
+            if valid_pairs.any():
+                pair_losses = F.relu(torch.sign(delta_tfx) * delta_uncertainty)
+                uncertainty_loss = pair_losses[valid_pairs].mean()
+            else:
+                uncertainty_loss = tumor_pred.new_tensor(0.0)
+
+        return consistency, uncertainty_loss
 
 
 class BioDVNMDNLoss:
     """Combined external loss for BioDVN with MDN output heads.
 
-    Total loss = Analytical CRPS (tumor + background) + optional point MSE.
+    Total loss = analytical CRPS (tumor + background) + CCC/PHT structure losses.
     The internal loss (KL + contrastive + reconstruction) is added by the
     training loop, not by this class.
     """
@@ -1148,11 +1289,15 @@ class BioDVNMDNLoss:
     def __init__(
         self,
         beta_background: float = 1.0,
-        beta_point_mse: float = 0.0,
+        beta_ccc: float = 1.0,
+        beta_pht_consistency: float = 0.0,
+        beta_pht_uncertainty: float = 1.5,
     ):
         self.mdn_crps = MixtureDensityCRPSLoss(
             beta_background=beta_background,
-            beta_point_mse=beta_point_mse,
+            beta_ccc=beta_ccc,
+            beta_pht_consistency=beta_pht_consistency,
+            beta_pht_uncertainty=beta_pht_uncertainty,
         )
 
     def __call__(
@@ -1160,6 +1305,7 @@ class BioDVNMDNLoss:
         predictions: dict,
         targets: dict,
         sample_weight: Optional[torch.Tensor] = None,
+        features: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, dict]:
-        return self.mdn_crps(predictions, targets, sample_weight)
+        return self.mdn_crps(predictions, targets, sample_weight, features)
 

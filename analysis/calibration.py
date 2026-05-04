@@ -1,5 +1,5 @@
 """
-calibration.py — Conformalized Quantile Regression (CQR) with gene-regime pooling.
+calibration.py — Asymmetric conformalized quantile calibration with gene-regime pooling.
 
 Implements K-fold conformalized quantile calibration with normalized
 non-conformity scores, pooled within broad gene regimes.  This is the
@@ -33,6 +33,12 @@ At test time:
 
     [L_ig − q̂_r · S_ig,  U_ig + q̂_r · S_ig]
 
+This module uses an **asymmetric** extension of normalized CQR: lower-tail
+and upper-tail exceedances are scored separately and receive independent
+regime-pooled conformal corrections. This preserves the heteroskedastic
+interval shape from the MDN quantiles while allowing the lower and upper
+tails to calibrate differently.
+
 **Gene-regime pooling** addresses the fact that per-gene calibration
 with only ~40 OOF samples is unstable (effective quantile rounds to max),
 while global calibration ignores systematic differences across gene
@@ -50,7 +56,7 @@ References
 Public API
 ----------
 - ``compute_gene_regimes``    — assign genes to (var_q, zero_q) regime bins
-- ``compute_regime_qhats``    — CQR normalized scores → per-regime q̂
+- ``compute_regime_qhats``    — asymmetric CQR normalized scores → per-regime lower/upper q̂
 - ``calibrate_intervals``     — apply regime-based q̂ to new intervals
 - ``evaluate_calibration``    — empirical coverage at multiple nominal levels
 - ``RegimeCalibrator``        — stateful container bundling the above
@@ -155,17 +161,17 @@ def _intersect_regime_genes(
 # ── Normalized CQR Scores ────────────────────────────────────────────────
 
 
-def _normalized_scores(
+def _normalized_tail_scores(
     truth: np.ndarray,
     ci_lo: np.ndarray,
     ci_hi: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Compute normalized CQR non-conformity scores and local scales.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute asymmetric normalized CQR scores and local scales.
 
     For each observation (i, g):
         S_ig = U_ig − L_ig                         (local scale)
-        A_ig = max(L_ig − y_ig, y_ig − U_ig, 0)   (raw CQR score)
-             / (S_ig + ε)                           (normalized)
+        A_lo,ig = max(L_ig − y_ig, 0) / (S_ig + ε)
+        A_hi,ig = max(y_ig − U_ig, 0) / (S_ig + ε)
 
     Parameters
     ----------
@@ -173,12 +179,14 @@ def _normalized_scores(
 
     Returns
     -------
-    (scores, scales) — arrays of the same shape as inputs.
+    (lower_scores, upper_scores, scales) — arrays of the same shape as inputs.
     """
     scales = ci_hi - ci_lo  # S_ig
-    raw = np.maximum(np.maximum(ci_lo - truth, truth - ci_hi), 0.0)
-    scores = raw / (scales + _EPS)
-    return scores, scales
+    lower_raw = np.maximum(ci_lo - truth, 0.0)
+    upper_raw = np.maximum(truth - ci_hi, 0.0)
+    lower_scores = lower_raw / (scales + _EPS)
+    upper_scores = upper_raw / (scales + _EPS)
+    return lower_scores, upper_scores, scales
 
 
 def compute_regime_qhats(
@@ -188,12 +196,12 @@ def compute_regime_qhats(
     regime_df: pd.DataFrame,
     *,
     alpha: float = 0.10,
-) -> Dict[str, float]:
-    """Compute per-regime conformal quantile q̂_r from OOF data.
+) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Compute per-regime lower/upper conformal q̂ values from OOF data.
 
-    For every regime *r*, collects all normalized non-conformity scores
-    from genes in that regime, then takes the ⌈(1−α)(n+1)⌉/n empirical
-    quantile (the standard finite-sample-corrected conformal quantile).
+    For every regime *r*, collects all normalized lower-tail and upper-tail
+    non-conformity scores from genes in that regime, then takes the
+    ⌈(1−α/2)(n+1)⌉/n empirical quantile for each tail separately.
 
     Parameters
     ----------
@@ -203,13 +211,18 @@ def compute_regime_qhats(
     regime_df :
         output of ``compute_gene_regimes``.  Must cover all genes in the
         prediction matrices.
-    alpha : miscoverage budget (default 0.10 → target 90% coverage).
+    alpha : total interval miscoverage budget
+        (default 0.10 → target 90% central coverage). The lower and upper
+        tails each receive ``alpha / 2``.
 
     Returns
     -------
-    Dict mapping regime label → q̂ (float).  Regimes with fewer than 10
-    valid observations get q̂ = 0.0 (no correction).
+    Two dicts mapping regime label → q̂ for the lower and upper tails.
+    Regimes with fewer than 10 valid observations get q̂ = 0.0.
     """
+    if not 0.0 < alpha < 1.0:
+        raise ValueError(f"alpha must lie in (0, 1), got {alpha!r}")
+
     common_genes = _intersect_regime_genes(
         truth_wide.index.intersection(ci_lo_wide.index).intersection(ci_hi_wide.index),
         regime_df.index,
@@ -224,23 +237,31 @@ def compute_regime_qhats(
     hi = ci_hi_wide.loc[common_genes, common_samples].values
     regimes = regime_df.loc[common_genes, "regime"].values
 
-    scores, _ = _normalized_scores(t, lo, hi)
+    lower_scores, upper_scores, _ = _normalized_tail_scores(t, lo, hi)
 
     unique_regimes = np.unique(regimes)
-    q_hats: Dict[str, float] = {}
+    q_hats_lower: Dict[str, float] = {}
+    q_hats_upper: Dict[str, float] = {}
+    tail_alpha = alpha / 2.0
 
     for r in unique_regimes:
         mask = regimes == r  # boolean mask over genes
-        regime_scores = scores[mask].flatten()
-        valid = regime_scores[np.isfinite(regime_scores)]
-        n = len(valid)
-        if n < 10:
-            q_hats[r] = 0.0
+        regime_lower = lower_scores[mask].flatten()
+        regime_upper = upper_scores[mask].flatten()
+        valid_lower = regime_lower[np.isfinite(regime_lower)]
+        valid_upper = regime_upper[np.isfinite(regime_upper)]
+        n_lower = len(valid_lower)
+        n_upper = len(valid_upper)
+        if n_lower < 10 or n_upper < 10:
+            q_hats_lower[r] = 0.0
+            q_hats_upper[r] = 0.0
             continue
-        quantile_level = min(np.ceil((1 - alpha) * (n + 1)) / n, 1.0)
-        q_hats[r] = float(np.quantile(valid, quantile_level))
+        quantile_level_lower = min(np.ceil((1 - tail_alpha) * (n_lower + 1)) / n_lower, 1.0)
+        quantile_level_upper = min(np.ceil((1 - tail_alpha) * (n_upper + 1)) / n_upper, 1.0)
+        q_hats_lower[r] = float(np.quantile(valid_lower, quantile_level_lower))
+        q_hats_upper[r] = float(np.quantile(valid_upper, quantile_level_upper))
 
-    return q_hats
+    return q_hats_lower, q_hats_upper
 
 
 # ── Apply Calibration ────────────────────────────────────────────────────
@@ -250,12 +271,13 @@ def calibrate_intervals(
     ci_lo_wide: pd.DataFrame,
     ci_hi_wide: pd.DataFrame,
     regime_df: pd.DataFrame,
-    q_hats: Dict[str, float],
+    q_hats_lower: Dict[str, float],
+    q_hats_upper: Dict[str, float],
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Apply regime-based CQR calibration to interval predictions.
+    """Apply asymmetric regime-based CQR calibration to interval predictions.
 
     For each gene *g* in regime *r*, the calibrated interval is:
-        [L_ig − q̂_r · S_ig,  U_ig + q̂_r · S_ig]
+        [L_ig − q̂_lo,r · S_ig,  U_ig + q̂_hi,r · S_ig]
     where S_ig = U_ig − L_ig is the base interval width.
 
     Intervals are clamped to the valid expression range
@@ -265,7 +287,7 @@ def calibrate_intervals(
     ----------
     ci_lo_wide, ci_hi_wide : genes × samples base interval bounds.
     regime_df : gene regime assignments (from ``compute_gene_regimes``).
-    q_hats : per-regime q̂ values (from ``compute_regime_qhats``).
+    q_hats_lower, q_hats_upper : per-regime lower/upper q̂ values.
 
     Returns
     -------
@@ -279,23 +301,26 @@ def calibrate_intervals(
     lo = ci_lo_wide.loc[common_genes]
     hi = ci_hi_wide.loc[common_genes]
 
-    # Build per-gene q̂ vector from regime assignments
+    # Build per-gene lower/upper q̂ vectors from regime assignments
     gene_regimes = regime_df.loc[common_genes, "regime"]
-    gene_q = gene_regimes.map(q_hats).fillna(0.0).astype(np.float64)
+    gene_q_lower = gene_regimes.map(q_hats_lower).fillna(0.0).astype(np.float64)
+    gene_q_upper = gene_regimes.map(q_hats_upper).fillna(0.0).astype(np.float64)
 
     # Local scale S_ig = U_ig − L_ig  (genes × samples)
     S = hi.values - lo.values  # ndarray
 
-    # q̂_r broadcast to (genes, 1) then multiplied by S  →  (genes, samples)
-    q_arr = gene_q.values[:, np.newaxis]
-    adjustment = q_arr * S
+    # Tail-specific q̂_r values broadcast to (genes, 1) and scaled by width.
+    q_lower_arr = gene_q_lower.values[:, np.newaxis]
+    q_upper_arr = gene_q_upper.values[:, np.newaxis]
+    lower_adjustment = q_lower_arr * S
+    upper_adjustment = q_upper_arr * S
 
     lo_adj = pd.DataFrame(
-        lo.values - adjustment,
+        lo.values - lower_adjustment,
         index=lo.index, columns=lo.columns,
     )
     hi_adj = pd.DataFrame(
-        hi.values + adjustment,
+        hi.values + upper_adjustment,
         index=hi.index, columns=hi.columns,
     )
 
@@ -334,20 +359,22 @@ def evaluate_calibration(
     ci_lo_wide: pd.DataFrame,
     ci_hi_wide: pd.DataFrame,
     regime_df: pd.DataFrame,
-    q_hats: Dict[str, float],
+    q_hats_lower: Dict[str, float],
+    q_hats_upper: Dict[str, float],
     *,
-    nominal_levels: Sequence[float] = (0.50, 0.80, 0.90, 0.95),
+        nominal_levels: Sequence[float] = (0.50, 0.80, 0.90),
+        interval_nominal: float = 0.90,
 ) -> Dict[str, Any]:
     """Comprehensive calibration evaluation on held-out data.
 
     For each nominal level, the interval is scaled symmetrically around the
     point prediction μ such that its width corresponds to the nominal
-    fraction of the full (calibrated) 95% interval.
+        fraction of the directly modelled calibrated interval.
 
     Computes:
       - overall empirical coverage at each nominal level
-      - mean and median interval width (at 95%)
-      - per-regime coverage (at 95%)
+            - mean and median interval width (at ``interval_nominal``)
+            - per-regime coverage (at ``interval_nominal``)
       - raw arrays for plotting
 
     Parameters
@@ -355,8 +382,11 @@ def evaluate_calibration(
     truth_wide, pred_wide, ci_lo_wide, ci_hi_wide :
         genes × samples DataFrames for the evaluation split.
     regime_df : gene regime assignments.
-    q_hats : per-regime q̂ values.
+    q_hats_lower, q_hats_upper : per-regime lower/upper q̂ values.
     nominal_levels : target coverage levels to evaluate.
+    interval_nominal : nominal level of the directly modelled interval passed
+        in via ``ci_lo_wide``/``ci_hi_wide``. For q0.05/q0.95 intervals,
+        this is 0.90.
 
     Returns
     -------
@@ -365,11 +395,27 @@ def evaluate_calibration(
         ``empirical``     — list of corresponding empirical coverages
         ``mean_width``    — mean calibrated interval width
         ``median_width``  — median calibrated interval width
-        ``regime_coverage`` — dict {regime: empirical_coverage_at_95%}
+        ``regime_coverage`` — dict {regime: empirical_coverage_at_interval_nominal}
         ``n_observations``  — total number of valid observation pairs
     """
+    if not 0.0 < interval_nominal <= 1.0:
+        raise ValueError(
+            f"interval_nominal must lie in (0, 1], got {interval_nominal!r}"
+        )
+    if any(level > interval_nominal for level in nominal_levels):
+        raise ValueError(
+            "nominal_levels cannot exceed interval_nominal for a single "
+            "directly modelled interval"
+        )
+
     # Apply calibration
-    cal_lo, cal_hi = calibrate_intervals(ci_lo_wide, ci_hi_wide, regime_df, q_hats)
+    cal_lo, cal_hi = calibrate_intervals(
+        ci_lo_wide,
+        ci_hi_wide,
+        regime_df,
+        q_hats_lower,
+        q_hats_upper,
+    )
 
     # Align everything
     common_genes = _intersect_regime_genes(
@@ -402,21 +448,20 @@ def evaluate_calibration(
         }
 
     # ── Overall coverage at multiple nominal levels ──
-    max_nominal = max(nominal_levels)
     empiricals = []
     for level in nominal_levels:
-        scale = level / max_nominal
+        scale = level / interval_nominal
         adj_lo = mu_f - scale * (mu_f - lo_f)
         adj_hi = mu_f + scale * (hi_f - mu_f)
         coverage = float(((t_f >= adj_lo) & (t_f <= adj_hi)).sum() / len(t_f))
         empiricals.append(coverage)
 
-    # ── Interval widths at full (95%) level ──
+    # ── Interval widths at the directly modelled level ──
     widths = hi_f - lo_f
     mean_width = float(np.mean(widths))
     median_width = float(np.median(widths))
 
-    # ── Per-regime coverage at 95% ──
+    # ── Per-regime coverage at the directly modelled level ──
     regimes_arr = regime_df.loc[common_genes, "regime"].values
     regime_coverage: Dict[str, float] = {}
     for r in np.unique(regimes_arr):
@@ -464,7 +509,8 @@ class RegimeCalibrator:
         )
     """
     regime_df: pd.DataFrame
-    q_hats: Dict[str, float]
+    q_hats_lower: Dict[str, float]
+    q_hats_upper: Dict[str, float]
     alpha: float = 0.10
     n_regimes: int = 0
     n_calibration_obs: int = 0
@@ -486,13 +532,13 @@ class RegimeCalibrator:
         truth_wide, ci_lo_wide, ci_hi_wide :
             OOF (out-of-fold) truth and base quantile predictions.
         regime_df : gene regime assignments from ``compute_gene_regimes``.
-        alpha : miscoverage budget.
+        alpha : total interval miscoverage budget.
 
         Returns
         -------
         Fitted ``RegimeCalibrator`` instance.
         """
-        q_hats = compute_regime_qhats(
+        q_hats_lower, q_hats_upper = compute_regime_qhats(
             truth_wide, ci_lo_wide, ci_hi_wide, regime_df, alpha=alpha,
         )
         # Count total calibration observations
@@ -504,9 +550,10 @@ class RegimeCalibrator:
         n_obs = len(common_genes) * len(common_samples)
         return cls(
             regime_df=regime_df,
-            q_hats=q_hats,
+            q_hats_lower=q_hats_lower,
+            q_hats_upper=q_hats_upper,
             alpha=alpha,
-            n_regimes=len(q_hats),
+            n_regimes=len(set(q_hats_lower) | set(q_hats_upper)),
             n_calibration_obs=n_obs,
         )
 
@@ -520,7 +567,11 @@ class RegimeCalibrator:
         Returns (calibrated_lo, calibrated_hi).
         """
         return calibrate_intervals(
-            ci_lo_wide, ci_hi_wide, self.regime_df, self.q_hats,
+            ci_lo_wide,
+            ci_hi_wide,
+            self.regime_df,
+            self.q_hats_lower,
+            self.q_hats_upper,
         )
 
     def evaluate(
@@ -530,26 +581,34 @@ class RegimeCalibrator:
         ci_lo_wide: pd.DataFrame,
         ci_hi_wide: pd.DataFrame,
         *,
-        nominal_levels: Sequence[float] = (0.50, 0.80, 0.90, 0.95),
+        nominal_levels: Sequence[float] = (0.50, 0.80, 0.90),
     ) -> Dict[str, Any]:
         """Full evaluation on held-out data (delegates to ``evaluate_calibration``)."""
         return evaluate_calibration(
             truth_wide, pred_wide, ci_lo_wide, ci_hi_wide,
-            self.regime_df, self.q_hats,
+            self.regime_df, self.q_hats_lower, self.q_hats_upper,
+            interval_nominal=1.0 - self.alpha,
             nominal_levels=nominal_levels,
         )
 
     def summary(self) -> str:
         """Human-readable summary of the calibration state."""
-        q_vals = list(self.q_hats.values())
+        lower_vals = list(self.q_hats_lower.values())
+        upper_vals = list(self.q_hats_upper.values())
         lines = [
             f"RegimeCalibrator (α={self.alpha})",
             f"  {self.n_regimes} regimes, {self.n_calibration_obs} calibration obs",
         ]
-        if q_vals:
+        if lower_vals:
             lines.append(
-                f"  q̂ range: [{min(q_vals):.4f}, {max(q_vals):.4f}]  "
-                f"median={float(np.median(q_vals)):.4f}  "
-                f"mean={float(np.mean(q_vals)):.4f}"
+                f"  lower q̂ range: [{min(lower_vals):.4f}, {max(lower_vals):.4f}]  "
+                f"median={float(np.median(lower_vals)):.4f}  "
+                f"mean={float(np.mean(lower_vals)):.4f}"
+            )
+        if upper_vals:
+            lines.append(
+                f"  upper q̂ range: [{min(upper_vals):.4f}, {max(upper_vals):.4f}]  "
+                f"median={float(np.median(upper_vals)):.4f}  "
+                f"mean={float(np.mean(upper_vals)):.4f}"
             )
         return "\n".join(lines)

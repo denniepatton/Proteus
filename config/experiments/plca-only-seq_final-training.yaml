@@ -1,8 +1,9 @@
 # Proteus PLCA model only-seq — final full training (BioDVN_OnlySeq)
 #
-# Uses the PLCAv2 trial-3 recipe with rounded optimizer values and the
-# only-seq channel mode. Full-train uses the chunk-based all-data loader on
-# 100% of the PLCA TSV and saves full_train/final_model.pt.
+# Fixed PLCAv3 finalized defaults, aligned to the v3-4 finalize study and the
+# selected best-trial settings for the production only-seq full-train run.
+# Full-train uses the same multi-source sampling contract as tuning on 100% of
+# the PLCA TSV and saves the terminal epoch state as full_train/final_model.pt.
 
 name: proteus_plca-model_only-seq
 output_dir: trained_models/proteus_plca-model_only-seq
@@ -10,7 +11,7 @@ output_dir: trained_models/proteus_plca-model_only-seq
 transfer: ~
 
 objective:
-  metric: weighted_tumor_gvw_crps_mean
+  metric: weighted_tumor_gvw_crps_max
   direction: minimize
 
 tuning: ~
@@ -20,7 +21,8 @@ data:
   zarr_base: /hpc/temp/ha_g/user/rpatton/ProteusZarrs
   subsample_frac: 1.00
   seed: 23
-  batch_mode: chunk
+  batch_mode: multi_source
+  steps_per_epoch: 4000
   selection_metric: min_weighted_source_crps
   source_groups:
     CRPC-RA: [CRPC-RA]
@@ -29,38 +31,42 @@ data:
     SCLC-Synthetic: [SCLC-PDX]
 
 structural:
-  beta_point_mse: 0.25
+  beta_ccc: 1.0
   beta_background: 1.0
-  beta_tcvae: 1.5
+  beta_kl: 1.0
   beta_contrastive: 1.0
-  beta_grl: 0.2
-  beta_reconstruction: 0.25
+  beta_tfx: 2.0
+  beta_pht_consistency: 0.0
+  beta_pht_uncertainty: 1.5
+  beta_reconstruction: 1.25
   cl_margin: 1.0
-  internal_weight: 0.25
+  internal_weight: 0.5
 
 training:
-  epochs: 25
-  patience: 25
+  epochs: 100
+  patience: 100
   use_amp: true
-  ema_decay: 0.9999
+  ema_decay: 0.0
+  grad_accum_steps: 4
   min_lr_ratio: 0.01
   warmup_start_lr: 1.0e-5
   warmup_frac: 0.05
   schedule_frac: 0.90
   max_grad_norm: 10.0
-  max_lr: 1.5e-4
-  weight_decay: 1.0e-6
+  max_lr: 4.0e-4
+  weight_decay: 2.0e-8
 
 scale:
   signal_ksize: 6
   interaction_ksize: 3
   n_reductions: 3
+  funnel_reduction_factor: 4
   reduction_dilation: 3
-  encoder_start: 512
+  encoder_start: 256
   latent_size: 128
   decoder_start: 64
   mdn_hidden: 64
   mdn_final: 16
-  signal_filters: 16
-  initial_reduction_channels: 64
-  dropout_rate: 0.10
+  signal_filters: 8
+  initial_reduction_channels: 32
+  dropout_rate: 0.25

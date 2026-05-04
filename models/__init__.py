@@ -11,9 +11,8 @@ from .model_utils import (
     contrastive_loss,
     reconstruction_loss,
     InternalLossComputer,
-    # Gradient reversal for TFX-invariant latents
-    GradientReversalLayer,
-    TFXDiscriminator,
+    # Auxiliary TFX prediction
+    TFXPredictor,
     # Combined loss
     BioDVNMDNLoss,
     # Metrics
@@ -36,8 +35,8 @@ __all__ = [
     # Loss functions
     'kl_divergence', 'contrastive_loss', 'reconstruction_loss',
     'InternalLossComputer', 'BioDVNMDNLoss',
-    # Gradient reversal
-    'GradientReversalLayer', 'TFXDiscriminator',
+    # Auxiliary TFX prediction
+    'TFXPredictor',
     # Metrics
     'MaskedR2Metric', 'MetricsTracker',
     # Models

@@ -19,6 +19,7 @@ Key features:
 import os
 import json
 import random
+import re
 from typing import Dict, List, Optional, Tuple, Union, Any
 from pathlib import Path
 
@@ -37,6 +38,16 @@ from proteus_utils.data_helpers import (
 def _collate_identity(batch: List[Any]) -> Any:
     """Return the single element produced by DataLoader(batch_size=1)."""
     return batch[0]
+
+
+_PHT_META_RE = re.compile(r'^PHT-Fold-\d+_(.+)-(BP[^_]+)(?:_.*)?$')
+
+
+def _parse_pht_metadata(sample_name: str) -> Tuple[bool, str, str]:
+    match = _PHT_META_RE.match(str(sample_name))
+    if match is None:
+        return False, '', ''
+    return True, match.group(1), match.group(2)
 
 
 class ProteusGeneChunkIterableDataset(IterableDataset):
@@ -575,20 +586,13 @@ class ProteusInferenceDataset(Dataset):
 
 
 class ProteusMultiSourceBatchDataset(IterableDataset):
-    """Multi-source gene-conditioned batch loader using a union gene universe.
+    """PHT-aware source-balanced gene-conditioned batch loader.
 
-    Uses the **union** of all source gene sets so that no data is discarded.
-    Each batch contains 32 items drawn from 2–3 unique genes with roughly
-    equal representation across available sources.
-
-    Gene iteration is a **uniform shuffle without replacement** over the full
-    union gene list, guaranteeing every gene is seen at least once per epoch.
-
-    For each gene in a batch, only sources that actually have that gene
-    contribute samples.  Slots are distributed roughly equally across
-    available sources, and within each source samples are drawn without
-    replacement from a cycling queue (reshuffled and restarted when
-    depleted), ensuring every sample is seen over 1–2 epochs.
+    Each training batch samples a small set of genes and, for each gene,
+    draws multiple samples across source groups.  Gene choice is variance
+    weighted, PHT draws are grouped by parent tumor or HD donor when possible,
+    and metadata are emitted so CCC/PHT losses can operate on the actual
+    training mini-panel.
 
     Loss weights per gene are compressed: ``sqrt(variance) / median_stdev``,
     clamped to ``[gene_weight_min, gene_weight_max]``.
@@ -610,8 +614,9 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         sample_paths_by_source: Dict[str, List[str]],
         gene_variance: Dict[str, float],
         n_eff_per_source: int = 24,
-        genes_per_batch: int = 2,
-        batch_size: int = 32,
+        genes_per_batch: int = 4,
+        batch_size: int = 64,
+        steps_per_epoch: int = 4000,
         gene_weight_min: float = 0.5,
         gene_weight_max: float = 2.0,
         seed: int = 42,
@@ -628,6 +633,7 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         self.n_eff_per_source = n_eff_per_source
         self.genes_per_batch = genes_per_batch
         self.batch_size = batch_size
+        self.steps_per_epoch = int(steps_per_epoch)
         self.gene_weight_min = gene_weight_min
         self.gene_weight_max = gene_weight_max
         self.seed = seed
@@ -643,6 +649,14 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         if not all_paths:
             raise ValueError("No sample paths provided to "
                              "ProteusMultiSourceBatchDataset")
+        if self.genes_per_batch <= 0:
+            raise ValueError('genes_per_batch must be > 0')
+        if self.batch_size <= 0:
+            raise ValueError('batch_size must be > 0')
+        if self.batch_size % self.genes_per_batch != 0:
+            raise ValueError('batch_size must be divisible by genes_per_batch')
+        if self.steps_per_epoch <= 0:
+            raise ValueError('steps_per_epoch must be > 0')
 
         # Discover per-source gene sets.  Samples within a source can have
         # slightly different gene panels (genes with >50% NaN features are
@@ -680,6 +694,7 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         # because source_gene_mask prevents drawing them).
         self._preloaded: Dict[str, Dict[str, np.ndarray]] = {}
         self._preload_all_samples(all_paths, source_gene_sets, gene_to_idx)
+        self._build_sampling_groups()
 
         # Per-gene loss weights: sqrt(variance) / median(stdev), clamped.
         variance_arr = np.array(
@@ -697,18 +712,24 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
             raw_weights, gene_weight_min, gene_weight_max,
         ).astype(np.float32)
 
-        # Epoch length: every gene seen by n_eff_total samples per epoch.
-        # n_eff_total = n_sources × n_eff_per_source effective sample draws.
-        # Each batch holds batch_size items, so total batches = n_eff_total × n_genes / batch_size.
+        positive_variances = variance_arr[variance_arr > 0]
+        variance_floor = (
+            0.05 * float(np.median(positive_variances))
+            if positive_variances.size > 0 else 1.0
+        )
+        sampling_weights = variance_arr + variance_floor
+        self._gene_sampling_probs = (
+            sampling_weights / sampling_weights.sum()
+        ).astype(np.float64)
+
         items_per_gene = self.batch_size // self.genes_per_batch
-        n_eff_total = self.n_eff_per_source * self.n_sources
-        self._n_batches = max(1, (n_eff_total * n_genes) // self.batch_size)
+        self._n_batches = self.steps_per_epoch
 
         if subsample_frac is not None and 0.0 < subsample_frac < 1.0:
             self._n_batches = max(1, int(self._n_batches * subsample_frac))
 
         print(f"  [MultiSource] {n_genes} union genes, "
-              f"{self.n_sources} sources × {self.n_eff_per_source} eff/source, "
+              f"{self.n_sources} sources, "
               f"batch={self.batch_size} ({self.genes_per_batch}g × "
               f"{items_per_gene}sps), "
               f"{self._n_batches} batches/epoch")
@@ -796,6 +817,9 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                     name = Path(zarr_path).stem.replace('.zarr', '')
                 sample_display = str(name)
 
+            available_mask = np.zeros(n_union, dtype=np.bool_)
+            available_mask[local_to_union] = True
+
             return zarr_path, {
                 'TSS_signals': signals,
                 'TSS_nucleotides': nucleotides,
@@ -805,6 +829,7 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                 'tumor_exp': tumor_exp,
                 'background_exp': bg_exp,
                 'TFX_label': tfx_label,
+                'available_mask': available_mask,
             }, sample_display
 
         unique_paths = sorted(set(all_paths))
@@ -822,6 +847,10 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
               f"estimated {total_gb:.1f} GB...")
 
         self._sample_display_names: Dict[str, str] = {}
+        self._sample_source_names: Dict[str, str] = {}
+        self._sample_is_pht: Dict[str, bool] = {}
+        self._sample_pht_parent: Dict[str, str] = {}
+        self._sample_pht_donor: Dict[str, str] = {}
 
         max_threads = min(4, n_samples)
         with ThreadPoolExecutor(max_workers=max_threads) as executor:
@@ -831,6 +860,11 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                 zarr_path, arrays, display_name = future.result()
                 self._preloaded[zarr_path] = arrays
                 self._sample_display_names[zarr_path] = display_name
+                self._sample_source_names[zarr_path] = path_to_source[zarr_path]
+                is_pht, parent_id, donor_id = _parse_pht_metadata(display_name)
+                self._sample_is_pht[zarr_path] = is_pht
+                self._sample_pht_parent[zarr_path] = parent_id
+                self._sample_pht_donor[zarr_path] = donor_id
                 done += 1
                 if done % 20 == 0 or done == n_samples:
                     print(f"    ... loaded {done}/{n_samples} samples")
@@ -843,35 +877,95 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
             Path(zarr_path).stem.replace('.zarr', ''),
         )
 
-    # -- Per-source cycling queues --
+    def _build_sampling_groups(self) -> None:
+        self._source_real_paths: Dict[str, List[str]] = {src: [] for src in self.source_names}
+        self._source_pht_paths: Dict[str, List[str]] = {src: [] for src in self.source_names}
+        self._source_pht_by_parent: Dict[str, Dict[str, List[str]]] = {src: {} for src in self.source_names}
+        self._source_pht_by_donor: Dict[str, Dict[str, List[str]]] = {src: {} for src in self.source_names}
 
-    def _build_source_queues(
-        self, rng: random.Random,
-    ) -> Dict[str, List[str]]:
-        """Build per-source sample queues for without-replacement cycling.
-
-        Large sources are shuffled as-is.  Small sources (fewer samples
-        than n_eff_per_source) are repeated enough times to cover n_eff
-        slots, then shuffled — so every real sample appears at least once
-        before any repeats.
-        """
-        queues: Dict[str, List[str]] = {}
         for src in self.source_names:
-            paths = list(self.sample_paths_by_source[src])
-            n_avail = len(paths)
-            n_eff = self.n_eff_per_source
-            if n_avail >= n_eff:
-                # Undersample: shuffle and draw without replacement.
-                rng.shuffle(paths)
-                queues[src] = paths
-            else:
-                # Oversample: repeat to reach n_eff, then shuffle.
-                full_copies = n_eff // n_avail
-                remainder = n_eff % n_avail
-                expanded = paths * full_copies + rng.sample(paths, remainder)
-                rng.shuffle(expanded)
-                queues[src] = expanded
-        return queues
+            for path in self.sample_paths_by_source[src]:
+                if self._sample_is_pht.get(path, False):
+                    self._source_pht_paths[src].append(path)
+                    parent = self._sample_pht_parent.get(path, '')
+                    donor = self._sample_pht_donor.get(path, '')
+                    if parent:
+                        self._source_pht_by_parent[src].setdefault(parent, []).append(path)
+                    if donor:
+                        self._source_pht_by_donor[src].setdefault(donor, []).append(path)
+                else:
+                    self._source_real_paths[src].append(path)
+
+        for src in self.source_names:
+            print(
+                f"  [MultiSource] source '{src}': "
+                f"{len(self._source_real_paths[src])} real + "
+                f"{len(self._source_pht_paths[src])} PHT samples"
+            )
+
+    def _path_has_gene(self, zarr_path: str, gene_idx: int) -> bool:
+        return bool(self._preloaded[zarr_path]['available_mask'][gene_idx])
+
+    def _passes_val_mask(self, zarr_path: str, gene_idx: int) -> bool:
+        if self.val_mask is None:
+            return True
+        sample_idx = self._sample_path_to_idx[zarr_path]
+        return not bool(self.val_mask[sample_idx, gene_idx])
+
+    def _valid_paths_for_gene(self, paths: List[str], gene_idx: int) -> List[str]:
+        return [
+            path for path in paths
+            if self._path_has_gene(path, gene_idx) and self._passes_val_mask(path, gene_idx)
+        ]
+
+    def _draw_real_paths(self, src: str, gene_idx: int, n_draws: int, rng: random.Random) -> List[str]:
+        candidates = self._valid_paths_for_gene(self._source_real_paths[src], gene_idx)
+        if not candidates or n_draws <= 0:
+            return []
+        return [rng.choice(candidates) for _ in range(n_draws)]
+
+    def _draw_pht_paths(self, src: str, gene_idx: int, n_draws: int, rng: random.Random) -> List[str]:
+        if n_draws <= 0:
+            return []
+        grouped = self._source_pht_by_parent[src] if rng.random() < 0.5 else self._source_pht_by_donor[src]
+        valid_groups = []
+        for group_paths in grouped.values():
+            valid = self._valid_paths_for_gene(group_paths, gene_idx)
+            if len(valid) >= 2:
+                valid_groups.append(valid)
+        if valid_groups:
+            chosen_group = rng.choice(valid_groups)
+            if len(chosen_group) >= n_draws:
+                return rng.sample(chosen_group, n_draws)
+            return chosen_group + [rng.choice(chosen_group) for _ in range(n_draws - len(chosen_group))]
+        candidates = self._valid_paths_for_gene(self._source_pht_paths[src], gene_idx)
+        if not candidates:
+            return []
+        return [rng.choice(candidates) for _ in range(n_draws)]
+
+    def _draw_source_paths(self, src: str, gene_idx: int, n_draws: int, rng: random.Random) -> List[str]:
+        if n_draws <= 0:
+            return []
+        pht_available = bool(self._valid_paths_for_gene(self._source_pht_paths[src], gene_idx))
+        real_available = bool(self._valid_paths_for_gene(self._source_real_paths[src], gene_idx))
+        if pht_available and real_available:
+            n_pht = max(1, n_draws // 4)
+            n_real = n_draws - n_pht
+        elif pht_available:
+            n_pht = n_draws
+            n_real = 0
+        else:
+            n_pht = 0
+            n_real = n_draws
+        drawn = self._draw_real_paths(src, gene_idx, n_real, rng)
+        drawn.extend(self._draw_pht_paths(src, gene_idx, n_pht, rng))
+        while len(drawn) < n_draws:
+            filler = self._draw_real_paths(src, gene_idx, 1, rng) or self._draw_pht_paths(src, gene_idx, 1, rng)
+            if not filler:
+                break
+            drawn.extend(filler)
+        rng.shuffle(drawn)
+        return drawn[:n_draws]
 
     # -- Core iteration --
 
@@ -888,14 +982,9 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         epoch_seed = self.seed + self._epoch_counter * 997 + worker_id * 31
         rng = random.Random(epoch_seed)
 
-        # Build per-source cycling queues and position cursors.
-        queues = self._build_source_queues(rng)
-        positions: Dict[str, int] = {src: 0 for src in self.source_names}
-
-        # Uniform shuffle of all genes (without replacement → full coverage).
         n_genes = len(self._union_genes)
-        gene_order = list(range(n_genes))
-        rng.shuffle(gene_order)
+        gene_population = list(range(n_genes))
+        gene_sampling_probs = self._gene_sampling_probs.tolist()
 
         # Divide batches across workers.
         total_batches = self._n_batches
@@ -903,22 +992,14 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         if worker_id < (total_batches % num_workers):
             worker_batches += 1
 
-        # Gene cursor: consume genes_per_batch genes per batch from the
-        # shuffled order, wrapping around if needed.
-        gene_cursor = worker_id * self.genes_per_batch  # offset by worker
-
         items_per_gene = self.batch_size // self.genes_per_batch
 
         for _batch_idx in range(worker_batches):
-            # Take next genes_per_batch genes from the shuffled order.
-            batch_gene_indices = []
-            for _ in range(self.genes_per_batch):
-                if gene_cursor >= n_genes:
-                    rng.shuffle(gene_order)
-                    gene_cursor = 0
-                batch_gene_indices.append(gene_order[gene_cursor])
-                gene_cursor += self.genes_per_batch * num_workers
-                # If that jumps past the end, wrap later at the top of loop.
+            batch_gene_indices = rng.choices(
+                gene_population,
+                weights=gene_sampling_probs,
+                k=self.genes_per_batch,
+            )
 
             feat_signals = []
             feat_nt = []
@@ -928,9 +1009,14 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
             lab_tumor = []
             lab_bg = []
             lab_weight = []
+            lab_ccc_weight = []
             lab_tfx = []
             meta_samples: List[str] = []
             meta_genes: List[str] = []
+            meta_sources: List[str] = []
+            meta_parent_ids: List[str] = []
+            meta_donor_ids: List[str] = []
+            meta_is_pht: List[float] = []
 
             for g_idx in batch_gene_indices:
                 gene_name = self._union_genes[g_idx]
@@ -940,6 +1026,7 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                 available_sources = [
                     src for src in self.source_names
                     if self._source_gene_mask[src][g_idx]
+                    and self._valid_paths_for_gene(self.sample_paths_by_source[src], g_idx)
                 ]
                 if not available_sources:
                     continue  # gene not in any source (shouldn't happen)
@@ -955,37 +1042,9 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                     src_counts[src] = base_per_src + (1 if si < remainder else 0)
 
                 for src, n_draws in src_counts.items():
-                    for _ in range(n_draws):
-                        # Draw next sample from this source's queue.
-                        pos = positions[src]
-                        if pos >= len(queues[src]):
-                            rng.shuffle(queues[src])
-                            pos = 0
-                        zarr_path = queues[src][pos]
-                        positions[src] = pos + 1
-
-                        # Skip held-out (sample, gene) pairs if val_mask
-                        # is active (full-training mode).
-                        if self.val_mask is not None:
-                            s_idx = self._sample_path_to_idx[zarr_path]
-                            if self.val_mask[s_idx, g_idx]:
-                                # Try next sample from same source.
-                                found = False
-                                for _retry in range(len(queues[src])):
-                                    pos2 = positions[src]
-                                    if pos2 >= len(queues[src]):
-                                        rng.shuffle(queues[src])
-                                        pos2 = 0
-                                    zarr_path = queues[src][pos2]
-                                    positions[src] = pos2 + 1
-                                    s_idx = self._sample_path_to_idx[zarr_path]
-                                    if not self.val_mask[s_idx, g_idx]:
-                                        found = True
-                                        break
-                                if not found:
-                                    continue  # all samples held out for this gene+source
-
+                    for zarr_path in self._draw_source_paths(src, g_idx, n_draws, rng):
                         sd = self._preloaded[zarr_path]
+                        is_pht = self._sample_is_pht.get(zarr_path, False)
 
                         feat_signals.append(
                             torch.from_numpy(
@@ -1002,6 +1061,7 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                             torch.from_numpy(sd['ref_scalars'][g_idx]))
                         lab_tfx.append(float(sd['TFX_label'][g_idx]))
                         lab_weight.append(gene_weight)
+                        lab_ccc_weight.append(0.0 if is_pht else gene_weight)
 
                         if self.labeled:
                             lab_tumor.append(float(sd['tumor_exp'][g_idx]))
@@ -1012,6 +1072,10 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                             meta_samples.append(
                                 self._get_sample_name(zarr_path))
                             meta_genes.append(gene_name)
+                            meta_sources.append(src)
+                            meta_parent_ids.append(self._sample_pht_parent.get(zarr_path, ''))
+                            meta_donor_ids.append(self._sample_pht_donor.get(zarr_path, ''))
+                            meta_is_pht.append(1.0 if is_pht else 0.0)
 
             # If val_mask filtering removed all items, skip this batch.
             if not feat_signals:
@@ -1028,6 +1092,10 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
             if self.include_metadata:
                 features['sample_name'] = meta_samples
                 features['gene_name'] = meta_genes
+                features['source_name'] = meta_sources
+                features['pht_parent_id'] = meta_parent_ids
+                features['pht_donor_id'] = meta_donor_ids
+                features['is_pht'] = torch.tensor(meta_is_pht, dtype=torch.float32).unsqueeze(-1)
 
             w_t = torch.tensor(lab_weight, dtype=torch.float32)
             t_t = torch.tensor(lab_tfx, dtype=torch.float32)
@@ -1039,6 +1107,8 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                     'background_exp': torch.tensor(
                         lab_bg, dtype=torch.float32).unsqueeze(-1),
                     'sample_weight': w_t.unsqueeze(-1),
+                    'ccc_weight': torch.tensor(
+                        lab_ccc_weight, dtype=torch.float32).unsqueeze(-1),
                     'TFX_label': t_t.unsqueeze(-1),
                 }
             else:
@@ -1115,9 +1185,14 @@ class ProteusHoldoutValDataset(IterableDataset):
         buf_tumor = []
         buf_bg = []
         buf_weight = []
+        buf_ccc_weight = []
         buf_tfx = []
         buf_samples: List[str] = []
         buf_genes: List[str] = []
+        buf_sources: List[str] = []
+        buf_parents: List[str] = []
+        buf_donors: List[str] = []
+        buf_is_pht: List[float] = []
 
         for s_idx, g_idx in worker_pairs:
             zarr_path = all_paths[s_idx]
@@ -1134,10 +1209,16 @@ class ProteusHoldoutValDataset(IterableDataset):
             buf_ref.append(torch.from_numpy(sd['ref_scalars'][g_idx]))
             buf_tfx.append(float(sd['TFX_label'][g_idx]))
             buf_weight.append(gene_weight)
+            is_pht = ds._sample_is_pht.get(zarr_path, False)
+            buf_ccc_weight.append(0.0 if is_pht else gene_weight)
             buf_tumor.append(float(sd['tumor_exp'][g_idx]))
             buf_bg.append(float(sd['background_exp'][g_idx]))
             buf_samples.append(ds._get_sample_name(zarr_path))
             buf_genes.append(gene_name)
+            buf_sources.append(ds._sample_source_names.get(zarr_path, ''))
+            buf_parents.append(ds._sample_pht_parent.get(zarr_path, ''))
+            buf_donors.append(ds._sample_pht_donor.get(zarr_path, ''))
+            buf_is_pht.append(1.0 if is_pht else 0.0)
 
             if len(buf_signals) == self.batch_size:
                 features: Dict[str, Any] = {
@@ -1148,6 +1229,10 @@ class ProteusHoldoutValDataset(IterableDataset):
                     'ref_scalars': torch.stack(buf_ref),
                     'sample_name': list(buf_samples),
                     'gene_name': list(buf_genes),
+                    'source_name': list(buf_sources),
+                    'pht_parent_id': list(buf_parents),
+                    'pht_donor_id': list(buf_donors),
+                    'is_pht': torch.tensor(buf_is_pht, dtype=torch.float32).unsqueeze(-1),
                 }
                 labels: Dict[str, torch.Tensor] = {
                     'tumor_exp': torch.tensor(
@@ -1156,6 +1241,8 @@ class ProteusHoldoutValDataset(IterableDataset):
                         buf_bg, dtype=torch.float32).unsqueeze(-1),
                     'sample_weight': torch.tensor(
                         buf_weight, dtype=torch.float32).unsqueeze(-1),
+                    'ccc_weight': torch.tensor(
+                        buf_ccc_weight, dtype=torch.float32).unsqueeze(-1),
                     'TFX_label': torch.tensor(
                         buf_tfx, dtype=torch.float32).unsqueeze(-1),
                 }
@@ -1169,9 +1256,14 @@ class ProteusHoldoutValDataset(IterableDataset):
                 buf_tumor.clear()
                 buf_bg.clear()
                 buf_weight.clear()
+                buf_ccc_weight.clear()
                 buf_tfx.clear()
                 buf_samples.clear()
                 buf_genes.clear()
+                buf_sources.clear()
+                buf_parents.clear()
+                buf_donors.clear()
+                buf_is_pht.clear()
 
 
 def collate_inference(batch: List[Dict]) -> Dict[str, torch.Tensor]:
@@ -1504,8 +1596,9 @@ def build_multisource_loaders_from_splits(
     source_groups: Dict[str, List[str]],
     gene_variance: Dict[str, float],
     n_eff_per_source: int = 24,
-    genes_per_batch: int = 2,
-    batch_size: int = 32,
+    genes_per_batch: int = 4,
+    batch_size: int = 64,
+    steps_per_epoch: int = 4000,
     gene_weight_min: float = 0.5,
     gene_weight_max: float = 2.0,
     num_workers: int = 4,
@@ -1528,9 +1621,11 @@ def build_multisource_loaders_from_splits(
         val_fold: Fold number held out for validation.
         source_groups: Mapping of source name → list of cohort names.
         gene_variance: Per-gene raw variance (for loss weights).
-        n_eff_per_source: Effective samples per source per epoch.
-        genes_per_batch: Unique genes drawn per batch (default 2).
-        batch_size: Total items per batch (default 32).
+        n_eff_per_source: Retained for caller compatibility; fixed stochastic
+            epochs are controlled by ``steps_per_epoch``.
+        genes_per_batch: Unique genes drawn per batch (default 4).
+        batch_size: Total items per batch (default 64).
+        steps_per_epoch: Fixed stochastic batches per epoch (default 4000).
         gene_weight_min: Minimum compressed loss weight (default 0.5).
         gene_weight_max: Maximum compressed loss weight (default 2.0).
         num_workers: DataLoader workers.
@@ -1574,12 +1669,13 @@ def build_multisource_loaders_from_splits(
         n_eff_per_source=n_eff_per_source,
         genes_per_batch=genes_per_batch,
         batch_size=batch_size,
+        steps_per_epoch=steps_per_epoch,
         gene_weight_min=gene_weight_min,
         gene_weight_max=gene_weight_max,
         seed=seed,
         labeled=True,
         sample_name_map=zarr_path_to_sample_name,
-        include_metadata=False,
+        include_metadata=True,
         subsample_frac=subsample_frac,
     )
 

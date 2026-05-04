@@ -25,11 +25,13 @@ import json
 import math
 import os
 import sys
+import time
 import traceback
 import warnings
 from typing import Any, Dict, List, Literal, Optional
 
 import optuna
+from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
 
 # Suppress Optuna experimental feature warnings (multivariate, constant_liar are stable in practice)
 warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
@@ -92,18 +94,37 @@ def _make_storage(url: str) -> Any:
 
     SQLite can only handle one writer at a time.  With many parallel
     workers the default 5-second busy timeout is too short and causes
-    ``database is locked`` errors.  This helper creates an
-    ``RDBStorage`` with a 300-second timeout so workers wait rather
-    than crash.  Non-SQLite URLs are returned unchanged.
+    ``database is locked`` errors.  Under simultaneous worker startup,
+    SQLite schema initialization can also race and transiently raise
+    ``table ... already exists`` for different Optuna metadata tables while
+    SQLAlchemy is issuing CREATE TABLE statements.  This helper retries that
+    startup path so workers converge on the same shared study instead of
+    crashing during launch.
     """
     if url.startswith("sqlite"):
-        return optuna.storages.RDBStorage(
-            url=url,
-            engine_kwargs={
-                "connect_args": {"timeout": 300},
-                "pool_pre_ping": True,
-            },
-        )
+        last_error: Optional[SQLAlchemyOperationalError] = None
+        for attempt in range(8):
+            try:
+                return optuna.storages.RDBStorage(
+                    url=url,
+                    engine_kwargs={
+                        "connect_args": {"timeout": 300},
+                        "pool_pre_ping": True,
+                    },
+                )
+            except SQLAlchemyOperationalError as exc:
+                err_text = str(exc).lower()
+                if (
+                    "already exists" not in err_text
+                    and "database is locked" not in err_text
+                ):
+                    raise
+                last_error = exc
+                if attempt == 7:
+                    raise
+                time.sleep(2.0 + attempt)
+        if last_error is not None:
+            raise last_error
     return url
 
 
@@ -379,6 +400,7 @@ def run_optuna_cv_tuning(
                 balance_cohorts=exp.data.balance_cohorts,
                 source_groups=exp.data.source_groups,
                 target_n_per_source=exp.data.target_n_per_source,
+                steps_per_epoch=exp.data.steps_per_epoch,
                 batch_mode=exp.data.batch_mode,
             )
         except optuna.TrialPruned:
@@ -520,7 +542,10 @@ def run_optuna_fold_tuning(
                     val_metrics.get('val_balanced_tumor_gvw_r', val_score),
                 )
             else:
-                if exp.objective.metric == 'weighted_tumor_gvw_crps_mean':
+                if exp.objective.metric in (
+                    'weighted_tumor_gvw_crps_mean',
+                    'weighted_tumor_gvw_crps_max',
+                ):
                     metric_val = val_metrics.get(
                         'val_weighted_tumor_gvw_crps',
                         val_metrics.get('val_balanced_tumor_gvw_crps', val_score),
@@ -551,6 +576,7 @@ def run_optuna_fold_tuning(
                 balance_cohorts=exp.data.balance_cohorts,
                 source_groups=exp.data.source_groups,
                 target_n_per_source=exp.data.target_n_per_source,
+                steps_per_epoch=exp.data.steps_per_epoch,
                 batch_mode=exp.data.batch_mode,
             )
         except optuna.TrialPruned:
@@ -602,6 +628,7 @@ def run_optuna_fold_tuning(
         weighted_val = fold_metrics.get("weighted_tumor_gvw_crps", None)
         if weighted_val is not None:
             obj["weighted_tumor_gvw_crps_mean"] = float(weighted_val)
+            obj["weighted_tumor_gvw_crps_max"] = float(weighted_val)
         balanced_r = fold_metrics.get("balanced_tumor_gvw_r", None)
         if balanced_r is not None:
             obj["balanced_tumor_gvw_r_mean"] = float(balanced_r)
@@ -1125,7 +1152,10 @@ def coordinated_tell(
                 _tid = _frozen_id_map[trial_num]
                 fold_rows = collect_fold_metrics(run_dir)
                 for step, row in enumerate(fold_rows):
-                    if metric == 'weighted_tumor_gvw_crps_mean':
+                    if metric in (
+                        'weighted_tumor_gvw_crps_mean',
+                        'weighted_tumor_gvw_crps_max',
+                    ):
                         fold_value = row.get('weighted_tumor_gvw_crps')
                     elif direction == 'maximize':
                         fold_value = row.get('balanced_tumor_gvw_r')
@@ -1181,11 +1211,14 @@ def run_coordinated_fold(
         trial_cfg = json.load(f)
 
     model_cfg, train_cfg = configs_from_trial_json(trial_cfg, exp)
+    use_fixed_schedule_oof = str(exp.tuning.phase).strip().lower().endswith("finalize")
 
     from Proteus import train_model_cv  # local import to avoid circulars
 
     print(f"[Coordinated] Training trial {trial_number:05d}, fold {fold_num}",
           flush=True)
+    if use_fixed_schedule_oof:
+        print("[Coordinated] Finalize phase: using fixed-schedule OOF evaluation from final_model.pt", flush=True)
 
     train_model_cv(
         model_name="BioDVN",
@@ -1201,5 +1234,7 @@ def run_coordinated_fold(
         balance_cohorts=exp.data.balance_cohorts,
         source_groups=exp.data.source_groups,
         target_n_per_source=exp.data.target_n_per_source,
+        steps_per_epoch=exp.data.steps_per_epoch,
         batch_mode=exp.data.batch_mode,
+        fixed_schedule_oof=use_fixed_schedule_oof,
     )

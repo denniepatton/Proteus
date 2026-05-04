@@ -25,7 +25,12 @@ _GENE_ALIAS_FALLBACKS: Dict[str, str] = {
     "TARP": "CD3G",
 }
 
-_MDN_GAMMA_SHAPE: float = 0.80
+_MDN_GAMMA_SHAPE: float = 0.75
+_PAM50_GENEFU_MODEL_NAMES: Tuple[str, ...] = ("pam50.scale",)
+_PAM50_LABEL_MAP: Dict[str, str] = {
+    "Her2": "HER2",
+}
+_GENEFU_BRIDGE_CACHE: Optional[Tuple[Any, Any, Any]] = None
 
 
 def _augment_missing_gene_aliases(expr_df: pd.DataFrame) -> pd.DataFrame:
@@ -338,6 +343,8 @@ def load_cv_predictions_proteus_full(
         ``gamma_beta_wide``   — genes × samples merged gamma_beta (or None)
         ``normal_mean_wide``  — genes × samples merged normal_mean (or None)
         ``normal_stdev_wide`` — genes × samples merged normal_stdev (or None)
+        ``activity_odds_ratio_wide`` — genes × samples log2(pi_normal / (pi_delta + pi_gamma)) (or None)
+        ``active_confidence_wide`` — genes × samples P(Y >= 2.0) from the raw MDN (or None)
         ``fold_data``         — {fold_int: dict of per-fold wide DFs}
         ``sample_fold``       — {sample_name: fold_int}
     """
@@ -398,6 +405,39 @@ def load_cv_predictions_proteus_full(
     for key, parts in optional_parts.items():
         result[key] = _merge_wide_folds(parts) if parts else None
 
+    if (
+        result.get("p0_wide") is not None
+        and result.get("pi_gamma_wide") is not None
+        and result.get("pi_normal_wide") is not None
+    ):
+        result["activity_odds_ratio_wide"] = mdn_activity_odds_ratio_wide(
+            result["p0_wide"],
+            result["pi_gamma_wide"],
+            result["pi_normal_wide"],
+        )
+    else:
+        result["activity_odds_ratio_wide"] = None
+
+    required_mdn_keys = (
+        "p0_wide",
+        "pi_gamma_wide",
+        "pi_normal_wide",
+        "gamma_beta_wide",
+        "normal_mean_wide",
+        "normal_stdev_wide",
+    )
+    if all(result.get(key) is not None for key in required_mdn_keys):
+        result["active_confidence_wide"] = mdn_on_probability_wide(
+            result["p0_wide"],
+            result["pi_gamma_wide"],
+            result["pi_normal_wide"],
+            result["gamma_beta_wide"],
+            result["normal_mean_wide"],
+            result["normal_stdev_wide"],
+        )
+    else:
+        result["active_confidence_wide"] = None
+
     return result
 
 
@@ -416,6 +456,8 @@ def load_holdout_predictions_proteus_full(
         ``gamma_beta_wide``   — genes × samples gamma_beta (or None)
         ``normal_mean_wide``  — genes × samples normal_mean (or None)
         ``normal_stdev_wide`` — genes × samples normal_stdev (or None)
+        ``activity_odds_ratio_wide`` — genes × samples log2(pi_normal / (pi_delta + pi_gamma)) (or None)
+        ``active_confidence_wide`` — genes × samples P(Y >= 2.0) from the raw MDN (or None)
     """
     _OPTIONAL_COLS = {
         "ci_q5": "ci_lo_wide",
@@ -431,6 +473,37 @@ def load_holdout_predictions_proteus_full(
     result: Dict[str, Any] = {"pred_wide": _long_to_wide(df, "prediction_mean")}
     for tsv_col, key in _OPTIONAL_COLS.items():
         result[key] = _long_to_wide(df, tsv_col) if tsv_col in df.columns else None
+    if (
+        result.get("p0_wide") is not None
+        and result.get("pi_gamma_wide") is not None
+        and result.get("pi_normal_wide") is not None
+    ):
+        result["activity_odds_ratio_wide"] = mdn_activity_odds_ratio_wide(
+            result["p0_wide"],
+            result["pi_gamma_wide"],
+            result["pi_normal_wide"],
+        )
+    else:
+        result["activity_odds_ratio_wide"] = None
+    required_mdn_keys = (
+        "p0_wide",
+        "pi_gamma_wide",
+        "pi_normal_wide",
+        "gamma_beta_wide",
+        "normal_mean_wide",
+        "normal_stdev_wide",
+    )
+    if all(result.get(key) is not None for key in required_mdn_keys):
+        result["active_confidence_wide"] = mdn_on_probability_wide(
+            result["p0_wide"],
+            result["pi_gamma_wide"],
+            result["pi_normal_wide"],
+            result["gamma_beta_wide"],
+            result["normal_mean_wide"],
+            result["normal_stdev_wide"],
+        )
+    else:
+        result["active_confidence_wide"] = None
     return result
 
 
@@ -986,6 +1059,7 @@ def cohort_summary_table(
     label: str = "",
     n_workers: Optional[int] = None,
     var_map: Optional[Dict[str, float]] = None,
+    verbose: bool = True,
 ) -> Dict[str, Any]:
     """Compute the full cohort summary metrics dict.
 
@@ -1011,15 +1085,19 @@ def cohort_summary_table(
     T_arr = tw.values.astype(np.float64)
     P_arr = pw.values.astype(np.float64)
     w_gene = np.array([var_map.get(g, 0.0) for g in common_genes], dtype=np.float64)
-    print(f"    GVW ...", end=" ", flush=True)
+    if verbose:
+        print(f"    GVW ...", end=" ", flush=True)
     gvw_r_val = _gvw_r_from_wide(T_arr, P_arr, w_gene)
     gvw_rho_val = _gvw_rho_from_wide(T_arr, P_arr, w_gene)
 
-    print("gene metrics ...", end=" ", flush=True)
+    if verbose:
+        print("gene metrics ...", end=" ", flush=True)
     gene_met = gene_level_metrics(tw, pw, n_workers=n_workers)
-    print("sample metrics ...", end=" ", flush=True)
+    if verbose:
+        print("sample metrics ...", end=" ", flush=True)
     sample_met = sample_level_metrics(tw, pw, n_workers=n_workers)
-    print("done", flush=True)
+    if verbose:
+        print("done", flush=True)
 
     # Suppress benign "Mean of empty slice" from pandas .mean() on
     # columns that may be all-NaN (e.g. constant genes with 5 HO samples).
@@ -1049,23 +1127,31 @@ def cohort_summary_table(
 
 def print_summary_table(summaries: List[Dict[str, Any]]) -> None:
     """Pretty-print a list of cohort_summary_table() results."""
+    label_width = 28
     header = (
-        f"{'Label':<20s} {'n_g':>6s} {'n_s':>5s} "
+        f"{'Label':<{label_width}s} {'n_g':>6s} {'n_s':>5s} "
         f"{'GVW-r':>7s} {'GVW-ρ':>7s} "
         f"{'μ_g_r':>7s} {'M_g_r':>7s} {'μ_g_ρ':>7s} {'M_g_ρ':>7s} "
         f"{'μ_t_r':>7s} {'M_t_r':>7s} {'μ_t_ρ':>7s} {'M_t_ρ':>7s}"
     )
     print(header)
     print("-" * len(header))
-    for s in summaries:
+
+    def _print_summary_row(summary: Dict[str, Any]) -> None:
         print(
-            f"{s['label']:<20s} {s['n_genes']:>6d} {s['n_samples']:>5d} "
-            f"{s['gvw_r']:>7.4f} {s['gvw_rho']:>7.4f} "
-            f"{s['mean_gene_r']:>7.4f} {s['median_gene_r']:>7.4f} "
-            f"{s['mean_gene_rho']:>7.4f} {s['median_gene_rho']:>7.4f} "
-            f"{s['mean_transcriptome_r']:>7.4f} {s['median_transcriptome_r']:>7.4f} "
-            f"{s['mean_transcriptome_rho']:>7.4f} {s['median_transcriptome_rho']:>7.4f}"
+            f"{summary['label']:<{label_width}s} {summary['n_genes']:>6d} {summary['n_samples']:>5d} "
+            f"{summary['gvw_r']:>7.4f} {summary['gvw_rho']:>7.4f} "
+            f"{summary['mean_gene_r']:>7.4f} {summary['median_gene_r']:>7.4f} "
+            f"{summary['mean_gene_rho']:>7.4f} {summary['median_gene_rho']:>7.4f} "
+            f"{summary['mean_transcriptome_r']:>7.4f} {summary['median_transcriptome_r']:>7.4f} "
+            f"{summary['mean_transcriptome_rho']:>7.4f} {summary['median_transcriptome_rho']:>7.4f}"
         )
+
+    for s in summaries:
+        _print_summary_row(s)
+        median_summary = s.get("_median_point_summary")
+        if isinstance(median_summary, dict):
+            _print_summary_row(median_summary)
 
 
 # ---------------------------------------------------------------------------
@@ -1238,6 +1324,215 @@ def _mdn_on_probability(
     return np.clip(1.0 - cdf, 0.0, 1.0)
 
 
+def _mdn_activity_odds_ratio(
+    p0_flat: np.ndarray,
+    pi_gamma_flat: np.ndarray,
+    pi_normal_flat: np.ndarray,
+    *,
+    min_mass: float = 1e-12,
+) -> np.ndarray:
+    """Compute log2(pi_normal / (pi_delta + pi_gamma)).
+
+    Under this definition the normal branch is the active mass and the delta
+    spike plus gamma branch together form the off mass.
+    """
+    off_mass = np.clip(
+        p0_flat.astype(np.float64) + pi_gamma_flat.astype(np.float64),
+        min_mass,
+        None,
+    )
+    normal_mass = np.clip(pi_normal_flat.astype(np.float64), min_mass, None)
+    return np.log2(normal_mass / off_mass)
+
+
+def _dedupe_wide_axes(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop duplicated row/column labels from a wide genes x samples matrix.
+
+    Gene-set selections can repeat the same gene label, which materializes
+    duplicate rows after ``.loc[...]`` even when the source matrix itself is
+    unique. MDN alignment helpers operate on one value per gene-sample pair,
+    so they collapse duplicate labels to the first occurrence.
+    """
+    deduped = df
+    if deduped.index.has_duplicates:
+        deduped = deduped.loc[~deduped.index.duplicated(keep="first")]
+    if deduped.columns.has_duplicates:
+        deduped = deduped.loc[:, ~deduped.columns.duplicated(keep="first")]
+    return deduped
+
+
+def mdn_on_probability_wide(
+    p0_wide: pd.DataFrame,
+    pi_gamma_wide: pd.DataFrame,
+    pi_normal_wide: pd.DataFrame,
+    gamma_beta_wide: pd.DataFrame,
+    normal_mean_wide: pd.DataFrame,
+    normal_stdev_wide: pd.DataFrame,
+    *,
+    threshold: float = 2.0,
+) -> pd.DataFrame:
+    """Compute genes x samples P(Y >= threshold) from the raw MDN outputs."""
+    p0_wide = _dedupe_wide_axes(p0_wide)
+    pi_gamma_wide = _dedupe_wide_axes(pi_gamma_wide)
+    pi_normal_wide = _dedupe_wide_axes(pi_normal_wide)
+    gamma_beta_wide = _dedupe_wide_axes(gamma_beta_wide)
+    normal_mean_wide = _dedupe_wide_axes(normal_mean_wide)
+    normal_stdev_wide = _dedupe_wide_axes(normal_stdev_wide)
+
+    common_genes = (
+        p0_wide.index
+        .intersection(pi_gamma_wide.index)
+        .intersection(pi_normal_wide.index)
+        .intersection(gamma_beta_wide.index)
+        .intersection(normal_mean_wide.index)
+        .intersection(normal_stdev_wide.index)
+    )
+    common_samples = (
+        p0_wide.columns
+        .intersection(pi_gamma_wide.columns)
+        .intersection(pi_normal_wide.columns)
+        .intersection(gamma_beta_wide.columns)
+        .intersection(normal_mean_wide.columns)
+        .intersection(normal_stdev_wide.columns)
+    )
+    if len(common_genes) == 0 or len(common_samples) == 0:
+        return pd.DataFrame(index=common_genes, columns=common_samples, dtype=np.float64)
+
+    p_on_flat = _mdn_on_probability(
+        p0_wide.loc[common_genes, common_samples].to_numpy(dtype=np.float64).ravel(),
+        pi_gamma_wide.loc[common_genes, common_samples].to_numpy(dtype=np.float64).ravel(),
+        pi_normal_wide.loc[common_genes, common_samples].to_numpy(dtype=np.float64).ravel(),
+        gamma_beta_wide.loc[common_genes, common_samples].to_numpy(dtype=np.float64).ravel(),
+        normal_mean_wide.loc[common_genes, common_samples].to_numpy(dtype=np.float64).ravel(),
+        normal_stdev_wide.loc[common_genes, common_samples].to_numpy(dtype=np.float64).ravel(),
+        threshold,
+    )
+    p_on = p_on_flat.reshape(len(common_genes), len(common_samples))
+    return pd.DataFrame(p_on, index=common_genes, columns=common_samples)
+
+
+def mdn_activity_odds_ratio_wide(
+    p0_wide: pd.DataFrame,
+    pi_gamma_wide: pd.DataFrame,
+    pi_normal_wide: pd.DataFrame,
+) -> pd.DataFrame:
+    """Compute genes x samples activity odds ratio from MDN mixture weights."""
+    p0_wide = _dedupe_wide_axes(p0_wide)
+    pi_gamma_wide = _dedupe_wide_axes(pi_gamma_wide)
+    pi_normal_wide = _dedupe_wide_axes(pi_normal_wide)
+
+    common_genes = (
+        p0_wide.index
+        .intersection(pi_gamma_wide.index)
+        .intersection(pi_normal_wide.index)
+    )
+    common_samples = (
+        p0_wide.columns
+        .intersection(pi_gamma_wide.columns)
+        .intersection(pi_normal_wide.columns)
+    )
+    if len(common_genes) == 0 or len(common_samples) == 0:
+        return pd.DataFrame(index=common_genes, columns=common_samples, dtype=np.float64)
+
+    aor_flat = _mdn_activity_odds_ratio(
+        p0_wide.loc[common_genes, common_samples].to_numpy(dtype=np.float64).ravel(),
+        pi_gamma_wide.loc[common_genes, common_samples].to_numpy(dtype=np.float64).ravel(),
+        pi_normal_wide.loc[common_genes, common_samples].to_numpy(dtype=np.float64).ravel(),
+    )
+    aor = aor_flat.reshape(len(common_genes), len(common_samples))
+    return pd.DataFrame(aor, index=common_genes, columns=common_samples)
+
+
+def mdn_pit_values_wide(
+    truth_wide: pd.DataFrame,
+    pi_delta: pd.DataFrame,
+    pi_gamma: pd.DataFrame,
+    pi_normal: pd.DataFrame,
+    gamma_beta: pd.DataFrame,
+    normal_mean: pd.DataFrame,
+    normal_stdev: pd.DataFrame,
+    *,
+    random_seed: int = 0,
+) -> np.ndarray:
+    """Compute randomized PIT values from the hurdle-gamma-normal MDN.
+
+    Because the MDN contains a point mass at zero, this uses randomized PIT
+    at the jump: for observations with y = 0, returns a value sampled
+    uniformly on [F(y-), F(y)].  All randomness is seeded deterministically.
+    """
+    from scipy.special import erf, gammainc
+
+    common_genes = (
+        truth_wide.index.intersection(pi_delta.index)
+        .intersection(pi_gamma.index)
+        .intersection(pi_normal.index)
+        .intersection(gamma_beta.index)
+        .intersection(normal_mean.index)
+        .intersection(normal_stdev.index)
+    )
+    common_samples = (
+        truth_wide.columns.intersection(pi_delta.columns)
+        .intersection(pi_gamma.columns)
+        .intersection(pi_normal.columns)
+        .intersection(gamma_beta.columns)
+        .intersection(normal_mean.columns)
+        .intersection(normal_stdev.columns)
+    )
+    if len(common_genes) == 0 or len(common_samples) == 0:
+        return np.asarray([], dtype=np.float64)
+
+    truth_arr = truth_wide.loc[common_genes, common_samples].to_numpy(dtype=np.float64)
+    p0_arr = pi_delta.loc[common_genes, common_samples].to_numpy(dtype=np.float64)
+    pg_arr = pi_gamma.loc[common_genes, common_samples].to_numpy(dtype=np.float64)
+    pn_arr = pi_normal.loc[common_genes, common_samples].to_numpy(dtype=np.float64)
+    beta_arr = gamma_beta.loc[common_genes, common_samples].to_numpy(dtype=np.float64)
+    mu_arr = normal_mean.loc[common_genes, common_samples].to_numpy(dtype=np.float64)
+    sigma_arr = normal_stdev.loc[common_genes, common_samples].to_numpy(dtype=np.float64)
+
+    prob_sum = p0_arr + pg_arr + pn_arr
+    valid = (
+        np.isfinite(truth_arr)
+        & np.isfinite(p0_arr)
+        & np.isfinite(pg_arr)
+        & np.isfinite(pn_arr)
+        & np.isfinite(beta_arr)
+        & np.isfinite(mu_arr)
+        & np.isfinite(sigma_arr)
+        & (prob_sum > 0.0)
+    )
+    if int(valid.sum()) == 0:
+        return np.asarray([], dtype=np.float64)
+
+    truth_flat = truth_arr[valid]
+    p0_flat = p0_arr[valid] / prob_sum[valid]
+    pg_flat = pg_arr[valid] / prob_sum[valid]
+    pn_flat = pn_arr[valid] / prob_sum[valid]
+    beta_flat = np.clip(beta_arr[valid], 1e-12, None)
+    mu_flat = mu_arr[valid]
+    sigma_flat = np.clip(sigma_arr[valid], 1e-12, None)
+
+    gamma_cdf = gammainc(_MDN_GAMMA_SHAPE, beta_flat * np.maximum(truth_flat, 0.0))
+    normal_cdf = 0.5 * (1.0 + erf((truth_flat - mu_flat) / (sigma_flat * np.sqrt(2.0))))
+    cdf_right = (
+        p0_flat * (truth_flat >= 0.0).astype(np.float64)
+        + pg_flat * gamma_cdf
+        + pn_flat * normal_cdf
+    )
+
+    zero_mask = np.isclose(truth_flat, 0.0, atol=1e-12)
+    pit = cdf_right.copy()
+    if bool(zero_mask.any()):
+        cdf_left = (
+            pg_flat[zero_mask] * 0.0
+            + pn_flat[zero_mask] * normal_cdf[zero_mask]
+        )
+        rng = np.random.default_rng(random_seed)
+        u = rng.uniform(size=int(zero_mask.sum()))
+        pit[zero_mask] = cdf_left + u * (cdf_right[zero_mask] - cdf_left)
+
+    return np.clip(pit, 0.0, 1.0)
+
+
 def compute_subset_metrics(
     truth_wide: pd.DataFrame,
     pred_wide: pd.DataFrame,
@@ -1408,6 +1703,68 @@ def build_study_var_map() -> Dict[str, float]:
     return compute_gene_variance(build_study_truth_pool())
 
 
+def export_plca_training_variance_table(
+    out_path: Optional[Union[str, Path]] = None,
+) -> pd.DataFrame:
+    """Export the exact PLCA tumor-expression variance table used in training.
+
+    This follows the full-train PLCA recipe in
+    ``config/experiments/plca_final-training.yaml``:
+    non-PHT PLCA samples are collected from the splits TSV, tumor-expression
+    variance is computed from ``flat/tumor_exp``, and the loss weights are the
+    same variances clipped to ``[0.1, 10.0]``.
+
+    Args:
+        out_path: Optional output TSV path. Defaults to
+            ``analysis/results/plca_training_gene_variance.tsv``.
+
+    Returns:
+        DataFrame with columns ``gene``, ``variance_raw``, and
+        ``variance_clipped``.
+    """
+    from config.experiment_spec import load_experiment_spec
+    from proteus_utils.data_helpers import collect_zarr_paths
+    from proteus_utils.proteus_utils import _compute_gene_variances
+
+    spec = load_experiment_spec(str(PROJECT_ROOT / "config" / "experiments" / "plca_final-training.yaml"))
+    training_set_tsv = PROJECT_ROOT / spec.data.training_set
+    zarr_base = spec.data.zarr_base
+
+    zarr_paths = collect_zarr_paths(
+        str(training_set_tsv),
+        zarr_base,
+        exclude_cohorts={"PHT"},
+    )
+    if not zarr_paths:
+        raise FileNotFoundError(
+            "No PLCA training zarr stores were found for variance export under "
+            f"{zarr_base} using {training_set_tsv}"
+        )
+
+    raw_variance, clipped_variance = _compute_gene_variances(
+        zarr_paths,
+        label_key="flat/tumor_exp",
+        clip_min=0.1,
+        clip_max=10.0,
+    )
+    genes = sorted(raw_variance)
+    table = pd.DataFrame(
+        {
+            "gene": genes,
+            "variance_raw": [raw_variance[g] for g in genes],
+            "variance_clipped": [clipped_variance[g] for g in genes],
+        }
+    )
+
+    if out_path is None:
+        out_path = PROJECT_ROOT / "analysis" / "results" / "plca_training_gene_variance.tsv"
+    out_path = Path(out_path)
+    ensure_dir(str(out_path.parent))
+    table.to_csv(out_path, sep="\t", index=False)
+
+    return table
+
+
 # ---------------------------------------------------------------------------
 # Interval coverage evaluation
 # ---------------------------------------------------------------------------
@@ -1430,16 +1787,28 @@ def compute_coverage_curve(
     ci_lo_flat: np.ndarray,
     ci_hi_flat: np.ndarray,
     pred_flat: np.ndarray,
-    nominal_levels: Sequence[float] = (0.50, 0.60, 0.70, 0.80, 0.90, 0.95),
+    nominal_levels: Sequence[float] = (0.50, 0.60, 0.70, 0.80, 0.90),
+    interval_nominal: float = 0.90,
 ) -> Dict[str, List[float]]:
     """Compute empirical coverage at multiple nominal levels.
 
-    Assumes ci_lo, ci_hi correspond to the widest band (e.g. 95%).
-    Narrower bands are interpolated by shrinking the interval symmetrically
-    around the prediction mean.
+    Assumes ``ci_lo`` and ``ci_hi`` correspond to a directly modelled
+    interval with nominal coverage ``interval_nominal``. Narrower bands are
+    interpolated by shrinking the interval symmetrically around the
+    prediction mean as a diagnostic only.
 
     Returns dict with keys 'nominal' and 'empirical'.
     """
+    if not 0.0 < interval_nominal <= 1.0:
+        raise ValueError(
+            f"interval_nominal must lie in (0, 1], got {interval_nominal!r}"
+        )
+    if any(level > interval_nominal for level in nominal_levels):
+        raise ValueError(
+            "nominal_levels cannot exceed interval_nominal for a single "
+            "directly modelled interval"
+        )
+
     mask = (np.isfinite(truth_flat) & np.isfinite(ci_lo_flat)
             & np.isfinite(ci_hi_flat) & np.isfinite(pred_flat))
     y = truth_flat[mask]
@@ -1450,12 +1819,9 @@ def compute_coverage_curve(
         return {"nominal": list(nominal_levels),
                 "empirical": [np.nan] * len(nominal_levels)}
 
-    # Original interval corresponds to the widest nominal (assume 95%)
-    max_nominal = max(nominal_levels)
-
     empiricals = []
     for level in nominal_levels:
-        scale = level / max_nominal
+        scale = level / interval_nominal
         adj_lo = mu - scale * (mu - lo)
         adj_hi = mu + scale * (hi - mu)
         coverage = float(((y >= adj_lo) & (y <= adj_hi)).sum() / len(y))
@@ -1651,6 +2017,247 @@ def compute_risk_coverage_data(
     )
 
 
+def compute_active_confidence_curve(
+    truth_flat: np.ndarray,
+    active_confidence_flat: np.ndarray,
+    *,
+    threshold: float = _ONOFF_THRESHOLD_DEFAULT,
+    target_ppv: float = 0.90,
+) -> Dict[str, Any]:
+    """Sweep active-confidence thresholds for ON calling against truth.
+
+    ``active_confidence_flat`` is interpreted as ``P(Y >= threshold)``.
+    The selected threshold is the lowest posterior-on threshold whose
+    retained ON calls achieve ``PPV >= target_ppv``. If no threshold meets
+    the target, the threshold with the highest achievable PPV is selected,
+    breaking ties toward lower thresholds to preserve coverage.
+    """
+    valid = np.isfinite(truth_flat) & np.isfinite(active_confidence_flat)
+    t = truth_flat[valid]
+    p_on = np.clip(active_confidence_flat[valid].astype(np.float64), 0.0, 1.0)
+    n_total = len(t)
+    if n_total == 0:
+        return {
+            "threshold": np.array([], dtype=np.float64),
+            "coverage": np.array([], dtype=np.float64),
+            "ppv": np.array([], dtype=np.float64),
+            "fdr": np.array([], dtype=np.float64),
+            "n_predicted_on": np.array([], dtype=np.int64),
+            "selected_threshold": float("nan"),
+            "selected_coverage": float("nan"),
+            "selected_ppv": float("nan"),
+            "selected_fdr": float("nan"),
+            "selected_n_predicted_on": 0,
+            "target_ppv": float(target_ppv),
+            "target_met": False,
+            "n_total": 0,
+            "n_true_on": 0,
+        }
+
+    y_true = (t >= threshold).astype(np.int64)
+    order = np.argsort(-p_on, kind="mergesort")
+    p_sorted = p_on[order]
+    y_sorted = y_true[order]
+
+    tp_cum = np.cumsum(y_sorted == 1)
+    fp_cum = np.cumsum(y_sorted == 0)
+    last_idx = np.flatnonzero(np.r_[p_sorted[1:] != p_sorted[:-1], True])
+    thresholds = p_sorted[last_idx]
+    tp = tp_cum[last_idx].astype(np.float64)
+    fp = fp_cum[last_idx].astype(np.float64)
+    n_predicted_on = (tp + fp).astype(np.int64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ppv = np.divide(tp, n_predicted_on, out=np.full_like(tp, np.nan), where=n_predicted_on > 0)
+    fdr = 1.0 - ppv
+    coverage = n_predicted_on.astype(np.float64) / float(n_total)
+
+    meets_target = np.isfinite(ppv) & (ppv >= float(target_ppv)) & (n_predicted_on > 0)
+    if meets_target.any():
+        selected_idx = int(np.flatnonzero(meets_target)[-1])
+        target_met = True
+    else:
+        valid_ppv = np.isfinite(ppv) & (n_predicted_on > 0)
+        if valid_ppv.any():
+            best_ppv = float(np.nanmax(ppv[valid_ppv]))
+            selected_idx = int(np.flatnonzero(valid_ppv & np.isclose(ppv, best_ppv))[-1])
+        else:
+            selected_idx = 0
+        target_met = False
+
+    return {
+        "threshold": thresholds.astype(np.float64),
+        "coverage": coverage.astype(np.float64),
+        "ppv": ppv.astype(np.float64),
+        "fdr": fdr.astype(np.float64),
+        "n_predicted_on": n_predicted_on,
+        "selected_threshold": float(thresholds[selected_idx]),
+        "selected_coverage": float(coverage[selected_idx]),
+        "selected_ppv": float(ppv[selected_idx]),
+        "selected_fdr": float(fdr[selected_idx]),
+        "selected_n_predicted_on": int(n_predicted_on[selected_idx]),
+        "target_ppv": float(target_ppv),
+        "target_met": bool(target_met),
+        "n_total": int(n_total),
+        "n_true_on": int(y_true.sum()),
+    }
+
+
+def compute_activity_odds_ratio_on_curve(
+    truth_flat: np.ndarray,
+    activity_odds_ratio_flat: np.ndarray,
+    *,
+    threshold: float = _ONOFF_THRESHOLD_DEFAULT,
+    target_ppv: float = 0.90,
+) -> Dict[str, Any]:
+    """Sweep upper AOR thresholds for ON calling against truth."""
+    valid = np.isfinite(truth_flat) & np.isfinite(activity_odds_ratio_flat)
+    t = truth_flat[valid]
+    aor = activity_odds_ratio_flat[valid].astype(np.float64)
+    n_total = len(t)
+    if n_total == 0:
+        return {
+            "threshold": np.array([], dtype=np.float64),
+            "coverage": np.array([], dtype=np.float64),
+            "ppv": np.array([], dtype=np.float64),
+            "fdr": np.array([], dtype=np.float64),
+            "n_predicted_on": np.array([], dtype=np.int64),
+            "selected_threshold": float("nan"),
+            "selected_coverage": float("nan"),
+            "selected_ppv": float("nan"),
+            "selected_fdr": float("nan"),
+            "selected_n_predicted_on": 0,
+            "target_ppv": float(target_ppv),
+            "target_met": False,
+            "n_total": 0,
+            "n_true_on": 0,
+        }
+
+    y_true = (t >= threshold).astype(np.int64)
+    order = np.argsort(-aor, kind="mergesort")
+    aor_sorted = aor[order]
+    y_sorted = y_true[order]
+
+    tp_cum = np.cumsum(y_sorted == 1)
+    fp_cum = np.cumsum(y_sorted == 0)
+    last_idx = np.flatnonzero(np.r_[aor_sorted[1:] != aor_sorted[:-1], True])
+    thresholds = aor_sorted[last_idx]
+    tp = tp_cum[last_idx].astype(np.float64)
+    fp = fp_cum[last_idx].astype(np.float64)
+    n_predicted_on = (tp + fp).astype(np.int64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ppv = np.divide(tp, n_predicted_on, out=np.full_like(tp, np.nan), where=n_predicted_on > 0)
+    fdr = 1.0 - ppv
+    coverage = n_predicted_on.astype(np.float64) / float(n_total)
+
+    meets_target = np.isfinite(ppv) & (ppv >= float(target_ppv)) & (n_predicted_on > 0)
+    if meets_target.any():
+        selected_idx = int(np.flatnonzero(meets_target)[-1])
+        target_met = True
+    else:
+        valid_ppv = np.isfinite(ppv) & (n_predicted_on > 0)
+        if valid_ppv.any():
+            best_ppv = float(np.nanmax(ppv[valid_ppv]))
+            selected_idx = int(np.flatnonzero(valid_ppv & np.isclose(ppv, best_ppv))[-1])
+        else:
+            selected_idx = 0
+        target_met = False
+
+    return {
+        "threshold": thresholds.astype(np.float64),
+        "coverage": coverage.astype(np.float64),
+        "ppv": ppv.astype(np.float64),
+        "fdr": fdr.astype(np.float64),
+        "n_predicted_on": n_predicted_on,
+        "selected_threshold": float(thresholds[selected_idx]),
+        "selected_coverage": float(coverage[selected_idx]),
+        "selected_ppv": float(ppv[selected_idx]),
+        "selected_fdr": float(fdr[selected_idx]),
+        "selected_n_predicted_on": int(n_predicted_on[selected_idx]),
+        "target_ppv": float(target_ppv),
+        "target_met": bool(target_met),
+        "n_total": int(n_total),
+        "n_true_on": int(y_true.sum()),
+    }
+
+
+def compute_activity_odds_ratio_off_curve(
+    truth_flat: np.ndarray,
+    activity_odds_ratio_flat: np.ndarray,
+    *,
+    threshold: float = _ONOFF_THRESHOLD_DEFAULT,
+    target_npv: float = 0.90,
+) -> Dict[str, Any]:
+    """Sweep lower AOR thresholds for OFF calling against truth."""
+    valid = np.isfinite(truth_flat) & np.isfinite(activity_odds_ratio_flat)
+    t = truth_flat[valid]
+    aor = activity_odds_ratio_flat[valid].astype(np.float64)
+    n_total = len(t)
+    if n_total == 0:
+        return {
+            "threshold": np.array([], dtype=np.float64),
+            "coverage": np.array([], dtype=np.float64),
+            "npv": np.array([], dtype=np.float64),
+            "for": np.array([], dtype=np.float64),
+            "n_predicted_off": np.array([], dtype=np.int64),
+            "selected_threshold": float("nan"),
+            "selected_coverage": float("nan"),
+            "selected_npv": float("nan"),
+            "selected_for": float("nan"),
+            "selected_n_predicted_off": 0,
+            "target_npv": float(target_npv),
+            "target_met": False,
+            "n_total": 0,
+            "n_true_off": 0,
+        }
+
+    truth_off = (t < threshold).astype(np.int64)
+    order = np.argsort(aor, kind="mergesort")
+    aor_sorted = aor[order]
+    truth_off_sorted = truth_off[order]
+
+    tn_cum = np.cumsum(truth_off_sorted == 1)
+    fn_cum = np.cumsum(truth_off_sorted == 0)
+    last_idx = np.flatnonzero(np.r_[aor_sorted[1:] != aor_sorted[:-1], True])
+    thresholds = aor_sorted[last_idx]
+    tn = tn_cum[last_idx].astype(np.float64)
+    fn = fn_cum[last_idx].astype(np.float64)
+    n_predicted_off = (tn + fn).astype(np.int64)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        npv = np.divide(tn, n_predicted_off, out=np.full_like(tn, np.nan), where=n_predicted_off > 0)
+    false_omission_rate = 1.0 - npv
+    coverage = n_predicted_off.astype(np.float64) / float(n_total)
+
+    meets_target = np.isfinite(npv) & (npv >= float(target_npv)) & (n_predicted_off > 0)
+    if meets_target.any():
+        selected_idx = int(np.flatnonzero(meets_target)[-1])
+        target_met = True
+    else:
+        valid_npv = np.isfinite(npv) & (n_predicted_off > 0)
+        if valid_npv.any():
+            best_npv = float(np.nanmax(npv[valid_npv]))
+            selected_idx = int(np.flatnonzero(valid_npv & np.isclose(npv, best_npv))[-1])
+        else:
+            selected_idx = 0
+        target_met = False
+
+    return {
+        "threshold": thresholds.astype(np.float64),
+        "coverage": coverage.astype(np.float64),
+        "npv": npv.astype(np.float64),
+        "for": false_omission_rate.astype(np.float64),
+        "n_predicted_off": n_predicted_off,
+        "selected_threshold": float(thresholds[selected_idx]),
+        "selected_coverage": float(coverage[selected_idx]),
+        "selected_npv": float(npv[selected_idx]),
+        "selected_for": float(false_omission_rate[selected_idx]),
+        "selected_n_predicted_off": int(n_predicted_off[selected_idx]),
+        "target_npv": float(target_npv),
+        "target_met": bool(target_met),
+        "n_total": int(n_total),
+        "n_true_off": int(truth_off.sum()),
+    }
+
+
 def _ppv_fpr(
     y_true: np.ndarray,
     pred: np.ndarray,
@@ -1676,6 +2283,11 @@ def compute_onoff_confusion(
     pred_flat: np.ndarray,
     ci_lo_flat: Optional[np.ndarray] = None,
     ci_hi_flat: Optional[np.ndarray] = None,
+    activity_odds_ratio_flat: Optional[np.ndarray] = None,
+    lower_threshold: Optional[float] = None,
+    upper_threshold: Optional[float] = None,
+    active_confidence_flat: Optional[np.ndarray] = None,
+    active_threshold: float = 0.5,
     threshold: float = _ONOFF_THRESHOLD_DEFAULT,
 ) -> Dict[str, Any]:
     """Compute 3-way on/off/indeterminate confusion summary.
@@ -1684,10 +2296,16 @@ def compute_onoff_confusion(
 
     * **Models without CIs** — every gene-sample pair is called ON
       (pred >= threshold) or OFF (pred < threshold).  No indeterminate.
-    * **Models with 90% CIs** — a pair is INDETERMINATE when the CI
-      straddles the threshold (ci_lo < threshold < ci_hi).  Confident
-      ON requires ci_lo >= threshold; confident OFF requires
-      ci_hi < threshold.
+                * **Models with activity odds ratio thresholds** — a pair is
+                    INDETERMINATE when ``lower_threshold <= AOR <= upper_threshold``.
+                    Confident ON requires ``AOR > upper_threshold``; confident OFF
+                    requires ``AOR < lower_threshold``.
+        * **Models with active-confidence** — a pair is INDETERMINATE when
+            ``1 - active_threshold < P_on < active_threshold``. Confident ON
+            requires ``P_on >= active_threshold``; confident OFF requires
+            ``P_on <= 1 - active_threshold``.
+        * **Models with 90% CIs but no active-confidence** — falls back to the
+            legacy CI-straddle rule.
 
     Returns a dict with:
         n_total, n_on, n_off, n_indet,
@@ -1695,6 +2313,10 @@ def compute_onoff_confusion(
         accuracy, ppv, npv, fpr, fnr, coverage (fraction not indet).
     """
     valid = np.isfinite(truth_flat) & np.isfinite(pred_flat)
+    if activity_odds_ratio_flat is not None:
+        valid &= np.isfinite(activity_odds_ratio_flat)
+    if active_confidence_flat is not None:
+        valid &= np.isfinite(active_confidence_flat)
     if ci_lo_flat is not None and ci_hi_flat is not None:
         valid &= np.isfinite(ci_lo_flat) & np.isfinite(ci_hi_flat)
     t = truth_flat[valid]
@@ -1704,6 +2326,93 @@ def compute_onoff_confusion(
         return {"n_total": 0}
 
     truth_on = t >= threshold
+
+    if (
+        activity_odds_ratio_flat is not None
+        and lower_threshold is not None
+        and upper_threshold is not None
+        and np.isfinite(lower_threshold)
+        and np.isfinite(upper_threshold)
+    ):
+        aor = activity_odds_ratio_flat[valid].astype(np.float64)
+        conf_on = aor > float(upper_threshold)
+        conf_off = aor < float(lower_threshold)
+        indet = ~(conf_on | conf_off)
+
+        n_indet = int(indet.sum())
+        n_on = int(conf_on.sum())
+        n_off = int(conf_off.sum())
+
+        confident = ~indet
+        n_conf = int(confident.sum())
+        if n_conf == 0:
+            return {
+                "n_total": n_total,
+                "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
+                "tp": 0, "fp": 0, "tn": 0, "fn": 0,
+                "accuracy": float("nan"), "ppv": float("nan"),
+                "npv": float("nan"), "fpr": float("nan"), "fnr": float("nan"),
+                "coverage": 0.0,
+            }
+
+        pred_on_conf = conf_on[confident]
+        truth_on_conf = truth_on[confident]
+        tp = int((pred_on_conf & truth_on_conf).sum())
+        fp = int((pred_on_conf & (~truth_on_conf)).sum())
+        fn = int(((~pred_on_conf) & truth_on_conf).sum())
+        tn = int(((~pred_on_conf) & (~truth_on_conf)).sum())
+        return {
+            "n_total": n_total,
+            "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
+            "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+            "accuracy": (tp + tn) / max(n_conf, 1),
+            "ppv": tp / max(tp + fp, 1),
+            "npv": tn / max(tn + fn, 1),
+            "fpr": fp / max(fp + tn, 1),
+            "fnr": fn / max(fn + tp, 1),
+            "coverage": n_conf / max(n_total, 1),
+        }
+
+    if active_confidence_flat is not None:
+        p_on = np.clip(active_confidence_flat[valid].astype(np.float64), 0.0, 1.0)
+        confidence_threshold = float(np.clip(active_threshold, 0.5, 1.0))
+        conf_on = p_on >= confidence_threshold
+        conf_off = p_on <= (1.0 - confidence_threshold)
+        indet = ~(conf_on | conf_off)
+
+        n_indet = int(indet.sum())
+        n_on = int(conf_on.sum())
+        n_off = int(conf_off.sum())
+
+        confident = ~indet
+        n_conf = int(confident.sum())
+        if n_conf == 0:
+            return {
+                "n_total": n_total,
+                "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
+                "tp": 0, "fp": 0, "tn": 0, "fn": 0,
+                "accuracy": float("nan"), "ppv": float("nan"),
+                "npv": float("nan"), "fpr": float("nan"), "fnr": float("nan"),
+                "coverage": 0.0,
+            }
+
+        pred_on_conf = conf_on[confident]
+        truth_on_conf = truth_on[confident]
+        tp = int((pred_on_conf & truth_on_conf).sum())
+        fp = int((pred_on_conf & (~truth_on_conf)).sum())
+        fn = int(((~pred_on_conf) & truth_on_conf).sum())
+        tn = int(((~pred_on_conf) & (~truth_on_conf)).sum())
+        return {
+            "n_total": n_total,
+            "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
+            "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+            "accuracy": (tp + tn) / max(n_conf, 1),
+            "ppv": tp / max(tp + fp, 1),
+            "npv": tn / max(tn + fn, 1),
+            "fpr": fp / max(fp + tn, 1),
+            "fnr": fn / max(fn + tp, 1),
+            "coverage": n_conf / max(n_total, 1),
+        }
 
     if ci_lo_flat is None or ci_hi_flat is None:
         # No CIs: binary ON/OFF
@@ -1839,126 +2548,206 @@ _PAM50_CENTROIDS_RAW: Dict[str, List[float]] = {
 }
 
 
-def pam50_classify(expr_df: pd.DataFrame) -> pd.DataFrame:
-    """Classify samples using the PAM50 centroid correlation method.
-
-    Uses the 4 clinical subtypes (Basal, HER2, LumA, LumB).
-    Normal is excluded — it represents tissue contamination / low-TFx
-    artefacts rather than a clinically actionable subtype.
-
-    Parameters
-    ----------
-    expr_df : pd.DataFrame
-        Genes × samples expression matrix (log2 scale).
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per sample with columns ``predicted_subtype`` and per-subtype
-        Spearman correlations (``corr_Basal``, ``corr_HER2``, etc.).
-    """
-    from scipy.stats import spearmanr as _spearmanr
-
-    centroid_genes = [g for g in _PAM50_CENTROIDS_RAW if g in expr_df.index]
-    if len(centroid_genes) < 10:
-        warnings.warn(f"PAM50: only {len(centroid_genes)}/50 genes found — "
-                      "classification unreliable")
-    # Build centroid matrix for all 5 subtypes (index aligned to raw data)
-    centroid_df = pd.DataFrame(
-        {g: _PAM50_CENTROIDS_RAW[g] for g in centroid_genes},
-        index=list(_PAM50_SUBTYPES),
-    ).T  # genes × subtypes
-
-    # Subset and median-center gene expression
-    expr_sub = expr_df.loc[centroid_genes].copy()
-    expr_sub = expr_sub.subtract(expr_sub.median(axis=1), axis=0)
-
-    rows = []
-    for sample in expr_sub.columns:
-        sample_vec = expr_sub[sample].values
-        corrs = {}
-        # Compute correlations against all 5 centroids for reporting
-        for st in _PAM50_SUBTYPES:
-            rho, _ = _spearmanr(sample_vec, centroid_df[st].values)
-            corrs[f"corr_{st}"] = rho
-        # Classify using only the 4 clinical subtypes
-        clinical_corrs = {k: v for k, v in corrs.items()
-                         if k.replace("corr_", "") in _PAM50_CLINICAL_SUBTYPES}
-        best = max(clinical_corrs, key=clinical_corrs.get)
-        predicted = best.replace("corr_", "")
-        rows.append({"sample": sample, "predicted_subtype": predicted, **corrs})
-
-    return pd.DataFrame(rows)
+def _normalize_pam50_label(label: Any) -> str:
+    """Normalize genefu PAM50 labels to the repo's display convention."""
+    return _PAM50_LABEL_MAP.get(str(label), str(label))
 
 
-def pam50_classify_mc(
+def _load_genefu_bridge() -> Tuple[Any, Any, Any]:
+    """Load the R bridge that wraps genefu PAM50 classification."""
+    global _GENEFU_BRIDGE_CACHE
+    if _GENEFU_BRIDGE_CACHE is not None:
+        return _GENEFU_BRIDGE_CACHE
+
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+
+    ro.r(
+        """
+                proteus_load_genefu <- function() {
+                    if ("genefu" %in% loadedNamespaces()) {
+                        return(invisible(TRUE))
+                    }
+
+                    withCallingHandlers(
+                        loadNamespace("genefu"),
+                        warning = function(w) {
+                            msg <- conditionMessage(w)
+                            if (grepl("replacing previous import.*logsumexp.*when loading 'genefu'", msg)) {
+                                invokeRestart("muffleWarning")
+                            }
+                        }
+                    )
+
+                    invisible(TRUE)
+                }
+
+        genefu_pam50_classify <- function(expr_df, model_name) {
+                    proteus_load_genefu()
+
+          data(list = model_name, package = 'genefu', envir = environment())
+          sbt.model <- get(model_name, envir = environment())
+
+          expr_matrix <- as.matrix(expr_df)
+          common_probes <- intersect(rownames(expr_matrix), sbt.model$centroids.map$probe)
+          if (length(common_probes) < 10) {
+            return(data.frame())
+          }
+
+          expr_sub <- expr_matrix[common_probes, , drop = FALSE]
+          data_sub <- t(expr_sub)
+          model_map <- sbt.model$centroids.map[match(common_probes, sbt.model$centroids.map$probe), , drop = FALSE]
+          annot <- data.frame(EntrezGene.ID = model_map$EntrezGene.ID, row.names = common_probes)
+
+          pred <- genefu::intrinsic.cluster.predict(
+            sbt.model = sbt.model,
+            data = data_sub,
+            annot = annot,
+            do.mapping = FALSE,
+            do.prediction.strength = FALSE,
+            verbose = FALSE
+          )
+
+          out <- data.frame(
+            sample = rownames(data_sub),
+            predicted_subtype = as.character(pred$subtype),
+            stringsAsFactors = FALSE,
+            row.names = rownames(data_sub)
+          )
+
+          if (!is.null(pred$cor)) {
+            cor_df <- as.data.frame(pred$cor)
+            cor_df <- cor_df[rownames(data_sub), , drop = FALSE]
+            colnames(cor_df) <- paste0('corr_', colnames(cor_df))
+            out <- cbind(out, cor_df)
+          }
+          if (!is.null(pred$subtype.proba)) {
+            proba_df <- as.data.frame(pred$subtype.proba)
+            proba_df <- proba_df[rownames(data_sub), , drop = FALSE]
+            colnames(proba_df) <- paste0('proba_', colnames(proba_df))
+            out <- cbind(out, proba_df)
+          }
+
+          rownames(out) <- NULL
+          out
+        }
+        """
+    )
+    _GENEFU_BRIDGE_CACHE = (ro, pandas2ri, localconverter)
+    return _GENEFU_BRIDGE_CACHE
+
+
+def _pam50_classify_single_genefu(
+    expr_df: pd.DataFrame,
+    *,
+    model_name: str,
+    bridge: Optional[Tuple[Any, Any, Any]] = None,
+) -> pd.DataFrame:
+    """Classify one expression matrix with one genefu PAM50 model variant."""
+    ro, pandas2ri, localconverter = _load_genefu_bridge() if bridge is None else bridge
+    converter = ro.default_converter + pandas2ri.converter
+    with localconverter(converter):
+        r_expr = ro.conversion.get_conversion().py2rpy(expr_df)
+        result_r = ro.globalenv["genefu_pam50_classify"](r_expr, model_name)
+        result = ro.conversion.get_conversion().rpy2py(result_r)
+
+    result_df = pd.DataFrame(result)
+    if result_df.empty:
+        return result_df
+
+    result_df["predicted_subtype"] = result_df["predicted_subtype"].map(_normalize_pam50_label)
+    rename_map = {
+        column: column.replace("Her2", "HER2")
+        for column in result_df.columns
+        if "Her2" in column
+    }
+    if rename_map:
+        result_df = result_df.rename(columns=rename_map)
+    return result_df
+
+
+def pam50_classify_genefu(
+    expr_df: pd.DataFrame,
+    *,
+    model_names: Sequence[str] = _PAM50_GENEFU_MODEL_NAMES,
+) -> Dict[str, pd.DataFrame]:
+    """Classify samples with each requested genefu PAM50 model variant."""
+    bridge = _load_genefu_bridge()
+    results: Dict[str, pd.DataFrame] = {}
+    for model_name in model_names:
+        results[model_name] = _pam50_classify_single_genefu(
+            expr_df,
+            model_name=model_name,
+            bridge=bridge,
+        )
+    return results
+
+
+def pam50_classify_mc_genefu(
     draws: List[pd.DataFrame],
     point_pred: pd.DataFrame,
-) -> pd.DataFrame:
-    """Run PAM50 classification on MC draws and aggregate.
-
-    Parameters
-    ----------
-    draws : list[DataFrame]
-        M expression matrices from ``mdn_monte_carlo_sample()``.
-    point_pred : pd.DataFrame
-        Point-prediction matrix (genes x samples) used to identify
-        which samples to classify.
-
-    Returns
-    -------
-    pd.DataFrame
-        One row per sample with ``predicted_subtype`` (modal across draws),
-        ``stability`` (fraction of draws agreeing on modal), and per-subtype
-        mean Spearman correlations.
-    """
+    *,
+    model_names: Sequence[str] = _PAM50_GENEFU_MODEL_NAMES,
+) -> Dict[str, pd.DataFrame]:
+    """Run genefu PAM50 classification across MC draws and aggregate by variant."""
     from collections import Counter
 
-    # Collect per-sample subtype votes across draws
-    sample_votes: Dict[str, List[str]] = {s: [] for s in point_pred.columns}
-    sample_corrs: Dict[str, List[Dict[str, float]]] = {
-        s: [] for s in point_pred.columns}
+    bridge = _load_genefu_bridge()
+    results: Dict[str, pd.DataFrame] = {}
+    for model_name in model_names:
+        sample_votes: Dict[str, List[str]] = {sample: [] for sample in point_pred.columns}
+        sample_metrics: Dict[str, List[Dict[str, float]]] = {sample: [] for sample in point_pred.columns}
 
-    for draw in draws:
-        # Subset to point_pred's columns; drop columns that are entirely NaN
-        draw_sub = draw.reindex(columns=point_pred.columns)
-        draw_sub = draw_sub.loc[:, draw_sub.notna().any(axis=0)]
-        if draw_sub.shape[1] == 0:
-            continue
-        result = pam50_classify(draw_sub)
-        for _, row in result.iterrows():
-            s = row["sample"]
-            if s in sample_votes:
-                sample_votes[s].append(row["predicted_subtype"])
-                corr_cols = {k: v for k, v in row.items()
-                             if k.startswith("corr_")}
-                sample_corrs[s].append(corr_cols)
+        for draw in draws:
+            draw_sub = draw.reindex(columns=point_pred.columns)
+            draw_sub = draw_sub.loc[:, draw_sub.notna().any(axis=0)]
+            if draw_sub.shape[1] == 0:
+                continue
+            draw_result = _pam50_classify_single_genefu(
+                draw_sub,
+                model_name=model_name,
+                bridge=bridge,
+            )
+            if draw_result.empty:
+                continue
+            for _, row in draw_result.iterrows():
+                sample_name = row["sample"]
+                if sample_name not in sample_votes:
+                    continue
+                sample_votes[sample_name].append(row["predicted_subtype"])
+                metrics = {
+                    key: float(row[key])
+                    for key in draw_result.columns
+                    if key.startswith("corr_") or key.startswith("proba_")
+                }
+                sample_metrics[sample_name].append(metrics)
 
-    rows = []
-    for sample in point_pred.columns:
-        votes = sample_votes[sample]
-        if not votes:
-            continue
-        counts = Counter(votes)
-        modal_subtype = counts.most_common(1)[0][0]
-        stability = counts[modal_subtype] / len(votes)
+        rows: List[Dict[str, Any]] = []
+        for sample_name in point_pred.columns:
+            votes = sample_votes[sample_name]
+            if not votes:
+                continue
+            counts = Counter(votes)
+            modal_subtype = counts.most_common(1)[0][0]
+            stability = counts[modal_subtype] / len(votes)
+            row: Dict[str, Any] = {
+                "sample": sample_name,
+                "predicted_subtype": modal_subtype,
+                "stability": float(stability),
+            }
+            metric_draws = sample_metrics[sample_name]
+            if metric_draws:
+                all_metric_keys = sorted({key for metric_dict in metric_draws for key in metric_dict})
+                for metric_key in all_metric_keys:
+                    metric_values = [metric_dict[metric_key] for metric_dict in metric_draws if metric_key in metric_dict]
+                    if metric_values:
+                        row[metric_key] = float(np.mean(metric_values))
+            rows.append(row)
 
-        # Mean correlations across draws
-        mean_corrs: Dict[str, float] = {}
-        if sample_corrs[sample]:
-            all_keys = sample_corrs[sample][0].keys()
-            for k in all_keys:
-                vals = [d[k] for d in sample_corrs[sample] if k in d]
-                mean_corrs[k] = float(np.mean(vals))
+        results[model_name] = pd.DataFrame(rows)
 
-        rows.append({
-            "sample": sample,
-            "predicted_subtype": modal_subtype,
-            "stability": stability,
-            **mean_corrs,
-        })
-
-    return pd.DataFrame(rows)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -2057,9 +2846,11 @@ def compute_cox_univariate(
     Returns
     -------
     pd.DataFrame
-        Rows = covariates, columns = ``HR``, ``HR_lo``, ``HR_hi``, ``p``.
+        Rows = covariates, columns include ``HR``, ``HR_lo``, ``HR_hi``, ``p``,
+        ``n``, ``n_events``, and proportional-hazards diagnostic ``ph_p``.
     """
     from lifelines import CoxPHFitter
+    from lifelines.statistics import proportional_hazard_test
 
     results = []
     for col in covariates_df.columns:
@@ -2072,6 +2863,8 @@ def compute_cox_univariate(
             results.append({
                 "variable": col, "HR": np.nan, "HR_lo": np.nan,
                 "HR_hi": np.nan, "p": np.nan,
+                "n": int(cph_df.shape[0]), "n_events": int(cph_df["E"].sum()),
+                "ph_p": np.nan,
             })
             continue
         # Standardise covariate to unit variance for comparable HRs
@@ -2080,6 +2873,8 @@ def compute_cox_univariate(
             results.append({
                 "variable": col, "HR": np.nan, "HR_lo": np.nan,
                 "HR_hi": np.nan, "p": np.nan,
+                "n": int(cph_df.shape[0]), "n_events": int(cph_df["E"].sum()),
+                "ph_p": np.nan,
             })
             continue
         cph_df[col] = cph_df[col] / std
@@ -2087,12 +2882,18 @@ def compute_cox_univariate(
         cph = CoxPHFitter()
         cph.fit(cph_df, duration_col="T", event_col="E")
         summary = cph.summary
+        ph_test = proportional_hazard_test(cph, cph_df, time_transform="rank")
+        ph_summary = ph_test.summary
+        ph_p = float(ph_summary.loc[col, "p"]) if col in ph_summary.index else np.nan
         results.append({
             "variable": col,
             "HR": float(summary.loc[col, "exp(coef)"]),
             "HR_lo": float(summary.loc[col, "exp(coef) lower 95%"]),
             "HR_hi": float(summary.loc[col, "exp(coef) upper 95%"]),
             "p": float(summary.loc[col, "p"]),
+            "n": int(cph_df.shape[0]),
+            "n_events": int(cph_df["E"].sum()),
+            "ph_p": ph_p,
         })
     return pd.DataFrame(results)
 
@@ -2126,9 +2927,11 @@ def compute_cox_multivariate(
     Returns
     -------
     pd.DataFrame
-        Rows = covariates, columns = ``HR``, ``HR_lo``, ``HR_hi``, ``p``.
+        Rows = covariates, columns include ``HR``, ``HR_lo``, ``HR_hi``, ``p``,
+        ``n``, ``n_events``, and proportional-hazards diagnostics.
     """
     from lifelines import CoxPHFitter
+    from lifelines.statistics import proportional_hazard_test
 
     results = []
     for col in covariates_df.columns:
@@ -2144,6 +2947,8 @@ def compute_cox_multivariate(
             results.append({
                 "variable": col, "HR": np.nan, "HR_lo": np.nan,
                 "HR_hi": np.nan, "p": np.nan,
+                "n": int(cph_df.shape[0]), "n_events": int(cph_df["E"].sum()),
+                "ph_p": np.nan, "ph_adjust_p": np.nan, "ph_min_p": np.nan,
             })
             continue
         # Standardise both covariates to unit variance
@@ -2157,12 +2962,25 @@ def compute_cox_multivariate(
         cph = CoxPHFitter()
         cph.fit(cph_df, duration_col="T", event_col="E")
         summary = cph.summary
+        ph_test = proportional_hazard_test(cph, cph_df, time_transform="rank")
+        ph_summary = ph_test.summary
+        ph_p = float(ph_summary.loc[col, "p"]) if col in ph_summary.index else np.nan
+        ph_adjust_p = (
+            float(ph_summary.loc[adjust_name, "p"])
+            if adjust_name in ph_summary.index else np.nan
+        )
+        ph_min_p = float(pd.to_numeric(ph_summary["p"], errors="coerce").min())
         results.append({
             "variable": col,
             "HR": float(summary.loc[col, "exp(coef)"]),
             "HR_lo": float(summary.loc[col, "exp(coef) lower 95%"]),
             "HR_hi": float(summary.loc[col, "exp(coef) upper 95%"]),
             "p": float(summary.loc[col, "p"]),
+            "n": int(cph_df.shape[0]),
+            "n_events": int(cph_df["E"].sum()),
+            "ph_p": ph_p,
+            "ph_adjust_p": ph_adjust_p,
+            "ph_min_p": ph_min_p,
         })
     return pd.DataFrame(results)
 
@@ -2172,7 +2990,7 @@ def compute_cox_multivariate(
 # ---------------------------------------------------------------------------
 
 # Fixed constants matching model_utils.py
-_K_GAMMA = 0.80   # Gamma shape parameter (fixed)
+_K_GAMMA = 0.75   # Gamma shape parameter (fixed)
 _Y_MAX = 19.93    # Expression ceiling
 
 
@@ -2193,7 +3011,7 @@ def mdn_monte_carlo_sample(
 
     Returns a list of *M* DataFrames, each genes x samples, where each
     element is an independent draw from the 3-component mixture
-    (hurdle at 0, Gamma(k=0.80, beta), Normal(mu, sigma^2)),
+    (hurdle at 0, Gamma(k=0.75, beta), Normal(mu, sigma^2)),
     clamped to [0, Y_MAX].
     """
     genes = pi_delta.index
@@ -2269,3 +3087,98 @@ def mdn_predictive_variance(
     var = np.maximum(ex2 - ex ** 2, 1e-12)
 
     return pd.DataFrame(var, index=pi_delta.index, columns=pi_delta.columns)
+
+
+def mdn_quantile_interval_wide(
+    pi_delta: pd.DataFrame,
+    pi_gamma: pd.DataFrame,
+    pi_normal: pd.DataFrame,
+    gamma_beta: pd.DataFrame,
+    normal_mean: pd.DataFrame,
+    normal_stdev: pd.DataFrame,
+    quantiles: Tuple[float, float] = (0.25, 0.75),
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute wide lower/upper MDN quantile surfaces from stored mixture params."""
+    import torch
+
+    from models.model_utils import mixture_quantile
+
+    if len(quantiles) != 2:
+        raise ValueError("quantiles must contain exactly two probability levels")
+
+    pi_delta = _dedupe_wide_axes(pi_delta)
+    pi_gamma = _dedupe_wide_axes(pi_gamma)
+    pi_normal = _dedupe_wide_axes(pi_normal)
+    gamma_beta = _dedupe_wide_axes(gamma_beta)
+    normal_mean = _dedupe_wide_axes(normal_mean)
+    normal_stdev = _dedupe_wide_axes(normal_stdev)
+
+    genes = (
+        pi_delta.index
+        .intersection(pi_gamma.index)
+        .intersection(pi_normal.index)
+        .intersection(gamma_beta.index)
+        .intersection(normal_mean.index)
+        .intersection(normal_stdev.index)
+    )
+    samples = (
+        pi_delta.columns
+        .intersection(pi_gamma.columns)
+        .intersection(pi_normal.columns)
+        .intersection(gamma_beta.columns)
+        .intersection(normal_mean.columns)
+        .intersection(normal_stdev.columns)
+    )
+    if len(genes) == 0 or len(samples) == 0:
+        empty = pd.DataFrame(index=genes, columns=samples, dtype=np.float64)
+        return empty.copy(), empty
+
+    p0_arr = pi_delta.reindex(index=genes, columns=samples).values.astype(np.float64)
+    pg_arr = pi_gamma.reindex(index=genes, columns=samples).values.astype(np.float64)
+    pn_arr = pi_normal.reindex(index=genes, columns=samples).values.astype(np.float64)
+    beta_arr = gamma_beta.reindex(index=genes, columns=samples).values.astype(np.float64)
+    mu_arr = normal_mean.reindex(index=genes, columns=samples).values.astype(np.float64)
+    sigma_arr = normal_stdev.reindex(index=genes, columns=samples).values.astype(np.float64)
+
+    lo_arr = np.full(p0_arr.shape, np.nan, dtype=np.float64)
+    hi_arr = np.full(p0_arr.shape, np.nan, dtype=np.float64)
+
+    p0_flat = p0_arr.reshape(-1)
+    pg_flat = pg_arr.reshape(-1)
+    pn_flat = pn_arr.reshape(-1)
+    beta_flat = beta_arr.reshape(-1)
+    mu_flat = mu_arr.reshape(-1)
+    sigma_flat = sigma_arr.reshape(-1)
+
+    prob_sum = p0_flat + pg_flat + pn_flat
+    valid_flat = (
+        np.isfinite(p0_flat)
+        & np.isfinite(pg_flat)
+        & np.isfinite(pn_flat)
+        & np.isfinite(beta_flat)
+        & np.isfinite(mu_flat)
+        & np.isfinite(sigma_flat)
+        & (prob_sum > 0.0)
+    )
+
+    if valid_flat.any():
+        probs = np.stack([p0_flat[valid_flat], pg_flat[valid_flat], pn_flat[valid_flat]], axis=1)
+        probs /= probs.sum(axis=1, keepdims=True)
+
+        mdn_params = {
+            "log_pi": torch.from_numpy(np.log(np.clip(probs, 1e-12, None))).float(),
+            "gamma_beta": torch.from_numpy(np.clip(beta_flat[valid_flat], 1e-12, None)).float().unsqueeze(-1),
+            "normal_mu": torch.from_numpy(mu_flat[valid_flat]).float().unsqueeze(-1),
+            "normal_sigma": torch.from_numpy(np.clip(sigma_flat[valid_flat], 1e-12, None)).float().unsqueeze(-1),
+        }
+        q = mixture_quantile(mdn_params, quantiles=quantiles).cpu().numpy()
+
+        lo_flat = lo_arr.reshape(-1)
+        hi_flat = hi_arr.reshape(-1)
+        lo_flat[valid_flat] = q[:, 0]
+        hi_flat[valid_flat] = q[:, 1]
+
+    return (
+        pd.DataFrame(lo_arr, index=genes, columns=samples),
+        pd.DataFrame(hi_arr, index=genes, columns=samples),
+    )

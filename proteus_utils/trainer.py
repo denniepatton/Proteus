@@ -46,22 +46,22 @@ from proteus_utils.data_helpers import weighted_group_mean
 class TrainingConfig:
     """Configuration for training."""
     # Optimizer settings
-    weight_decay: float = 1e-5
+    weight_decay: float = 2e-8
     
     # LR schedule settings (step-based cosine annealing with warmup)
-    max_lr: float = 0.0015       # Peak learning rate
-    min_lr_ratio: float = 5e-4   # Minimum LR as fraction of max_lr (eta_min = min_lr_ratio * max_lr)
-    warmup_start_lr: float = 2.5e-4 # LR at the start of warmup (0 = start from 0)
-    warmup_frac: float = 0.10    # Warmup as fraction of total training steps
+    max_lr: float = 4e-4         # Peak learning rate
+    min_lr_ratio: float = 1e-2   # Minimum LR as fraction of max_lr (eta_min = min_lr_ratio * max_lr)
+    warmup_start_lr: float = 1e-5 # LR at the start of warmup (0 = start from 0)
+    warmup_frac: float = 0.05    # Warmup as fraction of total training steps
     schedule_frac: float = 0.90  # Fraction of total training for cosine cycle (1.0 = full, 0.5 = half)
     
     # Training settings
-    epochs: int = 15
-    max_grad_norm: float = 18.0  # Gradient clipping threshold (prevents explosion)
+    epochs: int = 100
+    max_grad_norm: float = 10.0  # Gradient clipping threshold (prevents explosion)
 
     # Gradient accumulation: effective batch = genes_per_batch × accum_steps.
     # Set >1 to trade per-step noise for fewer optimizer steps per epoch.
-    grad_accum_steps: int = 1
+    grad_accum_steps: int = 4
     
     # Mixed precision
     use_amp: bool = True
@@ -80,7 +80,7 @@ class TrainingConfig:
     compile_mode: str = 'reduce-overhead'  # 'default', 'reduce-overhead', 'max-autotune'
     
     # Early stopping
-    patience: int = 3
+    patience: int = 100
     min_delta: float = 0.0
 
     # Model selection metric.
@@ -89,7 +89,7 @@ class TrainingConfig:
     #   PLCAv2 source GVW-CRPS (0.3/0.3/0.2/0.2 across the 4 source buckets).
     # 'max_gvw_r_lower_bound': select epoch with highest
     #   balanced_tumor_gvw_r_lower_bound (mean − std across sources).
-    selection_metric: str = 'min_balanced_crps'
+    selection_metric: str = 'min_weighted_source_crps'
     
     # Checkpointing
     checkpoint_dir: str = 'checkpoints'
@@ -110,12 +110,9 @@ class TrainingConfig:
 
     # Runtime banner (prints device / memory / one batch shape)
     runtime_device_banner: bool = False
-    
-    # Transfer learning
-    freeze_level: Optional[str] = None  # 'Medium-Heavy', 'Heavy', 'Extra-Heavy', 'Extreme'
-    freeze_mode: Optional[str] = None   # 'full_unfreeze', 'backbone_only', etc.
+
+    # Optional initialization from a pre-trained checkpoint.
     base_weights: Optional[str] = None
-    backbone_lr_multiplier: float = 1.0  # Multiplier for backbone param group LR
 
 
 class CosineDecayScheduler:
@@ -295,12 +292,6 @@ class Trainer:
         # Load base weights if provided
         if config.base_weights is not None:
             self._load_weights(config.base_weights)
-        
-        # Apply freezing if specified (freeze_mode takes precedence)
-        if config.freeze_mode is not None:
-            self._apply_freeze_mode(config.freeze_mode)
-        elif config.freeze_level is not None:
-            self._apply_freeze_level(config.freeze_level)
 
         # Optimizer is created lazily (after optional warmup/compile) to ensure
         # parameter sets and wrappers are finalized.
@@ -317,7 +308,9 @@ class Trainer:
         # Loss functions
         self.external_loss_fn = BioDVNMDNLoss(
             beta_background=self.model_config.beta_background,
-            beta_point_mse=getattr(self.model_config, 'beta_point_mse', 0.0),
+            beta_ccc=getattr(self.model_config, 'beta_ccc', 0.25),
+            beta_pht_consistency=getattr(self.model_config, 'beta_pht_consistency', 0.10),
+            beta_pht_uncertainty=getattr(self.model_config, 'beta_pht_uncertainty', 0.05),
         )
         
         # Metrics
@@ -348,38 +341,10 @@ class Trainer:
         self._active_rich_progress = None
         self._active_pbar = None
 
-    _BACKBONE_MODULE_PREFIXES = (
-        'signal_processor.', 'reduction.', 'signal_encoder.',
-    )
-
     def _create_optimizer(self) -> torch.optim.Optimizer:
-        mult = self.config.backbone_lr_multiplier
-        use_groups = mult < 1.0
-
-        if use_groups:
-            backbone_params = []
-            other_params = []
-            for name, param in self.model.named_parameters():
-                if not param.requires_grad:
-                    continue
-                if any(name.startswith(p) for p in self._BACKBONE_MODULE_PREFIXES):
-                    backbone_params.append(param)
-                else:
-                    other_params.append(param)
-            param_groups = [
-                {'params': other_params, 'lr': self.config.max_lr},
-                {'params': backbone_params, 'lr': self.config.max_lr * mult},
-            ]
-            print(f'  Differential LR: backbone={self.config.max_lr * mult:.2e} '
-                  f'({len(backbone_params)} params), '
-                  f'other={self.config.max_lr:.2e} ({len(other_params)} params)')
-        else:
-            param_groups = filter(lambda p: p.requires_grad,
-                                  self.model.parameters())
-
         # Fused AdamW — always available on PyTorch 2.0+.
         return torch.optim.AdamW(
-            param_groups,
+            filter(lambda p: p.requires_grad, self.model.parameters()),
             lr=self.config.max_lr,
             weight_decay=self.config.weight_decay,
             fused=True,
@@ -403,7 +368,7 @@ class Trainer:
         self.optimizer = self._create_optimizer()
 
         # Initialize EMA shadow after optimizer so the initial shadow
-        # matches the (possibly weight-loaded / frozen) model state.
+        # matches the active model state.
         ema_decay = getattr(self.config, 'ema_decay', 0.0)
         if ema_decay > 0.0:
             self._ema = _EMAState(self.model, ema_decay)
@@ -473,31 +438,6 @@ class Trainer:
         else:
             state_dict = loaded
         self.model.load_state_dict(state_dict, strict=False)
-    
-    def _apply_freeze_level(self, level: str):
-        """Apply freezing based on level."""
-        print(f'Applying freeze level: {level}')
-        
-        if level == 'Extreme':
-            self.model.freeze_encoders()
-        elif level in ['Medium-Heavy', 'Heavy', 'Extra-Heavy']:
-            self.model.freeze_signal_processing()
-            if level in ['Extra-Heavy']:
-                # Freeze first layers of encoders
-                for name, param in self.model.tumor_encoder.named_parameters():
-                    if any(f'layers.{i}' in name for i in range(4)):
-                        param.requires_grad = False
-                for name, param in self.model.background_encoder.named_parameters():
-                    if any(f'layers.{i}' in name for i in range(4)):
-                        param.requires_grad = False
-
-    def _apply_freeze_mode(self, mode: str):
-        """Apply freeze_mode via the model's apply_freeze_mode() dispatch."""
-        print(f'Applying freeze mode: {mode}')
-        self.model.apply_freeze_mode(mode)
-        n_frozen = sum(1 for p in self.model.parameters() if not p.requires_grad)
-        n_total = sum(1 for p in self.model.parameters())
-        print(f'  Frozen {n_frozen}/{n_total} parameter tensors')
     
     def _move_batch_to_device(
         self,
@@ -647,7 +587,8 @@ class Trainer:
             external_loss, external_metrics = self.external_loss_fn(
                 predictions,
                 labels,
-                sample_weight=labels.get('sample_weight')
+                sample_weight=labels.get('sample_weight'),
+                features=features,
             )
 
             # Total loss
@@ -943,7 +884,8 @@ class Trainer:
             external_loss, external_metrics = self.external_loss_fn(
                 predictions,
                 labels,
-                sample_weight=labels.get('sample_weight')
+                sample_weight=labels.get('sample_weight'),
+                features=features,
             )
 
             # Resolve gene variance weights for this batch (pooled for overall GVW-CRPS).
@@ -1204,6 +1146,7 @@ class Trainer:
         epochs: Optional[int] = None,
         epoch_end_callback=None,
         external_stop_check=None,
+        monitor_only_validation: bool = False,
     ) -> Dict[str, List[float]]:
         """
         Full training loop.
@@ -1212,6 +1155,9 @@ class Trainer:
             train_loader: Training data loader
             val_loader: Validation data loader (optional)
             epochs: Number of epochs (overrides config)
+            monitor_only_validation: If True, run validation on schedule for
+                diagnostics and loss curves, but do not checkpoint-select or
+                early-stop on the validation metrics.
             
         Returns:
             Dictionary of metric histories
@@ -1296,8 +1242,13 @@ class Trainer:
             
             print(f'  Train Loss: {train_metrics["loss"]:.4f} | Time: {train_metrics["epoch_time"]:.1f}s')
             
-            # Validation
-            if val_loader is not None:
+            # Validation runs on the fixed cadence and always on the final
+            # epoch so checkpoint selection and fold metrics remain defined.
+            should_validate = (
+                val_loader is not None
+                and (epoch == epochs or (epoch % 5) == 0)
+            )
+            if should_validate:
                 # When EMA is active, swap to shadow weights for validation
                 # and checkpointing so both reflect the averaged model.
                 _ema_backup: Optional[Dict[str, torch.Tensor]] = None
@@ -1350,6 +1301,13 @@ class Trainer:
                     f'{r_str} '
                     f'| Agg R²: {val_metrics.get("val_tumor_aggregate_r2", 0):.4f}'
                 )
+
+                # Fixed-schedule monitoring mode records validation curves but
+                # must not alter checkpointing or the epoch budget.
+                if monitor_only_validation:
+                    if _ema_backup is not None:
+                        self._ema.restore(self.model, _ema_backup)
+                    continue
 
                 # Model selection / early stopping metric.
                 if _maximize:
@@ -1409,9 +1367,22 @@ class Trainer:
                 # Restore raw model weights for next training epoch.
                 if _ema_backup is not None:
                     self._ema.restore(self.model, _ema_backup)
+            elif val_loader is not None:
+                history['val_loss'].append(float('nan'))
+                history['val_tumor_gvw_crps'].append(float('nan'))
+                history['val_weighted_tumor_gvw_crps'].append(float('nan'))
+                history['val_tumor_aggregate_r2'].append(float('nan'))
+                history['val_balanced_tumor_gvw_r'].append(float('nan'))
+                if 'val_balanced_tumor_gvw_crps' in history:
+                    history['val_balanced_tumor_gvw_crps'].append(float('nan'))
+                print('  Validation skipped (scheduled every 5 epochs)')
         
         if val_loader is None:
             print('\nTraining complete (fixed schedule; no validation checkpoint selection).')
+            return history
+
+        if monitor_only_validation:
+            print('\nTraining complete (fixed schedule; validation recorded for diagnostics only).')
             return history
 
         if _maximize:

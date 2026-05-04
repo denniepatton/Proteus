@@ -254,8 +254,8 @@ an Optuna search specification:
 
 | Group | Parameters |
 |---|---|
-| **Structural** | `beta_background`, `beta_tcvae`, `beta_contrastive`, `beta_reconstruction`, `beta_grl`, `beta_point_mse`, `cl_margin`, `internal_weight` |
-| **Training** | `max_lr`, `min_lr_ratio`, `warmup_start_lr`, `weight_decay`, `max_grad_norm`, `warmup_frac`, `schedule_frac`, `epochs`, `patience`, `use_amp` |
+| **Structural** | `beta_background`, `beta_kl`, `beta_contrastive`, `beta_reconstruction`, `beta_tfx`, `beta_ccc`, `beta_pht_consistency`, `beta_pht_uncertainty`, `cl_margin`, `internal_weight` |
+| **Training** | `max_lr`, `min_lr_ratio`, `warmup_start_lr`, `weight_decay`, `max_grad_norm`, `warmup_frac`, `schedule_frac`, `epochs`, `patience`, `use_amp`, `grad_accum_steps` |
 | **Scale** | `encoder_start`, `latent_size`, `decoder_start`, `mdn_hidden`, `mdn_final`, `signal_filters`, `signal_encoder_width`, `signal_ksize`, `interaction_ksize`, `initial_reduction_channels`, `n_reductions`, `reduction_dilation_small`, `reduction_dilation_large`, `dropout_rate` |
 
 ## Zarr Store Schema

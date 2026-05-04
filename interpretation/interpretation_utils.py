@@ -87,7 +87,12 @@ import sys as _sys
 if str(_PROJECT_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_PROJECT_ROOT))
 
-from models.models import BioDVN, BioDVNConfig  # noqa: E402
+from models.models import (  # noqa: E402
+    BioDVN,
+    BioDVNConfig,
+    channel_mode_for_model,
+    get_model_instance,
+)
 from models.model_utils import mixture_mean  # noqa: E402
 
 
@@ -146,14 +151,16 @@ CUSTOM_CMAP = LinearSegmentedColormap.from_list(
     N=100,
 )
 
-# Classic SHAP-style diverging colormap (blue → violet → red).
-# Matches the shap.plots.beeswarm palette.
+# Beeswarm diverging colormap.
+# Keep the original smooth blue → fuchsia-violet → red ramp. We control the
+# effective saturation point through the normalization rather than by
+# compressing the midpoint stops, which keeps the colorbar visually continuous.
 SHAP_CMAP = LinearSegmentedColormap.from_list(
     'shap_blue_violet_red',
     [
-        (0.0, '#1E88E5'),   # blue
-        (0.5, '#D500F9'),   # violet / purple
-        (1.0, '#FF0D57'),   # red / hot-pink
+        (0.00, '#1E88E5'),  # blue
+        (0.50, '#D500F9'),  # fuchsia-violet midpoint
+        (1.00, '#FF0D57'),  # red / hot-pink
     ],
     N=256,
 )
@@ -191,22 +198,48 @@ def load_model(
         if os.path.isfile(candidate):
             config_path = candidate
 
-    if config_path is not None:
-        with open(config_path, 'r') as f:
-            cfg_raw = json.load(f)
-        allowed = set(BioDVNConfig.__dataclass_fields__.keys())
-        cfg = {k: v for k, v in cfg_raw.items() if k in allowed}
-        model_config = BioDVNConfig(**cfg)
-    else:
-        model_config = BioDVNConfig()
+    if config_path is None:
+        raise FileNotFoundError(
+            'Interpretation requires model_config.json next to the checkpoint so '
+            'the current BioDVN architecture can be reconstructed exactly. '
+            f'Missing config for checkpoint: {weights_path}'
+        )
 
-    model = BioDVN(model_config).to(device)
+    with open(config_path, 'r') as f:
+        cfg_raw = json.load(f)
+    allowed = set(BioDVNConfig.__dataclass_fields__.keys())
+    cfg = {k: v for k, v in cfg_raw.items() if k in allowed}
+    model_config = BioDVNConfig(**cfg)
+
+    channel_mode = model_config.channel_mode
+    channel_mode_to_model_name = {
+        channel_mode_for_model('BioDVN'): 'BioDVN',
+        channel_mode_for_model('BioDVN_NoSeq'): 'BioDVN_NoSeq',
+        channel_mode_for_model('BioDVN_OnlySeq'): 'BioDVN_OnlySeq',
+    }
+    model_name = channel_mode_to_model_name.get(channel_mode)
+    if model_name is None:
+        raise ValueError(
+            f'Unsupported channel_mode {channel_mode!r} in {config_path}. '
+            'Interpretation currently supports BioDVN all/no_seq/only_seq.'
+        )
+
+    ModelClass = get_model_instance(model_name)
+    model = ModelClass(model_config).to(device)
     state = torch.load(weights_path, map_location=device, weights_only=False)
     # Checkpoints saved by Trainer include a nested dict; plain state-dicts
     # (from Proteus.py full-train) are loaded directly.
     if isinstance(state, dict) and 'model_state_dict' in state:
         state = state['model_state_dict']
-    model.load_state_dict(state, strict=False)
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f'Checkpoint/config mismatch for interpretation model load. '
+            f'weights={weights_path}, config={config_path}. '
+            'This usually means the BioDVN architecture changed or the wrong '
+            'checkpoint/config pair was supplied.'
+        ) from exc
     model.eval()
     return model
 
@@ -217,9 +250,10 @@ def load_model(
 
 # Approximate bytes per gene loaded into RAM:
 #   TSS_signals(2000×9) + TSS_nucleotides(2000×4) + TSS_features(11)
-#   + GB_features(11) + ref_scalars(3) + TFX_label(1) + tumor_exp(1)
-# = 26,027 float32 values × 4 bytes ≈ 104 KB/gene
-_BYTES_PER_GENE = 26_027 * 4
+#   + GB_features(11) + ref_scalars(3) + TFX_label(1)
+#   + tumor_exp(1) + background_exp(1)
+# = 26,028 float32 values × 4 bytes ≈ 104 KB/gene
+_BYTES_PER_GENE = 26_028 * 4
 
 
 def load_interpretation_data(
@@ -248,8 +282,10 @@ def load_interpretation_data(
             ref_scalars      (N, 3)         float32
             TFX_label        (N,)           float32
             tumor_exp        (N,)           float32
+            background_exp   (N,)           float32
             gene_names       list[str]       length N
             sample_names     list[str]       length N
+            cohort_names     list[str]       length N
 
         where *N* is total genes across all loaded samples.
     """
@@ -273,10 +309,12 @@ def load_interpretation_data(
 
     all_arrays: Dict[str, list] = {
         'TSS_signals': [], 'TSS_nucleotides': [], 'TSS_features': [],
-        'GB_features': [], 'ref_scalars': [], 'TFX_label': [], 'tumor_exp': [],
+        'GB_features': [], 'ref_scalars': [], 'TFX_label': [],
+        'tumor_exp': [], 'background_exp': [],
     }
     all_gene_names: List[str] = []
     all_sample_names: List[str] = []
+    all_cohort_names: List[str] = []
     total_loaded = 0
 
     for idx, zpath in enumerate(zarr_paths, 1):
@@ -301,6 +339,10 @@ def load_interpretation_data(
             all_arrays['tumor_exp'].append(flat['tumor_exp'][:n_genes].astype(np.float32))
         else:
             all_arrays['tumor_exp'].append(np.full(n_genes, np.nan, dtype=np.float32))
+        if 'background_exp' in flat:
+            all_arrays['background_exp'].append(flat['background_exp'][:n_genes].astype(np.float32))
+        else:
+            all_arrays['background_exp'].append(np.full(n_genes, np.nan, dtype=np.float32))
 
         # Gene names
         if 'gene_names' in store:
@@ -311,12 +353,16 @@ def load_interpretation_data(
 
         # Sample name
         sample_name = store.attrs.get('sample_name', Path(zpath).stem.replace('.zarr', ''))
+        zarr_path = Path(zpath)
+        cohort_name = zarr_path.parent.parent.name if zarr_path.parent.name == 'zarr_files' else 'Unknown'
         all_sample_names.extend([str(sample_name)] * n_genes)
+        all_cohort_names.extend([str(cohort_name)] * n_genes)
         total_loaded += n_genes
 
     data = {k: np.concatenate(v, axis=0) for k, v in all_arrays.items()}
     data['gene_names'] = all_gene_names
     data['sample_names'] = all_sample_names
+    data['cohort_names'] = all_cohort_names
     actual_gb = sum(v.nbytes for v in data.values() if isinstance(v, np.ndarray)) / 1e9
     print(f'  Loaded {total_loaded:,} genes from {n_stores} stores ({actual_gb:.1f} GB)')
     return data
@@ -571,6 +617,9 @@ def plot_signal_conv1d_filters(model: BioDVN, folder_path: Optional[str] = None)
     contiguous in the weight tensor: ``w[ch*sf : (ch+1)*sf, 0, :]``.
     """
     sp = model.signal_processor
+    if sp.conv1d_signals is None:
+        print('  [skip] Signal Conv1d filters unavailable for this channel mode')
+        return
     n_channels = sp.n_signal_channels
     signal_filters = sp.signal_filters
     ksize = sp.signal_ksize
@@ -625,6 +674,9 @@ def plot_nucleotide_conv2d_filters(model: BioDVN, folder_path: Optional[str] = N
     shape ``(1, 4, ksize)`` kernels, producing *signal_filters* output channels.
     """
     sp = model.signal_processor
+    if sp.conv2d_nt is None:
+        print('  [skip] Nucleotide Conv2d filters unavailable for this channel mode')
+        return
     # conv2d_nt is a Sequential; the Conv2d layer is the first element
     conv2d = sp.conv2d_nt[0]
     w = _get_conv_weights(conv2d)  # (out_ch, in_ch=1, H=4, W=ksize)
@@ -710,7 +762,6 @@ def plot_reduction_filters(model: BioDVN, folder_path: Optional[str] = None) -> 
             r, c = divmod(idx, cols)
             axs[r, c].axis('off')
 
-        dilation = reduction._skip_offsets[iteration_idx] * 2 // max(ksize_h - 1, 1) if ksize_h > 1 else 1
         fig.suptitle(
             f'ReductionBlock iteration {iteration_idx} Conv2d filters '
             f'({out_ch} filters, kernel=({ksize_h},{ksize_w}), '
@@ -748,6 +799,11 @@ def compute_PWM(
         ``(ksize, 4, num_filters)`` and *background_freq* is ``(4,)``.
     """
     sp = model.signal_processor
+    if sp.conv2d_nt is None:
+        raise ValueError(
+            'PWM computation requires the nucleotide Conv2d branch, but the '
+            f'loaded model channel_mode is {model.config.channel_mode!r}.'
+        )
     # conv2d_nt is a Sequential; Conv2d is the first element
     conv2d = sp.conv2d_nt[0]
     w = _get_conv_weights(conv2d)  # (num_filters, 1, 4, ksize)
@@ -913,6 +969,9 @@ def plot_motifs(
     save_filepath: Optional[str] = None,
 ) -> None:
     """Wrapper: compute PWMs, export MEME, and plot motif logos."""
+    if model.signal_processor.conv2d_nt is None:
+        print('  [skip] Motif analysis unavailable for this channel mode')
+        return
     pwm_filters, bg_freq = compute_PWM(model, data, save_filepath=save_filepath)
     export_PWM_to_MEME(pwm_filters, bg_freq, save_filepath)
     plot_nucleotide_motifs(pwm_filters, save_filepath)
@@ -983,13 +1042,27 @@ def _run_attribution(
     _ensure_captum()
     from captum.attr import IntegratedGradients, GradientShap
 
-    wrapper = wrapper_cls(model)
+    device = next(model.parameters()).device
+    wrapper = wrapper_cls(model).to(device)
     wrapper.eval()
 
     if method == 'integrated_gradients':
         attr_method = IntegratedGradients(wrapper)
+        baseline_summary = tuple(
+            tensor.mean(dim=0, keepdim=True).to(device)
+            for tensor in baseline_tensors
+        )
     elif method == 'gradient_shap':
         attr_method = GradientShap(wrapper)
+        baseline_pool_size = min(256, baseline_tensors[0].shape[0])
+        baseline_summary = tuple(
+            tensor[:baseline_pool_size].to(device)
+            for tensor in baseline_tensors
+        )
+        print(
+            f'  GradientShap baseline pool capped at {baseline_pool_size:,} genes '
+            'for GPU stability'
+        )
     else:
         raise ValueError(f"Unknown attribution method: {method!r}")
 
@@ -998,12 +1071,12 @@ def _run_attribution(
 
     for start in range(0, n_test, batch_size):
         end = min(start + batch_size, n_test)
-        batch_inputs = tuple(t[start:end] for t in test_tensors)
+        batch_inputs = tuple(t[start:end].to(device) for t in test_tensors)
 
         if method == 'integrated_gradients':
             baselines = tuple(
-                t.mean(dim=0, keepdim=True).expand_as(b)
-                for t, b in zip(baseline_tensors, batch_inputs)
+                baseline.expand_as(batch_input)
+                for baseline, batch_input in zip(baseline_summary, batch_inputs)
             )
             batch_attr = attr_method.attribute(
                 batch_inputs, baselines=baselines, n_steps=n_steps,
@@ -1011,7 +1084,7 @@ def _run_attribution(
             )
         else:  # gradient_shap
             batch_attr = attr_method.attribute(
-                batch_inputs, baselines=baseline_tensors, n_samples=n_steps,
+                batch_inputs, baselines=baseline_summary, n_samples=n_steps,
             )
 
         batch_np = [a.detach().cpu().numpy() for a in batch_attr]
@@ -1030,6 +1103,113 @@ def _run_attribution(
     if attr_accum is None:
         raise RuntimeError('No test samples processed.')
     return attr_accum
+
+
+def _observed_sequence_contribution(
+    attributions: List[np.ndarray],
+    data: Dict[str, np.ndarray],
+) -> np.ndarray:
+    """Return the signed nucleotide attribution for the observed base at each position."""
+    return (attributions[1] * data['TSS_nucleotides']).sum(axis=-1)
+
+
+def _signed_signal_sequence_interaction(
+    attributions: List[np.ndarray],
+    data: Dict[str, np.ndarray],
+) -> np.ndarray:
+    """Return signed signal × observed-sequence interaction for all bio channels."""
+    sig_attr = attributions[0][:, :, :8]
+    observed_seq_attr = _observed_sequence_contribution(attributions, data)
+    return sig_attr * observed_seq_attr[:, :, np.newaxis]
+
+
+def _bp_window_to_indices(start_bp: int, end_bp: int, seq_len: int) -> Tuple[int, int]:
+    """Convert a TSS-relative bp window to half-open array indices."""
+    start_idx = max(0, min(seq_len, int(start_bp + 1000)))
+    end_idx = max(start_idx + 1, min(seq_len, int(end_bp + 1000)))
+    return start_idx, end_idx
+
+
+def _build_weighted_pwm(
+    nuc_data: np.ndarray,
+    weights: np.ndarray,
+    center_pos: int,
+    window_size: int,
+) -> Optional[np.ndarray]:
+    """Build a weighted PWM around a center position."""
+    half_window = window_size // 2
+    lo = max(0, center_pos - half_window)
+    hi = min(nuc_data.shape[1], center_pos + half_window + 1)
+    positive_weights = np.clip(weights.astype(np.float64), 0.0, None)
+    weight_sum = positive_weights.sum()
+    if weight_sum <= 1e-12:
+        return None
+    norm_weights = positive_weights / weight_sum
+    return np.einsum('n,nwc->wc', norm_weights, nuc_data[:, lo:hi, :])
+
+
+def _mean_group_attribution_per_gene(attributions: List[np.ndarray]) -> Dict[str, np.ndarray]:
+    """Return per-gene mean absolute attribution for each input group."""
+    return {
+        'Signals': np.abs(attributions[0][:, :, :8]).mean(axis=(1, 2)),
+        'Sequence': np.abs(attributions[1]).mean(axis=(1, 2)),
+        'TSS Scalars': np.abs(attributions[2]).mean(axis=1),
+        'GB Scalars': np.abs(attributions[3]).mean(axis=1),
+        'Ref Scalars': np.abs(attributions[4]).mean(axis=1),
+    }
+
+
+def _top_spaced_positions(profile: np.ndarray, top_k: int, spacing: int) -> List[int]:
+    """Select top interaction positions while suppressing nearby duplicates."""
+    work = np.asarray(profile, dtype=np.float32).copy()
+    positions: List[int] = []
+    radius = max(int(spacing), 1)
+    for _ in range(top_k):
+        pos = int(np.argmax(work))
+        if not np.isfinite(work[pos]) or work[pos] <= 0:
+            break
+        positions.append(pos)
+        lo = max(0, pos - radius)
+        hi = min(work.shape[0], pos + radius + 1)
+        work[lo:hi] = -np.inf
+    return positions
+
+
+def _slice_data_dict(data: Dict[str, Any], indices: np.ndarray) -> Dict[str, Any]:
+    """Slice an interpretation data dictionary by row indices."""
+    sliced: Dict[str, Any] = {}
+    for key, value in data.items():
+        if isinstance(value, np.ndarray):
+            sliced[key] = value[indices].copy()
+        elif isinstance(value, list):
+            sliced[key] = [value[int(i)] for i in indices]
+        else:
+            sliced[key] = value
+    return sliced
+
+
+def _predict_tumor_expression(
+    model: nn.Module,
+    data: Dict[str, Any],
+    batch_size: int = 64,
+) -> np.ndarray:
+    """Run batched forward passes and return tumor mean predictions."""
+    device = next(model.parameters()).device
+    n_total = int(data['TSS_signals'].shape[0])
+    preds: List[np.ndarray] = []
+    for start in range(0, n_total, batch_size):
+        end = min(start + batch_size, n_total)
+        features = {
+            'TSS_signals': torch.from_numpy(data['TSS_signals'][start:end]).to(device),
+            'TSS_nucleotides': torch.from_numpy(data['TSS_nucleotides'][start:end]).to(device),
+            'TSS_features': torch.from_numpy(data['TSS_features'][start:end]).to(device),
+            'GB_features': torch.from_numpy(data['GB_features'][start:end]).to(device),
+            'ref_scalars': torch.from_numpy(data['ref_scalars'][start:end]).to(device),
+        }
+        with torch.no_grad():
+            batch_preds, _ = model(features, return_internal_loss=False)
+        preds.append(batch_preds['tumor_exp'].detach().cpu().numpy().squeeze(-1))
+    return np.concatenate(preds, axis=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1240,11 +1420,19 @@ def plot_scalar_summary(
             if sigma > 1e-8:
                 feat_vals[:, 10] = (col - mu) / sigma
 
-        # Symmetric colour limits centred at 0 for z-scored features
+        # Symmetric colour limits centred at 0 for z-scored features.
+        # Cap the effective colour range at +/-1.5 so the beeswarm keeps a
+        # smooth continuum but reaches saturated blue/red before the extreme
+        # tails near +/-2.
         all_feat = feat_vals[:, order]
-        vlim = max(abs(np.nanpercentile(all_feat, 1)),
-                   abs(np.nanpercentile(all_feat, 99)),
-                   1e-6)
+        vlim = min(
+            max(
+                abs(np.nanpercentile(all_feat, 1)),
+                abs(np.nanpercentile(all_feat, 99)),
+                1e-6,
+            ),
+            1.5,
+        )
         norm = TwoSlopeNorm(vmin=-vlim, vcenter=0, vmax=vlim)
 
         fig, ax = plt.subplots(figsize=(8, max(3, 0.5 * n_features)),
@@ -1381,40 +1569,227 @@ def plot_scalar_bars(
 
 def plot_signal_sequence_interaction(
     attributions: List[np.ndarray],
+    data: Optional[Dict[str, np.ndarray]] = None,
     folder_path: Optional[str] = None,
 ) -> None:
-    """Plot position-resolved fragment-end × nucleotide interaction scores.
+    """Plot position-resolved signal × observed-sequence interaction scores."""
+    if data is None:
+        sig_attr = attributions[0][:, :, :8]
+        nuc_summed = np.abs(attributions[1]).sum(axis=-1)
+        mean_interaction = (np.abs(sig_attr) * nuc_summed[:, :, np.newaxis]).mean(axis=0).T
+    else:
+        signed_interaction = _signed_signal_sequence_interaction(attributions, data)
+        mean_interaction = np.abs(signed_interaction).mean(axis=0).T
+    positions = np.linspace(-1000, 1000, mean_interaction.shape[1])
+    promoter_lo, promoter_hi = -150, 0
+    promoter_start, promoter_end = _bp_window_to_indices(promoter_lo, promoter_hi, mean_interaction.shape[1])
+    promoter_strength = mean_interaction[:, promoter_start:promoter_end].mean(axis=1)
 
-    Computes the element-wise product ``|attr_frag| × |attr_nuc_sum|`` at
-    each of the 2000 TSS positions.  Positions with high interaction
-    indicate genomic locations where the model jointly relies on both
-    fragment-end patterns (channels 1–2) and nucleotide context.
-    """
-    sig_attr = attributions[0]    # (N, 2000, 9)
-    nuc_attr = attributions[1]    # (N, 2000, 4)
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(12, 6),
+        constrained_layout=True,
+        gridspec_kw={'height_ratios': [3.5, 1.2]},
+    )
+    im = axes[0].imshow(mean_interaction, cmap='viridis', aspect='auto', interpolation='nearest')
+    axes[0].set_yticks(range(len(BIOLOGICAL_SIGNAL_NAMES)))
+    axes[0].set_yticklabels(BIOLOGICAL_SIGNAL_NAMES, fontsize=8)
+    axes[0].set_xticks(np.linspace(0, mean_interaction.shape[1] - 1, 9))
+    axes[0].set_xticklabels([f'{int(x)}' for x in np.linspace(-1000, 1000, 9)])
+    axes[0].axvline(promoter_start, color='white', linewidth=0.9, linestyle='--')
+    axes[0].axvline(promoter_end - 1, color='white', linewidth=0.9, linestyle='--')
+    axes[0].set_title('Mean |signal × sequence interaction|', fontsize=11)
+    axes[0].set_ylabel('Signal channel', fontsize=9)
+    fig.colorbar(im, ax=axes[0], label='Mean |interaction|')
 
-    # Fragment-end channels: 1 = coverage, 2 = asymmetry
-    frag_end_attr = np.abs(sig_attr[:, :, 1:3])           # (N, 2000, 2)
-    nuc_summed = np.abs(nuc_attr).sum(axis=-1)             # (N, 2000)
-    interaction = frag_end_attr * nuc_summed[:, :, np.newaxis]  # (N, 2000, 2)
-    mean_interaction = interaction.mean(axis=0)            # (2000, 2)
-
-    channel_names = ['Frag End Coverage × Sequence', 'Frag End Asymmetry × Sequence']
-    positions = np.linspace(-1000, 1000, 2000)
-
-    fig, axes = plt.subplots(2, 1, figsize=(12, 4), constrained_layout=True)
-    for i, (ax, name) in enumerate(zip(axes, channel_names)):
-        ax.fill_between(positions, mean_interaction[:, i],
-                        alpha=0.6, color='steelblue')
-        ax.set_ylabel('Interaction', fontsize=9)
-        ax.set_title(name, fontsize=10)
-        ax.set_xlim(-1000, 1000)
-        if i < 1:
-            ax.set_xticklabels([])
-    axes[-1].set_xlabel('Position relative to TSS (bp)', fontsize=10)
+    order = np.argsort(promoter_strength)
+    axes[1].barh(
+        range(len(order)),
+        promoter_strength[order],
+        color='#2C7FB8',
+        alpha=0.9,
+    )
+    axes[1].set_yticks(range(len(order)))
+    axes[1].set_yticklabels([BIOLOGICAL_SIGNAL_NAMES[i] for i in order], fontsize=8)
+    axes[1].set_xlabel('Promoter-window mean |interaction| (-150 to 0 bp)', fontsize=9)
+    axes[1].set_title('Promoter-focused interaction ranking', fontsize=10)
 
     fig.suptitle('Signal–Sequence Interaction Scores', fontsize=13)
     _save_or_show(fig, folder_path, 'signal_sequence_interaction.png')
+
+
+def plot_signed_signal_sequence_interaction(
+    attributions: List[np.ndarray],
+    data: Dict[str, np.ndarray],
+    folder_path: Optional[str] = None,
+) -> None:
+    """Plot signed signal × observed-sequence interaction profiles."""
+    signed_interaction = _signed_signal_sequence_interaction(attributions, data)
+    mean_signed = signed_interaction.mean(axis=0).T
+    promoter_start, promoter_end = _bp_window_to_indices(-150, 0, mean_signed.shape[1])
+
+    vmax = np.nanpercentile(np.abs(mean_signed), 99)
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        vmax = 1e-6
+    norm = TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax)
+
+    fig, ax = plt.subplots(figsize=(12, 4.8), constrained_layout=True)
+    im = ax.imshow(mean_signed, cmap=CUSTOM_CMAP, aspect='auto', interpolation='nearest', norm=norm)
+    ax.set_yticks(range(len(BIOLOGICAL_SIGNAL_NAMES)))
+    ax.set_yticklabels(BIOLOGICAL_SIGNAL_NAMES, fontsize=8)
+    ax.set_xticks(np.linspace(0, mean_signed.shape[1] - 1, 9))
+    ax.set_xticklabels([f'{int(x)}' for x in np.linspace(-1000, 1000, 9)])
+    ax.axvline(promoter_start, color='white', linewidth=0.9, linestyle='--')
+    ax.axvline(promoter_end - 1, color='white', linewidth=0.9, linestyle='--')
+    ax.set_xlabel('Position relative to TSS (bp)', fontsize=10)
+    ax.set_ylabel('Signal channel', fontsize=9)
+    ax.set_title('Signed signal–sequence interaction across all signal channels', fontsize=11)
+    fig.colorbar(im, ax=ax, label='Signed interaction')
+
+    fig.suptitle('Signed Signal–Sequence Interaction Scores', fontsize=13)
+    _save_or_show(fig, folder_path, 'signal_sequence_interaction_signed.png')
+
+
+def counterfactual_signal_sequence_synergy(
+    model: nn.Module,
+    attributions: List[np.ndarray],
+    data: Dict[str, np.ndarray],
+    folder_path: Optional[str] = None,
+    top_k: int = 4,
+    n_genes: int = 256,
+    window_size: int = 21,
+    batch_size: int = 64,
+    max_plot_rows: int = 12,
+) -> None:
+    """Quantify joint sequence and signal effects with local ablations."""
+    signed_interaction = _signed_signal_sequence_interaction(attributions, data)
+    bg_freq = data['TSS_nucleotides'].mean(axis=(0, 1)).astype(np.float32)
+
+    half_window = window_size // 2
+    summary_rows: List[Dict[str, Any]] = []
+
+    for signal_channel, channel_name in enumerate(BIOLOGICAL_SIGNAL_NAMES):
+        profile = np.abs(signed_interaction[:, :, signal_channel]).mean(axis=0)
+        positions = _top_spaced_positions(profile, top_k=top_k, spacing=window_size)
+
+        for pos in positions:
+            gene_scores = np.abs(signed_interaction[:, pos, signal_channel])
+            if gene_scores.size == 0:
+                continue
+            order = np.argsort(gene_scores)[::-1]
+            use_idx = order[: min(n_genes, order.size)]
+            subset = _slice_data_dict(data, use_idx)
+
+            lo = max(0, pos - half_window)
+            hi = min(subset['TSS_signals'].shape[1], pos + half_window + 1)
+
+            seq_only = _slice_data_dict(subset, np.arange(subset['TSS_signals'].shape[0]))
+            sig_only = _slice_data_dict(subset, np.arange(subset['TSS_signals'].shape[0]))
+            both = _slice_data_dict(subset, np.arange(subset['TSS_signals'].shape[0]))
+
+            seq_only['TSS_nucleotides'][:, lo:hi, :] = bg_freq.reshape(1, 1, 4)
+            sig_only['TSS_signals'][:, lo:hi, signal_channel] = 0.0
+            both['TSS_nucleotides'][:, lo:hi, :] = bg_freq.reshape(1, 1, 4)
+            both['TSS_signals'][:, lo:hi, signal_channel] = 0.0
+
+            original_pred = _predict_tumor_expression(model, subset, batch_size=batch_size)
+            seq_pred = _predict_tumor_expression(model, seq_only, batch_size=batch_size)
+            sig_pred = _predict_tumor_expression(model, sig_only, batch_size=batch_size)
+            both_pred = _predict_tumor_expression(model, both, batch_size=batch_size)
+
+            cooperative_gain = seq_pred + sig_pred - both_pred - original_pred
+            signal_window_mean = subset['TSS_signals'][:, lo:hi, signal_channel].mean(axis=1)
+            positive_mask = signal_window_mean > 0.0
+            negative_mask = signal_window_mean < 0.0
+
+            summary_rows.append({
+                'channel': channel_name,
+                'position_index': int(pos),
+                'position_bp': int(pos - 1000),
+                'n_genes': int(cooperative_gain.shape[0]),
+                'n_positive_signal': int(positive_mask.sum()),
+                'n_negative_signal': int(negative_mask.sum()),
+                'mean_abs_interaction': float(profile[pos]),
+                'mean_signed_interaction': float(signed_interaction[:, pos, signal_channel].mean()),
+                'cooperative_gain_mean': float(np.mean(cooperative_gain)),
+                'cooperative_gain_median': float(np.median(cooperative_gain)),
+                'cooperative_gain_positive_signal_mean': (
+                    float(np.mean(cooperative_gain[positive_mask]))
+                    if bool(positive_mask.any()) else np.nan
+                ),
+                'cooperative_gain_negative_signal_mean': (
+                    float(np.mean(cooperative_gain[negative_mask]))
+                    if bool(negative_mask.any()) else np.nan
+                ),
+            })
+
+    if not summary_rows:
+        return
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df['abs_cooperative_gain_mean'] = summary_df['cooperative_gain_mean'].abs()
+    summary_df = summary_df.sort_values(
+        ['abs_cooperative_gain_mean', 'mean_abs_interaction'],
+        ascending=[False, False],
+    ).reset_index(drop=True)
+    if folder_path is not None:
+        os.makedirs(folder_path, exist_ok=True)
+        summary_df.to_csv(
+            os.path.join(folder_path, 'signal_sequence_counterfactual_synergy.tsv'),
+            sep='\t',
+            index=False,
+        )
+
+    plot_df = summary_df.head(min(max_plot_rows, len(summary_df))).copy()
+    labels = [
+        f"{row.channel} {int(row.position_bp):+d} bp"
+        for row in plot_df.itertuples(index=False)
+    ]
+    cmap = plt.get_cmap('tab10')
+    channel_color = {
+        name: cmap(idx % 10)
+        for idx, name in enumerate(BIOLOGICAL_SIGNAL_NAMES)
+    }
+    bar_colors = [channel_color.get(name, '#555555') for name in plot_df['channel']]
+
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(11, max(5.5, 0.42 * len(labels) + 2.5)),
+        constrained_layout=True,
+        gridspec_kw={'height_ratios': [2.2, 1.6]},
+    )
+
+    axes[0].axvline(0.0, color='black', linewidth=0.8)
+    axes[0].barh(
+        range(len(labels)),
+        plot_df['cooperative_gain_mean'].to_numpy(dtype=np.float32),
+        color=bar_colors,
+        alpha=0.9,
+    )
+    axes[0].set_yticks(range(len(labels)))
+    axes[0].set_yticklabels(labels, fontsize=7)
+    axes[0].set_xlabel('Mean cooperative gain after joint ablation', fontsize=9)
+    axes[0].set_title('Top signal–sequence synergy hits', fontsize=10)
+
+    axes[1].axvline(0.0, color='black', linewidth=0.8)
+    y_pos = np.arange(len(labels))
+    pos_vals = plot_df['cooperative_gain_positive_signal_mean'].to_numpy(dtype=np.float32)
+    neg_vals = plot_df['cooperative_gain_negative_signal_mean'].to_numpy(dtype=np.float32)
+    for row_idx, (pos_val, neg_val) in enumerate(zip(pos_vals, neg_vals)):
+        if np.isfinite(pos_val) and np.isfinite(neg_val):
+            axes[1].plot([neg_val, pos_val], [row_idx, row_idx], color='#999999', linewidth=1.0, alpha=0.9)
+    axes[1].scatter(pos_vals, y_pos, color='#CC3311', s=18, label='Positive signal window')
+    axes[1].scatter(neg_vals, y_pos, color='#0077BB', s=18, label='Negative signal window')
+    axes[1].set_yticks(range(len(labels)))
+    axes[1].set_yticklabels(labels, fontsize=7)
+    axes[1].set_xlabel('Direction-specific cooperative gain', fontsize=9)
+    axes[1].set_title('Conditional gain by signal sign', fontsize=10)
+    axes[1].legend(fontsize=8, loc='best')
+
+    fig.suptitle('Counterfactual Signal–Sequence Synergy', fontsize=13)
+    _save_or_show(fig, folder_path, 'signal_sequence_counterfactual_synergy.png')
 
 
 def extract_interaction_motifs(
@@ -1500,6 +1875,300 @@ def extract_interaction_motifs(
     fig.suptitle('Interaction-Conditioned Motifs (Fragment End × Sequence)',
                  fontsize=12)
     _save_or_show(fig, folder_path, 'interaction_conditioned_motifs.png')
+
+
+def highlight_directional_promoter_motifs(
+    attributions: List[np.ndarray],
+    data: Dict[str, np.ndarray],
+    folder_path: Optional[str] = None,
+    window_start_bp: int = -150,
+    window_end_bp: int = 0,
+    motif_window_size: int = 21,
+) -> None:
+    """Highlight the strongest directional sequence motifs in the core promoter."""
+    signed_interaction = _signed_signal_sequence_interaction(attributions, data)
+    nuc_data = data['TSS_nucleotides']
+    start_idx, end_idx = _bp_window_to_indices(window_start_bp, window_end_bp, signed_interaction.shape[1])
+    region = signed_interaction[:, start_idx:end_idx, :]
+    mean_region = region.mean(axis=0)
+
+    positive_flat = int(np.argmax(mean_region))
+    negative_flat = int(np.argmin(mean_region))
+    n_positions, n_channels = mean_region.shape
+    candidates = [
+        ('positive', positive_flat, float(mean_region.reshape(-1)[positive_flat])),
+        ('negative', negative_flat, float(mean_region.reshape(-1)[negative_flat])),
+    ]
+
+    motif_rows: List[Dict[str, Any]] = []
+    motifs_to_plot: List[Tuple[str, int, int, float, np.ndarray]] = []
+    for direction, flat_index, score in candidates:
+        pos_offset, channel_idx = divmod(flat_index, n_channels)
+        pos_idx = start_idx + pos_offset
+        channel_name = BIOLOGICAL_SIGNAL_NAMES[channel_idx]
+        signed_weights = signed_interaction[:, pos_idx, channel_idx]
+        if direction == 'positive':
+            pwm = _build_weighted_pwm(nuc_data, signed_weights, pos_idx, motif_window_size)
+        else:
+            pwm = _build_weighted_pwm(nuc_data, -signed_weights, pos_idx, motif_window_size)
+        if pwm is None:
+            continue
+        motifs_to_plot.append((direction, pos_idx, channel_idx, score, pwm))
+        motif_rows.append({
+            'direction': direction,
+            'channel': channel_name,
+            'position_index': int(pos_idx),
+            'position_bp': int(pos_idx - 1000),
+            'mean_signed_interaction': float(score),
+        })
+
+    if not motifs_to_plot:
+        return
+
+    summary_df = pd.DataFrame(motif_rows)
+    if folder_path is not None:
+        os.makedirs(folder_path, exist_ok=True)
+        summary_df.to_csv(
+            os.path.join(folder_path, 'promoter_directional_motif_highlights.tsv'),
+            sep='\t',
+            index=False,
+        )
+
+    fig, axes = plt.subplots(
+        len(motifs_to_plot),
+        1,
+        figsize=(8, 2.1 * len(motifs_to_plot)),
+        constrained_layout=True,
+    )
+    if len(motifs_to_plot) == 1:
+        axes = [axes]
+
+    for ax, (direction, pos_idx, channel_idx, score, pwm) in zip(axes, motifs_to_plot):
+        row_sums = pwm.sum(axis=1, keepdims=True)
+        pwm_norm = np.where(row_sums > 0, pwm / row_sums, 0.25)
+        ic = np.log2(4) + np.where(
+            pwm_norm > 0,
+            pwm_norm * np.log2(pwm_norm + 1e-12),
+            0.0,
+        ).sum(axis=1, keepdims=True)
+        ic_df = pd.DataFrame(pwm_norm * ic, columns=['A', 'C', 'G', 'T'])
+        logomaker.Logo(ic_df, ax=ax, shade_below=0.5, fade_below=0.5)
+        ax.set_ylabel('bits', fontsize=8)
+        ax.set_title(
+            f"{direction.title()} motif: {BIOLOGICAL_SIGNAL_NAMES[channel_idx]} at {pos_idx - 1000:+d} bp "
+            f"(mean signed interaction {score:.3g})",
+            fontsize=9,
+        )
+
+    fig.suptitle('Directional promoter motifs (-150 to 0 bp)', fontsize=12)
+    _save_or_show(fig, folder_path, 'promoter_directional_motif_highlights.png')
+
+
+def tfx_input_focus_analysis(
+    attributions: List[np.ndarray],
+    data: Dict[str, np.ndarray],
+    folder_path: Optional[str] = None,
+    n_bins: int = 8,
+) -> None:
+    """Summarize how input-group focus shifts across the TFX continuum."""
+    group_scores = _mean_group_attribution_per_gene(attributions)
+    sample_names = np.asarray(
+        data.get('sample_names', [f'gene_{idx}' for idx in range(len(data['TFX_label']))]),
+        dtype=object,
+    )
+    tfx_vals = np.asarray(data['TFX_label'], dtype=np.float32)
+
+    unique_samples, inverse = np.unique(sample_names, return_inverse=True)
+    sample_rows: List[Dict[str, float]] = []
+    for sample_idx, sample_name in enumerate(unique_samples):
+        mask = inverse == sample_idx
+        if not bool(mask.any()):
+            continue
+        row: Dict[str, float] = {
+            'sample_name': str(sample_name),
+            'tfx': float(np.mean(tfx_vals[mask])),
+        }
+        for group_name, scores in group_scores.items():
+            row[f'{group_name}_mean_abs_attr'] = float(np.mean(scores[mask]))
+        sample_rows.append(row)
+
+    if not sample_rows:
+        return
+
+    sample_df = pd.DataFrame(sample_rows)
+    _continuum_input_focus_analysis(
+        sample_df=sample_df,
+        continuum_col='tfx',
+        continuum_label='TFX',
+        folder_path=folder_path,
+        output_stem='tfx_input_focus',
+        n_bins=n_bins,
+        x_min=0.0,
+        x_max=1.0,
+        title_prefix='TFX-Conditioned',
+    )
+
+
+def _continuum_input_focus_analysis(
+    sample_df: pd.DataFrame,
+    continuum_col: str,
+    continuum_label: str,
+    folder_path: Optional[str],
+    output_stem: str,
+    n_bins: int,
+    x_min: Optional[float] = None,
+    x_max: Optional[float] = None,
+    title_prefix: Optional[str] = None,
+) -> None:
+    """Summarize how attribution focus shifts across a scalar continuum."""
+    sample_df = sample_df.copy()
+    continuum_vals = np.asarray(sample_df[continuum_col], dtype=np.float32)
+    finite_mask = np.isfinite(continuum_vals)
+    if not bool(finite_mask.any()):
+        return
+    sample_df = sample_df.loc[finite_mask].copy()
+    continuum_vals = np.asarray(sample_df[continuum_col], dtype=np.float32)
+
+    group_names = [
+        'Signals', 'Sequence', 'TSS Scalars', 'GB Scalars', 'Ref Scalars'
+    ]
+    total_scores = np.zeros(len(sample_df), dtype=np.float32)
+    for group_name in group_names:
+        total_scores += np.asarray(sample_df[f'{group_name}_mean_abs_attr'], dtype=np.float32)
+    total_scores = np.maximum(total_scores, 1e-12)
+    sample_df['total_mean_abs_attr'] = total_scores
+    for group_name in group_names:
+        sample_df[f'{group_name}_share'] = sample_df[f'{group_name}_mean_abs_attr'] / sample_df['total_mean_abs_attr']
+
+    if x_min is None:
+        x_min = float(np.nanmin(continuum_vals))
+    if x_max is None:
+        x_max = float(np.nanmax(continuum_vals))
+    if not np.isfinite(x_min) or not np.isfinite(x_max):
+        return
+    if x_max <= x_min:
+        x_max = x_min + 1e-6
+
+    sample_df['_continuum_value'] = np.clip(continuum_vals, x_min, x_max)
+    bin_edges = np.linspace(x_min, x_max, n_bins + 1)
+    sample_df['_continuum_bin'] = pd.cut(
+        sample_df['_continuum_value'],
+        bins=bin_edges,
+        include_lowest=True,
+        labels=False,
+    )
+
+    bin_rows: List[Dict[str, float]] = []
+    for bin_idx in range(n_bins):
+        bin_mask = sample_df['_continuum_bin'] == bin_idx
+        if not bool(bin_mask.any()):
+            continue
+        subset = sample_df.loc[bin_mask]
+        center = float((bin_edges[bin_idx] + bin_edges[bin_idx + 1]) / 2.0)
+        row = {
+            'continuum_bin': int(bin_idx),
+            'continuum_center': center,
+            'n_samples': int(len(subset)),
+            'continuum_mean': float(subset[continuum_col].mean()),
+        }
+        for group_name in group_names:
+            row[f'{group_name}_mean_abs_attr'] = float(subset[f'{group_name}_mean_abs_attr'].mean())
+            row[f'{group_name}_share'] = float(subset[f'{group_name}_share'].mean())
+        bin_rows.append(row)
+
+    if not bin_rows:
+        return
+
+    bin_df = pd.DataFrame(bin_rows)
+    slope_rows: List[Dict[str, float]] = []
+    for group_name in group_names:
+        share_col = f'{group_name}_share'
+        abs_col = f'{group_name}_mean_abs_attr'
+        share_slope = float(np.polyfit(sample_df['_continuum_value'], sample_df[share_col], deg=1)[0]) if len(sample_df) >= 2 else 0.0
+        abs_slope = float(np.polyfit(sample_df['_continuum_value'], sample_df[abs_col], deg=1)[0]) if len(sample_df) >= 2 else 0.0
+        share_corr = float(np.corrcoef(sample_df['_continuum_value'], sample_df[share_col])[0, 1]) if len(sample_df) >= 2 else 0.0
+        abs_corr = float(np.corrcoef(sample_df['_continuum_value'], sample_df[abs_col])[0, 1]) if len(sample_df) >= 2 else 0.0
+        slope_rows.append({
+            'group': group_name,
+            f'share_slope_vs_{continuum_col}': share_slope,
+            f'share_corr_vs_{continuum_col}': share_corr,
+            f'abs_slope_vs_{continuum_col}': abs_slope,
+            f'abs_corr_vs_{continuum_col}': abs_corr,
+        })
+    slope_df = pd.DataFrame(slope_rows)
+
+    if folder_path is not None:
+        os.makedirs(folder_path, exist_ok=True)
+        sample_df.to_csv(os.path.join(folder_path, f'{output_stem}_samples.tsv'), sep='\t', index=False)
+        bin_df.to_csv(os.path.join(folder_path, f'{output_stem}_bins.tsv'), sep='\t', index=False)
+        slope_df.to_csv(os.path.join(folder_path, f'{output_stem}_summary.tsv'), sep='\t', index=False)
+
+    colors = {
+        'Signals': '#1f77b4',
+        'Sequence': '#ff7f0e',
+        'TSS Scalars': '#2ca02c',
+        'GB Scalars': '#d62728',
+        'Ref Scalars': '#9467bd',
+    }
+    fig, axes = plt.subplots(2, 1, figsize=(10, 7), constrained_layout=True, sharex=True)
+    for group_name in group_names:
+        axes[0].plot(
+            bin_df['continuum_center'],
+            bin_df[f'{group_name}_share'],
+            marker='o',
+            linewidth=1.8,
+            label=group_name,
+            color=colors[group_name],
+        )
+        axes[1].plot(
+            bin_df['continuum_center'],
+            bin_df[f'{group_name}_mean_abs_attr'],
+            marker='o',
+            linewidth=1.8,
+            label=group_name,
+            color=colors[group_name],
+        )
+    axes[0].set_ylabel('Mean attribution share', fontsize=9)
+    axes[0].set_title(f'Relative input focus across the {continuum_label} continuum', fontsize=11)
+    axes[0].legend(fontsize=8, ncol=3, loc='best')
+    axes[1].set_ylabel('Mean |attribution| per entity', fontsize=9)
+    axes[1].set_xlabel(continuum_label, fontsize=10)
+    axes[1].set_title(f'Absolute input reliance across the {continuum_label} continuum', fontsize=11)
+    axes[1].set_xlim(x_min, x_max)
+    suptitle_prefix = title_prefix if title_prefix is not None else f'{continuum_label}-Conditioned'
+    fig.suptitle(f'{suptitle_prefix} Input Focus', fontsize=13)
+    _save_or_show(fig, folder_path, f'{output_stem}.png')
+
+
+def depth_input_focus_analysis(
+    attributions: List[np.ndarray],
+    data: Dict[str, np.ndarray],
+    folder_path: Optional[str] = None,
+    n_bins: int = 8,
+) -> None:
+    """Summarize how input-group focus shifts across per-gene mean depth."""
+    group_scores = _mean_group_attribution_per_gene(attributions)
+    depth_log1p = np.asarray(data['TSS_features'][:, 10], dtype=np.float32)
+    depth_raw = np.expm1(depth_log1p)
+
+    gene_df = pd.DataFrame({
+        'gene_index': np.arange(depth_raw.shape[0], dtype=np.int32),
+        'mean_region_depth': depth_raw,
+    })
+    for group_name, scores in group_scores.items():
+        gene_df[f'{group_name}_mean_abs_attr'] = np.asarray(scores, dtype=np.float32)
+
+    _continuum_input_focus_analysis(
+        sample_df=gene_df,
+        continuum_col='mean_region_depth',
+        continuum_label='Mean Region Depth',
+        folder_path=folder_path,
+        output_stem='depth_input_focus',
+        n_bins=n_bins,
+        x_min=0.0,
+        x_max=float(np.nanpercentile(depth_raw[np.isfinite(depth_raw)], 99.0)) if bool(np.isfinite(depth_raw).any()) else None,
+        title_prefix='Depth-Conditioned',
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1648,65 +2317,98 @@ def reduction_activation_analysis(
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _build_sample_metadata() -> pd.DataFrame:
-    """Build a lookup table mapping sample names to cohort, subtype, and TFx.
+    """Build a lookup table mapping ``(cohort, sample_name)`` to subtype and TFx.
 
-    Reads ``data/BTS_sample-splits.tsv`` for cohort membership and each
-    cohort's ``labels/{cohort}_TFX_Subtype.tsv`` for subtype and TFx.
-
-    Returns:
-        DataFrame indexed by sample name with columns
-        ``['cohort', 'subtype', 'tfx']``.
+    Scans all ``data/*_sample-splits.tsv`` files so cohort/sample metadata is
+    available for PLCA, BTS, and other composite datasets rather than being
+    hard-wired to BTS only.
     """
     import csv
 
-    splits_path = _PROJECT_ROOT / 'data' / 'BTS_sample-splits.tsv'
-    if not splits_path.exists():
-        return pd.DataFrame(columns=['cohort', 'subtype', 'tfx'])
+    sample_keys: set[Tuple[str, str]] = set()
+    for splits_path in sorted((_PROJECT_ROOT / 'data').glob('*_sample-splits.tsv')):
+        with open(splits_path, 'r', newline='') as f:
+            reader = csv.DictReader(f, delimiter='\t')
+            for row in reader:
+                cohort = row['Cohort'].strip()
+                sample = row['Sample'].strip()
+                sample_keys.add((cohort, sample))
+                prefix = f'{cohort}_'
+                if sample.startswith(prefix):
+                    sample_keys.add((cohort, sample[len(prefix):]))
 
-    # Read cohort assignments
-    with open(splits_path, 'r', newline='') as f:
-        reader = csv.DictReader(f, delimiter='\t')
-        rows = [(r['Sample'].strip(), r['Cohort'].strip()) for r in reader]
-    sample_cohort = {s: c for s, c in rows}
+    if not sample_keys:
+        return pd.DataFrame(columns=['subtype', 'tfx'])
 
     # Read per-cohort label files
     labels_dir = _PROJECT_ROOT / 'labels'
-    label_dfs: List[pd.DataFrame] = []
-    for cohort in sorted(set(sample_cohort.values())):
+    label_rows: List[Dict[str, Any]] = []
+    for cohort in sorted({cohort for cohort, _ in sample_keys}):
         label_path = labels_dir / f'{cohort}_TFX_Subtype.tsv'
         if not label_path.exists():
             continue
         df = pd.read_csv(label_path, sep='\t')
-        df['cohort'] = cohort
-        label_dfs.append(df)
+        rename_map = {str(col).strip().lower(): col for col in df.columns}
+        sample_col = rename_map.get('sample')
+        subtype_col = rename_map.get('subtype')
+        tfx_col = rename_map.get('tfx')
+        if sample_col is None:
+            continue
+        for _, row in df.iterrows():
+            sample = str(row[sample_col]).strip()
+            subtype = str(row[subtype_col]).strip() if subtype_col is not None else 'Unknown'
+            tfx = pd.to_numeric(row[tfx_col], errors='coerce') if tfx_col is not None else np.nan
+            label_rows.append({
+                'cohort': cohort,
+                'sample_name': sample,
+                'subtype': subtype,
+                'tfx': float(tfx) if pd.notna(tfx) else np.nan,
+            })
+            prefix = f'{cohort}_'
+            if sample.startswith(prefix):
+                label_rows.append({
+                    'cohort': cohort,
+                    'sample_name': sample[len(prefix):],
+                    'subtype': subtype,
+                    'tfx': float(tfx) if pd.notna(tfx) else np.nan,
+                })
 
-    if not label_dfs:
-        # Fall back to cohort-only
-        return pd.DataFrame({
-            'cohort': sample_cohort,
+    if label_rows:
+        meta = pd.DataFrame(label_rows).drop_duplicates(subset=['cohort', 'sample_name'])
+        meta = meta.set_index(['cohort', 'sample_name'])[['subtype', 'tfx']]
+    else:
+        meta = pd.DataFrame(columns=['subtype', 'tfx'])
+        meta.index = pd.MultiIndex.from_tuples([], names=['cohort', 'sample_name'])
+
+    missing_rows: List[Dict[str, Any]] = []
+    for cohort, sample in sorted(sample_keys):
+        if (cohort, sample) in meta.index:
+            continue
+        cohort_index = meta.loc[cohort] if cohort in meta.index.get_level_values(0) else None
+        if cohort_index is not None and not cohort_index.empty:
+            matches = [idx for idx in cohort_index.index if str(idx).startswith(sample)]
+            if matches:
+                matched = cohort_index.loc[matches[0]]
+                missing_rows.append({
+                    'cohort': cohort,
+                    'sample_name': sample,
+                    'subtype': matched['subtype'],
+                    'tfx': matched['tfx'],
+                })
+                continue
+        missing_rows.append({
+            'cohort': cohort,
+            'sample_name': sample,
             'subtype': 'Unknown',
             'tfx': np.nan,
         })
 
-    meta = pd.concat(label_dfs, ignore_index=True)
-    meta = meta.rename(columns={'sample': 'sample_name'})
-    meta = meta.set_index('sample_name')[['cohort', 'subtype', 'tfx']]
-    meta['tfx'] = pd.to_numeric(meta['tfx'], errors='coerce')
+    if missing_rows:
+        missing_df = pd.DataFrame(missing_rows).drop_duplicates(subset=['cohort', 'sample_name'])
+        missing_df = missing_df.set_index(['cohort', 'sample_name'])[['subtype', 'tfx']]
+        meta = pd.concat([meta, missing_df])
 
-    # Add any BTS samples missing from label files (cohort only)
-    for sample, cohort in sample_cohort.items():
-        if sample not in meta.index:
-            # HD-L samples differ: BTS has "BP1124576" but label file has
-            # "BP1124576_S78".  Try prefix match.
-            matched = [idx for idx in meta.index if idx.startswith(sample)]
-            if matched:
-                first = matched[0]
-                meta.loc[sample] = meta.loc[first]
-            else:
-                meta.loc[sample] = {'cohort': cohort, 'subtype': 'Unknown',
-                                    'tfx': np.nan}
-
-    return meta
+    return meta.sort_index()
 
 def latent_space_umap(
     model: nn.Module,
@@ -1787,21 +2489,21 @@ def latent_space_umap(
     tumor_truth = sub['tumor_exp']
     bg_truth = sub['background_exp']
     sample_names = np.array(sub['sample_names'])
+    cohort_names = np.array(sub.get('cohort_names', ['Unknown'] * len(sample_names)))
 
     # Build sample-level metadata lookup
     meta = _build_sample_metadata()
 
-    cohorts = np.array([
-        meta.loc[s, 'cohort'] if s in meta.index else 'Unknown'
-        for s in sample_names
-    ])
+    cohorts = cohort_names
     subtypes = np.array([
-        meta.loc[s, 'subtype'] if s in meta.index else 'Unknown'
-        for s in sample_names
+        meta.loc[(cohort, sample), 'subtype']
+        if (cohort, sample) in meta.index else 'Unknown'
+        for cohort, sample in zip(cohort_names, sample_names)
     ])
     tfx_values = np.array([
-        float(meta.loc[s, 'tfx']) if s in meta.index else np.nan
-        for s in sample_names
+        float(meta.loc[(cohort, sample), 'tfx'])
+        if (cohort, sample) in meta.index else np.nan
+        for cohort, sample in zip(cohort_names, sample_names)
     ], dtype=np.float32)
 
     # ── Run UMAP + plots for each branch ──
@@ -1948,11 +2650,11 @@ def latent_space_umap(
 def zero_component_attribution(
     model: nn.Module,
     data: Dict[str, np.ndarray],
-    background_size: int = 50_000,
-    test_size: int = 5_000,
+    background_size: int = 4_096,
+    test_size: int = 1_536,
     method: str = 'integrated_gradients',
-    n_steps: int = 50,
-    batch_size: int = 32,
+    n_steps: int = 32,
+    batch_size: int = 16,
     folder_path: Optional[str] = None,
     seed: int = 200,
 ) -> None:
@@ -1970,8 +2672,8 @@ def zero_component_attribution(
     test_data = subsample(data, sample_size=test_size,
                           seed=seed + 1, restriction='inactive_genes')
 
-    bg_tensors = _data_to_tensors(bg_data, device)
-    test_tensors = _data_to_tensors(test_data, device)
+    bg_tensors = _data_to_tensors(bg_data, torch.device('cpu'))
+    test_tensors = _data_to_tensors(test_data, torch.device('cpu'))
 
     print(f'  Zero-component attribution: {test_tensors[0].shape[0]} test genes')
 
@@ -2006,11 +2708,11 @@ def zero_component_attribution(
 def attribution_analysis(
     model: BioDVN,
     data: Dict[str, np.ndarray],
-    background_size: int = 50_000,
-    test_size: int = 5_000,
+    background_size: int = 4_096,
+    test_size: int = 1_536,
     method: str = 'integrated_gradients',
-    n_steps: int = 50,
-    batch_size: int = 32,
+    n_steps: int = 32,
+    batch_size: int = 16,
     save_filepath: Optional[str] = None,
     seed: int = 200,
     run_interaction: bool = True,
@@ -2024,7 +2726,8 @@ def attribution_analysis(
     1. Sub-sample background and test sets.
     2. Compute Captum attributions.
     3. Generate polarity-impact, beeswarm, and bar-chart plots.
-    4. *(Optional)* Signal–sequence interaction + motif extraction.
+     4. *(Optional)* Signal–sequence interaction, directional motif,
+         synergy, and TFX-focus analysis.
 
     After the per-subset loop, optionally runs:
     - ReductionBlock activation analysis.
@@ -2058,8 +2761,8 @@ def attribution_analysis(
     test_data = subsample(data, sample_size=test_size,
                           seed=seed + 1, restriction='all_genes')
 
-    bg_tensors = _data_to_tensors(bg_data, device)
-    test_tensors = _data_to_tensors(test_data, device)
+    bg_tensors = _data_to_tensors(bg_data, torch.device('cpu'))
+    test_tensors = _data_to_tensors(test_data, torch.device('cpu'))
 
     print(f'  Background: {bg_tensors[0].shape[0]} genes')
     print(f'  Test: {test_tensors[0].shape[0]} genes')
@@ -2084,11 +2787,31 @@ def attribution_analysis(
     plot_scalar_summary(attributions, test_data, folder_path)
     plot_scalar_bars(attributions, folder_path)
 
-    if run_interaction:
+    print('  Testing TFX-conditioned input focus...')
+    tfx_input_focus_analysis(attributions, test_data, folder_path)
+
+    print('  Testing depth-conditioned input focus...')
+    depth_input_focus_analysis(attributions, test_data, folder_path)
+
+    if run_interaction and model.signal_processor.conv1d_signals is not None and model.signal_processor.conv2d_nt is not None:
         print('  Plotting signal–sequence interaction...')
-        plot_signal_sequence_interaction(attributions, folder_path)
+        plot_signal_sequence_interaction(attributions, test_data, folder_path)
+        print('  Plotting signed signal–sequence interaction...')
+        plot_signed_signal_sequence_interaction(attributions, test_data, folder_path)
         print('  Extracting interaction-conditioned motifs...')
         extract_interaction_motifs(attributions, test_data, folder_path)
+        print('  Highlighting directional promoter motifs...')
+        highlight_directional_promoter_motifs(attributions, test_data, folder_path)
+        print('  Running counterfactual signal–sequence synergy analysis...')
+        counterfactual_signal_sequence_synergy(
+            model,
+            attributions,
+            test_data,
+            folder_path,
+            batch_size=max(32, batch_size),
+        )
+    elif run_interaction:
+        print('  [skip] Signal–sequence interaction analysis requires both signal and sequence branches')
 
     del attributions
     print('  Done: all_genes')

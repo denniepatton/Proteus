@@ -101,7 +101,11 @@ def train_final_model(
     print(f"  Val rows:   {len(val_idx):,} ({100*val_frac:.0f}%) — for early stopping only")
 
     # ---- Train with early stopping on val; keep best checkpoint ----
-    params = {**xgb_params, "objective": "reg:squarederror"}
+    params = {
+        "objective": "reg:squarederror",
+        "eval_metric": "rmse",
+        **xgb_params,
+    }
     print(f"Training model (up to {n_estimators} rounds, "
           f"early_stopping_rounds={EARLY_STOPPING_ROUNDS})...")
     model = xgb.train(

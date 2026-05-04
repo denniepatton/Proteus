@@ -1,7 +1,11 @@
 """Training, evaluation, and prediction saving for the XGBoost baseline.
 
-Mirrors the Proteus 5-fold CV pipeline:
-  - Same zarr features (25 scalars), same fold assignments, same gene-variance
+    # ---- Train with the requested objective; default to weighted squared error ----
+    params = {
+        "objective": "reg:squarederror",
+        "eval_metric": "rmse",
+        **xgb_params,
+    }
     weighting.  Single-regressor point predictions evaluated with RMSE,
     GVW-R², per-gene / per-sample Spearman R².
 """
