@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,6 +26,53 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _NAIVE_DIRNAME = "NaiveExample"
 _MIXTURE_PDF_NAME = "MDN_Mixture_Fit.pdf"
 _EPS = 1e-6
+_LIGHT_GRAY = "#CFCFCF"
+_GRAY = "#7A7A7A"
+_TEAL = "#0F8B8D"
+_BLACK = "#000000"
+_SCATTER_TICKS = [0.0, 3.0, 6.0, 9.0, 12.0, 15.0]
+_SPEARMAN_TICKS = [-1.0, -0.5, 0.0, 0.5, 1.0]
+_SPEARMAN_DENSITY_Y_TICKS = [0.0, 0.5, 1.0, 1.5, 2.0]
+
+
+def _nice_step_for_five_ticks(span: float) -> float:
+    if not np.isfinite(span) or span <= 0.0:
+        return 1.0
+    target = span / 4.0
+    steps = [0.05, 0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 2.5, 4.0, 5.0, 10.0, 20.0]
+    for step in steps:
+        if step >= target:
+            return step
+    return steps[-1]
+
+
+def _five_ticks(lower: float, upper: float) -> np.ndarray:
+    return np.linspace(float(lower), float(upper), 5)
+
+
+def _set_axis_ticks(
+    ax: plt.Axes,
+    *,
+    x_ticks: Optional[Sequence[float]] = None,
+    y_ticks: Optional[Sequence[float]] = None,
+) -> None:
+    if x_ticks is not None:
+        ax.set_xticks(list(x_ticks))
+    if y_ticks is not None:
+        ax.set_yticks(list(y_ticks))
+
+
+def _set_five_y_ticks(ax: plt.Axes, *, lower: float = 0.0) -> None:
+    y_hi = float(ax.get_ylim()[1])
+    step = _nice_step_for_five_ticks(max(y_hi - lower, 1e-9))
+    upper = lower + 4.0 * step
+    ax.set_ylim(lower, upper)
+    ax.set_yticks(_five_ticks(lower, upper))
+
+
+def _nice_upper_bound(max_value: float) -> float:
+    step = _nice_step_for_five_ticks(max(float(max_value), 1e-9))
+    return 4.0 * step
 
 
 def gamma_pdf(x: np.ndarray, k: float, beta: float) -> np.ndarray:
@@ -245,7 +292,7 @@ def fit_expression_mixture(
     )
 
     data_pos = raw_data[raw_data > 1e-10]
-    x_max = raw_data.max() * 1.05
+    x_max = _nice_upper_bound(raw_data.max() * 1.05)
     xvals = np.linspace(1e-6, x_max, 500)
 
     pdf_gam_comp = fit["pi_gam"] * gamma_pdf(xvals, fit["k"], fit["beta"])
@@ -264,7 +311,7 @@ def fit_expression_mixture(
         hist_density,
         width=hist_widths,
         alpha=0.4,
-        color="steelblue",
+        color=_LIGHT_GRAY,
         label="Empirical density (x > 0, scaled by 1-pi_delta)",
     )
     ax.axvline(0.0, color="red", lw=2, ls="-", alpha=0.7)
@@ -282,7 +329,7 @@ def fit_expression_mixture(
         pdf_gam_comp,
         "--",
         color="orange",
-        lw=1.5,
+        lw=3.0,
         label=f"Gamma(k={fit['k']:.2f}, beta={fit['beta']:.2f})  pi={fit['pi_gam']:.3f}",
     )
     ax.plot(
@@ -290,7 +337,7 @@ def fit_expression_mixture(
         pdf_norm_comp,
         "--",
         color="green",
-        lw=1.5,
+        lw=3.0,
         label=f"N(mu={fit['mu']:.2f}, sigma={fit['sigma']:.2f})  pi={fit['pi_norm']:.3f}",
     )
     ax.set_ylim(0, 1.0)
@@ -299,6 +346,11 @@ def fit_expression_mixture(
     ax.set_title("Mixture Fit: delta(0) + Gamma + Normal", fontsize=15)
     ax.legend(fontsize=12)
     ax.set_xlim(0, x_max)
+    _set_axis_ticks(
+        ax,
+        x_ticks=_five_ticks(0.0, x_max),
+        y_ticks=_five_ticks(0.0, 1.0),
+    )
     ax.tick_params(labelsize=12)
     ax.text(
         0.98,
@@ -322,13 +374,19 @@ def fit_expression_mixture(
         fit["pi_delta"] * (sorted_data >= 0.0).astype(float)
         + continuous_cdf(sorted_data, fit["pi_gam"], fit["pi_norm"], fit["k"], fit["beta"], fit["mu"], fit["sigma"])
     )
-    ax2.plot(sorted_data, ecdf, "steelblue", lw=1.5, label="Empirical CDF")
-    ax2.plot(sorted_data, fitted_cdf, "k--", lw=1.5, label="Fitted CDF")
+    ax2.plot(sorted_data, ecdf, color=_LIGHT_GRAY, lw=3.0, label="Empirical CDF")
+    ax2.plot(sorted_data, fitted_cdf, "k--", lw=3.0, label="Fitted CDF", zorder=5)
     ax2.set_xlabel("log2(CPM + 1)", fontsize=14)
     ax2.set_ylabel("CDF", fontsize=14)
     ax2.set_title("CDF Comparison", fontsize=15)
     ax2.legend(fontsize=12)
     ax2.set_xlim(0, x_max)
+    ax2.set_ylim(0.0, 1.0)
+    _set_axis_ticks(
+        ax2,
+        x_ticks=_five_ticks(0.0, x_max),
+        y_ticks=_five_ticks(0.0, 1.0),
+    )
     ax2.tick_params(labelsize=12)
 
     plt.tight_layout()
@@ -336,7 +394,14 @@ def fit_expression_mixture(
     plt.close(fig)
 
 
-def _gene_pearson_r(truth_arr: np.ndarray, pred_arr: np.ndarray) -> np.ndarray:
+def _gene_spearman_rho(truth_arr: np.ndarray, pred_arr: np.ndarray) -> np.ndarray:
+    truth_rank = pd.DataFrame(truth_arr).rank(axis=1, method="average", na_option="keep").values
+    pred_rank = pd.DataFrame(pred_arr).rank(axis=1, method="average", na_option="keep").values
+
+    return _gene_pearson_like_correlation(truth_rank, pred_rank)
+
+
+def _gene_pearson_like_correlation(truth_arr: np.ndarray, pred_arr: np.ndarray) -> np.ndarray:
     finite = np.isfinite(truth_arr) & np.isfinite(pred_arr)
     n_valid = finite.sum(axis=1)
     result = np.full(truth_arr.shape[0], np.nan)
@@ -355,9 +420,132 @@ def _gene_pearson_r(truth_arr: np.ndarray, pred_arr: np.ndarray) -> np.ndarray:
     num = nv * stp - st * sp
     with np.errstate(invalid="ignore"):
         den = np.sqrt((nv * stt - st ** 2) * (nv * spp - sp ** 2))
+    truth_ss = nv * stt - st ** 2
+    pred_ss = nv * spp - sp ** 2
     with np.errstate(divide="ignore", invalid="ignore"):
         result[ok] = np.where(den > 0, num / den, np.nan)
+    result[ok] = np.where(truth_ss > 1e-12, result[ok], np.nan)
+    result[ok] = np.where((truth_ss > 1e-12) & (pred_ss <= 1e-12), 0.0, result[ok])
     return result
+
+
+def _pca_sample_coordinates(
+    truth_wide: pd.DataFrame,
+    *,
+    n_components: int = 2,
+) -> pd.DataFrame:
+    sample_names = truth_wide.columns.astype(str).tolist()
+    if len(sample_names) < 2:
+        return pd.DataFrame(columns=[f"PC{i + 1}" for i in range(n_components)])
+
+    sample_matrix = truth_wide.T.values.astype(np.float64)
+    feature_means = np.nanmean(sample_matrix, axis=0, keepdims=True)
+    centered = sample_matrix - feature_means
+    centered[~np.isfinite(centered)] = 0.0
+
+    max_components = min(n_components, centered.shape[0], centered.shape[1])
+    if max_components < 1:
+        return pd.DataFrame(columns=[f"PC{i + 1}" for i in range(n_components)])
+
+    u, s, _ = np.linalg.svd(centered, full_matrices=False)
+    scores = u[:, :max_components] * s[:max_components]
+    if scores.shape[0] < 2:
+        return pd.DataFrame(columns=[f"PC{i + 1}" for i in range(n_components)])
+
+    if max_components < n_components:
+        padding = np.zeros((scores.shape[0], n_components - max_components), dtype=np.float64)
+        scores = np.hstack((scores, padding))
+    columns = [f"PC{i + 1}" for i in range(n_components)]
+    return pd.DataFrame(scores[:, :n_components], index=sample_names, columns=columns)
+
+
+def _pca_nearest_neighbor_map(pca_coords: pd.DataFrame) -> Dict[str, str]:
+    if pca_coords.empty or len(pca_coords.index) < 2:
+        return {}
+
+    coord_arr = pca_coords.values.astype(np.float64)
+    deltas = coord_arr[:, None, :] - coord_arr[None, :, :]
+    dist_sq = np.sum(deltas ** 2, axis=2)
+    np.fill_diagonal(dist_sq, np.inf)
+
+    nearest_indices = np.argmin(dist_sq, axis=1)
+    nearest_map: Dict[str, str] = {}
+    sample_names = pca_coords.index.astype(str).tolist()
+    for idx, neighbor_idx in enumerate(nearest_indices):
+        if not np.isfinite(dist_sq[idx, neighbor_idx]):
+            continue
+        nearest_map[sample_names[idx]] = sample_names[neighbor_idx]
+    return nearest_map
+
+
+def _unique_pairs_from_neighbor_map(neighbor_map: Dict[str, str]) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for sample_name, neighbor_name in neighbor_map.items():
+        key = tuple(sorted((sample_name, neighbor_name)))
+        if sample_name == neighbor_name or key in seen:
+            continue
+        seen.add(key)
+        pairs.append((sample_name, neighbor_name))
+    return pairs
+
+
+def _plot_pca_nearest_neighbors(
+    pca_coords: pd.DataFrame,
+    pca_pairs: list[tuple[str, str]],
+    out_path: Path,
+) -> None:
+    if pca_coords.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    for sample_name_a, sample_name_b in pca_pairs:
+        ax.plot(
+            [pca_coords.loc[sample_name_a, "PC1"], pca_coords.loc[sample_name_b, "PC1"]],
+            [pca_coords.loc[sample_name_a, "PC2"], pca_coords.loc[sample_name_b, "PC2"]],
+            color=_TEAL,
+            alpha=0.35,
+            lw=1.5,
+            zorder=1,
+        )
+
+    ax.scatter(
+        pca_coords["PC1"],
+        pca_coords["PC2"],
+        color=_TEAL,
+        s=52.0,
+        alpha=0.9,
+        linewidths=0,
+        zorder=2,
+    )
+    if "LuCaP_136" in pca_coords.index:
+        ax.scatter(
+            [pca_coords.loc["LuCaP_136", "PC1"]],
+            [pca_coords.loc["LuCaP_136", "PC2"]],
+            color=_BLACK,
+            s=68.0,
+            linewidths=0,
+            zorder=3,
+        )
+
+    for sample_name, row in pca_coords.iterrows():
+        ax.annotate(
+            sample_name,
+            (float(row["PC1"]), float(row["PC2"])),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=8,
+            color=_BLACK,
+            zorder=4,
+        )
+
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_title("PC-PDX PCA Nearest-Neighbor Pairings")
+    ax.grid(alpha=0.2)
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    plt.close(fig)
 
 
 def generate_naive_example(out_dir: str, overwrite: bool) -> None:
@@ -369,12 +557,40 @@ def generate_naive_example(out_dir: str, overwrite: bool) -> None:
         index_col=0,
     )
     keep = [s for s in PC_PDX_STUDY if s in pc_truth.columns]
-    if len(keep) < 3:
-        raise ValueError("NaiveExample requires at least three PC-PDX study samples")
+    if len(keep) < 5:
+        raise ValueError("NaiveExample requires at least five PC-PDX study samples")
 
     truth_wide = pc_truth[keep]
     truth_arr = truth_wide.values.astype(np.float64)
     n_genes, n_samples = truth_arr.shape
+    pca_coords = _pca_sample_coordinates(truth_wide)
+    pca_neighbor_map = _pca_nearest_neighbor_map(pca_coords)
+    pca_pairs = _unique_pairs_from_neighbor_map(pca_neighbor_map)
+
+    pca_pairs_path = Path(naive_dir) / "pca_nearest_neighbor_pairs.tsv"
+    pd.DataFrame(
+        [
+            {
+                "sample": sample_name,
+                "nearest_neighbor": neighbor_name,
+                "sample_pc1": float(pca_coords.loc[sample_name, "PC1"]),
+                "sample_pc2": float(pca_coords.loc[sample_name, "PC2"]),
+                "neighbor_pc1": float(pca_coords.loc[neighbor_name, "PC1"]),
+                "neighbor_pc2": float(pca_coords.loc[neighbor_name, "PC2"]),
+                "pca_distance": float(
+                    np.sqrt(
+                        (pca_coords.loc[sample_name, "PC1"] - pca_coords.loc[neighbor_name, "PC1"]) ** 2
+                        + (pca_coords.loc[sample_name, "PC2"] - pca_coords.loc[neighbor_name, "PC2"]) ** 2
+                    )
+                ),
+            }
+            for sample_name, neighbor_name in pca_pairs
+        ]
+    ).to_csv(pca_pairs_path, sep="\t", index=False)
+
+    pca_plot_path = Path(naive_dir) / "pca_nearest_neighbor_embedding.pdf"
+    if overwrite or not pca_plot_path.exists():
+        _plot_pca_nearest_neighbors(pca_coords, pca_pairs, pca_plot_path)
 
     if "LuCaP_136" in truth_wide.columns and "LuCaP_136CR" in truth_wide.columns:
         out_path = Path(naive_dir) / "replicate_scatter_136_vs_136CR"
@@ -385,6 +601,38 @@ def generate_naive_example(out_dir: str, overwrite: bool) -> None:
                 "LuCaP_136 vs 136CR",
                 str(out_path),
                 goi=None,
+                point_style="scatter",
+                point_color=_TEAL,
+                point_size=16.0,
+                axis_max=15.0,
+                diagonal_color=_BLACK,
+                diagonal_lw=2.0,
+                diagonal_alpha=1.0,
+                diagonal_zorder=6.0,
+                x_ticks=_SCATTER_TICKS,
+                y_ticks=_SCATTER_TICKS,
+            )
+
+    if "LuCaP_136" in truth_wide.columns and "LuCaP_136" in pca_neighbor_map:
+        nearest_sample = pca_neighbor_map["LuCaP_136"]
+        out_path = Path(naive_dir) / "pca_nearest_neighbor_scatter_136_vs_nearest"
+        if overwrite or not Path(f"{out_path}.pdf").exists():
+            sample_scatter(
+                truth_wide["LuCaP_136"],
+                truth_wide[nearest_sample],
+                f"LuCaP_136 vs PCA-Nearest ({nearest_sample})",
+                str(out_path),
+                goi=None,
+                point_style="scatter",
+                point_color=_TEAL,
+                point_size=16.0,
+                axis_max=15.0,
+                diagonal_color=_BLACK,
+                diagonal_lw=2.0,
+                diagonal_alpha=1.0,
+                diagonal_zorder=6.0,
+                x_ticks=_SCATTER_TICKS,
+                y_ticks=_SCATTER_TICKS,
             )
 
     if "LuCaP_136" in truth_wide.columns:
@@ -402,6 +650,16 @@ def generate_naive_example(out_dir: str, overwrite: bool) -> None:
                 "LuCaP_136 vs Random Other",
                 str(out_path),
                 goi=None,
+                point_style="scatter",
+                point_color=_GRAY,
+                point_size=16.0,
+                axis_max=15.0,
+                diagonal_color=_BLACK,
+                diagonal_lw=2.0,
+                diagonal_alpha=1.0,
+                diagonal_zorder=6.0,
+                x_ticks=_SCATTER_TICKS,
+                y_ticks=_SCATTER_TICKS,
             )
 
     cr_pairs = [
@@ -417,31 +675,78 @@ def generate_naive_example(out_dir: str, overwrite: bool) -> None:
     if len(valid_pairs) >= 2:
         non_cr_arr = truth_wide[[a for a, _ in valid_pairs]].values.astype(np.float64)
         cr_arr = truth_wide[[b for _, b in valid_pairs]].values.astype(np.float64)
-        lineage_r = _gene_pearson_r(non_cr_arr, cr_arr)
-        lineage_r_series = pd.Series(lineage_r[np.isfinite(lineage_r)], name="pearson_r")
-        out_path = Path(naive_dir) / "lineage_derivative_pearson_r_distribution"
+        lineage_r = _gene_spearman_rho(non_cr_arr, cr_arr)
+        lineage_r_series = pd.Series(lineage_r[np.isfinite(lineage_r)], name="spearman_rho")
+        out_path = Path(naive_dir) / "lineage_derivative_spearman_rho_distribution"
         if overwrite or not Path(f"{out_path}.pdf").exists():
             metric_distribution(
                 lineage_r_series,
-                "Per-Gene Pearson r (CR / non-CR Pairs)",
+            "Per-Gene Spearman rho (CR / non-CR Pairs)",
                 str(out_path),
                 xlim=(-1.0, 1.0),
                 square=True,
                 draw_stat_lines=False,
+                hist_color=_TEAL,
+                kde_color=_TEAL,
+                reference_line_color=_BLACK,
+                reference_line_lw=1.6,
+                reference_line_alpha=1.0,
+                reference_line_zorder=6.0,
+                x_ticks=_SPEARMAN_TICKS,
+                y_ticks=_SPEARMAN_DENSITY_Y_TICKS,
+                ylim=(0.0, 2.0),
+            )
+
+    pca_neighbor_r_series: Optional[pd.Series] = None
+    if len(pca_pairs) >= 2:
+        pca_anchor_arr = truth_wide[[a for a, _ in pca_pairs]].values.astype(np.float64)
+        pca_neighbor_arr = truth_wide[[b for _, b in pca_pairs]].values.astype(np.float64)
+        pca_neighbor_r = _gene_spearman_rho(pca_anchor_arr, pca_neighbor_arr)
+        pca_neighbor_r_series = pd.Series(
+            pca_neighbor_r[np.isfinite(pca_neighbor_r)],
+            name="spearman_rho",
+        )
+        out_path = Path(naive_dir) / "pca_nearest_neighbor_spearman_rho_distribution"
+        if overwrite or not Path(f"{out_path}.pdf").exists():
+            metric_distribution(
+                pca_neighbor_r_series,
+                "Per-Gene Spearman rho (PCA Nearest Neighbors)",
+                str(out_path),
+                xlim=(-1.0, 1.0),
+                square=True,
+                draw_stat_lines=False,
+                hist_color=_TEAL,
+                kde_color=_TEAL,
+                reference_line_color=_BLACK,
+                reference_line_lw=1.6,
+                reference_line_alpha=1.0,
+                reference_line_zorder=6.0,
+                x_ticks=_SPEARMAN_TICKS,
+                y_ticks=_SPEARMAN_DENSITY_Y_TICKS,
+                ylim=(0.0, 2.0),
             )
 
     naive_pred = generate_null_predictions(truth_wide, seed=42)
-    naive_r = _gene_pearson_r(truth_arr, naive_pred.values.astype(np.float64))
-    naive_r_series = pd.Series(naive_r[np.isfinite(naive_r)], name="pearson_r")
-    out_path = Path(naive_dir) / "naive_gene_pearson_r_distribution"
+    naive_r = _gene_spearman_rho(truth_arr, naive_pred.values.astype(np.float64))
+    naive_r_series = pd.Series(naive_r[np.isfinite(naive_r)], name="spearman_rho")
+    out_path = Path(naive_dir) / "naive_gene_spearman_rho_distribution"
     if overwrite or not Path(f"{out_path}.pdf").exists():
         metric_distribution(
             naive_r_series,
-            "Per-Gene Pearson r (Naive)",
+            "Per-Gene Spearman rho (Naive)",
             str(out_path),
             xlim=(-1.0, 1.0),
             square=True,
             draw_stat_lines=False,
+            hist_color=_GRAY,
+            kde_color=_GRAY,
+            reference_line_color=_BLACK,
+            reference_line_lw=1.6,
+            reference_line_alpha=1.0,
+            reference_line_zorder=6.0,
+            x_ticks=_SPEARMAN_TICKS,
+            y_ticks=_SPEARMAN_DENSITY_Y_TICKS,
+            ylim=(0.0, 2.0),
         )
 
     var_map = compute_gene_variance(truth_wide)
@@ -457,15 +762,24 @@ def generate_naive_example(out_dir: str, overwrite: bool) -> None:
             "method": "Lineage_Derivative",
             "GVW_r": _gvw_r_from_wide(non_cr_arr, cr_arr, w_gene),
             "GVW_rho": _gvw_rho_from_wide(non_cr_arr, cr_arr, w_gene),
-            "median_gene_r": float(lineage_r_series.median()),
+            "median_gene_rho": float(lineage_r_series.median()),
             "n_genes": len(lineage_r_series),
             "n_samples": len(valid_pairs),
+        })
+    if pca_neighbor_r_series is not None:
+        rows.append({
+            "method": "PCA_Nearest_Neighbor",
+            "GVW_r": _gvw_r_from_wide(pca_anchor_arr, pca_neighbor_arr, w_gene),
+            "GVW_rho": _gvw_rho_from_wide(pca_anchor_arr, pca_neighbor_arr, w_gene),
+            "median_gene_rho": float(pca_neighbor_r_series.median()),
+            "n_genes": len(pca_neighbor_r_series),
+            "n_samples": len(pca_pairs),
         })
     rows.append({
         "method": "Naive_Shuffle",
         "GVW_r": gvw_r_naive,
         "GVW_rho": gvw_rho_naive,
-        "median_gene_r": float(naive_r_series.median()),
+        "median_gene_rho": float(naive_r_series.median()),
         "n_genes": len(naive_r_series),
         "n_samples": n_samples,
     })

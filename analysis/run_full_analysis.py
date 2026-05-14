@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -56,7 +57,7 @@ from analysis.analysis_utils import (
     generate_null_predictions,
     get_gene_list,
     GENE_SET_BREAKS,
-    load_cv_predictions_proteus_full,
+    load_cv_predictions_proteus_full_from_paths,
     load_holdout_predictions_epicseq,
     load_holdout_predictions_proteus_full,
     load_holdout_predictions_xgboost,
@@ -66,6 +67,7 @@ from analysis.analysis_utils import (
     load_pluvicto_outcomes,
     load_subtypes,
     load_truth,
+    MIN_CORRELATION_N,
     mdn_activity_odds_ratio_wide,
     mdn_on_probability_wide,
     mdn_pit_values_wide,
@@ -91,11 +93,12 @@ from analysis.pipeline_config import (
     BENCHMARK_COMPLETE_MODELS,
     BENCHMARK_SUBSET_MODELS,
     DISCOVERY_COHORTS as CONFIG_DISCOVERY_COHORTS,
-    DISCOVERY_MODEL_PATHS as CONFIG_DISCOVERY_MODEL_PATHS,
+    DISCOVERY_PROTEUS_PATHS,
     EPIC_DISPLAY_NAMES as CONFIG_EPIC_DISPLAY_NAMES,
     EPIC_SCORE_COLUMNS as CONFIG_EPIC_SCORE_COLUMNS,
     PATIENT_BENCHMARK_COHORTS,
     PATIENT_EPIC_PATHS,
+    PLCA_CV_FOLD_TUMOR_PREDICTION_PATHS,
     PATIENT_PROTEUS_MODEL_PATHS,
     PATIENT_XGB_PATHS,
     SYNTHETIC_EPIC_PATH,
@@ -103,10 +106,8 @@ from analysis.pipeline_config import (
     SYNTHETIC_XGB_PATH,
     VALIDATION_PATIENT_CV_COHORTS,
     VALIDATION_PATIENT_HOLDOUT_COHORTS,
-    VALIDATION_PATIENT_HOLDOUT_PATH_TEMPLATE,
-    VALIDATION_PATIENT_CV_RESULTS_DIR,
+    VALIDATION_PATIENT_HOLDOUT_PATHS,
     VALIDATION_PDX_COHORTS,
-    VALIDATION_PDX_CV_RESULTS_DIR,
     VALIDATION_PDX_HOLDOUT_PATHS,
     benchmark_model_views,
 )
@@ -152,6 +153,90 @@ from analysis.plot_utils import (
     volcano_plot,
     enrichment_dot_plot,
 )
+
+
+_TFX_FILTER_NOTICE_KEYS: set[tuple[Any, ...]] = set()
+
+
+def _print_tfx_filter_notice_once(
+    notice_key: tuple[Any, ...],
+    summary: str,
+    details: Optional[str] = None,
+) -> None:
+    """Emit a TFx-filter notice only once for the current analysis run."""
+    if notice_key in _TFX_FILTER_NOTICE_KEYS:
+        return
+    _TFX_FILTER_NOTICE_KEYS.add(notice_key)
+    print(summary)
+    if details:
+        print(details)
+
+
+def _print_input_filter_banner(minimum_tfx: float) -> None:
+    """Print the generic startup banner for any input-level sample filtering."""
+    print("\n" + "=" * 70)
+    print("  INPUT SAMPLE FILTERS")
+    print("=" * 70)
+    print(f"  Minimum TFx threshold: {minimum_tfx:.3f}")
+
+
+def _truth_pred_correlation_values(
+    truth_values: Sequence[float] | np.ndarray | pd.Series,
+    pred_values: Sequence[float] | np.ndarray | pd.Series,
+) -> Tuple[int, float, float, float, float]:
+    """Return n, Pearson r/p, and Spearman rho/p for a truth-vs-pred pair."""
+    from scipy.stats import pearsonr, spearmanr
+
+    truth_arr = np.asarray(truth_values, dtype=np.float64)
+    pred_arr = np.asarray(pred_values, dtype=np.float64)
+    valid = np.isfinite(truth_arr) & np.isfinite(pred_arr)
+    truth_arr = truth_arr[valid]
+    pred_arr = pred_arr[valid]
+    n_valid = int(len(truth_arr))
+    if n_valid < MIN_CORRELATION_N:
+        return n_valid, np.nan, np.nan, np.nan, np.nan
+    if float(np.ptp(truth_arr)) <= 0.0:
+        return n_valid, np.nan, np.nan, np.nan, np.nan
+    if float(np.ptp(pred_arr)) <= 0.0:
+        return n_valid, 0.0, np.nan, 0.0, np.nan
+
+    pearson_result = pearsonr(truth_arr, pred_arr)
+    spearman_result = spearmanr(truth_arr, pred_arr)
+    return (
+        n_valid,
+        float(pearson_result.statistic),
+        float(pearson_result.pvalue),
+        float(spearman_result.statistic),
+        float(spearman_result.pvalue),
+    )
+
+
+def _generic_correlation_values(
+    x_values: Sequence[float] | np.ndarray | pd.Series,
+    y_values: Sequence[float] | np.ndarray | pd.Series,
+    *,
+    method: str,
+) -> Tuple[int, float, float]:
+    """Return n, statistic, p-value for a generic correlation calculation."""
+    from scipy.stats import pearsonr, spearmanr
+
+    x_arr = np.asarray(x_values, dtype=np.float64)
+    y_arr = np.asarray(y_values, dtype=np.float64)
+    valid = np.isfinite(x_arr) & np.isfinite(y_arr)
+    x_arr = x_arr[valid]
+    y_arr = y_arr[valid]
+    n_valid = int(len(x_arr))
+    if n_valid < MIN_CORRELATION_N:
+        return n_valid, np.nan, np.nan
+    if float(np.ptp(x_arr)) <= 0.0 or float(np.ptp(y_arr)) <= 0.0:
+        return n_valid, np.nan, np.nan
+    if method == "pearson":
+        result = pearsonr(x_arr, y_arr)
+    elif method == "spearman":
+        result = spearmanr(x_arr, y_arr)
+    else:
+        raise ValueError(f"Unsupported correlation method: {method}")
+    return n_valid, float(result.statistic), float(result.pvalue)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -218,9 +303,12 @@ def _section_results_dir(section_name: str) -> str:
 
 def _should_skip_section(section_name: str, args: argparse.Namespace) -> bool:
     """Return True when a top-level section folder already exists and overwrite is off."""
-    if bool(getattr(args, "overwrite", False)):
-        return False
     out_dir = _section_results_path(section_name)
+    if bool(getattr(args, "overwrite", False)):
+        if os.path.isdir(out_dir):
+            shutil.rmtree(out_dir)
+            print(f"  [overwrite] Removed existing {section_name} output folder ({out_dir})")
+        return False
     if os.path.isdir(out_dir):
         print(f"  [skip] {section_name}: top-level output folder already exists ({out_dir})")
         print("         Pass --overwrite to rerun this analysis group.")
@@ -228,7 +316,12 @@ def _should_skip_section(section_name: str, args: argparse.Namespace) -> bool:
     return False
 
 
-def _write_run_manifest(section_name: str, out_dir: str, args: argparse.Namespace) -> None:
+def _write_run_manifest(
+    section_name: str,
+    out_dir: str,
+    args: argparse.Namespace,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
     """Write a minimal reproducibility manifest for one analysis section."""
     manifest = {
         "section": section_name,
@@ -240,6 +333,8 @@ def _write_run_manifest(section_name: str, out_dir: str, args: argparse.Namespac
         "arguments": vars(args).copy(),
         "output_dir": out_dir,
     }
+    if extra:
+        manifest.update(extra)
     with open(os.path.join(out_dir, "run_manifest.json"), "w", encoding="utf-8") as handle:
         json.dump(manifest, handle, indent=2, sort_keys=True)
 
@@ -306,11 +401,22 @@ def _load_filtered_subtypes_for_reference(
     """Load subtype metadata aligned to a reference sample axis and apply TFx filtering."""
     resolved_label = label_name or cohort
     subtype_path = PROJECT_ROOT / "labels" / f"{resolved_label}_TFX_Subtype.tsv"
+    reference_index = pd.Index([str(column) for column in reference_columns])
+
     if not subtype_path.exists():
+        # Original implementation kept for reference:
+        # if minimum_tfx > 0.0 and _is_patient_cohort(cohort):
+        #     raise ValueError(
+        #         f"minimum_tfx={minimum_tfx} requested but TFx metadata is missing for patient cohort {resolved_label}"
+        #     )
         if minimum_tfx > 0.0 and _is_patient_cohort(cohort):
-            raise ValueError(
-                f"minimum_tfx={minimum_tfx} requested but TFx metadata is missing for patient cohort {resolved_label}"
+            context = report_context or cohort
+            _print_tfx_filter_notice_once(
+                ('no_subtype_file', str(resolved_label), float(minimum_tfx)),
+                f"  Minimum TFx filter ({context}): no TFx metadata supplied for {resolved_label}; "
+                "assuming all samples meet the threshold",
             )
+            return pd.DataFrame(index=reference_index, data={"tfx": np.nan})
         return None
 
     subtypes_df = _align_sample_metadata_to_reference(
@@ -322,26 +428,49 @@ def _load_filtered_subtypes_for_reference(
         return subtypes_df
 
     if "tfx" not in subtypes_df.columns:
-        raise ValueError(
-            f"minimum_tfx={minimum_tfx} requested but TFx metadata is missing a 'tfx' column for {resolved_label}"
+        # Original implementation kept for reference:
+        # raise ValueError(
+        #     f"minimum_tfx={minimum_tfx} requested but TFx metadata is missing a 'tfx' column for {resolved_label}"
+        # )
+        subtypes_df = subtypes_df.copy()
+        subtypes_df["tfx"] = np.nan
+        context = report_context or cohort
+        _print_tfx_filter_notice_once(
+            ('missing_tfx_column', str(resolved_label), float(minimum_tfx)),
+            f"  Minimum TFx filter ({context}): {resolved_label} has no TFx column; "
+            "assuming all samples with missing TFx meet the threshold",
         )
 
-    reference_index = pd.Index([str(column) for column in reference_columns])
     missing_samples = [sample_name for sample_name in reference_index if sample_name not in subtypes_df.index]
     if missing_samples:
-        raise ValueError(
-            f"minimum_tfx={minimum_tfx} requested but {resolved_label} is missing TFx metadata for samples: "
-            + ", ".join(missing_samples)
+        # Original implementation kept for reference:
+        # raise ValueError(
+        #     f"minimum_tfx={minimum_tfx} requested but {resolved_label} is missing TFx metadata for samples: "
+        #     + ", ".join(missing_samples)
+        # )
+        context = report_context or cohort
+        _print_tfx_filter_notice_once(
+            ('missing_samples', str(resolved_label), float(minimum_tfx), tuple(missing_samples)),
+            f"  Minimum TFx filter ({context}): assuming threshold pass for {len(missing_samples)} "
+            f"samples without TFx metadata in {resolved_label}",
+            (
+                "    " + ", ".join(missing_samples)
+                if len(missing_samples) <= 10
+                else "    " + ", ".join(missing_samples[:10]) + ", ..."
+            ),
         )
+
+    subtypes_df = subtypes_df.reindex(reference_index)
 
     low_tfx_mask = subtypes_df["tfx"].lt(float(minimum_tfx)).fillna(False)
     dropped_samples = subtypes_df.index[low_tfx_mask].tolist()
     if dropped_samples:
         context = report_context or cohort
-        print(
-            f"  Minimum TFx filter ({context}): dropped {len(dropped_samples)} patient samples below {minimum_tfx:.3f}"
+        _print_tfx_filter_notice_once(
+            ('dropped_samples', str(resolved_label), float(minimum_tfx)),
+            f"  Minimum TFx filter ({context}): dropped {len(dropped_samples)} patient samples below {minimum_tfx:.3f}",
+            "    " + ", ".join(dropped_samples),
         )
-        print("    " + ", ".join(dropped_samples))
     return subtypes_df.loc[~low_tfx_mask].copy()
 
 
@@ -1586,7 +1715,7 @@ _COLLECTED_TARGET_SETS = ["Targets_CRPC", "Targets_BLCA", "Targets_SCLC"]
 
 def _run_patient_validation_cohort(
     cohort: str,
-    model_path_template: str,
+    model_path: str,
     out_dir: str,
     args: argparse.Namespace,
     *,
@@ -1595,7 +1724,7 @@ def _run_patient_validation_cohort(
 ) -> Optional[Dict[str, Any]]:
     """Run Patient_Validation analysis for a single cohort.
 
-    Loads holdout predictions from ``model_path_template``, runs the full
+    Loads holdout predictions from ``model_path``, runs the full
     per-cohort suite (metrics + plots), and returns data for Collected.
 
     Returns a dict with cohort-level data for the Collected analysis,
@@ -1635,7 +1764,7 @@ def _run_patient_validation_cohort(
     cohort_out = ensure_dir(os.path.join(out_dir, cohort))
     summaries: List[Dict[str, Any]] = []
 
-    path = PROJECT_ROOT / model_path_template.format(cohort=cohort)
+    path = PROJECT_ROOT / model_path
     if not path.exists():
         print(f"    [skip] Predictions not found: {path.name}")
         return None
@@ -2028,7 +2157,7 @@ def _ihc_scatter(
         mask_series = pd.Series(False, index=pd.Index(sample_names))
         confident = np.ones(len(sample_names), dtype=bool)
 
-    if int(confident.sum()) >= 3:
+    if int(confident.sum()) >= MIN_CORRELATION_N:
         rho_result = spearmanr(ihc_vals[confident], expr_vals[confident])
         rho_val = float(rho_result.statistic)
         p_val = float(rho_result.pvalue)
@@ -2085,14 +2214,14 @@ def _ihc_scatter(
         point_x.append(float(ihc_val))
         point_y.append(float(expr_val))
 
-    if len(fit_x) > 2 and float(np.ptp(fit_x)) > 0.0:
+    if len(fit_x) >= MIN_CORRELATION_N and float(np.ptp(fit_x)) > 0.0:
         coeffs = np.polyfit(fit_x, fit_y, 1)
         x_line = np.linspace(float(fit_x.min()), float(fit_x.max()), 100)
         fit_fn = np.poly1d(coeffs)
         ax.plot(x_line, np.polyval(coeffs, x_line), "k-", lw=1, zorder=1)
 
         n = len(fit_x)
-        if n > 3:
+        if n >= MIN_CORRELATION_N:
             x_vals = np.asarray(fit_x, dtype=np.float64)
             y_vals = np.asarray(fit_y, dtype=np.float64)
             residuals = y_vals - fit_fn(x_vals)
@@ -2280,7 +2409,7 @@ def _run_ihc_analysis(
                     pred_vals.append(p_val)
                     aligned_samples.append(prefixed)
 
-        if len(ihc_vals) < 3:
+        if len(ihc_vals) < MIN_CORRELATION_N:
             continue
 
         ihc_arr = np.array(ihc_vals, dtype=np.float64)
@@ -2300,7 +2429,7 @@ def _run_ihc_analysis(
         else:
             confident = np.ones(len(aligned_samples), dtype=bool)
 
-        if int(confident.sum()) >= 3:
+        if int(confident.sum()) >= MIN_CORRELATION_N:
             rho_truth_ihc = float(spearmanr(truth_arr[confident], ihc_arr[confident]).statistic)
             rho_pred_ihc = float(spearmanr(pred_arr[confident], ihc_arr[confident]).statistic)
             rho_truth_pred = float(spearmanr(truth_arr[confident], pred_arr[confident]).statistic)
@@ -2588,7 +2717,7 @@ def _crpc_ra_bootstrap_correlation_ci(
     valid = np.isfinite(pd.to_numeric(x_values, errors="coerce").values) & np.isfinite(pd.to_numeric(y_values, errors="coerce").values)
     x = pd.to_numeric(x_values, errors="coerce").values[valid]
     y = pd.to_numeric(y_values, errors="coerce").values[valid]
-    if len(x) < 4:
+    if len(x) < MIN_CORRELATION_N:
         return (np.nan, np.nan)
     rng = np.random.default_rng(seed)
     estimates: List[float] = []
@@ -2803,6 +2932,10 @@ def _summarize_crpc_ra_gene_table(
     squared_error = pd.Series(summary_df["squared_error"].values, index=summary_df["gene"].values)
     met_sd = pd.Series(summary_df["met_sd"].values, index=summary_df["gene"].values)
     met_range = pd.Series(summary_df["met_range"].values, index=summary_df["gene"].values)
+    _, pearson_r, _, spearman_rho, _ = _truth_pred_correlation_values(
+        truth_series.values,
+        pred_series.values,
+    )
 
     return {
         f"{prefix}n_genes": int(len(summary_df)),
@@ -2811,8 +2944,8 @@ def _summarize_crpc_ra_gene_table(
         f"{prefix}rmse": float(np.sqrt(squared_error.mean())),
         f"{prefix}gvw_mae": _weighted_series_mean(abs_error, gene_weights),
         f"{prefix}gvw_rmse": float(np.sqrt(_weighted_series_mean(squared_error, gene_weights))),
-        f"{prefix}pearson_r": float(truth_series.corr(pred_series, method="pearson")),
-        f"{prefix}spearman_rho": float(truth_series.corr(pred_series, method="spearman")),
+        f"{prefix}pearson_r": pearson_r,
+        f"{prefix}spearman_rho": spearman_rho,
         f"{prefix}median_signed_residual": float(signed_residual.median()),
         f"{prefix}gvw_signed_residual": _weighted_series_mean(signed_residual, gene_weights),
         f"{prefix}median_met_sd": float(met_sd.median()),
@@ -3041,15 +3174,19 @@ def _plot_crpc_ra_metric_scatter(
         )
         for row in local_df.itertuples(index=False):
             axis.text(getattr(row, x_col), getattr(row, y_col), row.patient_id, fontsize=6, alpha=0.8)
-        if len(local_df) >= 3 and float(np.ptp(local_df[x_col].values)) > 0.0:
+        n_corr, rho_stat, rho_p = _generic_correlation_values(
+            local_df[x_col].values,
+            local_df[y_col].values,
+            method="spearman",
+        )
+        if n_corr >= MIN_CORRELATION_N and np.isfinite(rho_stat):
             coeffs = np.polyfit(local_df[x_col].values.astype(np.float64), local_df[y_col].values.astype(np.float64), 1)
             x_line = np.linspace(float(local_df[x_col].min()), float(local_df[x_col].max()), 100)
             axis.plot(x_line, np.polyval(coeffs, x_line), color="#444444", lw=1.2, ls="--")
-            rho_result = spearmanr(local_df[x_col].values, local_df[y_col].values)
             axis.text(
                 0.03,
                 0.97,
-                f"Spearman ρ = {float(rho_result.statistic):.3f}\n{format_pval(float(rho_result.pvalue))}",
+                f"Spearman ρ = {rho_stat:.3f}\n{format_pval(rho_p)}",
                 transform=axis.transAxes,
                 ha="left",
                 va="top",
@@ -3207,8 +3344,13 @@ def _plot_crpc_ra_pathway_truth_scatter(pathway_df: pd.DataFrame, name: str) -> 
         lo = float(min(local_df["truth_score"].min(), local_df["pred_score"].min()))
         hi = float(max(local_df["truth_score"].max(), local_df["pred_score"].max()))
         axis.plot([lo, hi], [lo, hi], ls="--", lw=1.0, color="#888888")
-        rho_result = spearmanr(local_df["truth_score"].values, local_df["pred_score"].values)
-        axis.text(0.03, 0.97, f"Spearman ρ = {float(rho_result.statistic):.3f}\n{format_pval(float(rho_result.pvalue))}", transform=axis.transAxes, ha="left", va="top", fontsize=8, bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8))
+        _, rho_stat, rho_p = _generic_correlation_values(
+            local_df["truth_score"].values,
+            local_df["pred_score"].values,
+            method="spearman",
+        )
+        if np.isfinite(rho_stat):
+            axis.text(0.03, 0.97, f"Spearman ρ = {rho_stat:.3f}\n{format_pval(rho_p)}", transform=axis.transAxes, ha="left", va="top", fontsize=8, bbox=dict(boxstyle="round,pad=0.25", facecolor="white", alpha=0.8))
         axis.set_title(pathway_label)
         axis.set_xlabel("Average-met score")
         axis.set_ylabel("Proteus score")
@@ -3518,17 +3660,21 @@ def _run_crpc_ra_metastasis_composition_analysis(
             local_df[outcome] = pd.to_numeric(local_df[outcome], errors="coerce")
             local_df[predictor] = pd.to_numeric(local_df[predictor], errors="coerce")
             local_df = local_df.dropna()
-            if len(local_df) < 4:
+            if len(local_df) < MIN_CORRELATION_N:
                 continue
-            from scipy.stats import spearmanr
-
-            result = spearmanr(local_df[predictor].values, local_df[outcome].values)
+            _, rho_stat, rho_p = _generic_correlation_values(
+                local_df[predictor].values,
+                local_df[outcome].values,
+                method="spearman",
+            )
+            if not np.isfinite(rho_stat):
+                continue
             ci_lo, ci_hi = _crpc_ra_bootstrap_correlation_ci(local_df[predictor], local_df[outcome], method="spearman")
             correlation_rows.append({
                 "outcome": outcome_label,
                 "predictor": predictor_label,
-                "spearman_rho": float(result.statistic),
-                "p_value": float(result.pvalue),
+                "spearman_rho": rho_stat,
+                "p_value": rho_p,
                 "bootstrap_ci_lo": ci_lo,
                 "bootstrap_ci_hi": ci_hi,
                 "n_patients": int(len(local_df)),
@@ -3697,21 +3843,22 @@ def _crosscohort_score_scatter(
     title: str,
     x_label: str = "Truth ssGSEA Score",
     y_label: str = "Predicted ssGSEA Score",
+    color_column: str = "cohort",
+    legend_title: str = "Cohort",
 ) -> None:
-    """Scatter pooled truth-vs-predicted score values across cohorts."""
+    """Scatter truth-vs-predicted score values using metadata-driven coloring."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from scipy.stats import pearsonr, spearmanr
 
     shared = truth_scores.index.intersection(pred_scores.index).intersection(sample_meta.index)
-    if len(shared) < 3:
+    if len(shared) < MIN_CORRELATION_N:
         return
 
     truth_vals = pd.to_numeric(truth_scores.loc[shared], errors="coerce")
     pred_vals = pd.to_numeric(pred_scores.loc[shared], errors="coerce")
     valid = np.isfinite(truth_vals.values) & np.isfinite(pred_vals.values)
-    if int(valid.sum()) < 3:
+    if int(valid.sum()) < MIN_CORRELATION_N:
         return
 
     shared = shared[valid]
@@ -3721,13 +3868,13 @@ def _crosscohort_score_scatter(
     palette = load_palette()
 
     fig, ax = plt.subplots(figsize=(5.5, 5.5))
-    seen_cohorts: Dict[str, str] = {}
+    seen_groups: Dict[str, str] = {}
     for sample in shared:
-        cohort = str(meta.loc[sample, "cohort"]) if "cohort" in meta.columns else "Unknown"
+        group_name = str(meta.loc[sample, color_column]) if color_column in meta.columns else "Unknown"
         status = str(meta.loc[sample, "status"]) if "status" in meta.columns else "validation"
         tfx_val = pd.to_numeric(pd.Series([meta.loc[sample, "tfx"]]), errors="coerce").iloc[0] \
             if "tfx" in meta.columns else np.nan
-        color = palette.get(cohort, "#999999")
+        color = palette.get(group_name, "#999999")
         marker = "D" if status == "holdout" else "o"
         size = max(40.0, 260.0 * float(tfx_val)) if np.isfinite(tfx_val) else 60.0
         ax.scatter(
@@ -3740,15 +3887,20 @@ def _crosscohort_score_scatter(
             linewidths=0.5,
             alpha=0.78,
         )
-        seen_cohorts[cohort] = color
+        seen_groups[group_name] = color
 
     lo = float(min(truth_vals.min(), pred_vals.min()))
     hi = float(max(truth_vals.max(), pred_vals.max()))
     pad = 0.05 * max(hi - lo, 1e-6)
     ax.plot([lo - pad, hi + pad], [lo - pad, hi + pad], ls="--", color="#BBBBBB", lw=1.2)
 
+    n_corr, r_p, p_p, r_s, p_s = _truth_pred_correlation_values(
+        truth_vals.values,
+        pred_vals.values,
+    )
     can_fit = (
-        len(shared) >= 3
+        n_corr >= MIN_CORRELATION_N
+        and np.isfinite(r_p)
         and float(np.ptp(truth_vals.values)) > 0.0
         and float(np.ptp(pred_vals.values)) > 0.0
     )
@@ -3757,16 +3909,20 @@ def _crosscohort_score_scatter(
         x_line = np.linspace(lo - pad, hi + pad, 100)
         ax.plot(x_line, np.polyval(coeffs, x_line), color="#CC3311", lw=1.5, alpha=0.8)
 
-    if can_fit:
-        r_p, p_p = pearsonr(truth_vals.values, pred_vals.values)
-        r_s, p_s = spearmanr(truth_vals.values, pred_vals.values)
+    if n_corr >= MIN_CORRELATION_N and np.isfinite(r_p) and np.isfinite(r_s):
         metric_text = (
             f"Pearson r = {r_p:.3f}  ({format_pval(p_p)})\n"
             f"Spearman ρ = {r_s:.3f}  ({format_pval(p_s)})\n"
-            f"n = {len(shared)}"
+            f"n = {n_corr}"
+        )
+    elif n_corr >= MIN_CORRELATION_N and r_p == 0.0 and r_s == 0.0:
+        metric_text = (
+            "Pearson r = 0.000  (p=NA)\n"
+            "Spearman ρ = 0.000  (p=NA)\n"
+            f"n = {n_corr}"
         )
     else:
-        metric_text = f"Pearson r = NA\nSpearman ρ = NA\nn = {len(shared)}"
+        metric_text = f"Pearson r = NA\nSpearman ρ = NA\nn = {n_corr}"
     ax.text(
         0.03,
         0.97,
@@ -3780,13 +3936,13 @@ def _crosscohort_score_scatter(
 
     handles = [
         plt.Line2D(
-            [0], [0], marker="o", color="w", label=cohort,
+            [0], [0], marker="o", color="w", label=group_name,
             markerfacecolor=color, markeredgecolor="black", markersize=8,
         )
-        for cohort, color in sorted(seen_cohorts.items())
+        for group_name, color in sorted(seen_groups.items())
     ]
     if handles:
-        ax.legend(handles=handles, title="Cohort", bbox_to_anchor=(1.02, 1.0),
+        ax.legend(handles=handles, title=legend_title, bbox_to_anchor=(1.02, 1.0),
                   loc="upper left", fontsize=8)
     ax.set_xlabel(x_label, fontsize=11)
     ax.set_ylabel(y_label, fontsize=11)
@@ -3804,7 +3960,7 @@ def _is_ne_like_subtype(cohort: str, subtype: Any) -> bool:
     """Map cohort-specific subtype labels to the requested NE-like labels."""
     subtype_str = str(subtype).strip().upper()
     if cohort in {"CRPC-RA", "CRPC-WCDT"}:
-        return ("NEPC" in subtype_str) or ("MIXED" in subtype_str)
+        return ("NEPC" in subtype_str) or ("AMPC" in subtype_str)
     if cohort == "BLCA-RA":
         return subtype_str == "NE"
     return False
@@ -3857,6 +4013,7 @@ def _run_collected_validation(
     target_sets: Optional[Sequence[str]] = None,
     include_ne10_roc: bool = True,
     activity_threshold_summary: Optional[Dict[str, Any]] = None,
+    run_pam50_crosscohort: bool = False,
 ) -> None:
     """Cross-cohort validation analysis combining all cohorts with truth.
 
@@ -4271,6 +4428,16 @@ def _run_collected_validation(
                     model_order=roc_cohort_order,
                 )
 
+    if run_pam50_crosscohort:
+        _run_pam50_analysis(
+            combined_pred,
+            collected_out,
+            args.overwrite,
+            cohort_label=label,
+            truth_wide=combined_truth,
+            emit_truth_vs_pred_confusion=False,
+        )
+
     # Save summary
     print_summary_table([summary])
     _save_summary_tsv([summary], os.path.join(collected_out, "summary_metrics.tsv"))
@@ -4289,11 +4456,6 @@ _DISCOVERY_COHORTS: List[Tuple[str, Optional[str]]] = [
     *CONFIG_DISCOVERY_COHORTS,
 ]
 
-# Models to check for each discovery cohort.
-_DISCOVERY_MODELS = [
-    *CONFIG_DISCOVERY_MODEL_PATHS,
-]
-
 # GMT files for GSEA
 _GSEA_HALLMARK_GMT = PROJECT_ROOT / "reference" / "h.all.v2026.1.Hs.symbols.gmt"
 _GSEA_SHORTLIST_GMT = PROJECT_ROOT / "reference" / "gsva_genesets_shortlist.gmt"
@@ -4306,6 +4468,258 @@ _PFIZER_RESPONSE_COLOR_MAP: Dict[str, str] = {
     "Progression": "#B63A3A",
     "Disease Control / Non-Progression": "#2C7A4B",
 }
+_PFIZER_RESPONSE_4CLASS_ORDER = ["PD", "Non-CR/PD", "SD", "PR & PSA50"]
+_PFIZER_RESPONSE_4CLASS_COLOR_MAP: Dict[str, str] = {
+    "PD": "#B63A3A",
+    "Non-CR/PD": "#C7892F",
+    "SD": "#2C7A4B",
+    "PR & PSA50": "#225EA8",
+}
+_PFIZER_PROGRESSION_ORDER = ["PD", "non-PD"]
+_PFIZER_PROGRESSION_COLOR_MAP: Dict[str, str] = {
+    "PD": "#B63A3A",
+    "non-PD": "#2C7A4B",
+}
+_PFIZER_ARM_ORDER = ["Enza-only", "EZH2i+Enza"]
+_PFIZER_ARM_COLOR_MAP: Dict[str, str] = {
+    "Enza-only": "#7F3C8D",
+    "EZH2i+Enza": "#11A579",
+}
+_PFIZER_DOSE_ORDER = [
+    "Enza",
+    "500mg+Enza",
+    "500mg+Enza with food",
+    "625mg+Enza",
+    "875mg+Enza",
+    "1250mg+Enza",
+]
+_PFIZER_EFFECTIVE_DOSE_ORDER = ["<625 mg / Enza-only", ">=625 mg + Enza"]
+_PFIZER_EFFECTIVE_DOSE_COLOR_MAP: Dict[str, str] = {
+    "<625 mg / Enza-only": "#7A7F86",
+    ">=625 mg + Enza": "#1F6AA5",
+}
+_PFIZER_ENZA_HISTORY_ORDER = ["Enza Experienced", "Enza Naive"]
+_PFIZER_FED_STATUS_ORDER = ["Fasted", "Fed"]
+_PFIZER_CLINICAL_BENEFIT_STRICT_ORDER = ["non-benefit", "indeterminate", "benefit"]
+_PFIZER_CLINICAL_BENEFIT_BROAD_ORDER = ["progression", "benefit_or_nonprogression"]
+_PFIZER_VISIT_MARKER_MAP: Dict[str, str] = {
+    "SCN": "o",
+    "C3D1": "s",
+    "EOT": "D",
+}
+_PFIZER_SHORTLIST_LABEL_MAP: Dict[str, str] = {
+    "ARG.10": "AR score",
+    "NE.10": "NE score",
+    "CCP.31": "CCP score",
+}
+_PFIZER_BASELINE_HALLMARKS: List[str] = [
+    "HALLMARK_ANDROGEN_RESPONSE",
+    "HALLMARK_E2F_TARGETS",
+    "HALLMARK_G2M_CHECKPOINT",
+    "HALLMARK_MYC_TARGETS_V1",
+    "HALLMARK_MYC_TARGETS_V2",
+    "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+    "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+    "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+    "HALLMARK_INFLAMMATORY_RESPONSE",
+    "HALLMARK_HYPOXIA",
+    "HALLMARK_PI3K_AKT_MTOR_SIGNALING",
+    "HALLMARK_APOPTOSIS",
+    "HALLMARK_P53_PATHWAY",
+]
+_PFIZER_BASELINE_EXPRESSION_GENES: List[str] = [
+    "EZH2",
+    "EED",
+    "SUZ12",
+    "AR",
+    "KLK3",
+    "KLK2",
+    "FKBP5",
+    "NKX3-1",
+    "TMPRSS2",
+    "HOXB13",
+    "ASCL1",
+    "NEUROD1",
+    "INSM1",
+    "SYP",
+    "CHGA",
+    "CHGB",
+    "ENO2",
+    "NCAM1",
+    "SOX2",
+    "MYCN",
+    "AURKA",
+    "MKI67",
+    "TOP2A",
+    "BIRC5",
+    "CDK1",
+    "CCNB1",
+    "CCNB2",
+    "MCM2",
+    "MCM3",
+    "MCM4",
+    "MCM5",
+    "MCM6",
+    "MCM7",
+]
+_PFIZER_PRESPECIFIED_BASELINE_FEATURES: List[str] = [
+    "AR score",
+    "NE score",
+    "CCP score",
+    "PRC2 target derepression score (exploratory)",
+    "HALLMARK_ANDROGEN_RESPONSE",
+    "HALLMARK_E2F_TARGETS",
+    "HALLMARK_G2M_CHECKPOINT",
+    "HALLMARK_MYC_TARGETS_V1",
+    "HALLMARK_MYC_TARGETS_V2",
+    "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+    "HALLMARK_HYPOXIA",
+    "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+    "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+    "HALLMARK_PI3K_AKT_MTOR_SIGNALING",
+]
+_PFIZER_C3D1_CORE_FEATURES: List[str] = [
+    "EZH2 Repression Target Score",
+    "EZH2 activity score",
+    "AR score",
+    "NE score",
+    "CCP score",
+    "PRC2 target derepression score (exploratory)",
+    "HALLMARK_ANDROGEN_RESPONSE",
+    "HALLMARK_E2F_TARGETS",
+    "HALLMARK_G2M_CHECKPOINT",
+    "HALLMARK_MYC_TARGETS_V1",
+    "HALLMARK_MYC_TARGETS_V2",
+    "HALLMARK_APOPTOSIS",
+    "HALLMARK_P53_PATHWAY",
+    "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+    "HALLMARK_HYPOXIA",
+    "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+    "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+    "HALLMARK_INFLAMMATORY_RESPONSE",
+]
+_PFIZER_COMPOSITE_COMPONENTS: List[Tuple[str, float]] = [
+    ("PRC2 target derepression score (exploratory)", 1.0),
+    ("AR score", -1.0),
+    ("CCP score", -1.0),
+    ("HALLMARK_E2F_TARGETS", -1.0),
+    ("HALLMARK_G2M_CHECKPOINT", -1.0),
+    ("HALLMARK_MYC_TARGETS_V1", -1.0),
+    ("NE score", -1.0),
+    ("HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION", -1.0),
+    ("HALLMARK_HYPOXIA", -1.0),
+]
+_PFIZER_COMPOSITE_COMPONENTS_NOPRC2: List[Tuple[str, float]] = [
+    component for component in _PFIZER_COMPOSITE_COMPONENTS if component[0] != "PRC2 target derepression score (exploratory)"
+]
+_PFIZER_AR_GENE_PANEL: List[str] = [
+    "AR",
+    "KLK3",
+    "KLK2",
+    "FKBP5",
+    "NKX3-1",
+    "TMPRSS2",
+    "HOXB13",
+    "ACPP",
+    "STEAP1",
+    "STEAP2",
+]
+_PFIZER_NE_GENE_PANEL: List[str] = [
+    "ASCL1",
+    "NEUROD1",
+    "INSM1",
+    "SYP",
+    "CHGA",
+    "CHGB",
+    "ENO2",
+    "NCAM1",
+    "SOX2",
+    "MYCN",
+    "AURKA",
+]
+_PFIZER_CELL_CYCLE_GENE_PANEL: List[str] = [
+    "MKI67",
+    "TOP2A",
+    "BIRC5",
+    "CDK1",
+    "CCNB1",
+    "CCNB2",
+    "MCM2",
+    "MCM3",
+    "MCM4",
+    "MCM5",
+    "MCM6",
+    "MCM7",
+    "PLK1",
+    "AURKB",
+]
+_PFIZER_PRC2_GENE_PANEL: List[str] = [
+    "EZH2",
+    "EED",
+    "SUZ12",
+    "RBBP4",
+    "RBBP7",
+    "KDM6A",
+    "KDM6B",
+]
+_PFIZER_GENE_LEVEL_PAIRED_PLOT_GENES: List[str] = [
+    "KLK3",
+    "FKBP5",
+    "AR",
+    "MKI67",
+    "TOP2A",
+    "BIRC5",
+    "ASCL1",
+    "INSM1",
+    "SYP",
+    "EZH2",
+]
+_PFIZER_EZH2_REPRESSION_TARGET_GENES: List[str] = [
+    "DAB2IP",
+    "MSMB",
+    "SLIT2",
+    "TIMP2",
+    "TIMP3",
+    "ID4",
+    "PEBP1",
+    "CDKN2A",
+    "CDH1",
+    "RUNX3",
+]
+_PFIZER_EZH2_ACTIVITY_GENES: List[str] = ["EZH2", "EED", "SUZ12"]
+_PFIZER_PRIMARY_PD_FEATURE = "EZH2 Repression Target Score"
+_PFIZER_EZH2_ACTIVITY_SCORE = "EZH2 activity score"
+_PFIZER_SECONDARY_PD_FEATURES: List[str] = [
+    _PFIZER_EZH2_ACTIVITY_SCORE,
+    "AR score",
+    "HALLMARK_ANDROGEN_RESPONSE",
+    "CCP score",
+    "HALLMARK_E2F_TARGETS",
+    "HALLMARK_G2M_CHECKPOINT",
+    "HALLMARK_MYC_TARGETS_V1",
+    "NE score",
+    "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+    "HALLMARK_HYPOXIA",
+    "HALLMARK_INFLAMMATORY_RESPONSE",
+    "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+    "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+]
+_PFIZER_EXPLORATORY_PRC2_TARGET_GENES: List[str] = [
+    "ATF3",
+    "BTG2",
+    "CDKN1A",
+    "DAB2IP",
+    "EHF",
+    "GATA6",
+    "ICAM1",
+    "IGFBP3",
+    "KLF4",
+    "RARRES3",
+    "RUNX3",
+    "SLIT2",
+    "SOX17",
+    "TGFBR2",
+]
 
 
 def _load_gmt(path: Path) -> Dict[str, List[str]]:
@@ -4386,6 +4800,7 @@ def _run_gsea(
     overwrite: bool,
     contrast: str = "NEPC-ARPC",
     tag: str = "",
+    extra_gene_sets: Optional[Dict[str, List[str]]] = None,
 ) -> None:
     """Run GSEA (prerank) on limma DE results using gseapy.
 
@@ -4497,6 +4912,43 @@ def _run_gsea(
                       f"FDR={float(row.get(fdr_col, float('nan'))):.3g}")
     else:
         print(f"    [skip] Shortlist GMT not found: {_GSEA_SHORTLIST_GMT}")
+
+    if extra_gene_sets:
+        filtered_extra_sets = {
+            set_name: list(dict.fromkeys(genes))
+            for set_name, genes in extra_gene_sets.items()
+            if genes
+        }
+        if filtered_extra_sets:
+            custom_out = ensure_dir(os.path.join(gsea_out, "Custom"))
+            custom_tsv = os.path.join(custom_out, f"gsea_custom_results{tag}.tsv")
+
+            if overwrite or not os.path.exists(custom_tsv):
+                res_custom = gp.prerank(
+                    rnk=rank_series,
+                    gene_sets=filtered_extra_sets,
+                    outdir=custom_out,
+                    min_size=3,
+                    max_size=500,
+                    permutation_num=1000,
+                    seed=42,
+                    no_plot=True,
+                    verbose=False,
+                )
+                res_custom_df = res_custom.res2d
+                res_custom_df.to_csv(custom_tsv, sep="\t", index=False)
+                print("    Custom-signature GSEA results saved")
+            else:
+                res_custom_df = pd.read_csv(custom_tsv, sep="\t")
+
+            _maybe(
+                enrichment_dot_plot,
+                overwrite,
+                res_custom_df,
+                os.path.join(custom_out, "enrichment_dotplot_custom"),
+                contrast_name=contrast,
+                title="GSEA: custom pharmacodynamic signatures",
+            )
 
 
 def _run_limma_de(
@@ -4934,9 +5386,11 @@ def _plot_pam50_score_scatter(
 
         pearson_r = np.nan
         spearman_rho = np.nan
-        if int(valid.sum()) >= 3:
-            pearson_r = float(truth_values.loc[valid].corr(pred_values.loc[valid], method="pearson"))
-            spearman_rho = float(truth_values.loc[valid].corr(pred_values.loc[valid], method="spearman"))
+        if int(valid.sum()) >= MIN_CORRELATION_N:
+            _, pearson_r, _, spearman_rho, _ = _truth_pred_correlation_values(
+                truth_values.loc[valid].values,
+                pred_values.loc[valid].values,
+            )
 
         axis.set_title(subtype_name)
         axis.set_xlabel("Truth PAM50 score")
@@ -4972,6 +5426,7 @@ def _run_pam50_analysis(
     mc_draws: Optional[List[pd.DataFrame]] = None,
     reference_subtypes: Optional[pd.Series] = None,
     reference_label: Optional[str] = None,
+    emit_truth_vs_pred_confusion: bool = True,
 ) -> None:
     """Run PAM50 classification and score comparisons for a cohort."""
     pred_for_scores = _prepare_expression_matrix_for_scores(
@@ -5078,11 +5533,13 @@ def _run_pam50_analysis(
                     "spearman_rho": np.nan,
                     "mae": np.nan,
                 }
-                if int(valid.sum()) >= 3:
+                if int(valid.sum()) >= MIN_CORRELATION_N:
                     truth_valid = truth_values.loc[valid]
                     pred_valid = pred_values.loc[valid]
-                    row["pearson_r"] = float(truth_valid.corr(pred_valid, method="pearson"))
-                    row["spearman_rho"] = float(truth_valid.corr(pred_valid, method="spearman"))
+                    _, row["pearson_r"], _, row["spearman_rho"], _ = _truth_pred_correlation_values(
+                        truth_valid.values,
+                        pred_valid.values,
+                    )
                     row["mae"] = float((truth_valid - pred_valid).abs().mean())
                     flat_truth.append(truth_valid.to_numpy(dtype=float))
                     flat_pred.append(pred_valid.to_numpy(dtype=float))
@@ -5091,14 +5548,18 @@ def _run_pam50_analysis(
             if flat_truth and flat_pred:
                 flat_truth_values = np.concatenate(flat_truth)
                 flat_pred_values = np.concatenate(flat_pred)
-                if flat_truth_values.size >= 3 and flat_pred_values.size >= 3:
+                if flat_truth_values.size >= MIN_CORRELATION_N and flat_pred_values.size >= MIN_CORRELATION_N:
+                    _, all_pearson_r, _, all_spearman_rho, _ = _truth_pred_correlation_values(
+                        flat_truth_values,
+                        flat_pred_values,
+                    )
                     score_rows.append({
                         "score_type": score_type,
                         "score_column": "all_scores",
                         "subtype": "All",
                         "n_samples": int(flat_truth_values.size),
-                        "pearson_r": float(pd.Series(flat_truth_values).corr(pd.Series(flat_pred_values), method="pearson")),
-                        "spearman_rho": float(pd.Series(flat_truth_values).corr(pd.Series(flat_pred_values), method="spearman")),
+                        "pearson_r": all_pearson_r,
+                        "spearman_rho": all_spearman_rho,
                         "mae": float(np.mean(np.abs(flat_truth_values - flat_pred_values))),
                     })
 
@@ -5115,6 +5576,10 @@ def _run_pam50_analysis(
                 os.path.join(variant_out, "pam50_score_scatter_truth_vs_pred"),
                 title=f"PAM50 truth vs predicted scores — {cohort_label} ({variant_name})",
             )
+
+        if not emit_truth_vs_pred_confusion:
+            print(f"    PAM50 {cohort_label}: saved pooled truth-vs-predicted subtype score comparisons")
+            return
 
         comparison_df = pd.DataFrame({
             "sample": matched_samples,
@@ -5984,6 +6449,76 @@ def _pfizer_pretty_response(code: str) -> str:
     }.get(code, code)
 
 
+def _pfizer_normalize_response_4class(response_value: Any) -> str:
+    """Normalize Pfizer best-response labels into the requested 4-class encoding."""
+    response = str(response_value).strip()
+    if response == "PR &PSA50":
+        return "PR & PSA50"
+    return response
+
+
+def _pfizer_arm_from_dose(dose_value: Any) -> str:
+    """Map dose labels to the binary treatment-arm encoding used in analysis."""
+    dose = str(dose_value).strip()
+    return "Enza-only" if dose == "Enza" else "EZH2i+Enza"
+
+
+def _pfizer_dose_mg(dose_value: Any) -> Optional[int]:
+    """Extract the numeric Pfizer dose in mg when present."""
+    dose = str(dose_value).strip()
+    match = re.search(r"(\d+)\s*mg", dose, flags=re.IGNORECASE)
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
+def _pfizer_effective_dose_group(dose_value: Any) -> str:
+    """Map dose labels to the prespecified effective-dose split."""
+    dose_mg = _pfizer_dose_mg(dose_value)
+    if dose_mg is not None and dose_mg >= 625:
+        return ">=625 mg + Enza"
+    return "<625 mg / Enza-only"
+
+
+def _pfizer_enza_history(label_value: Any) -> str:
+    """Extract Enza-history status from the source metadata string."""
+    label = str(label_value).strip()
+    if label.startswith("Enza Experienced"):
+        return "Enza Experienced"
+    return "Enza Naive"
+
+
+def _pfizer_fed_status(label_value: Any) -> str:
+    """Extract fed-status from the source metadata string."""
+    label = str(label_value).strip()
+    if "(Fed)" in label:
+        return "Fed"
+    return "Fasted"
+
+
+def _pfizer_progression_binary(response_4class: Any) -> str:
+    """Collapse 4-class response to the primary PD-vs-non-PD grouping."""
+    return "PD" if str(response_4class).strip() == "PD" else "non-PD"
+
+
+def _pfizer_clinical_benefit_strict(response_4class: Any) -> str:
+    """Map 4-class response to the strict clinical-benefit grouping."""
+    response = str(response_4class).strip()
+    if response == "PD":
+        return "non-benefit"
+    if response in {"SD", "PR & PSA50"}:
+        return "benefit"
+    return "indeterminate"
+
+
+def _pfizer_clinical_benefit_broad(response_4class: Any) -> str:
+    """Map 4-class response to the broad non-progression grouping."""
+    response = str(response_4class).strip()
+    if response == "PD":
+        return "progression"
+    return "benefit_or_nonprogression"
+
+
 def _pfizer_response_scheme_specs() -> List[Dict[str, Any]]:
     """Return the single Pfizer binary response encoding used throughout discovery."""
     return [
@@ -6012,21 +6547,82 @@ def _load_pfizer_metadata(pred_columns: Sequence[str]) -> pd.DataFrame:
         columns={
             "sample_ID": "sample_id",
             "EZFDCAT": "enzalutamide_group",
-            "PF-1497_BID": "treatment_arm",
+            "PF-1497_BID": "dose",
             "Best_Overall_Resp": "best_response",
             "Pfizer_Visit": "visit",
             "Days_from_SCN": "days_from_scn",
+            "TFx": "tfx",
+            "depth_WGS": "depth_wgs",
         }
     )
     meta["sample_id"] = meta["sample_id"].astype(str)
     meta["best_response"] = meta["best_response"].map(_pfizer_normalize_best_response)
+    meta["response_4class"] = meta["best_response"].map(_pfizer_normalize_response_4class)
     meta["visit"] = pd.Categorical(
         meta["visit"].astype(str).str.strip(),
         categories=_PFIZER_VISIT_ORDER,
         ordered=True,
     )
+    meta["visit_order"] = meta["visit"].cat.codes
     meta["days_from_scn"] = pd.to_numeric(meta["days_from_scn"], errors="coerce")
+    meta["tfx"] = pd.to_numeric(meta.get("tfx"), errors="coerce")
+    meta["depth_wgs"] = pd.to_numeric(meta.get("depth_wgs"), errors="coerce")
     meta["patient_id"] = meta["sample_id"].map(_pfizer_patient_id)
+    meta["dose"] = meta["dose"].astype(str).str.strip()
+    meta["dose_mg"] = meta["dose"].map(_pfizer_dose_mg)
+    meta["arm"] = meta["dose"].map(_pfizer_arm_from_dose)
+    meta["effective_dose_group"] = meta["dose"].map(_pfizer_effective_dose_group)
+    meta["enza_history"] = meta["enzalutamide_group"].map(_pfizer_enza_history)
+    meta["fed_status"] = meta["enzalutamide_group"].map(_pfizer_fed_status)
+    meta["progression_binary"] = meta["response_4class"].map(_pfizer_progression_binary)
+    meta["clinical_benefit_strict"] = meta["response_4class"].map(_pfizer_clinical_benefit_strict)
+    meta["clinical_benefit_broad"] = meta["response_4class"].map(_pfizer_clinical_benefit_broad)
+
+    meta["response_4class"] = pd.Categorical(
+        meta["response_4class"],
+        categories=_PFIZER_RESPONSE_4CLASS_ORDER,
+        ordered=True,
+    )
+    meta["progression_binary"] = pd.Categorical(
+        meta["progression_binary"],
+        categories=_PFIZER_PROGRESSION_ORDER,
+        ordered=True,
+    )
+    meta["arm"] = pd.Categorical(
+        meta["arm"],
+        categories=_PFIZER_ARM_ORDER,
+        ordered=True,
+    )
+    meta["effective_dose_group"] = pd.Categorical(
+        meta["effective_dose_group"],
+        categories=_PFIZER_EFFECTIVE_DOSE_ORDER,
+        ordered=True,
+    )
+    meta["dose"] = pd.Categorical(
+        meta["dose"],
+        categories=_PFIZER_DOSE_ORDER,
+        ordered=True,
+    )
+    meta["enza_history"] = pd.Categorical(
+        meta["enza_history"],
+        categories=_PFIZER_ENZA_HISTORY_ORDER,
+        ordered=True,
+    )
+    meta["fed_status"] = pd.Categorical(
+        meta["fed_status"],
+        categories=_PFIZER_FED_STATUS_ORDER,
+        ordered=True,
+    )
+    meta["clinical_benefit_strict"] = pd.Categorical(
+        meta["clinical_benefit_strict"],
+        categories=_PFIZER_CLINICAL_BENEFIT_STRICT_ORDER,
+        ordered=True,
+    )
+    meta["clinical_benefit_broad"] = pd.Categorical(
+        meta["clinical_benefit_broad"],
+        categories=_PFIZER_CLINICAL_BENEFIT_BROAD_ORDER,
+        ordered=True,
+    )
 
     response_series = meta["best_response"].astype("string")
 
@@ -6282,7 +6878,13 @@ def _pfizer_plot_spaghetti(
     if legend_handles:
         ax.legend(handles=legend_handles, title="Best response", fontsize=8, loc="best")
 
-    fig.tight_layout()
+    fig.subplots_adjust(
+        left=0.08,
+        right=0.80 if legend_handles else 0.96,
+        top=0.96,
+        bottom=0.08,
+        hspace=0.05,
+    )
     fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
     plt.close(fig)
 
@@ -6299,6 +6901,7 @@ def _pfizer_plot_timepoint_distribution(
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from scipy.stats import mannwhitneyu
 
     marker_values = pd.to_numeric(values.reindex(pfizer_meta.index), errors="coerce")
     valid = pfizer_meta.loc[marker_values.notna()].copy()
@@ -6317,12 +6920,15 @@ def _pfizer_plot_timepoint_distribution(
     box_positions: List[float] = []
     box_colors: List[str] = []
     point_groups: List[Tuple[float, np.ndarray, str]] = []
+    visit_comparisons: List[Tuple[float, float, np.ndarray, np.ndarray]] = []
     nonempty_groups = 0
     for visit_idx, visit_name in enumerate(_PFIZER_VISIT_ORDER):
         visit_df = valid.loc[valid["visit"].astype(str) == visit_name]
+        per_visit_groups: Dict[str, np.ndarray] = {}
         for response_code in response_codes:
             group_df = visit_df.loc[visit_df["response_binary"].astype(str) == response_code]
             group_vals = group_df["value"].astype(float).values
+            per_visit_groups[response_code] = group_vals
             if len(group_vals) == 0:
                 continue
             nonempty_groups += 1
@@ -6331,6 +6937,15 @@ def _pfizer_plot_timepoint_distribution(
             box_positions.append(position)
             box_colors.append(_PFIZER_RESPONSE_COLOR_MAP[response_labels[response_code]])
             point_groups.append((position, group_vals, _PFIZER_RESPONSE_COLOR_MAP[response_labels[response_code]]))
+        if all(len(per_visit_groups.get(code, np.array([]))) > 0 for code in response_codes):
+            visit_comparisons.append(
+                (
+                    float(visit_centers[visit_idx] + response_offsets[response_codes[0]]),
+                    float(visit_centers[visit_idx] + response_offsets[response_codes[1]]),
+                    per_visit_groups[response_codes[0]],
+                    per_visit_groups[response_codes[1]],
+                )
+            )
 
     if nonempty_groups < 2:
         return
@@ -6366,6 +6981,26 @@ def _pfizer_plot_timepoint_distribution(
 
     for divider in visit_centers[:-1] + 0.5:
         ax.axvline(divider, color="#DDDDDD", linewidth=0.8, zorder=0)
+
+    if visit_comparisons:
+        y_min, y_max = ax.get_ylim()
+        y_range = max(y_max - y_min, 1e-6)
+        base_y = max(float(np.max(vals)) for vals in box_data if len(vals) > 0) + 0.06 * y_range
+        step_y = 0.10 * y_range
+        cap_y = 0.02 * y_range
+        for idx, (left_x, right_x, left_vals, right_vals) in enumerate(visit_comparisons):
+            p_value = float(mannwhitneyu(left_vals, right_vals, alternative="two-sided").pvalue)
+            y_ann = base_y + idx * step_y
+            ax.plot([left_x, left_x, right_x, right_x], [y_ann - cap_y, y_ann, y_ann, y_ann - cap_y], lw=1.0, color="black")
+            ax.text(
+                0.5 * (left_x + right_x),
+                y_ann + 0.01 * y_range,
+                format_pval(p_value),
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+        ax.set_ylim(y_min, max(y_max, base_y + len(visit_comparisons) * step_y + 0.08 * y_range))
 
     legend_handles = [
         plt.Line2D(
@@ -6483,6 +7118,7 @@ def _pfizer_plot_delta_distribution(
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    from scipy.stats import mannwhitneyu
 
     if marker_name not in delta_df.columns or response_column not in delta_df.columns:
         return
@@ -6517,6 +7153,25 @@ def _pfizer_plot_delta_distribution(
         color = _PFIZER_RESPONSE_COLOR_MAP.get(_pfizer_pretty_response(level), "#888888")
         jitter = np.random.default_rng(42).uniform(-0.12, 0.12, size=len(vals))
         ax.scatter(pos + jitter, vals, color=color, edgecolor="black", linewidth=0.4, s=34, alpha=0.85, zorder=3)
+
+    nonempty_groups = [vals for vals in grouped if len(vals) > 0]
+    if len(nonempty_groups) == 2:
+        y_min, y_max = ax.get_ylim()
+        y_range = max(y_max - y_min, 1e-6)
+        y_top = max(float(np.max(vals)) for vals in nonempty_groups)
+        y_ann = y_top + 0.08 * y_range
+        cap_y = 0.02 * y_range
+        p_value = float(mannwhitneyu(nonempty_groups[0], nonempty_groups[1], alternative="two-sided").pvalue)
+        ax.plot([positions[0], positions[0], positions[1], positions[1]], [y_ann - cap_y, y_ann, y_ann, y_ann - cap_y], lw=1.0, color="black")
+        ax.text(
+            0.5 * (positions[0] + positions[1]),
+            y_ann + 0.01 * y_range,
+            format_pval(p_value),
+            ha="center",
+            va="bottom",
+            fontsize=8,
+        )
+        ax.set_ylim(y_min, max(y_max, y_ann + 0.10 * y_range))
 
     ax.axhline(0.0, color="#999999", linestyle="--", linewidth=1.0)
     ax.set_xticks(positions)
@@ -6791,6 +7446,3386 @@ def _run_pfizer_delta_response_models(
             result_df.to_csv(out_path, sep="\t", index=False)
 
 
+def _pfizer_v2_bh_fdr(p_values: pd.Series) -> pd.Series:
+    """Compute Benjamini-Hochberg FDR values for a p-value series."""
+    numeric = pd.to_numeric(p_values, errors="coerce")
+    result = pd.Series(np.nan, index=numeric.index, dtype=float)
+    valid = numeric.notna()
+    if not bool(valid.any()):
+        return result
+
+    ordered = numeric.loc[valid].sort_values()
+    n_tests = int(len(ordered))
+    raw = ordered.values * n_tests / np.arange(1, n_tests + 1, dtype=float)
+    adjusted = np.minimum.accumulate(raw[::-1])[::-1]
+    adjusted = np.clip(adjusted, 0.0, 1.0)
+    result.loc[ordered.index] = adjusted
+    return result
+
+
+def _pfizer_v2_bootstrap_ci(
+    values: Sequence[float],
+    *,
+    statistic: str,
+    n_boot: int = 2000,
+    seed: int = 42,
+) -> Tuple[float, float]:
+    """Bootstrap a simple median or mean confidence interval."""
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return np.nan, np.nan
+    if arr.size == 1:
+        val = float(arr[0])
+        return val, val
+
+    rng = np.random.default_rng(seed)
+    boot = np.empty(n_boot, dtype=float)
+    for idx in range(n_boot):
+        sample = rng.choice(arr, size=arr.size, replace=True)
+        if statistic == "median":
+            boot[idx] = float(np.median(sample))
+        elif statistic == "mean":
+            boot[idx] = float(np.mean(sample))
+        else:
+            raise ValueError(f"Unsupported bootstrap statistic: {statistic}")
+    return float(np.percentile(boot, 2.5)), float(np.percentile(boot, 97.5))
+
+
+def _pfizer_v2_rank_biserial(group_a: Sequence[float], group_b: Sequence[float]) -> float:
+    """Return the Mann-Whitney rank-biserial effect size for group_b minus group_a."""
+    from scipy.stats import mannwhitneyu
+
+    arr_a = np.asarray(group_a, dtype=float)
+    arr_b = np.asarray(group_b, dtype=float)
+    arr_a = arr_a[np.isfinite(arr_a)]
+    arr_b = arr_b[np.isfinite(arr_b)]
+    if arr_a.size == 0 or arr_b.size == 0:
+        return np.nan
+    u_stat = float(mannwhitneyu(arr_a, arr_b, alternative="two-sided").statistic)
+    return float(1.0 - (2.0 * u_stat) / (arr_a.size * arr_b.size))
+
+
+def _pfizer_v2_signed_rank_biserial(deltas: Sequence[float]) -> float:
+    """Return the matched-pairs rank-biserial effect size for paired deltas."""
+    from scipy.stats import rankdata
+
+    delta_arr = np.asarray(deltas, dtype=float)
+    delta_arr = delta_arr[np.isfinite(delta_arr)]
+    delta_arr = delta_arr[delta_arr != 0.0]
+    if delta_arr.size == 0:
+        return np.nan
+
+    ranks = rankdata(np.abs(delta_arr), method="average")
+    pos_sum = float(ranks[delta_arr > 0].sum())
+    neg_sum = float(ranks[delta_arr < 0].sum())
+    denom = pos_sum + neg_sum
+    if denom <= 0.0:
+        return np.nan
+    return float((pos_sum - neg_sum) / denom)
+
+
+def _pfizer_v2_cohens_d(group_a: Sequence[float], group_b: Sequence[float]) -> float:
+    """Return Cohen's d for group_b minus group_a."""
+    arr_a = np.asarray(group_a, dtype=float)
+    arr_b = np.asarray(group_b, dtype=float)
+    arr_a = arr_a[np.isfinite(arr_a)]
+    arr_b = arr_b[np.isfinite(arr_b)]
+    if arr_a.size < 2 or arr_b.size < 2:
+        return np.nan
+
+    var_a = float(np.var(arr_a, ddof=1))
+    var_b = float(np.var(arr_b, ddof=1))
+    pooled_denom = ((arr_a.size - 1) * var_a) + ((arr_b.size - 1) * var_b)
+    pooled_n = arr_a.size + arr_b.size - 2
+    if pooled_n <= 0 or pooled_denom <= 0.0:
+        return np.nan
+    pooled_sd = float(np.sqrt(pooled_denom / pooled_n))
+    if pooled_sd <= 0.0:
+        return np.nan
+    return float((np.mean(arr_b) - np.mean(arr_a)) / pooled_sd)
+
+
+def _pfizer_v2_preferred_levels(column_name: str) -> Optional[List[str]]:
+    """Return preferred plotting order for key Pfizer metadata columns."""
+    return {
+        "response_4class": _PFIZER_RESPONSE_4CLASS_ORDER,
+        "progression_binary": _PFIZER_PROGRESSION_ORDER,
+        "arm": _PFIZER_ARM_ORDER,
+        "effective_dose_group": _PFIZER_EFFECTIVE_DOSE_ORDER,
+        "dose": _PFIZER_DOSE_ORDER,
+        "enza_history": _PFIZER_ENZA_HISTORY_ORDER,
+        "fed_status": _PFIZER_FED_STATUS_ORDER,
+        "clinical_benefit_strict": _PFIZER_CLINICAL_BENEFIT_STRICT_ORDER,
+        "clinical_benefit_broad": _PFIZER_CLINICAL_BENEFIT_BROAD_ORDER,
+    }.get(column_name)
+
+
+def _pfizer_v2_color_map(column_name: str, levels: Sequence[str]) -> Dict[str, str]:
+    """Return a stable categorical color map for a Pfizer grouping variable."""
+    base_maps: Dict[str, Dict[str, str]] = {
+        "response_4class": _PFIZER_RESPONSE_4CLASS_COLOR_MAP,
+        "progression_binary": _PFIZER_PROGRESSION_COLOR_MAP,
+        "arm": _PFIZER_ARM_COLOR_MAP,
+        "effective_dose_group": _PFIZER_EFFECTIVE_DOSE_COLOR_MAP,
+    }
+    preferred = dict(base_maps.get(column_name, {}))
+    missing = [level for level in levels if level not in preferred]
+    if not missing:
+        return preferred
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    cmap = plt.get_cmap("tab20")
+    for idx, level in enumerate(missing):
+        preferred[level] = matplotlib.colors.to_hex(cmap(idx % cmap.N))
+    return preferred
+
+
+def _pfizer_v2_response_legend_handles(
+    response_levels: Optional[Sequence[str]] = None,
+) -> List[Any]:
+    """Return legend handles for the Pfizer four-class response color mapping."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.lines import Line2D
+
+    levels = list(response_levels) if response_levels is not None else list(_PFIZER_RESPONSE_4CLASS_ORDER)
+    color_map = _pfizer_v2_color_map("response_4class", levels)
+    return [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color="w",
+            markerfacecolor=color_map.get(level, "#999999"),
+            markeredgecolor="black",
+            markeredgewidth=0.6,
+            linewidth=0,
+            markersize=7,
+            label=level,
+        )
+        for level in levels
+        if level in color_map
+    ]
+
+
+def _pfizer_v2_arm_marker_legend_handles() -> List[Any]:
+    """Return legend handles for the Pfizer treatment-arm marker mapping."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.lines import Line2D
+
+    marker_map = {"Enza-only": "o", "EZH2i+Enza": "s"}
+    return [
+        Line2D(
+            [0],
+            [0],
+            marker=marker_map[level],
+            color="black",
+            markerfacecolor="white",
+            markeredgecolor="black",
+            linewidth=0,
+            markersize=7,
+            label=level,
+        )
+        for level in _PFIZER_ARM_ORDER
+        if level in marker_map
+    ]
+
+
+def _pfizer_v2_visit_marker_legend_handles(
+    visit_levels: Optional[Sequence[str]] = None,
+) -> List[Any]:
+    """Return legend handles for the Pfizer visit marker mapping."""
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.lines import Line2D
+
+    levels = list(visit_levels) if visit_levels is not None else list(_PFIZER_VISIT_ORDER)
+    return [
+        Line2D(
+            [0],
+            [0],
+            marker=_PFIZER_VISIT_MARKER_MAP.get(level, "o"),
+            color="black",
+            markerfacecolor="white",
+            markeredgecolor="black",
+            linewidth=0,
+            markersize=7,
+            label=level,
+        )
+        for level in levels
+    ]
+
+
+def _pfizer_v2_add_dual_legends(
+    ax: Any,
+    *,
+    color_handles: Optional[Sequence[Any]] = None,
+    color_title: Optional[str] = None,
+    marker_handles: Optional[Sequence[Any]] = None,
+    marker_title: Optional[str] = None,
+    color_anchor: Tuple[float, float] = (1.02, 1.0),
+    marker_anchor: Tuple[float, float] = (1.02, 0.62),
+) -> None:
+    """Attach separate color and marker legends to a Pfizer plot."""
+    color_legend = None
+    if color_handles:
+        color_legend = ax.legend(
+            handles=list(color_handles),
+            title=color_title,
+            fontsize=8,
+            title_fontsize=8,
+            loc="upper left",
+            bbox_to_anchor=color_anchor,
+            frameon=False,
+        )
+        ax.add_artist(color_legend)
+    if marker_handles:
+        ax.legend(
+            handles=list(marker_handles),
+            title=marker_title,
+            fontsize=8,
+            title_fontsize=8,
+            loc="upper left",
+            bbox_to_anchor=marker_anchor,
+            frameon=False,
+        )
+
+
+def _pfizer_v2_patient_metadata(sample_df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse matched Pfizer metadata to one row per patient."""
+    rows: List[Dict[str, Any]] = []
+    ordered = sample_df.sort_values(["patient_id", "visit_order", "days_from_scn", "sample_id"])
+    for patient_id, patient_rows in ordered.groupby("patient_id"):
+        scn_rows = patient_rows.loc[patient_rows["visit"].astype(str) == "SCN"]
+        eot_rows = patient_rows.loc[patient_rows["visit"].astype(str) == "EOT"]
+        anchor = scn_rows.iloc[0] if not scn_rows.empty else patient_rows.iloc[0]
+        eot_anchor = eot_rows.iloc[0] if not eot_rows.empty else patient_rows.iloc[-1]
+        rows.append(
+            {
+                "patient_id": patient_id,
+                "arm": anchor["arm"],
+                "effective_dose_group": anchor["effective_dose_group"],
+                "dose": anchor["dose"],
+                "dose_mg": anchor["dose_mg"],
+                "enza_history": anchor["enza_history"],
+                "fed_status": anchor["fed_status"],
+                "response_4class": anchor["response_4class"],
+                "progression_binary": anchor["progression_binary"],
+                "clinical_benefit_strict": anchor["clinical_benefit_strict"],
+                "clinical_benefit_broad": anchor["clinical_benefit_broad"],
+                "n_samples": int(len(patient_rows)),
+                "visits_present": ";".join(patient_rows["visit"].astype(str).tolist()),
+                "sample_SCN": scn_rows.index[0] if not scn_rows.empty else pd.NA,
+                "sample_C3D1": patient_rows.loc[patient_rows["visit"].astype(str) == "C3D1"].index[0]
+                if bool((patient_rows["visit"].astype(str) == "C3D1").any())
+                else pd.NA,
+                "sample_EOT": eot_rows.index[0] if not eot_rows.empty else pd.NA,
+                "days_from_scn_EOT": pd.to_numeric(pd.Series([eot_anchor["days_from_scn"]]), errors="coerce").iloc[0],
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).set_index("patient_id")
+
+
+def _pfizer_v2_prepare_pam50(
+    pred_subset: pd.DataFrame,
+    pfizer_out: str,
+    overwrite: bool,
+) -> pd.DataFrame:
+    """Compute PAM50 calls and primary continuous scores for Pfizer samples."""
+    pred_for_scores = _prepare_expression_matrix_for_scores(
+        pred_subset,
+        context="CRPC-Pfizer PAM50",
+    )
+    if pred_for_scores.empty:
+        return pd.DataFrame()
+
+    selected = _select_pam50_result(pam50_classify_genefu(pred_for_scores))
+    if selected is None:
+        return pd.DataFrame()
+    variant_name, variant_df = selected
+    variant_out = ensure_dir(os.path.join(pfizer_out, "PAM50", _analysis_safe_name(variant_name)))
+    variant_df.to_csv(
+        os.path.join(variant_out, "pam50_classification_predicted.tsv"),
+        sep="\t",
+        index=False,
+    )
+    score_columns = _pam50_primary_score_columns(variant_df.columns)
+    if score_columns:
+        variant_df[["sample"] + score_columns].to_csv(
+            os.path.join(variant_out, "pam50_primary_scores.tsv"),
+            sep="\t",
+            index=False,
+        )
+    return variant_df.drop_duplicates(subset="sample").set_index("sample")
+
+
+def _pfizer_v2_build_sample_feature_table(
+    pred_subset: pd.DataFrame,
+    pfizer_meta: pd.DataFrame,
+    pfizer_out: str,
+    overwrite: bool,
+    *,
+    hallmark_scores: Optional[pd.DataFrame] = None,
+    shortlist_scores: Optional[pd.DataFrame] = None,
+    pam50_df: Optional[pd.DataFrame] = None,
+    compute_pam50: bool = True,
+) -> Tuple[pd.DataFrame, List[str]]:
+    """Assemble sample-level metadata, scores, and expression features for Pfizer."""
+    sample_df = pfizer_meta.copy()
+    if hallmark_scores is None:
+        hallmark_scores = _run_pluvicto_ssgsea(pred_subset, pfizer_out, overwrite, tag="_pfizer")
+    if shortlist_scores is None:
+        shortlist_scores = _run_pluvicto_shortlist_scores(pred_subset, pfizer_out, overwrite, tag="_pfizer")
+    if pam50_df is None:
+        pam50_df = _pfizer_v2_prepare_pam50(pred_subset, pfizer_out, overwrite) if compute_pam50 else pd.DataFrame()
+
+    available_features: List[str] = ["tfx"]
+    if shortlist_scores is not None and not shortlist_scores.empty:
+        for shortlist_name, display_name in _PFIZER_SHORTLIST_LABEL_MAP.items():
+            if shortlist_name not in shortlist_scores.index:
+                continue
+            sample_df[display_name] = pd.to_numeric(
+                shortlist_scores.loc[shortlist_name].reindex(sample_df.index),
+                errors="coerce",
+            )
+            available_features.append(display_name)
+
+    if hallmark_scores is not None and not hallmark_scores.empty:
+        for hallmark_name in _PFIZER_BASELINE_HALLMARKS:
+            if hallmark_name not in hallmark_scores.index:
+                continue
+            sample_df[hallmark_name] = pd.to_numeric(
+                hallmark_scores.loc[hallmark_name].reindex(sample_df.index),
+                errors="coerce",
+            )
+            available_features.append(hallmark_name)
+
+    expression_genes = list(dict.fromkeys(
+        _PFIZER_BASELINE_EXPRESSION_GENES
+        + _PFIZER_AR_GENE_PANEL
+        + _PFIZER_NE_GENE_PANEL
+        + _PFIZER_CELL_CYCLE_GENE_PANEL
+        + _PFIZER_PRC2_GENE_PANEL
+        + _PFIZER_EZH2_REPRESSION_TARGET_GENES
+        + _PFIZER_EZH2_ACTIVITY_GENES
+    ))
+    for gene_name in expression_genes:
+        if gene_name not in pred_subset.index:
+            continue
+        sample_df[gene_name] = pd.to_numeric(
+            pred_subset.loc[gene_name].reindex(sample_df.index),
+            errors="coerce",
+        )
+        available_features.append(gene_name)
+
+    available_ezh2_target_genes = [
+        gene_name for gene_name in _PFIZER_EZH2_REPRESSION_TARGET_GENES if gene_name in pred_subset.index
+    ]
+    if available_ezh2_target_genes:
+        ezh2_target_score = compute_geneset_score(pred_subset[sample_df.index], available_ezh2_target_genes)
+        sample_df[_PFIZER_PRIMARY_PD_FEATURE] = pd.to_numeric(
+            ezh2_target_score.reindex(sample_df.index),
+            errors="coerce",
+        )
+        available_features.append(_PFIZER_PRIMARY_PD_FEATURE)
+    else:
+        sample_df[_PFIZER_PRIMARY_PD_FEATURE] = np.nan
+
+    available_ezh2_activity_genes = [
+        gene_name for gene_name in _PFIZER_EZH2_ACTIVITY_GENES if gene_name in pred_subset.index
+    ]
+    if available_ezh2_activity_genes:
+        ezh2_activity_score = compute_geneset_score(pred_subset[sample_df.index], available_ezh2_activity_genes)
+        sample_df[_PFIZER_EZH2_ACTIVITY_SCORE] = pd.to_numeric(
+            ezh2_activity_score.reindex(sample_df.index),
+            errors="coerce",
+        )
+        available_features.append(_PFIZER_EZH2_ACTIVITY_SCORE)
+    else:
+        sample_df[_PFIZER_EZH2_ACTIVITY_SCORE] = np.nan
+
+    available_prc2_genes = [gene for gene in _PFIZER_EXPLORATORY_PRC2_TARGET_GENES if gene in pred_subset.index]
+    prc2_score_name = "PRC2 target derepression score (exploratory)"
+    if available_prc2_genes:
+        prc2_score = compute_geneset_score(pred_subset[sample_df.index], available_prc2_genes)
+        sample_df[prc2_score_name] = pd.to_numeric(prc2_score.reindex(sample_df.index), errors="coerce")
+        available_features.append(prc2_score_name)
+    else:
+        sample_df[prc2_score_name] = np.nan
+
+    if not pam50_df.empty:
+        sample_df["PAM50 subtype"] = pam50_df["predicted_subtype"].reindex(sample_df.index)
+        score_columns = _pam50_primary_score_columns(pam50_df.columns)
+        for score_column in score_columns:
+            renamed = f"PAM50 {score_column}"
+            sample_df[renamed] = pd.to_numeric(pam50_df[score_column].reindex(sample_df.index), errors="coerce")
+
+    sample_df = sample_df.sort_values(["patient_id", "visit_order", "days_from_scn", "sample_id"])
+    available_features = list(dict.fromkeys(available_features))
+
+    pd.DataFrame(
+        {
+            "feature": available_features,
+            "present_in_sample_table": [feature in sample_df.columns for feature in available_features],
+        }
+    ).to_csv(
+        os.path.join(pfizer_out, "feature_inventory.tsv"),
+        sep="\t",
+        index=False,
+    )
+    pd.DataFrame({
+        "gene": _PFIZER_EXPLORATORY_PRC2_TARGET_GENES,
+        "present_in_predictions": [gene in pred_subset.index for gene in _PFIZER_EXPLORATORY_PRC2_TARGET_GENES],
+    }).to_csv(
+        os.path.join(pfizer_out, "exploratory_prc2_target_genes.tsv"),
+        sep="\t",
+        index=False,
+    )
+    sample_df.to_csv(os.path.join(pfizer_out, "sample_level_features.tsv"), sep="\t")
+    return sample_df, available_features
+
+
+def _pfizer_v2_build_patient_feature_table(
+    sample_df: pd.DataFrame,
+    feature_columns: Sequence[str],
+) -> pd.DataFrame:
+    """Pivot sample-level Pfizer features into one patient-level wide table."""
+    patient_meta = _pfizer_v2_patient_metadata(sample_df)
+    if patient_meta.empty:
+        return pd.DataFrame()
+
+    ordered = sample_df.sort_values(["patient_id", "visit_order", "days_from_scn", "sample_id"])
+    rows: List[Dict[str, Any]] = []
+    for patient_id, patient_rows in ordered.groupby("patient_id"):
+        row = patient_meta.loc[patient_id].to_dict()
+        row["patient_id"] = patient_id
+        for visit_name in _PFIZER_VISIT_ORDER:
+            visit_rows = patient_rows.loc[patient_rows["visit"].astype(str) == visit_name]
+            if visit_rows.empty:
+                continue
+            visit_row = visit_rows.iloc[0]
+            row[f"days_from_scn__{visit_name}"] = pd.to_numeric(
+                pd.Series([visit_row["days_from_scn"]]), errors="coerce"
+            ).iloc[0]
+            for feature_name in feature_columns:
+                if feature_name not in visit_row.index:
+                    continue
+                row[f"{feature_name}__{visit_name}"] = pd.to_numeric(
+                    pd.Series([visit_row[feature_name]]), errors="coerce"
+                ).iloc[0]
+
+        for feature_name in feature_columns:
+            scn_value = row.get(f"{feature_name}__SCN", np.nan)
+            c3d1_value = row.get(f"{feature_name}__C3D1", np.nan)
+            eot_value = row.get(f"{feature_name}__EOT", np.nan)
+            row[f"{feature_name}__baseline_value"] = scn_value
+            row[f"{feature_name}__c3d1_delta"] = (
+                float(c3d1_value - scn_value)
+                if np.isfinite(scn_value) and np.isfinite(c3d1_value)
+                else np.nan
+            )
+            row[f"{feature_name}__eot_delta"] = (
+                float(eot_value - scn_value)
+                if np.isfinite(scn_value) and np.isfinite(eot_value)
+                else np.nan
+            )
+            row[f"{feature_name}__eot_from_c3d1_delta"] = (
+                float(eot_value - c3d1_value)
+                if np.isfinite(c3d1_value) and np.isfinite(eot_value)
+                else np.nan
+            )
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).set_index("patient_id")
+
+
+def _pfizer_v2_build_delta_frame(
+    patient_df: pd.DataFrame,
+    feature_columns: Sequence[str],
+    *,
+    start_visit: str,
+    end_visit: str,
+    delta_column_name: str,
+) -> pd.DataFrame:
+    """Create a patient-level delta table between two visits."""
+    rows: List[Dict[str, Any]] = []
+    meta_columns = [
+        "arm",
+        "effective_dose_group",
+        "dose",
+        "dose_mg",
+        "enza_history",
+        "fed_status",
+        "response_4class",
+        "progression_binary",
+        "clinical_benefit_strict",
+        "clinical_benefit_broad",
+        "days_from_scn_EOT",
+    ]
+    for patient_id, patient_row in patient_df.iterrows():
+        row: Dict[str, Any] = {"patient_id": patient_id}
+        for meta_column in meta_columns:
+            if meta_column in patient_row.index:
+                row[meta_column] = patient_row[meta_column]
+        row["baseline_tfx"] = pd.to_numeric(
+            pd.Series([patient_row.get(f"tfx__{start_visit}", np.nan)]),
+            errors="coerce",
+        ).iloc[0]
+        row["end_tfx"] = pd.to_numeric(
+            pd.Series([patient_row.get(f"tfx__{end_visit}", np.nan)]),
+            errors="coerce",
+        ).iloc[0]
+        row["delta_tfx"] = (
+            float(row["end_tfx"] - row["baseline_tfx"])
+            if np.isfinite(row["baseline_tfx"]) and np.isfinite(row["end_tfx"])
+            else np.nan
+        )
+        complete_any = False
+        for feature_name in feature_columns:
+            start_val = pd.to_numeric(pd.Series([patient_row.get(f"{feature_name}__{start_visit}", np.nan)]), errors="coerce").iloc[0]
+            end_val = pd.to_numeric(pd.Series([patient_row.get(f"{feature_name}__{end_visit}", np.nan)]), errors="coerce").iloc[0]
+            if np.isfinite(start_val) and np.isfinite(end_val):
+                row[feature_name] = float(end_val - start_val)
+                complete_any = True
+            else:
+                row[feature_name] = np.nan
+        if complete_any:
+            rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    delta_df = pd.DataFrame(rows).set_index("patient_id")
+    delta_df.attrs["delta_column_name"] = delta_column_name
+    return delta_df
+
+
+def _pfizer_v2_two_group_stats(
+    data_df: pd.DataFrame,
+    feature_columns: Sequence[str],
+    *,
+    group_column: str,
+    group_a: str,
+    group_b: str,
+    comparison_name: str,
+) -> pd.DataFrame:
+    """Summarize a two-group baseline or delta comparison across many features."""
+    from scipy.stats import mannwhitneyu
+
+    rows: List[Dict[str, Any]] = []
+    for feature_name in feature_columns:
+        if feature_name not in data_df.columns or group_column not in data_df.columns:
+            continue
+        working = data_df[[feature_name, group_column]].dropna().copy()
+        if working.empty:
+            continue
+        vals_a = working.loc[working[group_column].astype(str) == group_a, feature_name].astype(float).values
+        vals_b = working.loc[working[group_column].astype(str) == group_b, feature_name].astype(float).values
+        if vals_a.size == 0 or vals_b.size == 0:
+            continue
+
+        p_value = float(mannwhitneyu(vals_a, vals_b, alternative="two-sided").pvalue)
+        median_a = float(np.median(vals_a))
+        median_b = float(np.median(vals_b))
+        diff_samples = np.asarray([
+            np.median(np.random.default_rng(42 + idx).choice(vals_b, size=vals_b.size, replace=True))
+            - np.median(np.random.default_rng(1042 + idx).choice(vals_a, size=vals_a.size, replace=True))
+            for idx in range(500)
+        ], dtype=float)
+        rows.append(
+            {
+                "comparison": comparison_name,
+                "feature": feature_name,
+                "group_a": group_a,
+                "group_b": group_b,
+                "n_group_a": int(vals_a.size),
+                "n_group_b": int(vals_b.size),
+                "median_group_a": median_a,
+                "median_group_b": median_b,
+                "median_difference_group_b_minus_group_a": float(median_b - median_a),
+                "median_difference_ci_lo": float(np.percentile(diff_samples, 2.5)),
+                "median_difference_ci_hi": float(np.percentile(diff_samples, 97.5)),
+                "rank_biserial_group_b_minus_group_a": _pfizer_v2_rank_biserial(vals_a, vals_b),
+                "cohens_d_group_b_minus_group_a": _pfizer_v2_cohens_d(vals_a, vals_b),
+                "p_value": p_value,
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    result_df = pd.DataFrame(rows)
+    result_df["fdr"] = _pfizer_v2_bh_fdr(result_df["p_value"])
+    return result_df.sort_values(["p_value", "feature"]).reset_index(drop=True)
+
+
+def _pfizer_v2_paired_delta_stats(
+    delta_df: pd.DataFrame,
+    feature_columns: Sequence[str],
+    *,
+    comparison_name: str,
+) -> pd.DataFrame:
+    """Summarize paired delta distributions across many features."""
+    from scipy.stats import wilcoxon
+
+    rows: List[Dict[str, Any]] = []
+    for feature_name in feature_columns:
+        if feature_name not in delta_df.columns:
+            continue
+        values = pd.to_numeric(delta_df[feature_name], errors="coerce").dropna().values.astype(float)
+        if values.size == 0:
+            continue
+        q1, q3 = np.percentile(values, [25, 75]) if values.size >= 2 else (values[0], values[0])
+        try:
+            p_value = float(wilcoxon(values, zero_method="wilcox", alternative="two-sided").pvalue)
+        except ValueError:
+            p_value = np.nan
+        ci_lo, ci_hi = _pfizer_v2_bootstrap_ci(values, statistic="median")
+        rows.append(
+            {
+                "comparison": comparison_name,
+                "feature": feature_name,
+                "n": int(values.size),
+                "median_delta": float(np.median(values)),
+                "median_delta_ci_lo": ci_lo,
+                "median_delta_ci_hi": ci_hi,
+                "iqr_delta_lo": float(q1),
+                "iqr_delta_hi": float(q3),
+                "mean_delta": float(np.mean(values)),
+                "n_increasing": int(np.sum(values > 0.0)),
+                "n_decreasing": int(np.sum(values < 0.0)),
+                "signed_rank_biserial": _pfizer_v2_signed_rank_biserial(values),
+                "p_value": p_value,
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    result_df = pd.DataFrame(rows)
+    result_df["fdr"] = _pfizer_v2_bh_fdr(result_df["p_value"])
+    return result_df.sort_values(["p_value", "feature"]).reset_index(drop=True)
+
+
+def _pfizer_v2_add_composite_scores(
+    delta_df: pd.DataFrame,
+    *,
+    out_path: str,
+) -> pd.DataFrame:
+    """Add the prespecified C3D1 pharmacodynamic composite score(s) to a delta table."""
+    working = delta_df.copy()
+    component_records: List[Dict[str, Any]] = []
+    z_components: Dict[str, pd.Series] = {}
+    for feature_name, weight in _PFIZER_COMPOSITE_COMPONENTS:
+        if feature_name not in working.columns:
+            continue
+        values = pd.to_numeric(working[feature_name], errors="coerce")
+        mean_val = float(values.mean(skipna=True))
+        std_val = float(values.std(skipna=True, ddof=0))
+        if not np.isfinite(std_val) or std_val <= 0.0:
+            z_values = pd.Series(np.nan, index=values.index, dtype=float)
+        else:
+            z_values = (values - mean_val) / std_val
+        z_components[feature_name] = z_values
+        component_records.append(
+            {
+                "feature": feature_name,
+                "weight": float(weight),
+                "mean": mean_val,
+                "sd": std_val,
+                "included_in_primary": feature_name == "PRC2 target derepression score (exploratory)" or feature_name in dict(_PFIZER_COMPOSITE_COMPONENTS_NOPRC2),
+            }
+        )
+
+    if z_components:
+        primary_sum = pd.Series(0.0, index=working.index, dtype=float)
+        primary_count = pd.Series(0, index=working.index, dtype=int)
+        for feature_name, weight in _PFIZER_COMPOSITE_COMPONENTS:
+            z_values = z_components.get(feature_name)
+            if z_values is None:
+                continue
+            valid = z_values.notna()
+            primary_sum.loc[valid] = primary_sum.loc[valid] + (weight * z_values.loc[valid])
+            primary_count.loc[valid] = primary_count.loc[valid] + 1
+        working["C3D1 PD Response Score"] = primary_sum.where(primary_count > 0, np.nan)
+
+        secondary_sum = pd.Series(0.0, index=working.index, dtype=float)
+        secondary_count = pd.Series(0, index=working.index, dtype=int)
+        for feature_name, weight in _PFIZER_COMPOSITE_COMPONENTS_NOPRC2:
+            z_values = z_components.get(feature_name)
+            if z_values is None:
+                continue
+            valid = z_values.notna()
+            secondary_sum.loc[valid] = secondary_sum.loc[valid] + (weight * z_values.loc[valid])
+            secondary_count.loc[valid] = secondary_count.loc[valid] + 1
+        working["C3D1 PD Response Score noPRC2"] = secondary_sum.where(secondary_count > 0, np.nan)
+
+    pd.DataFrame(component_records).to_csv(out_path, sep="\t", index=False)
+    return working
+
+
+def _pfizer_v2_plot_stacked_bar(
+    patient_df: pd.DataFrame,
+    *,
+    group_column: str,
+    fill_column: str,
+    out_path: str,
+    title: str,
+) -> None:
+    """Plot a stacked bar summary for one Pfizer metadata grouping."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if group_column not in patient_df.columns or fill_column not in patient_df.columns:
+        return
+    working = patient_df[[group_column, fill_column]].dropna().copy()
+    if working.empty:
+        return
+
+    group_levels = _pfizer_v2_preferred_levels(group_column) or sorted(working[group_column].astype(str).unique().tolist())
+    fill_levels = _pfizer_v2_preferred_levels(fill_column) or sorted(working[fill_column].astype(str).unique().tolist())
+    tab = pd.crosstab(working[group_column].astype(str), working[fill_column].astype(str))
+    tab = tab.reindex(index=[level for level in group_levels if level in tab.index], fill_value=0)
+    tab = tab.reindex(columns=[level for level in fill_levels if level in tab.columns], fill_value=0)
+    if tab.empty:
+        return
+
+    fill_colors = _pfizer_v2_color_map(fill_column, tab.columns.tolist())
+    fig, ax = plt.subplots(figsize=(max(6.0, 1.2 * len(tab.index)), 4.8))
+    bottoms = np.zeros(len(tab.index), dtype=float)
+    x_positions = np.arange(len(tab.index), dtype=float)
+    for level in tab.columns:
+        vals = tab[level].astype(float).values
+        ax.bar(
+            x_positions,
+            vals,
+            bottom=bottoms,
+            width=0.75,
+            color=fill_colors.get(level, "#999999"),
+            edgecolor="black",
+            linewidth=0.6,
+            label=level,
+        )
+        bottoms = bottoms + vals
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(tab.index.tolist(), rotation=25, ha="right")
+    ax.set_ylabel("Patients")
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.legend(title=fill_column.replace("_", " "), fontsize=8, loc="best")
+    fig.tight_layout()
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_alluvial(
+    patient_df: pd.DataFrame,
+    *,
+    stage_columns: Sequence[str],
+    out_path: str,
+    title: str,
+) -> None:
+    """Draw a lightweight alluvial-style flow plot across ordered metadata stages."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+
+    if len(stage_columns) < 2:
+        return
+    working = patient_df[list(stage_columns)].dropna().copy()
+    if working.empty:
+        return
+
+    stage_levels: Dict[str, List[str]] = {}
+    stage_counts: Dict[str, pd.Series] = {}
+    stage_positions: Dict[str, Dict[str, Tuple[float, float]]] = {}
+    for stage_column in stage_columns:
+        levels = _pfizer_v2_preferred_levels(stage_column) or sorted(working[stage_column].astype(str).unique().tolist())
+        counts = working[stage_column].astype(str).value_counts().reindex(levels).dropna()
+        counts = counts.loc[counts > 0]
+        if counts.empty:
+            return
+        stage_levels[stage_column] = counts.index.tolist()
+        stage_counts[stage_column] = counts
+
+        current_y = 0.0
+        stage_positions[stage_column] = {}
+        for level, count in counts.items():
+            next_y = current_y + float(count)
+            stage_positions[stage_column][level] = (current_y, next_y)
+            current_y = next_y
+
+    max_height = max(float(counts.sum()) for counts in stage_counts.values())
+    fig, ax = plt.subplots(figsize=(10.5, 6.2))
+    x_positions = np.arange(len(stage_columns), dtype=float)
+    width = 0.18
+    line_scale = 6.0 / max(max_height, 1.0)
+
+    for stage_idx, stage_column in enumerate(stage_columns):
+        color_map = _pfizer_v2_color_map(stage_column, stage_levels[stage_column])
+        for level in stage_levels[stage_column]:
+            y0, y1 = stage_positions[stage_column][level]
+            rect = Rectangle(
+                (x_positions[stage_idx] - width / 2.0, y0),
+                width,
+                y1 - y0,
+                facecolor=color_map.get(level, "#BBBBBB"),
+                edgecolor="black",
+                linewidth=0.7,
+                alpha=0.85,
+            )
+            ax.add_patch(rect)
+            ax.text(
+                x_positions[stage_idx],
+                0.5 * (y0 + y1),
+                level,
+                ha="center",
+                va="center",
+                fontsize=8,
+                rotation=90,
+            )
+
+    for left_stage, right_stage in zip(stage_columns[:-1], stage_columns[1:]):
+        flow_counts = pd.crosstab(working[left_stage].astype(str), working[right_stage].astype(str))
+        left_offsets = {level: stage_positions[left_stage][level][0] for level in stage_levels[left_stage]}
+        right_offsets = {level: stage_positions[right_stage][level][0] for level in stage_levels[right_stage]}
+        right_colors = _pfizer_v2_color_map(right_stage, stage_levels[right_stage])
+        left_x = float(x_positions[list(stage_columns).index(left_stage)] + width / 2.0)
+        right_x = float(x_positions[list(stage_columns).index(right_stage)] - width / 2.0)
+        for left_level in stage_levels[left_stage]:
+            if left_level not in flow_counts.index:
+                continue
+            for right_level in stage_levels[right_stage]:
+                if right_level not in flow_counts.columns:
+                    continue
+                count = float(flow_counts.loc[left_level, right_level])
+                if count <= 0.0:
+                    continue
+                left_center = left_offsets[left_level] + 0.5 * count
+                right_center = right_offsets[right_level] + 0.5 * count
+                ax.plot(
+                    [left_x, right_x],
+                    [left_center, right_center],
+                    color=right_colors.get(right_level, "#999999"),
+                    alpha=0.35,
+                    linewidth=max(1.0, count * line_scale),
+                    solid_capstyle="round",
+                    zorder=0,
+                )
+                left_offsets[left_level] = left_offsets[left_level] + count
+                right_offsets[right_level] = right_offsets[right_level] + count
+
+    ax.set_xlim(x_positions[0] - 0.5, x_positions[-1] + 0.5)
+    ax.set_ylim(0.0, max_height)
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels([column.replace("_", " ") for column in stage_columns])
+    ax.set_yticks([])
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.tight_layout()
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_eot_timing(
+    patient_df: pd.DataFrame,
+    *,
+    out_path: str,
+    title: str,
+) -> None:
+    """Plot end-of-treatment timing per patient, faceted by treatment arm."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    working = patient_df.copy()
+    working["days_from_scn_EOT"] = pd.to_numeric(working["days_from_scn_EOT"], errors="coerce")
+    working = working.loc[working["days_from_scn_EOT"].notna()].copy()
+    if working.empty:
+        return
+
+    arm_levels = [level for level in _PFIZER_ARM_ORDER if level in set(working["arm"].astype(str))]
+    if not arm_levels:
+        arm_levels = sorted(working["arm"].astype(str).unique().tolist())
+    fig, axes = plt.subplots(1, len(arm_levels), figsize=(max(7.0, 4.6 * len(arm_levels)), 5.0), sharey=True)
+    if len(arm_levels) == 1:
+        axes = [axes]
+
+    response_colors = _pfizer_v2_color_map("response_4class", _PFIZER_RESPONSE_4CLASS_ORDER)
+    for ax, arm_name in zip(axes, arm_levels):
+        arm_df = working.loc[working["arm"].astype(str) == arm_name].copy()
+        arm_df = arm_df.sort_values(["days_from_scn_EOT", "patient_id"]).reset_index()
+        x_positions = np.arange(len(arm_df), dtype=float)
+        colors = [response_colors.get(str(response), "#999999") for response in arm_df["response_4class"]]
+        ax.scatter(
+            x_positions,
+            arm_df["days_from_scn_EOT"].astype(float).values,
+            c=colors,
+            edgecolor="black",
+            linewidth=0.5,
+            s=58,
+            zorder=3,
+        )
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(arm_df["patient_id"].tolist(), rotation=90, fontsize=8)
+        ax.set_title(arm_name, fontsize=11, fontweight="bold")
+        ax.set_xlabel("Patient ID")
+        ax.grid(axis="y", color="#DDDDDD", linewidth=0.8)
+    axes[0].set_ylabel("Days from SCN at EOT")
+    response_levels_present = [
+        level for level in _PFIZER_RESPONSE_4CLASS_ORDER
+        if level in set(working["response_4class"].astype(str))
+    ]
+    _pfizer_v2_add_dual_legends(
+        axes[-1],
+        color_handles=_pfizer_v2_response_legend_handles(response_levels_present),
+        color_title="Color = response",
+        marker_handles=None,
+    )
+    fig.suptitle(title, fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0.0, 0.0, 0.88, 0.96])
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_annotated_heatmap(
+    matrix_df: pd.DataFrame,
+    annotation_df: pd.DataFrame,
+    *,
+    out_path: str,
+    title: str,
+    zscore_rows: bool = True,
+) -> None:
+    """Render a patient-by-feature heatmap with compact metadata annotation bars."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from matplotlib import gridspec
+    from matplotlib.colors import ListedColormap
+    from matplotlib.patches import Patch
+
+    data = matrix_df.apply(pd.to_numeric, errors="coerce")
+    data = data.loc[data.notna().any(axis=1), data.notna().any(axis=0)]
+    if data.empty:
+        return
+
+    annotation_working = annotation_df.reindex(data.columns).copy()
+    ordered_columns = list(data.columns)
+    if {"response_4class", "arm", "dose"}.issubset(annotation_working.columns):
+        sort_frame = pd.DataFrame(
+            {
+                "response_4class": annotation_working["response_4class"].astype(str),
+                "arm": annotation_working["arm"].astype(str),
+                "dose": annotation_working["dose"].astype(str),
+                "patient_id": ordered_columns,
+            },
+            index=ordered_columns,
+        )
+        ordered_columns = sort_frame.sort_values(["response_4class", "arm", "dose", "patient_id"]).index.tolist()
+        data = data[ordered_columns]
+        annotation_working = annotation_working.reindex(ordered_columns)
+
+    if zscore_rows:
+        row_means = data.mean(axis=1)
+        row_sds = data.std(axis=1, ddof=0).replace(0.0, np.nan)
+        data = data.sub(row_means, axis=0).div(row_sds, axis=0)
+
+    annotation_columns = list(annotation_working.columns)
+    fig = plt.figure(figsize=(max(10.0, 0.52 * data.shape[1] + 2.5), max(6.0, 0.28 * data.shape[0] + 2.4 + 0.35 * len(annotation_columns))))
+    gs = gridspec.GridSpec(
+        len(annotation_columns) + 1,
+        1,
+        height_ratios=[0.28] * len(annotation_columns) + [max(4.5, 0.32 * data.shape[0])],
+        hspace=0.05,
+    )
+
+    legend_handles: List[Patch] = []
+    legend_labels: set[str] = set()
+    for ann_idx, ann_column in enumerate(annotation_columns):
+        ax_ann = fig.add_subplot(gs[ann_idx])
+        series = annotation_working[ann_column]
+        numeric = pd.to_numeric(series, errors="coerce")
+        if numeric.notna().sum() >= max(3, len(series) // 2):
+            values = numeric.values[np.newaxis, :]
+            ax_ann.imshow(values, aspect="auto", cmap="viridis", interpolation="nearest")
+        else:
+            levels = _pfizer_v2_preferred_levels(ann_column) or [level for level in series.astype(str).tolist() if level != "nan"]
+            levels = [level for level in dict.fromkeys(levels) if level in set(series.astype(str))]
+            if not levels:
+                levels = sorted(series.astype(str).unique().tolist())
+            color_map = _pfizer_v2_color_map(ann_column, levels)
+            level_to_idx = {level: idx for idx, level in enumerate(levels)}
+            arr = np.array([[level_to_idx.get(str(value), np.nan) for value in series]], dtype=float)
+            cmap = ListedColormap([color_map.get(level, "#999999") for level in levels])
+            cmap.set_bad("#F2F2F2")
+            ax_ann.imshow(arr, aspect="auto", cmap=cmap, interpolation="nearest", vmin=0, vmax=max(len(levels) - 1, 1))
+            for level in levels:
+                legend_label = f"{ann_column}: {level}"
+                if legend_label in legend_labels:
+                    continue
+                legend_handles.append(Patch(facecolor=color_map.get(level, "#999999"), edgecolor="black", label=legend_label))
+                legend_labels.add(legend_label)
+        ax_ann.set_yticks([0])
+        ax_ann.set_yticklabels([ann_column.replace("_", " ")], fontsize=8)
+        ax_ann.set_xticks([])
+        for spine in ax_ann.spines.values():
+            spine.set_visible(False)
+
+    ax_main = fig.add_subplot(gs[-1])
+    sns.heatmap(
+        data,
+        ax=ax_main,
+        cmap="vlag",
+        linewidths=0.15,
+        linecolor="#F2F2F2",
+        cbar_kws={"label": "Row z-score" if zscore_rows else "Value", "shrink": 0.7},
+    )
+    ax_main.set_xlabel("Patient")
+    ax_main.set_ylabel("Feature")
+    ax_main.set_xticklabels(ax_main.get_xticklabels(), rotation=90, fontsize=8)
+    ax_main.set_yticklabels(ax_main.get_yticklabels(), rotation=0, fontsize=8)
+    ax_main.set_title(title, fontsize=12, fontweight="bold")
+    if legend_handles:
+        ax_main.legend(
+            handles=legend_handles,
+            fontsize=7,
+            loc="upper left",
+            bbox_to_anchor=(1.02, 1.0),
+            frameon=False,
+        )
+    fig.subplots_adjust(
+        left=0.08,
+        right=0.80 if legend_handles else 0.96,
+        top=0.96,
+        bottom=0.08,
+        hspace=0.05,
+    )
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_scatter(
+    data_df: pd.DataFrame,
+    *,
+    x_column: str,
+    y_column: str,
+    out_path: str,
+    title: str,
+    annotate_points: bool = True,
+) -> None:
+    """Plot a baseline Pfizer feature scatter with response color and arm marker."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    required = [x_column, y_column, "response_4class", "arm"]
+    if any(column not in data_df.columns for column in required):
+        return
+    working = data_df[required].copy()
+    if "patient_id" in data_df.columns:
+        working["patient_id"] = data_df["patient_id"]
+    working[x_column] = pd.to_numeric(working[x_column], errors="coerce")
+    working[y_column] = pd.to_numeric(working[y_column], errors="coerce")
+    working = working.dropna(subset=[x_column, y_column])
+    if working.empty:
+        return
+
+    response_colors = _pfizer_v2_color_map("response_4class", _PFIZER_RESPONSE_4CLASS_ORDER)
+    marker_map = {"Enza-only": "o", "EZH2i+Enza": "s"}
+    fig, ax = plt.subplots(figsize=(6.2, 5.2))
+    for _, row in working.iterrows():
+        color = response_colors.get(str(row["response_4class"]), "#999999")
+        marker = marker_map.get(str(row["arm"]), "o")
+        ax.scatter(
+            float(row[x_column]),
+            float(row[y_column]),
+            s=70,
+            color=color,
+            edgecolor="black",
+            linewidth=0.6,
+            marker=marker,
+            alpha=0.9,
+        )
+        if annotate_points and "patient_id" in row.index:
+            ax.text(float(row[x_column]), float(row[y_column]), str(row["patient_id"]), fontsize=7, ha="left", va="bottom")
+    ax.set_xlabel(x_column)
+    ax.set_ylabel(y_column)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.grid(color="#E5E5E5", linewidth=0.8)
+    response_levels_present = [
+        level for level in _PFIZER_RESPONSE_4CLASS_ORDER
+        if level in set(working["response_4class"].astype(str))
+    ]
+    arm_levels_present = [
+        level for level in _PFIZER_ARM_ORDER
+        if level in set(working["arm"].astype(str))
+    ]
+    _pfizer_v2_add_dual_legends(
+        ax,
+        color_handles=_pfizer_v2_response_legend_handles(response_levels_present),
+        color_title="Color = response",
+        marker_handles=[
+            handle for handle in _pfizer_v2_arm_marker_legend_handles()
+            if handle.get_label() in arm_levels_present
+        ],
+        marker_title="Marker = arm",
+    )
+    fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_group_box(
+    data_df: pd.DataFrame,
+    *,
+    feature_name: str,
+    group_column: str,
+    out_path: str,
+    title: str,
+    y_label: Optional[str] = None,
+    p_value: Optional[float] = None,
+) -> None:
+    """Plot a grouped boxplot with four-class response-colored patient jitter."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if feature_name not in data_df.columns or group_column not in data_df.columns:
+        return
+    working = data_df[[feature_name, group_column, "response_4class"]].copy()
+    if "arm" in data_df.columns:
+        working["arm"] = data_df["arm"]
+    working[feature_name] = pd.to_numeric(working[feature_name], errors="coerce")
+    working = working.dropna(subset=[feature_name, group_column])
+    if working.empty:
+        return
+
+    group_levels = _pfizer_v2_preferred_levels(group_column) or sorted(working[group_column].astype(str).unique().tolist())
+    group_levels = [level for level in group_levels if level in set(working[group_column].astype(str))]
+    if len(group_levels) < 1:
+        return
+    group_colors = _pfizer_v2_color_map(group_column, group_levels)
+    response_colors = _pfizer_v2_color_map("response_4class", _PFIZER_RESPONSE_4CLASS_ORDER)
+    marker_map = {"Enza-only": "o", "EZH2i+Enza": "s"}
+
+    grouped_values = [
+        working.loc[working[group_column].astype(str) == level, feature_name].astype(float).values
+        for level in group_levels
+    ]
+    if sum(len(vals) > 0 for vals in grouped_values) < 1:
+        return
+
+    fig, ax = plt.subplots(figsize=(max(5.2, 1.45 * len(group_levels)), 4.8))
+    bp = ax.boxplot(
+        grouped_values,
+        positions=np.arange(len(group_levels), dtype=float),
+        widths=0.55,
+        patch_artist=True,
+        showfliers=False,
+        medianprops=dict(color="black", linewidth=1.5),
+    )
+    for patch, level in zip(bp["boxes"], group_levels):
+        patch.set_facecolor(group_colors.get(level, "#BBBBBB"))
+        patch.set_alpha(0.45)
+        patch.set_edgecolor("black")
+
+    rng = np.random.default_rng(42)
+    for pos, level in enumerate(group_levels):
+        group_rows = working.loc[working[group_column].astype(str) == level]
+        if group_rows.empty:
+            continue
+        jitter = rng.uniform(-0.12, 0.12, size=len(group_rows))
+        for offset, (_, row) in zip(jitter, group_rows.iterrows()):
+            ax.scatter(
+                float(pos + offset),
+                float(row[feature_name]),
+                color=response_colors.get(str(row["response_4class"]), "#999999"),
+                edgecolor="black",
+                linewidth=0.5,
+                marker=marker_map.get(str(row.get("arm", "Enza-only")), "o"),
+                s=46,
+                alpha=0.9,
+                zorder=3,
+            )
+
+    if p_value is not None and np.isfinite(p_value) and len(group_levels) == 2:
+        y_min, y_max = ax.get_ylim()
+        y_range = max(y_max - y_min, 1e-6)
+        y_ann = float(np.nanmax(working[feature_name])) + 0.10 * y_range
+        cap_y = 0.02 * y_range
+        ax.plot([0, 0, 1, 1], [y_ann - cap_y, y_ann, y_ann, y_ann - cap_y], color="black", linewidth=1.0)
+        ax.text(0.5, y_ann + 0.01 * y_range, format_pval(float(p_value)), ha="center", va="bottom", fontsize=8)
+        ax.set_ylim(y_min, max(y_max, y_ann + 0.10 * y_range))
+
+    ax.set_xticks(np.arange(len(group_levels), dtype=float))
+    ax.set_xticklabels(group_levels, rotation=20, ha="right")
+    ax.set_ylabel(y_label or feature_name)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    response_levels_present = [
+        level for level in _PFIZER_RESPONSE_4CLASS_ORDER
+        if level in set(working["response_4class"].astype(str))
+    ]
+    arm_levels_present = []
+    if "arm" in working.columns:
+        arm_levels_present = [
+            level for level in _PFIZER_ARM_ORDER
+            if level in set(working["arm"].astype(str))
+        ]
+    _pfizer_v2_add_dual_legends(
+        ax,
+        color_handles=_pfizer_v2_response_legend_handles(response_levels_present),
+        color_title="Point color = response",
+        marker_handles=[
+            handle for handle in _pfizer_v2_arm_marker_legend_handles()
+            if handle.get_label() in arm_levels_present
+        ],
+        marker_title="Point marker = arm",
+    )
+    fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_trajectory(
+    sample_df: pd.DataFrame,
+    *,
+    feature_name: str,
+    out_path: str,
+    title: str,
+    visit_order: Sequence[str],
+    facet_by_arm: bool = False,
+) -> None:
+    """Plot per-patient trajectories across ordered Pfizer visits."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if feature_name not in sample_df.columns:
+        return
+    working = sample_df[["patient_id", "visit", "arm", "response_4class", feature_name]].copy()
+    working[feature_name] = pd.to_numeric(working[feature_name], errors="coerce")
+    working = working.loc[working[feature_name].notna()].copy()
+    working = working.loc[working["visit"].astype(str).isin(list(visit_order))].copy()
+    if working.empty:
+        return
+
+    response_colors = _pfizer_v2_color_map("response_4class", _PFIZER_RESPONSE_4CLASS_ORDER)
+    arm_levels = [level for level in _PFIZER_ARM_ORDER if level in set(working["arm"].astype(str))]
+    if not arm_levels:
+        arm_levels = sorted(working["arm"].astype(str).unique().tolist())
+    facets = arm_levels if facet_by_arm else ["all"]
+    fig, axes = plt.subplots(1, len(facets), figsize=(max(6.0, 5.0 * len(facets)), 4.8), sharey=True)
+    if len(facets) == 1:
+        axes = [axes]
+
+    visit_to_x = {visit: idx for idx, visit in enumerate(visit_order)}
+    working["visit_rank"] = working["visit"].astype(str).map(visit_to_x)
+    for ax, facet in zip(axes, facets):
+        facet_df = working if facet == "all" else working.loc[working["arm"].astype(str) == facet].copy()
+        for patient_id, patient_rows in facet_df.groupby("patient_id"):
+            patient_rows = patient_rows.sort_values("visit_rank")
+            x_vals = [visit_to_x[str(visit)] for visit in patient_rows["visit"].astype(str)]
+            y_vals = patient_rows[feature_name].astype(float).tolist()
+            color = response_colors.get(str(patient_rows["response_4class"].iloc[0]), "#999999")
+            visit_ranks = patient_rows["visit_rank"].astype(int).tolist()
+            if len(x_vals) > 1:
+                for idx in range(len(x_vals) - 1):
+                    if visit_ranks[idx + 1] - visit_ranks[idx] != 1:
+                        continue
+                    ax.plot(
+                        x_vals[idx:idx + 2],
+                        y_vals[idx:idx + 2],
+                        color=color,
+                        linewidth=1.3,
+                        alpha=0.6,
+                        zorder=1,
+                    )
+            for visit_name, x_val, y_val in zip(patient_rows["visit"].astype(str), x_vals, y_vals):
+                ax.scatter(
+                    x_val,
+                    y_val,
+                    color=color,
+                    edgecolor="black",
+                    linewidth=0.5,
+                    marker=_PFIZER_VISIT_MARKER_MAP.get(visit_name, "o"),
+                    s=45,
+                    zorder=3,
+                )
+        ax.set_xticks(list(visit_to_x.values()))
+        ax.set_xticklabels(list(visit_order))
+        ax.set_xlabel("Visit")
+        if facet != "all":
+            ax.set_title(facet, fontsize=10, fontweight="bold")
+        ax.grid(axis="y", color="#E5E5E5", linewidth=0.8)
+    axes[0].set_ylabel(feature_name)
+    response_levels_present = [
+        level for level in _PFIZER_RESPONSE_4CLASS_ORDER
+        if level in set(working["response_4class"].astype(str))
+    ]
+    _pfizer_v2_add_dual_legends(
+        axes[-1],
+        color_handles=_pfizer_v2_response_legend_handles(response_levels_present),
+        color_title="Color = response",
+        marker_handles=_pfizer_v2_visit_marker_legend_handles(visit_order),
+        marker_title="Marker = visit",
+    )
+    fig.suptitle(title, fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0.0, 0.0, 0.86, 0.96])
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_waterfall(
+    delta_df: pd.DataFrame,
+    *,
+    feature_name: str,
+    out_path: str,
+    title: str,
+    y_label: str,
+) -> None:
+    """Plot a patient-ordered waterfall chart for one delta feature."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if feature_name not in delta_df.columns:
+        return
+    working = delta_df[[feature_name, "response_4class", "arm"]].copy()
+    working[feature_name] = pd.to_numeric(working[feature_name], errors="coerce")
+    working = working.dropna(subset=[feature_name])
+    if working.empty:
+        return
+    working = working.sort_values(feature_name, ascending=False)
+
+    response_colors = _pfizer_v2_color_map("response_4class", _PFIZER_RESPONSE_4CLASS_ORDER)
+    marker_map = {"Enza-only": "o", "EZH2i+Enza": "s"}
+    x_positions = np.arange(len(working), dtype=float)
+    bar_colors = [response_colors.get(str(response), "#999999") for response in working["response_4class"]]
+
+    fig, ax = plt.subplots(figsize=(max(7.0, 0.48 * len(working) + 2.0), 4.8))
+    ax.bar(x_positions, working[feature_name].astype(float).values, color=bar_colors, edgecolor="black", linewidth=0.5)
+    for x_pos, (_, row) in zip(x_positions, working.iterrows()):
+        ax.scatter(
+            x_pos,
+            float(row[feature_name]),
+            marker=marker_map.get(str(row["arm"]), "o"),
+            color="white",
+            edgecolor="black",
+            linewidth=0.8,
+            s=42,
+            zorder=4,
+        )
+    ax.axhline(0.0, color="#888888", linestyle="--", linewidth=1.0)
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(working.index.tolist(), rotation=90, fontsize=8)
+    ax.set_xlabel("Patient ID")
+    ax.set_ylabel(y_label)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    response_levels_present = [
+        level for level in _PFIZER_RESPONSE_4CLASS_ORDER
+        if level in set(working["response_4class"].astype(str))
+    ]
+    arm_levels_present = [
+        level for level in _PFIZER_ARM_ORDER
+        if level in set(working["arm"].astype(str))
+    ]
+    _pfizer_v2_add_dual_legends(
+        ax,
+        color_handles=_pfizer_v2_response_legend_handles(response_levels_present),
+        color_title="Bar color = response",
+        marker_handles=[
+            handle for handle in _pfizer_v2_arm_marker_legend_handles()
+            if handle.get_label() in arm_levels_present
+        ],
+        marker_title="Overlay marker = arm",
+    )
+    fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_effect_forest(
+    stats_df: pd.DataFrame,
+    *,
+    effect_column: str,
+    lower_column: str,
+    upper_column: str,
+    out_path: str,
+    title: str,
+) -> None:
+    """Plot a generic horizontal effect-size forest plot."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    required = {"feature", effect_column, lower_column, upper_column}
+    if stats_df.empty or not required.issubset(stats_df.columns):
+        return
+    working = stats_df[["feature", effect_column, lower_column, upper_column, "fdr", "p_value"]].copy()
+    working = working.dropna(subset=[effect_column]).sort_values(effect_column)
+    if working.empty:
+        return
+
+    fig_h = max(4.0, 0.34 * len(working) + 1.8)
+    fig, ax = plt.subplots(figsize=(8.4, fig_h))
+    y_pos = np.arange(len(working), dtype=float)
+    sig_mask = pd.to_numeric(working["fdr"], errors="coerce") < 0.10
+    colors = ["#B63A3A" if sig else "#666666" for sig in sig_mask.fillna(False)]
+    for idx, (_, row) in enumerate(working.iterrows()):
+        ax.plot(
+            [float(row[lower_column]), float(row[upper_column])],
+            [y_pos[idx], y_pos[idx]],
+            color=colors[idx],
+            linewidth=1.6,
+        )
+        ax.scatter(float(row[effect_column]), y_pos[idx], color=colors[idx], edgecolor="black", linewidth=0.5, s=52, zorder=3)
+    ax.axvline(0.0, color="#999999", linestyle="--", linewidth=1.0)
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(working["feature"].tolist(), fontsize=8)
+    ax.set_xlabel(effect_column.replace("_", " "))
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_pam50_tile(
+    sample_df: pd.DataFrame,
+    *,
+    out_path: str,
+    title: str,
+) -> None:
+    """Plot a patient-by-visit PAM50 subtype tile map."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import ListedColormap
+
+    if "PAM50 subtype" not in sample_df.columns:
+        return
+    working = sample_df[["patient_id", "visit", "PAM50 subtype"]].dropna().copy()
+    if working.empty:
+        return
+    subtype_levels = sorted(working["PAM50 subtype"].astype(str).unique().tolist())
+    patient_levels = sorted(working["patient_id"].astype(str).unique().tolist())
+    value_to_idx = {level: idx for idx, level in enumerate(subtype_levels)}
+    matrix = np.full((len(patient_levels), len(_PFIZER_VISIT_ORDER)), np.nan, dtype=float)
+    for _, row in working.iterrows():
+        patient_idx = patient_levels.index(str(row["patient_id"]))
+        visit_idx = _PFIZER_VISIT_ORDER.index(str(row["visit"]))
+        matrix[patient_idx, visit_idx] = value_to_idx.get(str(row["PAM50 subtype"]), np.nan)
+
+    color_map = _pfizer_v2_color_map("PAM50 subtype", subtype_levels)
+    cmap = ListedColormap([color_map[level] for level in subtype_levels])
+    cmap.set_bad("#F0F0F0")
+    fig, ax = plt.subplots(figsize=(6.2, max(4.5, 0.36 * len(patient_levels) + 1.8)))
+    im = ax.imshow(matrix, aspect="auto", cmap=cmap, interpolation="nearest", vmin=0, vmax=max(len(subtype_levels) - 1, 1))
+    del im
+    ax.set_xticks(np.arange(len(_PFIZER_VISIT_ORDER), dtype=float))
+    ax.set_xticklabels(_PFIZER_VISIT_ORDER)
+    ax.set_yticks(np.arange(len(patient_levels), dtype=float))
+    ax.set_yticklabels(patient_levels, fontsize=8)
+    ax.set_xlabel("Visit")
+    ax.set_ylabel("Patient")
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    from matplotlib.patches import Patch
+    legend_handles = [
+        Patch(facecolor=color_map[level], edgecolor="black", label=level)
+        for level in subtype_levels
+    ]
+    ax.legend(
+        handles=legend_handles,
+        title="Tile color = PAM50 subtype",
+        fontsize=8,
+        title_fontsize=8,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        frameon=False,
+    )
+    fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_embedding(
+    embedding_df: pd.DataFrame,
+    *,
+    x_column: str,
+    y_column: str,
+    color_column: str,
+    out_path: str,
+    title: str,
+    continuous_color: bool = False,
+) -> None:
+    """Plot a PCA or UMAP embedding with patient trajectories."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    required = {x_column, y_column, "patient_id", "visit", color_column}
+    if not required.issubset(embedding_df.columns):
+        return
+    working = embedding_df.copy()
+    working[x_column] = pd.to_numeric(working[x_column], errors="coerce")
+    working[y_column] = pd.to_numeric(working[y_column], errors="coerce")
+    working = working.dropna(subset=[x_column, y_column])
+    if working.empty:
+        return
+
+    fig, ax = plt.subplots(figsize=(6.4, 5.6))
+    if continuous_color:
+        color_values = pd.to_numeric(working[color_column], errors="coerce")
+        scatter = ax.scatter(
+            working[x_column].astype(float),
+            working[y_column].astype(float),
+            c=color_values,
+            cmap="viridis",
+            edgecolor="black",
+            linewidth=0.4,
+            s=58,
+            alpha=0.9,
+        )
+        fig.colorbar(scatter, ax=ax, shrink=0.8, label=color_column)
+    else:
+        color_levels = sorted(working[color_column].astype(str).unique().tolist())
+        color_map = _pfizer_v2_color_map(color_column, color_levels)
+        for level in color_levels:
+            sub = working.loc[working[color_column].astype(str) == level]
+            ax.scatter(
+                sub[x_column].astype(float),
+                sub[y_column].astype(float),
+                color=color_map.get(level, "#999999"),
+                edgecolor="black",
+                linewidth=0.4,
+                s=58,
+                alpha=0.9,
+                label=level,
+            )
+        ax.legend(title=f"Color = {color_column.replace('_', ' ')}", fontsize=8, loc="best")
+
+    for _, patient_rows in working.groupby("patient_id"):
+        patient_rows = patient_rows.sort_values("visit")
+        if len(patient_rows) < 2:
+            continue
+        ax.plot(
+            patient_rows[x_column].astype(float),
+            patient_rows[y_column].astype(float),
+            color="#666666",
+            linewidth=1.0,
+            alpha=0.45,
+            zorder=0,
+        )
+    ax.set_xlabel(x_column)
+    ax.set_ylabel(y_column)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.grid(color="#E5E5E5", linewidth=0.8)
+    if working["patient_id"].nunique() > 1:
+        from matplotlib.lines import Line2D
+        trajectory_handle = Line2D([0], [0], color="#666666", linewidth=1.0, alpha=0.45, label="Patient trajectory")
+        existing_legend = ax.get_legend()
+        if existing_legend is not None:
+            handles, labels = ax.get_legend_handles_labels()
+            handles = list(handles) + [trajectory_handle]
+            labels = list(labels) + [trajectory_handle.get_label()]
+            title_text = existing_legend.get_title().get_text()
+            existing_legend.remove()
+            ax.legend(handles, labels, title=title_text, fontsize=8, loc="best")
+        else:
+            ax.legend(handles=[trajectory_handle], fontsize=8, loc="best")
+    fig.tight_layout()
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_present_features(columns: Sequence[str], requested: Sequence[str]) -> List[str]:
+    """Keep requested Pfizer features that are present in the current table."""
+    available = set(columns)
+    return [feature for feature in requested if feature in available]
+
+
+def _pfizer_v2_run_metadata_overview(
+    sample_df: pd.DataFrame,
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Generate the descriptive cohort-overview outputs for Pfizer."""
+    module_out = ensure_dir(os.path.join(out_dir, "01_metadata_overview"))
+    sample_df.to_csv(os.path.join(module_out, "matched_sample_metadata.tsv"), sep="\t")
+    patient_df.to_csv(os.path.join(module_out, "patient_level_metadata.tsv"), sep="\t")
+
+    _maybe(
+        _pfizer_v2_plot_alluvial,
+        overwrite,
+        patient_df,
+        stage_columns=["enza_history", "dose", "response_4class"],
+        out_path=os.path.join(module_out, "alluvial_enza_history_to_dose_to_response"),
+        title="CRPC-Pfizer: Enza history → dose → response",
+    )
+    _maybe(
+        _pfizer_v2_plot_stacked_bar,
+        overwrite,
+        patient_df,
+        group_column="arm",
+        fill_column="response_4class",
+        out_path=os.path.join(module_out, "response_by_arm"),
+        title="Response by arm",
+    )
+    _maybe(
+        _pfizer_v2_plot_stacked_bar,
+        overwrite,
+        patient_df,
+        group_column="dose",
+        fill_column="response_4class",
+        out_path=os.path.join(module_out, "response_by_dose"),
+        title="Response by dose",
+    )
+    _maybe(
+        _pfizer_v2_plot_stacked_bar,
+        overwrite,
+        patient_df,
+        group_column="enza_history",
+        fill_column="response_4class",
+        out_path=os.path.join(module_out, "response_by_enza_history"),
+        title="Response by Enza history",
+    )
+    _maybe(
+        _pfizer_v2_plot_eot_timing,
+        overwrite,
+        patient_df,
+        out_path=os.path.join(module_out, "eot_timing_by_patient"),
+        title="End-of-treatment timing by patient and arm",
+    )
+
+
+def _pfizer_v2_run_baseline_landscape(
+    sample_df: pd.DataFrame,
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Generate baseline-state heatmaps, scatters, and primary boxplots."""
+    module_out = ensure_dir(os.path.join(out_dir, "02_baseline_landscape"))
+    baseline_df = sample_df.loc[sample_df["visit"].astype(str) == "SCN"].copy()
+    if baseline_df.empty:
+        return
+    baseline_df = baseline_df.set_index("patient_id", drop=False)
+    baseline_df.to_csv(os.path.join(module_out, "baseline_patient_table.tsv"), sep="\t")
+
+    heatmap_features = _pfizer_v2_present_features(
+        baseline_df.columns,
+        ["AR score", "NE score", "CCP score", "PRC2 target derepression score (exploratory)"]
+        + _PFIZER_BASELINE_HALLMARKS
+        + _PFIZER_BASELINE_EXPRESSION_GENES,
+    )
+    annotation_df = pd.DataFrame(
+        {
+            "response_4class": baseline_df["response_4class"].astype(str),
+            "progression_binary": baseline_df["progression_binary"].astype(str),
+            "arm": baseline_df["arm"].astype(str),
+            "dose": baseline_df["dose"].astype(str),
+            "enza_history": baseline_df["enza_history"].astype(str),
+            "PAM50 subtype": baseline_df.get("PAM50 subtype", pd.Series(index=baseline_df.index, dtype="string")).astype(str),
+            "days_from_scn_EOT": patient_df.reindex(baseline_df.index)["days_from_scn_EOT"],
+        },
+        index=baseline_df.index,
+    )
+    if heatmap_features:
+        heatmap_matrix = baseline_df[heatmap_features].T
+        _maybe(
+            _pfizer_v2_plot_annotated_heatmap,
+            overwrite,
+            heatmap_matrix,
+            annotation_df,
+            out_path=os.path.join(module_out, "baseline_feature_heatmap"),
+            title="CRPC-Pfizer baseline transcriptional landscape",
+        )
+
+    scatter_specs = [
+        ("AR score", "NE score", "AR score vs NE score"),
+        ("AR score", "CCP score", "AR score vs CCP score"),
+        ("NE score", "CCP score", "NE score vs CCP score"),
+        ("AR score", "HALLMARK_ANDROGEN_RESPONSE", "AR score vs androgen response"),
+        ("CCP score", "HALLMARK_E2F_TARGETS", "CCP score vs E2F targets"),
+    ]
+    for x_column, y_column, scatter_title in scatter_specs:
+        if x_column not in baseline_df.columns or y_column not in baseline_df.columns:
+            continue
+        _maybe(
+            _pfizer_v2_plot_scatter,
+            overwrite,
+            baseline_df.reset_index(drop=True),
+            x_column=x_column,
+            y_column=y_column,
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{x_column}_vs_{y_column}")),
+            title=scatter_title,
+        )
+
+    baseline_stats = _pfizer_v2_two_group_stats(
+        baseline_df,
+        _pfizer_v2_present_features(baseline_df.columns, ["AR score", "NE score", "CCP score"]),
+        group_column="progression_binary",
+        group_a="PD",
+        group_b="non-PD",
+        comparison_name="baseline_PD_vs_nonPD",
+    )
+    if not baseline_stats.empty:
+        baseline_stats.to_csv(os.path.join(module_out, "baseline_primary_boxplot_stats.tsv"), sep="\t", index=False)
+        for feature_name in baseline_stats["feature"].tolist():
+            row = baseline_stats.loc[baseline_stats["feature"] == feature_name].iloc[0]
+            _maybe(
+                _pfizer_v2_plot_group_box,
+                overwrite,
+                baseline_df.reset_index(drop=True),
+                feature_name=feature_name,
+                group_column="progression_binary",
+                out_path=os.path.join(module_out, _pfizer_safe_name(f"{feature_name}_by_progression_binary")),
+                title=f"{feature_name} at SCN by PD vs non-PD",
+                y_label=feature_name,
+                p_value=float(row["p_value"]),
+            )
+
+
+def _pfizer_v2_run_pam50_lineage_analysis(
+    sample_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Summarize PAM50 subtype distributions and lineage-state relationships."""
+    module_out = ensure_dir(os.path.join(out_dir, "03_pam50_lineage_state"))
+    baseline_df = sample_df.loc[sample_df["visit"].astype(str) == "SCN"].copy()
+    if baseline_df.empty or "PAM50 subtype" not in baseline_df.columns:
+        return
+    baseline_df = baseline_df.set_index("patient_id", drop=False)
+    baseline_df.to_csv(os.path.join(module_out, "baseline_pam50_table.tsv"), sep="\t")
+
+    for group_column, plot_name, plot_title in [
+        ("response_4class", "pam50_by_response", "PAM50 subtype by response"),
+        ("arm", "pam50_by_arm", "PAM50 subtype by arm"),
+        ("enza_history", "pam50_by_enza_history", "PAM50 subtype by Enza history"),
+    ]:
+        _maybe(
+            _pfizer_v2_plot_stacked_bar,
+            overwrite,
+            baseline_df,
+            group_column=group_column,
+            fill_column="PAM50 subtype",
+            out_path=os.path.join(module_out, plot_name),
+            title=plot_title,
+        )
+
+    for feature_name in _pfizer_v2_present_features(
+        baseline_df.columns,
+        ["AR score", "NE score", "CCP score", "HALLMARK_ANDROGEN_RESPONSE", "HALLMARK_E2F_TARGETS", "HALLMARK_G2M_CHECKPOINT"],
+    ):
+        _maybe(
+            _pfizer_v2_plot_group_box,
+            overwrite,
+            baseline_df.reset_index(drop=True),
+            feature_name=feature_name,
+            group_column="PAM50 subtype",
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{feature_name}_by_pam50_subtype")),
+            title=f"{feature_name} at SCN by PAM50 subtype",
+            y_label=feature_name,
+        )
+
+    _maybe(
+        _pfizer_v2_plot_pam50_tile,
+        overwrite,
+        sample_df,
+        out_path=os.path.join(module_out, "pam50_trajectory_tile"),
+        title="PAM50 subtype trajectory across visits",
+    )
+
+
+def _pfizer_v2_run_baseline_candidate_analysis(
+    sample_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Run baseline PD-vs-non-PD and strict-benefit candidate biomarker summaries."""
+    module_out = ensure_dir(os.path.join(out_dir, "04_baseline_candidate_biomarkers"))
+    baseline_df = sample_df.loc[sample_df["visit"].astype(str) == "SCN"].copy()
+    if baseline_df.empty:
+        return
+    baseline_df = baseline_df.set_index("patient_id", drop=False)
+
+    optional_genes = ["EZH2", "AR", "KLK3", "FKBP5", "NKX3-1", "ASCL1", "INSM1", "SYP", "CHGA", "SOX2", "MYCN", "MKI67", "TOP2A", "BIRC5", "AURKA"]
+    primary_features = _pfizer_v2_present_features(
+        baseline_df.columns,
+        _PFIZER_PRESPECIFIED_BASELINE_FEATURES + optional_genes,
+    )
+    primary_stats = _pfizer_v2_two_group_stats(
+        baseline_df,
+        primary_features,
+        group_column="progression_binary",
+        group_a="PD",
+        group_b="non-PD",
+        comparison_name="SCN_PD_vs_nonPD",
+    )
+    if not primary_stats.empty:
+        primary_stats.to_csv(os.path.join(module_out, "scn_pd_vs_nonpd_stats.tsv"), sep="\t", index=False)
+        _maybe(
+            _pfizer_v2_plot_effect_forest,
+            overwrite,
+            primary_stats,
+            effect_column="median_difference_group_b_minus_group_a",
+            lower_column="median_difference_ci_lo",
+            upper_column="median_difference_ci_hi",
+            out_path=os.path.join(module_out, "scn_pd_vs_nonpd_forest"),
+            title="Baseline effect sizes: PD vs non-PD",
+        )
+        for _, row in primary_stats.iterrows():
+            _maybe(
+                _pfizer_v2_plot_group_box,
+                overwrite,
+                baseline_df.reset_index(drop=True),
+                feature_name=str(row["feature"]),
+                group_column="progression_binary",
+                out_path=os.path.join(module_out, _pfizer_safe_name(f"{row['feature']}_scn_pd_vs_nonpd")),
+                title=f"{row['feature']} at SCN: PD vs non-PD",
+                y_label=str(row["feature"]),
+                p_value=float(row["p_value"]),
+            )
+
+    strict_df = baseline_df.loc[baseline_df["clinical_benefit_strict"].astype(str).isin(["non-benefit", "benefit"])].copy()
+    strict_stats = _pfizer_v2_two_group_stats(
+        strict_df,
+        primary_features,
+        group_column="clinical_benefit_strict",
+        group_a="non-benefit",
+        group_b="benefit",
+        comparison_name="SCN_strict_benefit_vs_PD",
+    )
+    if not strict_stats.empty:
+        strict_stats.to_csv(os.path.join(module_out, "scn_strict_benefit_vs_pd_stats.tsv"), sep="\t", index=False)
+        _maybe(
+            _pfizer_v2_plot_effect_forest,
+            overwrite,
+            strict_stats,
+            effect_column="median_difference_group_b_minus_group_a",
+            lower_column="median_difference_ci_lo",
+            upper_column="median_difference_ci_hi",
+            out_path=os.path.join(module_out, "scn_strict_benefit_vs_pd_forest"),
+            title="Baseline effect sizes: strict benefit vs PD",
+        )
+
+
+def _pfizer_v2_run_c3d1_pharmacodynamics(
+    sample_df: pd.DataFrame,
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> pd.DataFrame:
+    """Summarize paired SCN→C3D1 pharmacodynamic changes for all treated patients."""
+    module_out = ensure_dir(os.path.join(out_dir, "05_c3d1_pharmacodynamics"))
+    feature_list = _pfizer_v2_present_features(patient_df.columns, [f"{feature}__SCN" for feature in _PFIZER_C3D1_CORE_FEATURES])
+    feature_names = [feature.rsplit("__", 1)[0] for feature in feature_list]
+    delta_df = _pfizer_v2_build_delta_frame(
+        patient_df,
+        feature_names,
+        start_visit="SCN",
+        end_visit="C3D1",
+        delta_column_name="C3D1_minus_SCN",
+    )
+    if delta_df.empty:
+        return delta_df
+    delta_df.to_csv(os.path.join(module_out, "c3d1_minus_scn_deltas.tsv"), sep="\t")
+
+    stats_df = _pfizer_v2_paired_delta_stats(delta_df, feature_names, comparison_name="C3D1_minus_SCN_all_patients")
+    if not stats_df.empty:
+        stats_df.to_csv(os.path.join(module_out, "c3d1_minus_scn_summary.tsv"), sep="\t", index=False)
+        _maybe(
+            _pfizer_v2_plot_effect_forest,
+            overwrite,
+            stats_df,
+            effect_column="median_delta",
+            lower_column="median_delta_ci_lo",
+            upper_column="median_delta_ci_hi",
+            out_path=os.path.join(module_out, "c3d1_minus_scn_forest"),
+            title="C3D1 pharmacodynamic median deltas",
+        )
+
+    for feature_name in feature_names:
+        _maybe(
+            _pfizer_v2_plot_trajectory,
+            overwrite,
+            sample_df,
+            feature_name=feature_name,
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{feature_name}_trajectory_scn_c3d1")),
+            title=f"{feature_name}: SCN → C3D1",
+            visit_order=["SCN", "C3D1"],
+            facet_by_arm=True,
+        )
+        _maybe(
+            _pfizer_v2_plot_group_box,
+            overwrite,
+            delta_df.reset_index(drop=True),
+            feature_name=feature_name,
+            group_column="arm",
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{feature_name}_delta_by_arm")),
+            title=f"Δ {feature_name} (C3D1 - SCN) by arm",
+            y_label=f"Δ {feature_name} (C3D1 - SCN)",
+        )
+        _maybe(
+            _pfizer_v2_plot_waterfall,
+            overwrite,
+            delta_df,
+            feature_name=feature_name,
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{feature_name}_waterfall")),
+            title=f"Δ {feature_name} (C3D1 - SCN)",
+            y_label=f"Δ {feature_name} (C3D1 - SCN)",
+        )
+    return delta_df
+
+
+def _pfizer_v2_run_arm_delta_analysis(
+    delta_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Compare SCN→C3D1 deltas between Enza-only and EZH2i+Enza arms."""
+    module_out = ensure_dir(os.path.join(out_dir, "06_arm_delta_comparison"))
+    if delta_df.empty:
+        return
+    feature_names = _pfizer_v2_present_features(delta_df.columns, _PFIZER_C3D1_CORE_FEATURES)
+    stats_df = _pfizer_v2_two_group_stats(
+        delta_df,
+        feature_names,
+        group_column="arm",
+        group_a="Enza-only",
+        group_b="EZH2i+Enza",
+        comparison_name="C3D1_delta_combo_vs_enza",
+    )
+    if stats_df.empty:
+        return
+    stats_df.to_csv(os.path.join(module_out, "c3d1_delta_by_arm_stats.tsv"), sep="\t", index=False)
+    _maybe(
+        _pfizer_v2_plot_effect_forest,
+        overwrite,
+        stats_df,
+        effect_column="median_difference_group_b_minus_group_a",
+        lower_column="median_difference_ci_lo",
+        upper_column="median_difference_ci_hi",
+        out_path=os.path.join(module_out, "c3d1_delta_by_arm_forest"),
+        title="C3D1 delta-of-delta: EZH2i+Enza vs Enza-only",
+    )
+    for _, row in stats_df.iterrows():
+        _maybe(
+            _pfizer_v2_plot_group_box,
+            overwrite,
+            delta_df.reset_index(drop=True),
+            feature_name=str(row["feature"]),
+            group_column="arm",
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{row['feature']}_delta_by_arm")),
+            title=f"Δ {row['feature']} by arm",
+            y_label=f"Δ {row['feature']} (C3D1 - SCN)",
+            p_value=float(row["p_value"]),
+        )
+
+
+def _pfizer_v2_run_prc2_target_analysis(
+    sample_df: pd.DataFrame,
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Generate dedicated exploratory PRC2-derepression score outputs."""
+    module_out = ensure_dir(os.path.join(out_dir, "07_prc2_target_score"))
+    feature_name = "PRC2 target derepression score (exploratory)"
+    if feature_name not in sample_df.columns:
+        return
+    _maybe(
+        _pfizer_v2_plot_trajectory,
+        overwrite,
+        sample_df,
+        feature_name=feature_name,
+        out_path=os.path.join(module_out, "prc2_score_trajectory"),
+        title="Exploratory PRC2 target derepression score across visits",
+        visit_order=["SCN", "C3D1", "EOT"],
+        facet_by_arm=True,
+    )
+    delta_df = _pfizer_v2_build_delta_frame(
+        patient_df,
+        [feature_name],
+        start_visit="SCN",
+        end_visit="C3D1",
+        delta_column_name="C3D1_minus_SCN",
+    )
+    if delta_df.empty:
+        return
+    delta_df.to_csv(os.path.join(module_out, "prc2_c3d1_minus_scn.tsv"), sep="\t")
+    arm_stats = _pfizer_v2_two_group_stats(
+        delta_df,
+        [feature_name],
+        group_column="arm",
+        group_a="Enza-only",
+        group_b="EZH2i+Enza",
+        comparison_name="PRC2_delta_by_arm",
+    )
+    response_stats = _pfizer_v2_two_group_stats(
+        delta_df,
+        [feature_name],
+        group_column="progression_binary",
+        group_a="PD",
+        group_b="non-PD",
+        comparison_name="PRC2_delta_by_response",
+    )
+    if not arm_stats.empty:
+        arm_stats.to_csv(os.path.join(module_out, "prc2_delta_by_arm_stats.tsv"), sep="\t", index=False)
+        _maybe(
+            _pfizer_v2_plot_group_box,
+            overwrite,
+            delta_df.reset_index(drop=True),
+            feature_name=feature_name,
+            group_column="arm",
+            out_path=os.path.join(module_out, "prc2_delta_by_arm"),
+            title="Exploratory PRC2 score delta by arm",
+            y_label=f"Δ {feature_name} (C3D1 - SCN)",
+            p_value=float(arm_stats.iloc[0]["p_value"]),
+        )
+    if not response_stats.empty:
+        response_stats.to_csv(os.path.join(module_out, "prc2_delta_by_response_stats.tsv"), sep="\t", index=False)
+        _maybe(
+            _pfizer_v2_plot_group_box,
+            overwrite,
+            delta_df.reset_index(drop=True),
+            feature_name=feature_name,
+            group_column="progression_binary",
+            out_path=os.path.join(module_out, "prc2_delta_by_response"),
+            title="Exploratory PRC2 score delta by PD vs non-PD",
+            y_label=f"Δ {feature_name} (C3D1 - SCN)",
+            p_value=float(response_stats.iloc[0]["p_value"]),
+        )
+    _maybe(
+        _pfizer_v2_plot_waterfall,
+        overwrite,
+        delta_df,
+        feature_name=feature_name,
+        out_path=os.path.join(module_out, "prc2_delta_waterfall"),
+        title="Exploratory PRC2 score delta waterfall",
+        y_label=f"Δ {feature_name} (C3D1 - SCN)",
+    )
+
+
+def _pfizer_v2_run_composite_analysis(
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> pd.DataFrame:
+    """Compute and plot the prespecified C3D1 pharmacodynamic response composite."""
+    module_out = ensure_dir(os.path.join(out_dir, "08_c3d1_composite"))
+    component_features = [feature for feature, _ in _PFIZER_COMPOSITE_COMPONENTS]
+    component_features = _pfizer_v2_present_features(patient_df.columns, [f"{feature}__SCN" for feature in component_features])
+    component_names = [feature.rsplit("__", 1)[0] for feature in component_features]
+    delta_df = _pfizer_v2_build_delta_frame(
+        patient_df,
+        component_names,
+        start_visit="SCN",
+        end_visit="C3D1",
+        delta_column_name="C3D1_minus_SCN",
+    )
+    if delta_df.empty:
+        return delta_df
+    delta_df = _pfizer_v2_add_composite_scores(
+        delta_df,
+        out_path=os.path.join(module_out, "composite_component_scaling.tsv"),
+    )
+    delta_df.to_csv(os.path.join(module_out, "c3d1_composite_input_deltas.tsv"), sep="\t")
+
+    composite_feature = "C3D1 PD Response Score"
+    fallback_feature = "C3D1 PD Response Score noPRC2"
+    chosen_feature = composite_feature if composite_feature in delta_df.columns and delta_df[composite_feature].notna().any() else fallback_feature
+    if chosen_feature not in delta_df.columns:
+        return delta_df
+
+    stats_df = _pfizer_v2_two_group_stats(
+        delta_df,
+        [chosen_feature, fallback_feature] if fallback_feature in delta_df.columns else [chosen_feature],
+        group_column="progression_binary",
+        group_a="PD",
+        group_b="non-PD",
+        comparison_name="C3D1_composite_PD_vs_nonPD",
+    )
+    if not stats_df.empty:
+        stats_df.to_csv(os.path.join(module_out, "composite_by_response_stats.tsv"), sep="\t", index=False)
+
+    _maybe(
+        _pfizer_v2_plot_waterfall,
+        overwrite,
+        delta_df,
+        feature_name=chosen_feature,
+        out_path=os.path.join(module_out, "composite_waterfall"),
+        title=f"{chosen_feature} waterfall",
+        y_label=chosen_feature,
+    )
+    if not stats_df.empty and chosen_feature in set(stats_df["feature"]):
+        chosen_stats = stats_df.loc[stats_df["feature"] == chosen_feature].iloc[0]
+        _maybe(
+            _pfizer_v2_plot_group_box,
+            overwrite,
+            delta_df.reset_index(drop=True),
+            feature_name=chosen_feature,
+            group_column="progression_binary",
+            out_path=os.path.join(module_out, "composite_by_progression"),
+            title=f"{chosen_feature} by PD vs non-PD",
+            y_label=chosen_feature,
+            p_value=float(chosen_stats["p_value"]),
+        )
+    _maybe(
+        _pfizer_v2_plot_scatter,
+        overwrite,
+        delta_df.reset_index(),
+        x_column="days_from_scn_EOT",
+        y_column=chosen_feature,
+        out_path=os.path.join(module_out, "composite_vs_eot_day"),
+        title=f"{chosen_feature} vs EOT timing",
+    )
+
+    component_matrix = delta_df[_pfizer_v2_present_features(delta_df.columns, component_names)].T
+    if not component_matrix.empty:
+        annotation_df = delta_df[["response_4class", "progression_binary", "arm", "dose"]].copy()
+        _maybe(
+            _pfizer_v2_plot_annotated_heatmap,
+            overwrite,
+            component_matrix,
+            annotation_df,
+            out_path=os.path.join(module_out, "component_delta_heatmap"),
+            title="C3D1 composite component deltas",
+        )
+    return delta_df
+
+
+def _pfizer_v2_run_c3d1_predictor_analysis(
+    delta_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Compare early C3D1 deltas between progressors and non-progressors."""
+    module_out = ensure_dir(os.path.join(out_dir, "09_c3d1_predictors_of_outcome"))
+    if delta_df.empty:
+        return
+    feature_names = _pfizer_v2_present_features(
+        delta_df.columns,
+        [
+            "AR score",
+            "NE score",
+            "CCP score",
+            "HALLMARK_E2F_TARGETS",
+            "HALLMARK_G2M_CHECKPOINT",
+            "HALLMARK_MYC_TARGETS_V1",
+            "HALLMARK_ANDROGEN_RESPONSE",
+            "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+            "HALLMARK_HYPOXIA",
+            "HALLMARK_IL6_JAK_STAT3_SIGNALING",
+            "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+            "PRC2 target derepression score (exploratory)",
+            "C3D1 PD Response Score",
+            "C3D1 PD Response Score noPRC2",
+        ],
+    )
+    stats_df = _pfizer_v2_two_group_stats(
+        delta_df,
+        feature_names,
+        group_column="progression_binary",
+        group_a="PD",
+        group_b="non-PD",
+        comparison_name="C3D1_delta_PD_vs_nonPD",
+    )
+    if stats_df.empty:
+        return
+    stats_df.to_csv(os.path.join(module_out, "c3d1_predictor_stats.tsv"), sep="\t", index=False)
+    _maybe(
+        _pfizer_v2_plot_effect_forest,
+        overwrite,
+        stats_df,
+        effect_column="median_difference_group_b_minus_group_a",
+        lower_column="median_difference_ci_lo",
+        upper_column="median_difference_ci_hi",
+        out_path=os.path.join(module_out, "c3d1_predictor_forest"),
+        title="C3D1 deltas associated with later non-progression",
+    )
+    for _, row in stats_df.iterrows():
+        feature_name = str(row["feature"])
+        _maybe(
+            _pfizer_v2_plot_group_box,
+            overwrite,
+            delta_df.reset_index(drop=True),
+            feature_name=feature_name,
+            group_column="progression_binary",
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{feature_name}_by_progression")),
+            title=f"Δ {feature_name}: PD vs non-PD",
+            y_label=f"Δ {feature_name} (C3D1 - SCN)",
+            p_value=float(row["p_value"]),
+        )
+        _maybe(
+            _pfizer_v2_plot_waterfall,
+            overwrite,
+            delta_df,
+            feature_name=feature_name,
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{feature_name}_waterfall")),
+            title=f"Δ {feature_name}: patient waterfall",
+            y_label=f"Δ {feature_name} (C3D1 - SCN)",
+        )
+
+
+def _pfizer_v2_run_eot_analysis(
+    sample_df: pd.DataFrame,
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Characterize end-of-treatment resistance and escape-state biology."""
+    module_out = ensure_dir(os.path.join(out_dir, "10_eot_escape_biology"))
+    feature_names = _pfizer_v2_present_features(
+        patient_df.columns,
+        [
+            "AR score__SCN",
+            "NE score__SCN",
+            "CCP score__SCN",
+            "PRC2 target derepression score (exploratory)__SCN",
+            "HALLMARK_ANDROGEN_RESPONSE__SCN",
+            "HALLMARK_E2F_TARGETS__SCN",
+            "HALLMARK_G2M_CHECKPOINT__SCN",
+            "HALLMARK_MYC_TARGETS_V1__SCN",
+            "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION__SCN",
+            "HALLMARK_HYPOXIA__SCN",
+            "HALLMARK_TNFA_SIGNALING_VIA_NFKB__SCN",
+            "HALLMARK_IL6_JAK_STAT3_SIGNALING__SCN",
+        ],
+    )
+    feature_names = [feature.rsplit("__", 1)[0] for feature in feature_names]
+    if not feature_names:
+        return
+
+    for feature_name in feature_names:
+        _maybe(
+            _pfizer_v2_plot_trajectory,
+            overwrite,
+            sample_df,
+            feature_name=feature_name,
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{feature_name}_trajectory_scn_c3d1_eot")),
+            title=f"{feature_name}: SCN → C3D1 → EOT",
+            visit_order=["SCN", "C3D1", "EOT"],
+            facet_by_arm=False,
+        )
+
+    c3d1_df = _pfizer_v2_build_delta_frame(patient_df, feature_names, start_visit="SCN", end_visit="C3D1", delta_column_name="C3D1_minus_SCN")
+    eot_df = _pfizer_v2_build_delta_frame(patient_df, feature_names, start_visit="SCN", end_visit="EOT", delta_column_name="EOT_minus_SCN")
+    rebound_df = _pfizer_v2_build_delta_frame(patient_df, feature_names, start_visit="C3D1", end_visit="EOT", delta_column_name="EOT_minus_C3D1")
+    if not c3d1_df.empty:
+        c3d1_df.to_csv(os.path.join(module_out, "c3d1_minus_scn.tsv"), sep="\t")
+    if not eot_df.empty:
+        eot_df.to_csv(os.path.join(module_out, "eot_minus_scn.tsv"), sep="\t")
+    if not rebound_df.empty:
+        rebound_df.to_csv(os.path.join(module_out, "eot_minus_c3d1.tsv"), sep="\t")
+
+    if not eot_df.empty:
+        heatmap_rows: Dict[str, pd.Series] = {}
+        for feature_name in feature_names:
+            if feature_name in c3d1_df.columns:
+                heatmap_rows[f"{feature_name} | C3D1 - SCN"] = c3d1_df[feature_name]
+            if feature_name in rebound_df.columns:
+                heatmap_rows[f"{feature_name} | EOT - C3D1"] = rebound_df[feature_name]
+            if feature_name in eot_df.columns:
+                heatmap_rows[f"{feature_name} | EOT - SCN"] = eot_df[feature_name]
+        heatmap_matrix = pd.DataFrame(heatmap_rows).T if heatmap_rows else pd.DataFrame()
+        if not heatmap_matrix.empty:
+            annotation_df = eot_df[["response_4class", "progression_binary", "arm", "dose", "days_from_scn_EOT"]]
+            _maybe(
+                _pfizer_v2_plot_annotated_heatmap,
+                overwrite,
+                heatmap_matrix,
+                annotation_df,
+                out_path=os.path.join(module_out, "eot_delta_heatmap"),
+                title="End-of-treatment delta landscape",
+            )
+        for feature_name in ["CCP score", "AR score", "NE score", "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION"]:
+            if feature_name not in eot_df.columns:
+                continue
+            _maybe(
+                _pfizer_v2_plot_scatter,
+                overwrite,
+                eot_df.reset_index(),
+                x_column="days_from_scn_EOT",
+                y_column=feature_name,
+                out_path=os.path.join(module_out, _pfizer_safe_name(f"eot_day_vs_{feature_name}")),
+                title=f"EOT day vs {feature_name} (EOT - SCN)",
+            )
+
+
+def _pfizer_v2_run_gene_level_analysis(
+    sample_df: pd.DataFrame,
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Create focused AR, NE, proliferation, and PRC2 gene-level views."""
+    module_out = ensure_dir(os.path.join(out_dir, "11_gene_level_pharmacodynamics"))
+    baseline_df = sample_df.loc[sample_df["visit"].astype(str) == "SCN"].copy().set_index("patient_id", drop=False)
+    focused_genes = _pfizer_v2_present_features(
+        sample_df.columns,
+        _PFIZER_AR_GENE_PANEL + _PFIZER_NE_GENE_PANEL + _PFIZER_CELL_CYCLE_GENE_PANEL + _PFIZER_PRC2_GENE_PANEL,
+    )
+    if baseline_df.empty or not focused_genes:
+        return
+
+    baseline_matrix = baseline_df[focused_genes].T
+    annotation_df = pd.DataFrame(
+        {
+            "response_4class": baseline_df["response_4class"].astype(str),
+            "progression_binary": baseline_df["progression_binary"].astype(str),
+            "arm": baseline_df["arm"].astype(str),
+            "dose": baseline_df["dose"].astype(str),
+        },
+        index=baseline_df.index,
+    )
+    _maybe(
+        _pfizer_v2_plot_annotated_heatmap,
+        overwrite,
+        baseline_matrix,
+        annotation_df,
+        out_path=os.path.join(module_out, "baseline_gene_heatmap"),
+        title="Focused gene panel at SCN",
+    )
+
+    c3d1_df = _pfizer_v2_build_delta_frame(patient_df, focused_genes, start_visit="SCN", end_visit="C3D1", delta_column_name="C3D1_minus_SCN")
+    eot_df = _pfizer_v2_build_delta_frame(patient_df, focused_genes, start_visit="SCN", end_visit="EOT", delta_column_name="EOT_minus_SCN")
+    if not c3d1_df.empty:
+        _maybe(
+            _pfizer_v2_plot_annotated_heatmap,
+            overwrite,
+            c3d1_df[focused_genes].T,
+            c3d1_df[["response_4class", "progression_binary", "arm", "dose"]],
+            out_path=os.path.join(module_out, "c3d1_delta_gene_heatmap"),
+            title="Focused gene-panel deltas: C3D1 - SCN",
+        )
+    if not eot_df.empty:
+        _maybe(
+            _pfizer_v2_plot_annotated_heatmap,
+            overwrite,
+            eot_df[focused_genes].T,
+            eot_df[["response_4class", "progression_binary", "arm", "dose", "days_from_scn_EOT"]],
+            out_path=os.path.join(module_out, "eot_delta_gene_heatmap"),
+            title="Focused gene-panel deltas: EOT - SCN",
+        )
+
+    for gene_name in _pfizer_v2_present_features(sample_df.columns, _PFIZER_GENE_LEVEL_PAIRED_PLOT_GENES):
+        _maybe(
+            _pfizer_v2_plot_trajectory,
+            overwrite,
+            sample_df,
+            feature_name=gene_name,
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{gene_name}_paired_trajectory")),
+            title=f"{gene_name} across visits",
+            visit_order=["SCN", "C3D1", "EOT"],
+            facet_by_arm=True,
+        )
+
+
+def _pfizer_v2_run_unsupervised_analysis(
+    sample_df: pd.DataFrame,
+    pred_subset: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Create full-expression and pathway-score PCA/UMAP overviews for Pfizer."""
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+
+    module_out = ensure_dir(os.path.join(out_dir, "12_unsupervised_overview"))
+    expression_matrix = pred_subset.apply(pd.to_numeric, errors="coerce")
+    expression_matrix = expression_matrix.loc[~expression_matrix.isna().any(axis=1)]
+    if expression_matrix.shape[1] < 3 or expression_matrix.shape[0] < 10:
+        return
+
+    gene_variance = expression_matrix.var(axis=1).sort_values(ascending=False)
+    variable_genes = gene_variance.head(min(500, len(gene_variance))).index.tolist()
+    expr_for_embedding = expression_matrix.loc[variable_genes].T
+    scaled_expr = StandardScaler().fit_transform(expr_for_embedding.values)
+    pca_expr = PCA(n_components=2, random_state=42).fit_transform(scaled_expr)
+
+    embedding_df = sample_df.loc[expr_for_embedding.index].copy()
+    embedding_df["PC1"] = pca_expr[:, 0]
+    embedding_df["PC2"] = pca_expr[:, 1]
+    embedding_df.to_csv(os.path.join(module_out, "expression_pca_coordinates.tsv"), sep="\t")
+    for color_column in ["patient_id", "visit", "arm", "response_4class", "PAM50 subtype", "AR score", "NE score", "CCP score"]:
+        if color_column not in embedding_df.columns:
+            continue
+        _maybe(
+            _pfizer_v2_plot_embedding,
+            overwrite,
+            embedding_df.reset_index(drop=True),
+            x_column="PC1",
+            y_column="PC2",
+            color_column=color_column,
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"expression_pca_by_{color_column}")),
+            title=f"Expression PCA colored by {color_column}",
+            continuous_color=color_column in {"AR score", "NE score", "CCP score"},
+        )
+
+    try:
+        import umap
+    except ImportError:
+        print("    [skip] Pfizer UMAP: umap-learn is not installed")
+    else:
+        reducer = umap.UMAP(n_components=2, random_state=42, n_jobs=1)
+        umap_expr = reducer.fit_transform(scaled_expr)
+        embedding_df["UMAP1"] = umap_expr[:, 0]
+        embedding_df["UMAP2"] = umap_expr[:, 1]
+        embedding_df.to_csv(os.path.join(module_out, "expression_umap_coordinates.tsv"), sep="\t")
+        for color_column in ["patient_id", "visit", "arm", "response_4class", "PAM50 subtype", "AR score", "NE score", "CCP score"]:
+            if color_column not in embedding_df.columns:
+                continue
+            _maybe(
+                _pfizer_v2_plot_embedding,
+                overwrite,
+                embedding_df.reset_index(drop=True),
+                x_column="UMAP1",
+                y_column="UMAP2",
+                color_column=color_column,
+                out_path=os.path.join(module_out, _pfizer_safe_name(f"expression_umap_by_{color_column}")),
+                title=f"Expression UMAP colored by {color_column}",
+                continuous_color=color_column in {"AR score", "NE score", "CCP score"},
+            )
+
+    pathway_features = _pfizer_v2_present_features(
+        sample_df.columns,
+        ["AR score", "NE score", "CCP score", "PRC2 target derepression score (exploratory)"] + _PFIZER_BASELINE_HALLMARKS,
+    )
+    if len(pathway_features) >= 3:
+        pathway_matrix = sample_df[pathway_features].apply(pd.to_numeric, errors="coerce").dropna(axis=0, how="any")
+        if pathway_matrix.shape[0] >= 3:
+            pathway_embed = sample_df.loc[pathway_matrix.index].copy()
+            scaled_pathways = StandardScaler().fit_transform(pathway_matrix.values)
+            pca_pathways = PCA(n_components=2, random_state=42).fit_transform(scaled_pathways)
+            pathway_embed["PC1"] = pca_pathways[:, 0]
+            pathway_embed["PC2"] = pca_pathways[:, 1]
+            pathway_embed.to_csv(os.path.join(module_out, "pathway_pca_coordinates.tsv"), sep="\t")
+            for color_column in ["patient_id", "visit", "arm", "response_4class", "PAM50 subtype", "AR score", "NE score", "CCP score"]:
+                if color_column not in pathway_embed.columns:
+                    continue
+                _maybe(
+                    _pfizer_v2_plot_embedding,
+                    overwrite,
+                    pathway_embed.reset_index(drop=True),
+                    x_column="PC1",
+                    y_column="PC2",
+                    color_column=color_column,
+                    out_path=os.path.join(module_out, _pfizer_safe_name(f"pathway_pca_by_{color_column}")),
+                    title=f"Pathway-score PCA colored by {color_column}",
+                    continuous_color=color_column in {"AR score", "NE score", "CCP score"},
+                )
+
+
+def _pfizer_v2_mean_expression_from_draws(
+    draws: Sequence[pd.DataFrame],
+    template: pd.DataFrame,
+) -> pd.DataFrame:
+    """Average aligned Monte Carlo expression draws for uncertainty-adjusted plots."""
+    if not draws:
+        raise ValueError("draws must contain at least one Monte Carlo expression matrix")
+    running_sum = np.zeros(template.shape, dtype=np.float64)
+    for draw in draws:
+        aligned = draw.reindex(index=template.index, columns=template.columns)
+        if aligned.isna().any().any():
+            raise ValueError("Monte Carlo expression draw contains missing values after Pfizer alignment")
+        running_sum = running_sum + aligned.to_numpy(dtype=np.float64)
+    mean_values = running_sum / float(len(draws))
+    return pd.DataFrame(mean_values, index=template.index, columns=template.columns)
+
+
+def _pfizer_v2_sanitize_monte_carlo_draws(
+    draws: Sequence[pd.DataFrame],
+    template: pd.DataFrame,
+) -> Tuple[List[pd.DataFrame], pd.DataFrame]:
+    """Align Pfizer Monte Carlo draws and backfill missing cells from point predictions.
+
+    Some discovery cohorts carry sparse NaNs in the MDN parameter tables, which
+    propagate into MC draws even though the point prediction is defined. For the
+    uncertainty-adjusted Pfizer summaries we treat those cells as zero-uncertainty
+    fallbacks to the point prediction when available. Genes that remain unresolved
+    after fallback are excluded from the uncertainty-adjusted branch.
+    """
+    if not draws:
+        raise ValueError("draws must contain at least one Monte Carlo expression matrix")
+    template_aligned = template.reindex(index=template.index, columns=template.columns)
+    sanitized_draws: List[pd.DataFrame] = []
+    total_filled = 0
+    unresolved_mask = template_aligned.isna().copy()
+    for draw in draws:
+        aligned = draw.reindex(index=template.index, columns=template.columns)
+        missing_mask = aligned.isna()
+        if bool(missing_mask.values.any()):
+            total_filled += int(missing_mask.values.sum())
+            aligned = aligned.where(~missing_mask, template_aligned)
+        unresolved_mask = unresolved_mask | aligned.isna()
+        sanitized_draws.append(aligned)
+
+    unresolved_genes = unresolved_mask.any(axis=1)
+    if bool(unresolved_genes.any()):
+        n_genes_dropped = int(unresolved_genes.sum())
+        print(
+            f"    Pfizer MC draws: dropped {n_genes_dropped} genes with unresolved missing cells after fallback alignment"
+        )
+        keep_genes = unresolved_genes.index[~unresolved_genes]
+        template_aligned = template_aligned.loc[keep_genes]
+        sanitized_draws = [draw.loc[keep_genes] for draw in sanitized_draws]
+
+    if total_filled > 0:
+        print(f"    Pfizer MC draws: filled {total_filled} missing draw cells from point predictions")
+    return sanitized_draws, template_aligned
+
+
+def _pfizer_v2_effective_dose_legend_handles(
+    levels: Optional[Sequence[str]] = None,
+) -> List[Any]:
+    """Return legend handles for the Pfizer effective-dose split."""
+    from matplotlib.lines import Line2D
+
+    effective_levels = list(levels) if levels is not None else list(_PFIZER_EFFECTIVE_DOSE_ORDER)
+    color_map = _pfizer_v2_color_map("effective_dose_group", effective_levels)
+    return [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            color=color_map.get(level, "#999999"),
+            label=level,
+            markerfacecolor=color_map.get(level, "#999999"),
+            markeredgecolor="black",
+            linewidth=2.0,
+            markersize=7,
+        )
+        for level in effective_levels
+    ]
+
+
+def _pfizer_v2_plot_swimmer(
+    sample_df: pd.DataFrame,
+    *,
+    out_path: str,
+    title: str,
+) -> None:
+    """Plot the reduced Pfizer cohort as a patient swimmer with visit and TFx annotations."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    required = ["patient_id", "visit", "days_from_scn", "effective_dose_group", "tfx"]
+    if any(column not in sample_df.columns for column in required):
+        return
+    working = sample_df[required].copy()
+    working["days_from_scn"] = pd.to_numeric(working["days_from_scn"], errors="coerce")
+    working["tfx"] = pd.to_numeric(working["tfx"], errors="coerce")
+    working = working.dropna(subset=["patient_id", "visit", "days_from_scn", "effective_dose_group"])
+    if working.empty:
+        return
+
+    patient_order = (
+        working.groupby("patient_id")
+        .agg(
+            effective_dose_group=("effective_dose_group", lambda values: str(pd.Series(values).iloc[0])),
+            max_day=("days_from_scn", "max"),
+        )
+        .reset_index()
+        .sort_values(["effective_dose_group", "max_day", "patient_id"])
+    )
+    patient_levels = patient_order["patient_id"].tolist()
+    y_positions = {patient_id: idx for idx, patient_id in enumerate(patient_levels)}
+    color_map = _pfizer_v2_color_map("effective_dose_group", _PFIZER_EFFECTIVE_DOSE_ORDER)
+
+    fig, ax = plt.subplots(figsize=(11.0, max(5.5, 0.42 * len(patient_levels) + 1.8)))
+    for patient_id, patient_rows in working.groupby("patient_id"):
+        patient_rows = patient_rows.sort_values("days_from_scn")
+        y_val = float(y_positions[patient_id])
+        dose_group = str(patient_rows["effective_dose_group"].iloc[0])
+        color = color_map.get(dose_group, "#999999")
+        max_day = float(patient_rows["days_from_scn"].max())
+        ax.hlines(y_val, 0.0, max_day, color=color, linewidth=2.2, alpha=0.9)
+        for _, row in patient_rows.iterrows():
+            visit_name = str(row["visit"])
+            x_val = float(row["days_from_scn"])
+            ax.scatter(
+                x_val,
+                y_val,
+                color=color,
+                edgecolor="black",
+                linewidth=0.6,
+                marker=_PFIZER_VISIT_MARKER_MAP.get(visit_name, "o"),
+                s=58,
+                zorder=3,
+            )
+            if np.isfinite(float(row["tfx"])):
+                ax.text(
+                    x_val + 2.0,
+                    y_val,
+                    f"TFx={float(row['tfx']):.2f}",
+                    fontsize=7,
+                    va="center",
+                    ha="left",
+                )
+
+    ax.set_yticks(np.arange(len(patient_levels), dtype=float))
+    ax.set_yticklabels(patient_levels, fontsize=8)
+    ax.set_xlabel("Days from SCN")
+    ax.set_ylabel("Patient ID")
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.grid(axis="x", color="#E5E5E5", linewidth=0.8)
+    _pfizer_v2_add_dual_legends(
+        ax,
+        color_handles=_pfizer_v2_effective_dose_legend_handles(
+            [
+                level for level in _PFIZER_EFFECTIVE_DOSE_ORDER
+                if level in set(working["effective_dose_group"].astype(str))
+            ]
+        ),
+        color_title="Color = effective-dose group",
+        marker_handles=_pfizer_v2_visit_marker_legend_handles(_PFIZER_VISIT_ORDER),
+        marker_title="Marker = visit",
+    )
+    fig.tight_layout(rect=[0.0, 0.0, 0.84, 1.0])
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_dose_trajectory(
+    sample_df: pd.DataFrame,
+    *,
+    feature_name: str,
+    out_path: str,
+    title: str,
+    visit_order: Sequence[str],
+) -> None:
+    """Plot paired patient trajectories colored by the effective-dose split."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    required = ["patient_id", "visit", "effective_dose_group", feature_name]
+    if any(column not in sample_df.columns for column in required):
+        return
+    working = sample_df[required].copy()
+    working[feature_name] = pd.to_numeric(working[feature_name], errors="coerce")
+    working = working.loc[working[feature_name].notna()].copy()
+    working = working.loc[working["visit"].astype(str).isin(list(visit_order))].copy()
+    if working.empty:
+        return
+
+    visit_to_x = {visit_name: idx for idx, visit_name in enumerate(visit_order)}
+    color_map = _pfizer_v2_color_map("effective_dose_group", _PFIZER_EFFECTIVE_DOSE_ORDER)
+    fig, ax = plt.subplots(figsize=(6.4, 5.0))
+    for patient_id, patient_rows in working.groupby("patient_id"):
+        patient_rows = patient_rows.sort_values("visit", key=lambda values: values.astype(str).map(visit_to_x))
+        if patient_rows["visit"].astype(str).nunique() < 2:
+            continue
+        x_vals = [visit_to_x[str(visit_name)] for visit_name in patient_rows["visit"].astype(str)]
+        y_vals = patient_rows[feature_name].astype(float).tolist()
+        dose_group = str(patient_rows["effective_dose_group"].iloc[0])
+        color = color_map.get(dose_group, "#999999")
+        ax.plot(x_vals, y_vals, color=color, linewidth=1.6, alpha=0.75, zorder=1)
+        for visit_name, x_val, y_val in zip(patient_rows["visit"].astype(str), x_vals, y_vals):
+            ax.scatter(
+                x_val,
+                y_val,
+                color=color,
+                edgecolor="black",
+                linewidth=0.5,
+                marker=_PFIZER_VISIT_MARKER_MAP.get(visit_name, "o"),
+                s=46,
+                zorder=3,
+            )
+    ax.set_xticks(list(visit_to_x.values()))
+    ax.set_xticklabels(list(visit_order))
+    ax.set_xlabel("Visit")
+    ax.set_ylabel(feature_name)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.grid(axis="y", color="#E5E5E5", linewidth=0.8)
+    _pfizer_v2_add_dual_legends(
+        ax,
+        color_handles=_pfizer_v2_effective_dose_legend_handles(
+            [
+                level for level in _PFIZER_EFFECTIVE_DOSE_ORDER
+                if level in set(working["effective_dose_group"].astype(str))
+            ]
+        ),
+        color_title="Color = effective-dose group",
+        marker_handles=_pfizer_v2_visit_marker_legend_handles(visit_order),
+        marker_title="Marker = visit",
+    )
+    fig.tight_layout(rect=[0.0, 0.0, 0.84, 1.0])
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_plot_dose_waterfall(
+    delta_df: pd.DataFrame,
+    *,
+    feature_name: str,
+    out_path: str,
+    title: str,
+    y_label: str,
+) -> None:
+    """Plot a waterfall of patient deltas colored by the effective-dose split."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    required = [feature_name, "effective_dose_group"]
+    if any(column not in delta_df.columns for column in required):
+        return
+    working = delta_df[required].copy()
+    working[feature_name] = pd.to_numeric(working[feature_name], errors="coerce")
+    working = working.dropna(subset=[feature_name, "effective_dose_group"])
+    if working.empty:
+        return
+    working = working.sort_values(feature_name, ascending=False)
+    color_map = _pfizer_v2_color_map("effective_dose_group", _PFIZER_EFFECTIVE_DOSE_ORDER)
+    bar_colors = [color_map.get(str(level), "#999999") for level in working["effective_dose_group"]]
+    x_positions = np.arange(len(working), dtype=float)
+
+    fig, ax = plt.subplots(figsize=(max(7.0, 0.48 * len(working) + 2.0), 4.8))
+    ax.bar(x_positions, working[feature_name].astype(float).values, color=bar_colors, edgecolor="black", linewidth=0.5)
+    ax.axhline(0.0, color="#888888", linestyle="--", linewidth=1.0)
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(working.index.tolist(), rotation=90, fontsize=8)
+    ax.set_xlabel("Patient ID")
+    ax.set_ylabel(y_label)
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.legend(
+        handles=_pfizer_v2_effective_dose_legend_handles(
+            [
+                level for level in _PFIZER_EFFECTIVE_DOSE_ORDER
+                if level in set(working["effective_dose_group"].astype(str))
+            ]
+        ),
+        title="Bar color = effective-dose group",
+        fontsize=8,
+        title_fontsize=8,
+        loc="best",
+        frameon=False,
+    )
+    fig.tight_layout()
+    fig.savefig(f"{out_path}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def _pfizer_v2_grouped_paired_delta_stats(
+    delta_df: pd.DataFrame,
+    feature_columns: Sequence[str],
+    *,
+    group_column: str,
+) -> pd.DataFrame:
+    """Summarize paired deltas within each level of a grouping variable."""
+    grouped_results: List[pd.DataFrame] = []
+    for group_level in _pfizer_v2_preferred_levels(group_column) or sorted(delta_df[group_column].astype(str).unique().tolist()):
+        group_df = delta_df.loc[delta_df[group_column].astype(str) == group_level].copy()
+        if group_df.empty:
+            continue
+        group_stats = _pfizer_v2_paired_delta_stats(
+            group_df,
+            feature_columns,
+            comparison_name=f"{group_column}_{group_level}_paired_delta",
+        )
+        if group_stats.empty:
+            continue
+        group_stats.insert(1, group_column, group_level)
+        grouped_results.append(group_stats)
+    if not grouped_results:
+        return pd.DataFrame()
+    return pd.concat(grouped_results, ignore_index=True)
+
+
+def _pfizer_v2_tfx_adjusted_delta_models(
+    delta_df: pd.DataFrame,
+    feature_columns: Sequence[str],
+) -> pd.DataFrame:
+    """Fit TFx-adjusted paired delta models for the effective-dose comparison."""
+    from scipy.stats import t as student_t
+
+    rng = np.random.default_rng(42)
+    rows: List[Dict[str, Any]] = []
+    effective_label = _PFIZER_EFFECTIVE_DOSE_ORDER[1]
+    for feature_name in feature_columns:
+        required = [feature_name, "effective_dose_group", "baseline_tfx", "delta_tfx"]
+        if any(column not in delta_df.columns for column in required):
+            continue
+        working = delta_df[required].dropna().copy()
+        if working.empty:
+            continue
+        group_indicator = (working["effective_dose_group"].astype(str) == effective_label).astype(float).values
+        if np.unique(group_indicator).size < 2:
+            continue
+        y_vals = pd.to_numeric(working[feature_name], errors="coerce").values.astype(np.float64)
+        baseline_tfx = pd.to_numeric(working["baseline_tfx"], errors="coerce").values.astype(np.float64)
+        delta_tfx = pd.to_numeric(working["delta_tfx"], errors="coerce").values.astype(np.float64)
+        design = np.column_stack([
+            np.ones(len(working), dtype=np.float64),
+            group_indicator,
+            baseline_tfx,
+            delta_tfx,
+        ])
+        if np.linalg.matrix_rank(design) < design.shape[1]:
+            continue
+        coefficients, _, _, _ = np.linalg.lstsq(design, y_vals, rcond=None)
+        residuals = y_vals - design @ coefficients
+        df_resid = len(y_vals) - design.shape[1]
+        if df_resid <= 0:
+            continue
+        xtx_inv = np.linalg.inv(design.T @ design)
+        residual_var = float((residuals @ residuals) / df_resid)
+        std_errors = np.sqrt(np.diag(xtx_inv) * residual_var)
+        group_se = float(std_errors[1]) if np.isfinite(std_errors[1]) else np.nan
+        t_value = float(coefficients[1] / group_se) if np.isfinite(group_se) and group_se > 0.0 else np.nan
+        p_value = float(2.0 * student_t.sf(abs(t_value), df_resid)) if np.isfinite(t_value) else np.nan
+
+        bootstrap_effects: List[float] = []
+        for _ in range(1000):
+            sample_idx = rng.integers(0, len(working), size=len(working))
+            boot_y = y_vals[sample_idx]
+            boot_design = design[sample_idx, :]
+            if np.unique(boot_design[:, 1]).size < 2:
+                continue
+            if np.linalg.matrix_rank(boot_design) < boot_design.shape[1]:
+                continue
+            boot_coef, _, _, _ = np.linalg.lstsq(boot_design, boot_y, rcond=None)
+            bootstrap_effects.append(float(boot_coef[1]))
+
+        effect_ci_lo = float(np.percentile(bootstrap_effects, 2.5)) if bootstrap_effects else np.nan
+        effect_ci_hi = float(np.percentile(bootstrap_effects, 97.5)) if bootstrap_effects else np.nan
+        rows.append(
+            {
+                "feature": feature_name,
+                "n": int(len(working)),
+                "n_lower_or_none": int(np.sum(group_indicator == 0.0)),
+                "n_effective_dose": int(np.sum(group_indicator == 1.0)),
+                "effective_dose_coefficient": float(coefficients[1]),
+                "effective_dose_ci_lo": effect_ci_lo,
+                "effective_dose_ci_hi": effect_ci_hi,
+                "baseline_tfx_coefficient": float(coefficients[2]),
+                "delta_tfx_coefficient": float(coefficients[3]),
+                "standard_error": group_se,
+                "t_value": t_value,
+                "p_value": p_value,
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    result_df = pd.DataFrame(rows)
+    result_df["fdr"] = _pfizer_v2_bh_fdr(result_df["p_value"])
+    return result_df.sort_values(["p_value", "feature"]).reset_index(drop=True)
+
+
+def _pfizer_v2_run_tfx_mixed_models(
+    sample_df: pd.DataFrame,
+    feature_columns: Sequence[str],
+    out_dir: str,
+    *,
+    overwrite: bool,
+) -> None:
+    """Run TFx-adjusted SCN/C3D1 mixed models as a sensitivity analysis."""
+    import rpy2.robjects as ro
+    from rpy2.robjects import pandas2ri
+    from rpy2.robjects.conversion import localconverter
+
+    long_rows: List[Dict[str, Any]] = []
+    scn_c3d1_df = sample_df.loc[sample_df["visit"].astype(str).isin(["SCN", "C3D1"])].copy()
+    for feature_name in feature_columns:
+        if feature_name not in scn_c3d1_df.columns:
+            continue
+        feature_values = pd.to_numeric(scn_c3d1_df[feature_name], errors="coerce")
+        feature_slice = scn_c3d1_df.loc[feature_values.notna()].copy()
+        if feature_slice.empty:
+            continue
+        for _, row in feature_slice.iterrows():
+            long_rows.append(
+                {
+                    "feature": feature_name,
+                    "patient": row["patient_id"],
+                    "visit": str(row["visit"]),
+                    "effective_dose_group": str(row["effective_dose_group"]),
+                    "tfx": float(pd.to_numeric(pd.Series([row["tfx"]]), errors="coerce").iloc[0]),
+                    "value": float(pd.to_numeric(pd.Series([row[feature_name]]), errors="coerce").iloc[0]),
+                }
+            )
+    if not long_rows:
+        return
+
+    ro.r(
+        """
+        run_pfizer_tfx_mixed_models <- function(df, dose_levels) {
+          suppressPackageStartupMessages(library(nlme))
+          if (nrow(df) == 0) {
+            return(data.frame())
+          }
+          df$visit <- factor(df$visit, levels = c('SCN', 'C3D1'))
+          df$effective_dose_group <- factor(df$effective_dose_group, levels = dose_levels)
+          out <- list()
+          for (feature_name in unique(df$feature)) {
+            dsub <- droplevels(df[df$feature == feature_name, ])
+            if (nrow(dsub) < 6) {
+              next
+            }
+            if (length(unique(dsub$patient)) < 4 || length(unique(dsub$effective_dose_group)) < 2) {
+              next
+            }
+            fit <- try(
+              nlme::lme(
+                value ~ visit * effective_dose_group + tfx,
+                random = ~1 | patient,
+                data = dsub,
+                method = 'REML',
+                na.action = na.omit,
+                control = nlme::lmeControl(msMaxIter = 200)
+              ),
+              silent = TRUE
+            )
+            if (inherits(fit, 'try-error')) {
+              next
+            }
+            tt <- as.data.frame(summary(fit)$tTable)
+            tt$term <- rownames(tt)
+            tt$feature <- feature_name
+            tt$n_obs <- nrow(dsub)
+            tt$n_patients <- length(unique(dsub$patient))
+            rownames(tt) <- NULL
+            out[[length(out) + 1]] <- tt
+          }
+          if (length(out) == 0) {
+            return(data.frame())
+          }
+          do.call(rbind, out)
+        }
+        """
+    )
+
+    converter = ro.default_converter + pandas2ri.converter
+    with localconverter(converter):
+        r_df = ro.conversion.get_conversion().py2rpy(pd.DataFrame(long_rows))
+        r_levels = ro.StrVector(list(_PFIZER_EFFECTIVE_DOSE_ORDER))
+        result_r = ro.globalenv["run_pfizer_tfx_mixed_models"](r_df, r_levels)
+        result_df = ro.conversion.get_conversion().rpy2py(result_r)
+
+    if result_df is None or len(result_df) == 0:
+        return
+
+    result_df = pd.DataFrame(result_df).rename(
+        columns={
+            "Value": "estimate",
+            "Std.Error": "std_error",
+            "DF": "df",
+            "t-value": "t_value",
+            "p-value": "p_value",
+        }
+    )
+    interaction_df = result_df.loc[
+        result_df["term"].astype(str).str.contains("visitC3D1:effective_dose_group", regex=False)
+    ].copy()
+    if not result_df.empty and (overwrite or not os.path.exists(os.path.join(out_dir, "mixed_model_full.tsv"))):
+        result_df.to_csv(os.path.join(out_dir, "mixed_model_full.tsv"), sep="\t", index=False)
+    if not interaction_df.empty and (overwrite or not os.path.exists(os.path.join(out_dir, "mixed_model_interaction.tsv"))):
+        interaction_df.to_csv(os.path.join(out_dir, "mixed_model_interaction.tsv"), sep="\t", index=False)
+
+
+def _pfizer_v2_correlation_table(
+    data_df: pd.DataFrame,
+    feature_pairs: Sequence[Tuple[str, str]],
+) -> pd.DataFrame:
+    """Compute Pearson and Spearman correlations for requested Pfizer feature pairs."""
+    from scipy.stats import pearsonr, spearmanr
+
+    rows: List[Dict[str, Any]] = []
+    for left_feature, right_feature in feature_pairs:
+        if left_feature not in data_df.columns or right_feature not in data_df.columns:
+            continue
+        working = data_df[[left_feature, right_feature]].apply(pd.to_numeric, errors="coerce").dropna()
+        if len(working) < 3:
+            continue
+        pearson_r, pearson_p = pearsonr(working[left_feature].values, working[right_feature].values)
+        spearman_rho, spearman_p = spearmanr(working[left_feature].values, working[right_feature].values)
+        rows.append(
+            {
+                "feature_x": left_feature,
+                "feature_y": right_feature,
+                "n": int(len(working)),
+                "pearson_r": float(pearson_r),
+                "pearson_p": float(pearson_p),
+                "spearman_rho": float(spearman_rho),
+                "spearman_p": float(spearman_p),
+            }
+        )
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["feature_x", "feature_y"]).reset_index(drop=True)
+
+
+def _pfizer_v2_run_reduced_cohort_overview(
+    sample_df: pd.DataFrame,
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Write reduced-cohort summaries and the primary swimmer plot."""
+    module_out = ensure_dir(os.path.join(out_dir, "01_reduced_cohort_overview"))
+    sample_df.to_csv(os.path.join(module_out, "matched_sample_metadata.tsv"), sep="\t")
+    patient_df.to_csv(os.path.join(module_out, "patient_level_metadata.tsv"), sep="\t")
+
+    summary_rows = [
+        {"metric": "n_patients", "value": int(patient_df.index.nunique())},
+        {"metric": "n_samples", "value": int(sample_df.index.nunique())},
+        {
+            "metric": "n_patients_with_SCN_C3D1_pair",
+            "value": int(((patient_df["sample_SCN"].notna()) & (patient_df["sample_C3D1"].notna())).sum()),
+        },
+        {
+            "metric": "n_patients_with_all_three_visits",
+            "value": int(((patient_df["sample_SCN"].notna()) & (patient_df["sample_C3D1"].notna()) & (patient_df["sample_EOT"].notna())).sum()),
+        },
+        {
+            "metric": "n_effective_dose_patients_with_SCN_C3D1_pair",
+            "value": int((((patient_df["sample_SCN"].notna()) & (patient_df["sample_C3D1"].notna())) & (patient_df["effective_dose_group"].astype(str) == _PFIZER_EFFECTIVE_DOSE_ORDER[1])).sum()),
+        },
+        {
+            "metric": "n_lower_or_none_patients_with_SCN_C3D1_pair",
+            "value": int((((patient_df["sample_SCN"].notna()) & (patient_df["sample_C3D1"].notna())) & (patient_df["effective_dose_group"].astype(str) == _PFIZER_EFFECTIVE_DOSE_ORDER[0])).sum()),
+        },
+    ]
+    pd.DataFrame(summary_rows).to_csv(os.path.join(module_out, "reduced_cohort_summary.tsv"), sep="\t", index=False)
+    _maybe(
+        _pfizer_v2_plot_swimmer,
+        overwrite,
+        sample_df,
+        out_path=os.path.join(module_out, "patient_swimmer"),
+        title="CRPC-Pfizer reduced cohort: visits, effective dose, and TFx",
+    )
+
+
+def _pfizer_v2_run_primary_ezh2_pharmacodynamics(
+    sample_df: pd.DataFrame,
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> pd.DataFrame:
+    """Run the primary TFx-adjusted EZH2 repression pharmacodynamic analysis."""
+    module_out = ensure_dir(os.path.join(out_dir, "02_primary_ezh2_pharmacodynamics"))
+    feature_name = _PFIZER_PRIMARY_PD_FEATURE
+    if feature_name not in sample_df.columns or f"{feature_name}__SCN" not in patient_df.columns:
+        return pd.DataFrame()
+
+    delta_df = _pfizer_v2_build_delta_frame(
+        patient_df,
+        [feature_name],
+        start_visit="SCN",
+        end_visit="C3D1",
+        delta_column_name="C3D1_minus_SCN",
+    )
+    if delta_df.empty:
+        return delta_df
+    delta_df.to_csv(os.path.join(module_out, "c3d1_minus_scn_primary_deltas.tsv"), sep="\t")
+
+    grouped_stats = _pfizer_v2_grouped_paired_delta_stats(
+        delta_df,
+        [feature_name],
+        group_column="effective_dose_group",
+    )
+    if not grouped_stats.empty:
+        grouped_stats.to_csv(os.path.join(module_out, "primary_grouped_paired_delta_stats.tsv"), sep="\t", index=False)
+
+    model_stats = _pfizer_v2_tfx_adjusted_delta_models(delta_df, [feature_name])
+    if not model_stats.empty:
+        model_stats.to_csv(os.path.join(module_out, "primary_tfx_adjusted_delta_model.tsv"), sep="\t", index=False)
+        _maybe(
+            _pfizer_v2_plot_effect_forest,
+            overwrite,
+            model_stats,
+            effect_column="effective_dose_coefficient",
+            lower_column="effective_dose_ci_lo",
+            upper_column="effective_dose_ci_hi",
+            out_path=os.path.join(module_out, "primary_tfx_adjusted_delta_forest"),
+            title="TFx-adjusted SCN→C3D1 EZH2 repression-target shift",
+        )
+
+    _pfizer_v2_run_tfx_mixed_models(sample_df, [feature_name], module_out, overwrite=overwrite)
+    _maybe(
+        _pfizer_v2_plot_dose_trajectory,
+        overwrite,
+        sample_df,
+        feature_name=feature_name,
+        out_path=os.path.join(module_out, "primary_score_paired_lines"),
+        title="EZH2 Repression Target Score: SCN → C3D1",
+        visit_order=["SCN", "C3D1"],
+    )
+    _maybe(
+        _pfizer_v2_plot_dose_waterfall,
+        overwrite,
+        delta_df,
+        feature_name=feature_name,
+        out_path=os.path.join(module_out, "primary_score_waterfall"),
+        title="EZH2 Repression Target Score: C3D1 - SCN",
+        y_label="Δ EZH2 Repression Target Score",
+    )
+    return delta_df
+
+
+def _pfizer_v2_run_ezh2_target_gene_panel(
+    sample_df: pd.DataFrame,
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Create the dedicated 10-gene EZH2 repression target panel outputs."""
+    module_out = ensure_dir(os.path.join(out_dir, "03_ezh2_target_gene_panel"))
+    focused_genes = _pfizer_v2_present_features(sample_df.columns, _PFIZER_EZH2_REPRESSION_TARGET_GENES)
+    if not focused_genes:
+        return
+    delta_df = _pfizer_v2_build_delta_frame(
+        patient_df,
+        focused_genes,
+        start_visit="SCN",
+        end_visit="C3D1",
+        delta_column_name="C3D1_minus_SCN",
+    )
+    if delta_df.empty:
+        return
+    delta_df.to_csv(os.path.join(module_out, "ezh2_target_gene_deltas.tsv"), sep="\t")
+
+    annotation_df = delta_df[["effective_dose_group", "baseline_tfx", "delta_tfx"]].copy()
+    _maybe(
+        _pfizer_v2_plot_annotated_heatmap,
+        overwrite,
+        delta_df[focused_genes].T,
+        annotation_df,
+        out_path=os.path.join(module_out, "ezh2_target_gene_heatmap"),
+        title="EZH2 repression target genes: C3D1 - SCN",
+        zscore_rows=False,
+    )
+
+    gene_models = _pfizer_v2_tfx_adjusted_delta_models(delta_df, focused_genes)
+    if not gene_models.empty:
+        gene_models.to_csv(os.path.join(module_out, "ezh2_target_gene_delta_models.tsv"), sep="\t", index=False)
+
+    for gene_name in focused_genes:
+        _maybe(
+            _pfizer_v2_plot_dose_trajectory,
+            overwrite,
+            sample_df,
+            feature_name=gene_name,
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{gene_name}_paired_lines")),
+            title=f"{gene_name}: SCN → C3D1",
+            visit_order=["SCN", "C3D1"],
+        )
+
+
+def _pfizer_v2_run_secondary_pharmacodynamics(
+    sample_df: pd.DataFrame,
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> pd.DataFrame:
+    """Run TFx-adjusted secondary pharmacodynamic score analyses."""
+    module_out = ensure_dir(os.path.join(out_dir, "04_secondary_pharmacodynamics"))
+    feature_names = _pfizer_v2_present_features(patient_df.columns, [f"{feature}__SCN" for feature in _PFIZER_SECONDARY_PD_FEATURES])
+    feature_names = [feature_name.rsplit("__", 1)[0] for feature_name in feature_names]
+    if not feature_names:
+        return pd.DataFrame()
+
+    delta_df = _pfizer_v2_build_delta_frame(
+        patient_df,
+        feature_names,
+        start_visit="SCN",
+        end_visit="C3D1",
+        delta_column_name="C3D1_minus_SCN",
+    )
+    if delta_df.empty:
+        return delta_df
+    delta_df.to_csv(os.path.join(module_out, "secondary_c3d1_minus_scn_deltas.tsv"), sep="\t")
+
+    grouped_stats = _pfizer_v2_grouped_paired_delta_stats(
+        delta_df,
+        feature_names,
+        group_column="effective_dose_group",
+    )
+    if not grouped_stats.empty:
+        grouped_stats.to_csv(os.path.join(module_out, "secondary_grouped_paired_delta_stats.tsv"), sep="\t", index=False)
+
+    model_stats = _pfizer_v2_tfx_adjusted_delta_models(delta_df, feature_names)
+    if not model_stats.empty:
+        model_stats.to_csv(os.path.join(module_out, "secondary_tfx_adjusted_delta_models.tsv"), sep="\t", index=False)
+        _maybe(
+            _pfizer_v2_plot_effect_forest,
+            overwrite,
+            model_stats,
+            effect_column="effective_dose_coefficient",
+            lower_column="effective_dose_ci_lo",
+            upper_column="effective_dose_ci_hi",
+            out_path=os.path.join(module_out, "secondary_tfx_adjusted_delta_forest"),
+            title="TFx-adjusted SCN→C3D1 secondary pharmacodynamic shifts",
+        )
+
+    _pfizer_v2_run_tfx_mixed_models(sample_df, feature_names, module_out, overwrite=overwrite)
+
+    baseline_df = sample_df.loc[sample_df["visit"].astype(str) == "SCN"].copy().set_index("patient_id", drop=False)
+    baseline_corr = _pfizer_v2_correlation_table(
+        baseline_df,
+        [
+            (_PFIZER_EZH2_ACTIVITY_SCORE, "CCP score"),
+            (_PFIZER_EZH2_ACTIVITY_SCORE, "HALLMARK_E2F_TARGETS"),
+            (_PFIZER_EZH2_ACTIVITY_SCORE, "HALLMARK_G2M_CHECKPOINT"),
+        ],
+    )
+    if not baseline_corr.empty:
+        baseline_corr.to_csv(os.path.join(module_out, "baseline_ezh2_activity_correlations.tsv"), sep="\t", index=False)
+
+    delta_corr = _pfizer_v2_correlation_table(
+        delta_df,
+        [
+            (_PFIZER_EZH2_ACTIVITY_SCORE, "CCP score"),
+            (_PFIZER_EZH2_ACTIVITY_SCORE, "HALLMARK_E2F_TARGETS"),
+            (_PFIZER_EZH2_ACTIVITY_SCORE, "HALLMARK_G2M_CHECKPOINT"),
+        ],
+    )
+    if not delta_corr.empty:
+        delta_corr.to_csv(os.path.join(module_out, "delta_ezh2_activity_correlations.tsv"), sep="\t", index=False)
+    return delta_df
+
+
+def _pfizer_v2_run_eot_pharmacodynamics(
+    sample_df: pd.DataFrame,
+    patient_df: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+) -> None:
+    """Summarize whether the early pharmacodynamic shift is maintained through EOT."""
+    module_out = ensure_dir(os.path.join(out_dir, "05_eot_exploratory"))
+    feature_names = _pfizer_v2_present_features(
+        patient_df.columns,
+        [
+            f"{_PFIZER_PRIMARY_PD_FEATURE}__SCN",
+            f"{_PFIZER_EZH2_ACTIVITY_SCORE}__SCN",
+            "CCP score__SCN",
+            "HALLMARK_E2F_TARGETS__SCN",
+            "HALLMARK_G2M_CHECKPOINT__SCN",
+            "HALLMARK_MYC_TARGETS_V1__SCN",
+            "AR score__SCN",
+            "HALLMARK_ANDROGEN_RESPONSE__SCN",
+        ],
+    )
+    feature_names = [feature_name.rsplit("__", 1)[0] for feature_name in feature_names]
+    if not feature_names:
+        return
+
+    for feature_name in feature_names:
+        _maybe(
+            _pfizer_v2_plot_dose_trajectory,
+            overwrite,
+            sample_df,
+            feature_name=feature_name,
+            out_path=os.path.join(module_out, _pfizer_safe_name(f"{feature_name}_trajectory_scn_c3d1_eot")),
+            title=f"{feature_name}: SCN → C3D1 → EOT",
+            visit_order=["SCN", "C3D1", "EOT"],
+        )
+
+    c3d1_df = _pfizer_v2_build_delta_frame(patient_df, feature_names, start_visit="SCN", end_visit="C3D1", delta_column_name="C3D1_minus_SCN")
+    eot_df = _pfizer_v2_build_delta_frame(patient_df, feature_names, start_visit="SCN", end_visit="EOT", delta_column_name="EOT_minus_SCN")
+    rebound_df = _pfizer_v2_build_delta_frame(patient_df, feature_names, start_visit="C3D1", end_visit="EOT", delta_column_name="EOT_minus_C3D1")
+    if not c3d1_df.empty:
+        c3d1_df.to_csv(os.path.join(module_out, "c3d1_minus_scn.tsv"), sep="\t")
+    if not eot_df.empty:
+        eot_df.to_csv(os.path.join(module_out, "eot_minus_scn.tsv"), sep="\t")
+    if not rebound_df.empty:
+        rebound_df.to_csv(os.path.join(module_out, "eot_minus_c3d1.tsv"), sep="\t")
+
+    if not eot_df.empty:
+        heatmap_rows: Dict[str, pd.Series] = {}
+        for feature_name in feature_names:
+            if feature_name in c3d1_df.columns:
+                heatmap_rows[f"{feature_name} | C3D1 - SCN"] = c3d1_df[feature_name]
+            if feature_name in rebound_df.columns:
+                heatmap_rows[f"{feature_name} | EOT - C3D1"] = rebound_df[feature_name]
+            if feature_name in eot_df.columns:
+                heatmap_rows[f"{feature_name} | EOT - SCN"] = eot_df[feature_name]
+        heatmap_matrix = pd.DataFrame(heatmap_rows).T if heatmap_rows else pd.DataFrame()
+        if not heatmap_matrix.empty:
+            annotation_df = eot_df[["effective_dose_group", "days_from_scn_EOT", "baseline_tfx", "delta_tfx"]]
+            _maybe(
+                _pfizer_v2_plot_annotated_heatmap,
+                overwrite,
+                heatmap_matrix,
+                annotation_df,
+                out_path=os.path.join(module_out, "eot_delta_heatmap"),
+                title="Early and end-of-treatment pharmacodynamic deltas",
+            )
+
+
+def _pfizer_v2_run_c3d1_dose_limma_and_gsea(
+    pred_subset: pd.DataFrame,
+    pfizer_meta: pd.DataFrame,
+    out_dir: str,
+    overwrite: bool,
+    *,
+    mc_draws: Optional[List[pd.DataFrame]] = None,
+) -> None:
+    """Run TFx-adjusted C3D1 limma/GSEA for the effective-dose split."""
+    module_out = ensure_dir(os.path.join(out_dir, "06_c3d1_dose_limma_gsea"))
+    visit_meta = pfizer_meta.loc[
+        (pfizer_meta["visit"].astype(str) == "C3D1")
+        & pfizer_meta["effective_dose_group"].notna()
+    ].copy()
+    if visit_meta.empty:
+        return
+
+    subtype_df = pd.DataFrame(index=visit_meta.index)
+    subtype_df["subtype"] = np.where(
+        visit_meta["effective_dose_group"].astype(str) == _PFIZER_EFFECTIVE_DOSE_ORDER[1],
+        "EffectiveDose",
+        "LowerOrNone",
+    )
+    visit_meta[["patient_id", "dose", "effective_dose_group", "tfx"]].to_csv(
+        os.path.join(module_out, "c3d1_effective_dose_metadata.tsv"),
+        sep="\t",
+    )
+    contrast = "EffectiveDose-LowerOrNone"
+    extra_gene_sets = {_PFIZER_PRIMARY_PD_FEATURE: _PFIZER_EZH2_REPRESSION_TARGET_GENES}
+    if mc_draws is None:
+        de_results = _run_limma_de(
+            pred_subset[visit_meta.index],
+            subtype_df,
+            module_out,
+            overwrite,
+            contrast=contrast,
+            tag="",
+            tfx_series=visit_meta["tfx"],
+        )
+    else:
+        visit_draws = [draw[visit_meta.index] for draw in mc_draws]
+        de_results = _run_limma_de_mc(
+            visit_draws,
+            pred_subset[visit_meta.index],
+            subtype_df,
+            module_out,
+            overwrite,
+            contrast=contrast,
+            tag="",
+            tfx_series=visit_meta["tfx"],
+        )
+    if de_results is None:
+        return
+    _run_gsea(
+        de_results,
+        module_out,
+        overwrite,
+        contrast=contrast,
+        tag="",
+        extra_gene_sets=extra_gene_sets,
+    )
+
+
 def _run_crpc_pfizer_analysis(
     pred: pd.DataFrame,
     model_out: str,
@@ -6798,7 +10833,7 @@ def _run_crpc_pfizer_analysis(
     *,
     mc_draws: Optional[List[pd.DataFrame]] = None,
 ) -> None:
-    """Run longitudinal metadata-driven analyses for CRPC-Pfizer."""
+    """Run the patient-level CRPC-Pfizer transcriptomic analysis suite."""
     pfizer_meta = _load_pfizer_metadata(pred.columns)
     if pfizer_meta.empty:
         print("    [skip] CRPC-Pfizer metadata: no matched samples")
@@ -6809,143 +10844,65 @@ def _run_crpc_pfizer_analysis(
         f"{pfizer_meta['patient_id'].nunique()} patients"
     )
 
-    pfizer_out = ensure_dir(os.path.join(model_out, "Pfizer_Longitudinal"))
+    pfizer_out = os.path.join(model_out, "Pfizer_Longitudinal")
+    if overwrite and os.path.isdir(pfizer_out):
+        shutil.rmtree(pfizer_out)
+    pfizer_out = ensure_dir(pfizer_out)
+
     pfizer_meta.to_csv(os.path.join(pfizer_out, "metadata_matched.tsv"), sep="\t")
-
     pred_subset = pred[pfizer_meta.index]
-    ssgsea_raw = _run_pluvicto_ssgsea(pred_subset, model_out, overwrite, tag="_raw")
-    shortlist_raw = _run_pluvicto_shortlist_scores(pred_subset, model_out, overwrite, tag="_raw")
-    interesting_hallmarks_raw = _pfizer_run_limma_and_gsea(
-        pred_subset,
-        pfizer_meta,
-        model_out,
-        overwrite,
-        tag_prefix="_raw",
-    )
-    marker_matrix_raw = _build_pfizer_marker_matrix(
-        pred_subset,
-        shortlist_raw,
-        ssgsea_raw,
-        interesting_hallmarks_raw,
-    )
+    pred_subset.to_csv(os.path.join(pfizer_out, "predictions_wide.tsv"), sep="\t")
 
-    analysis_specs: List[Tuple[str, pd.DataFrame, Optional[pd.DataFrame], Optional[pd.DataFrame], List[str]]] = [
-        ("raw", marker_matrix_raw, shortlist_raw, ssgsea_raw, interesting_hallmarks_raw),
+    variant_specs: List[Tuple[str, str, pd.DataFrame, Optional[List[pd.DataFrame]], bool]] = [
+        ("raw", os.path.join(pfizer_out, "raw"), pred_subset, None, True),
     ]
-
     if mc_draws is not None:
-        mc_draws_subset = [draw[pfizer_meta.index] for draw in mc_draws]
-        ssgsea_adj = _run_pluvicto_ssgsea_mc(mc_draws_subset, model_out, overwrite)
-        shortlist_adj = _run_pluvicto_shortlist_scores_mc(mc_draws_subset, model_out, overwrite)
-        interesting_hallmarks_adj = _pfizer_run_limma_and_gsea(
-            pred_subset,
+        aligned_draws, adjusted_template = _pfizer_v2_sanitize_monte_carlo_draws(mc_draws, pred_subset)
+        mean_pred = _pfizer_v2_mean_expression_from_draws(aligned_draws, adjusted_template)
+        variant_specs.append(
+            ("uncertainty-adjusted", os.path.join(pfizer_out, "uncertainty-adjusted"), mean_pred, aligned_draws, False)
+        )
+
+    for variant_name, variant_out, variant_pred, variant_draws, compute_pam50 in variant_specs:
+        variant_out = ensure_dir(variant_out)
+        hallmark_scores = (
+            _run_pluvicto_ssgsea(variant_pred, variant_out, overwrite, tag="_pfizer")
+            if variant_draws is None
+            else _run_pluvicto_ssgsea_mc(variant_draws, variant_out, overwrite)
+        )
+        shortlist_scores = (
+            _run_pluvicto_shortlist_scores(variant_pred, variant_out, overwrite, tag="_pfizer")
+            if variant_draws is None
+            else _run_pluvicto_shortlist_scores_mc(variant_draws, variant_out, overwrite)
+        )
+        sample_df, feature_columns = _pfizer_v2_build_sample_feature_table(
+            variant_pred,
             pfizer_meta,
-            model_out,
+            variant_out,
             overwrite,
-            tag_prefix="_uncertainty-adjusted",
-            mc_draws=mc_draws_subset,
+            hallmark_scores=hallmark_scores,
+            shortlist_scores=shortlist_scores,
+            pam50_df=pd.DataFrame(),
+            compute_pam50=compute_pam50,
         )
-        marker_matrix_adj = _build_pfizer_marker_matrix(
-            pred_subset,
-            shortlist_adj,
-            ssgsea_adj,
-            interesting_hallmarks_adj,
-        )
-        analysis_specs.append(
-            ("uncertainty-adjusted", marker_matrix_adj, shortlist_adj, ssgsea_adj, interesting_hallmarks_adj)
-        )
-
-    for analysis_name, marker_matrix, shortlist_scores, _, interesting_hallmarks in analysis_specs:
-        if marker_matrix.empty:
-            print(f"    [skip] CRPC-Pfizer {analysis_name}: no marker panel available")
+        patient_df = _pfizer_v2_build_patient_feature_table(sample_df, feature_columns)
+        if patient_df.empty:
+            print(f"    [skip] CRPC-Pfizer {variant_name}: no patient-level feature table could be constructed")
             continue
-
-        analysis_out = ensure_dir(os.path.join(pfizer_out, analysis_name))
-        marker_matrix.to_csv(os.path.join(analysis_out, "marker_panel.tsv"), sep="\t")
-        pd.DataFrame({"hallmark": interesting_hallmarks}).to_csv(
-            os.path.join(analysis_out, "selected_hallmarks.tsv"),
-            sep="\t",
-            index=False,
-        )
-
-        spaghetti_out = ensure_dir(os.path.join(analysis_out, "spaghetti"))
-        timepoint_out = ensure_dir(os.path.join(analysis_out, "timepoint_markers"))
-        paired_out = ensure_dir(os.path.join(analysis_out, "paired_delta"))
-        for marker_name in marker_matrix.index:
-            stem = _pfizer_safe_name(marker_name)
-            _maybe(
-                _pfizer_plot_timepoint_distribution,
-                overwrite,
-                marker_name,
-                marker_matrix.loc[marker_name],
-                pfizer_meta,
-                os.path.join(timepoint_out, stem),
-                title_suffix=analysis_name,
-            )
-            _maybe(
-                _pfizer_plot_spaghetti,
-                overwrite,
-                marker_name,
-                marker_matrix.loc[marker_name],
-                pfizer_meta,
-                os.path.join(spaghetti_out, stem),
-                title_suffix=analysis_name,
-            )
-            _maybe(
-                _pfizer_plot_delta_slope,
-                overwrite,
-                marker_name,
-                marker_matrix.loc[marker_name],
-                pfizer_meta,
-                os.path.join(paired_out, stem),
-                title_suffix=analysis_name,
-            )
-
-        delta_df = _pfizer_build_delta_table(marker_matrix, pfizer_meta)
-        if not delta_df.empty:
-            delta_df.to_csv(os.path.join(analysis_out, "marker_deltas.tsv"), sep="\t")
-            delta_plot_out = ensure_dir(os.path.join(analysis_out, "delta_by_response"))
-            for scheme in _pfizer_response_scheme_specs():
-                scheme_out = ensure_dir(os.path.join(delta_plot_out, scheme["name"]))
-                for marker_name in marker_matrix.index:
-                    stem = _pfizer_safe_name(marker_name)
-                    _maybe(
-                        _pfizer_plot_delta_distribution,
-                        overwrite,
-                        marker_name,
-                        delta_df,
-                        scheme["column"],
-                        scheme["levels"],
-                        os.path.join(scheme_out, stem),
-                        title_suffix=analysis_name,
-                    )
-            _run_pfizer_delta_response_models(
-                delta_df,
-                analysis_out,
-                overwrite=overwrite,
-                title_suffix=analysis_name,
-            )
-
-        mixed_out = ensure_dir(os.path.join(analysis_out, "mixed_models"))
-        _run_pfizer_mixed_models(
-            marker_matrix,
+        sample_df.to_csv(os.path.join(variant_out, "sample_level_features.tsv"), sep="\t")
+        patient_df.to_csv(os.path.join(variant_out, "patient_level_features.tsv"), sep="\t")
+        _pfizer_v2_run_reduced_cohort_overview(sample_df, patient_df, variant_out, overwrite)
+        _pfizer_v2_run_primary_ezh2_pharmacodynamics(sample_df, patient_df, variant_out, overwrite)
+        _pfizer_v2_run_ezh2_target_gene_panel(sample_df, patient_df, variant_out, overwrite)
+        _pfizer_v2_run_secondary_pharmacodynamics(sample_df, patient_df, variant_out, overwrite)
+        _pfizer_v2_run_eot_pharmacodynamics(sample_df, patient_df, variant_out, overwrite)
+        _pfizer_v2_run_c3d1_dose_limma_and_gsea(
+            pred_subset if variant_draws is None else variant_pred,
             pfizer_meta,
-            mixed_out,
-            overwrite=overwrite,
-            title_suffix=analysis_name,
+            variant_out,
+            overwrite,
+            mc_draws=variant_draws,
         )
-
-        if shortlist_scores is not None and {"NE.10", "ARG.10"}.issubset(shortlist_scores.index):
-            state_out = ensure_dir(os.path.join(analysis_out, "state_space"))
-            _maybe(
-                _pfizer_plot_state_space,
-                overwrite,
-                shortlist_scores.loc["NE.10"],
-                shortlist_scores.loc["ARG.10"],
-                pfizer_meta,
-                os.path.join(state_out, "ne10_vs_arg10"),
-                title_suffix=analysis_name,
-            )
 
 
 def _run_discovery_cohort(
@@ -6961,8 +10918,12 @@ def _run_discovery_cohort(
 
     label_name = subtype_label or cohort
 
-    for model_name, path_pattern in _DISCOVERY_MODELS:
-        path = PROJECT_ROOT / path_pattern.format(cohort=cohort)
+    rel_path = DISCOVERY_PROTEUS_PATHS.get(cohort)
+    if rel_path is None:
+        print(f"    [skip] No hard-coded Proteus path configured for {cohort}")
+        return
+
+    for model_name, path in [("Proteus", PROJECT_ROOT / rel_path)]:
         if not path.exists():
             print(f"    [skip] {model_name}: not found")
             continue
@@ -7021,6 +10982,15 @@ def _run_discovery_cohort(
 
         model_out = cohort_out if model_name == "Proteus" else ensure_dir(os.path.join(cohort_out, model_name))
         print(f"    {model_name}: {pred.shape[0]} genes × {pred.shape[1]} samples")
+
+        if cohort == "CRPC-Pfizer":
+            _run_crpc_pfizer_analysis(
+                pred,
+                model_out,
+                args.overwrite,
+                mc_draws=mc_draws,
+            )
+            continue
 
         _maybe(sample_expression_kde, args.overwrite, pred,
                os.path.join(model_out, "expression_profiles"),
@@ -7130,14 +11100,6 @@ def _run_discovery_cohort(
                     tag="_uncertainty-adjusted",
                 )
 
-        if cohort == "CRPC-Pfizer":
-            _run_crpc_pfizer_analysis(
-                pred,
-                model_out,
-                args.overwrite,
-                mc_draws=mc_draws,
-            )
-
 
 def run_patient_discovery(args: argparse.Namespace) -> None:
     """Discovery cohort analysis: predictions only (no biopsy truth).
@@ -7181,9 +11143,13 @@ def run_patient_discovery(args: argparse.Namespace) -> None:
 
 def _load_main_plca_cv_full(minimum_tfx: float = 0.0) -> Optional[Dict[str, Any]]:
     """Load and prefix-normalize the canonical PLCA CV outputs."""
-    cv_dir = PROJECT_ROOT / VALIDATION_PATIENT_CV_RESULTS_DIR
-    if not os.path.isdir(cv_dir):
-        print(f"  [skip] PLCA CV results not found: {VALIDATION_PATIENT_CV_RESULTS_DIR}")
+    missing_cv_paths = [
+        rel_path
+        for _, rel_path in sorted(PLCA_CV_FOLD_TUMOR_PREDICTION_PATHS.items())
+        if not (PROJECT_ROOT / rel_path).exists()
+    ]
+    if missing_cv_paths:
+        print(f"  [skip] PLCA CV results not found: {missing_cv_paths[0]}")
         return None
 
     fold_splits = _load_plca_fold_splits()
@@ -7197,7 +11163,12 @@ def _load_main_plca_cv_full(minimum_tfx: float = 0.0) -> Optional[Dict[str, Any]
         cohort_map[short] = cohort
         prefix_map[short] = prefixed
 
-    cv_full = load_cv_predictions_proteus_full(str(cv_dir))
+    cv_full = load_cv_predictions_proteus_full_from_paths(
+        {
+            fold: PROJECT_ROOT / rel_path
+            for fold, rel_path in sorted(PLCA_CV_FOLD_TUMOR_PREDICTION_PATHS.items())
+        }
+    )
     table_keys = (
         "pred_wide",
         "truth_wide",
@@ -7569,6 +11540,7 @@ def run_validation_pdx(args: argparse.Namespace) -> None:
             interval_calibrator=interval_calibrator,
             calibrate_cis=args.calibrate_cis,
         )
+    shortlist_sets = _load_shortlist_sets()
 
     all_summaries: List[Dict[str, Any]] = []
     crosscohort_data: List[Dict[str, Any]] = []
@@ -7711,6 +11683,69 @@ def run_validation_pdx(args: argparse.Namespace) -> None:
             dim_ambiguous=args.dim_ambiguous,
         )
 
+        if cohort_name == "PC-PDX" and shortlist_sets:
+            common_samples = combined_truth.columns.intersection(combined_pred.columns)
+            if len(common_samples) >= 3:
+                score_meta = pd.DataFrame(index=common_samples)
+                if subtypes_df is not None:
+                    score_meta = subtypes_df.reindex(common_samples).copy()
+                if "status" not in score_meta.columns:
+                    score_meta["status"] = pd.Series(sample_status).reindex(common_samples)
+
+                truth_scores = _compute_ssgsea_score_matrix(
+                    combined_truth[common_samples], shortlist_sets, min_size=3,
+                )
+                raw_scores = _compute_ssgsea_score_matrix(
+                    combined_pred[common_samples], shortlist_sets, min_size=3,
+                )
+                scatter_out = ensure_dir(os.path.join(cohort_out, "ShortlistScores", "scatter_plots"))
+
+                if "CCP.31" in truth_scores.index and "CCP.31" in raw_scores.index:
+                    _maybe(
+                        _crosscohort_score_scatter,
+                        args.overwrite,
+                        truth_scores.loc["CCP.31"],
+                        raw_scores.loc["CCP.31"],
+                        score_meta,
+                        os.path.join(scatter_out, "CCP.31_raw"),
+                        title="PC-PDX — CCP.31 ssGSEA (Truth vs Predicted Raw)",
+                        x_label="RNA-Seq CCP.31 ssGSEA Score",
+                        y_label="Predicted CCP.31 ssGSEA Score",
+                        color_column="subtype",
+                        legend_title="Subtype",
+                    )
+
+                has_combined_mdn = all(combined_mdn_tables.get(key) is not None for key in _MDN_PARAM_KEYS)
+                if has_combined_mdn and "CCP.31" in truth_scores.index:
+                    print(f"    Shortlist ssGSEA MC: {cohort_name} ({len(common_samples)} samples)")
+                    mc_draws = mdn_monte_carlo_sample(
+                        combined_mdn_tables["p0_wide"][common_samples],
+                        combined_mdn_tables["pi_gamma_wide"][common_samples],
+                        combined_mdn_tables["pi_normal_wide"][common_samples],
+                        combined_mdn_tables["gamma_beta_wide"][common_samples],
+                        combined_mdn_tables["normal_mean_wide"][common_samples],
+                        combined_mdn_tables["normal_stdev_wide"][common_samples],
+                        M=args.montecarlo_draws,
+                        seed=42,
+                    )
+                    adjusted_scores, _, _ = _aggregate_ssgsea_score_matrices(
+                        mc_draws, shortlist_sets, min_size=3,
+                    )
+                    if adjusted_scores is not None and "CCP.31" in adjusted_scores.index:
+                        _maybe(
+                            _crosscohort_score_scatter,
+                            args.overwrite,
+                            truth_scores.loc["CCP.31"],
+                            adjusted_scores.loc["CCP.31"],
+                            score_meta,
+                            os.path.join(scatter_out, "CCP.31_uncertainty-adjusted"),
+                            title="PC-PDX — CCP.31 ssGSEA (Truth vs Predicted Adjusted)",
+                            x_label="RNA-Seq CCP.31 ssGSEA Score",
+                            y_label="Adjusted CCP.31 ssGSEA Score",
+                            color_column="subtype",
+                            legend_title="Subtype",
+                        )
+
         if raw_ho_data is not None and reliability_model is not None:
             _run_reliability_evaluation(
                 raw_ho_data,
@@ -7798,9 +11833,13 @@ def run_validation_patient(args: argparse.Namespace) -> None:
 
     for cohort in VALIDATION_PATIENT_HOLDOUT_COHORTS:
         print(f"\n  ── Cohort: {cohort} (holdout) ──")
+        holdout_path = VALIDATION_PATIENT_HOLDOUT_PATHS.get(cohort)
+        if holdout_path is None:
+            print(f"  [skip] No hard-coded holdout path configured for {cohort}")
+            continue
         result = _run_patient_validation_cohort(
             cohort,
-            VALIDATION_PATIENT_HOLDOUT_PATH_TEMPLATE,
+            holdout_path,
             out_dir,
             args,
             interval_calibrator=interval_calibrator,
@@ -7833,6 +11872,7 @@ def run_validation_patient(args: argparse.Namespace) -> None:
             args,
             label="CrossCohort",
             activity_threshold_summary=activity_threshold_summary,
+            run_pam50_crosscohort=True,
         )
 
 # ---------------------------------------------------------------------------
@@ -7891,7 +11931,6 @@ def _maybe(fn, overwrite: bool, *args, **kwargs) -> Any:
     if overwrite:
         return fn(*args, **kwargs)
 
-    # Try to find the output path — it's the first string arg that looks like a path
     for a in args:
         if isinstance(a, str) and ("/" in a or "\\" in a):
             if os.path.exists(f"{a}.pdf"):
@@ -7918,6 +11957,88 @@ def _save_summary_tsv(summaries: List[Dict[str, Any]], path: str) -> None:
 _BENCH_TFX_ORDER = ["TF0.50", "TF0.30", "TF0.10", "TF0.05", "TF0.03", "TF0.01"]
 _BENCH_DEPTH_ORDER = ["10x", "5x"]
 _BENCH_EXCLUDED_DEPTHS = {"1x", "30x", "50x"}
+
+
+def _file_manifest_entry(path: Path) -> Dict[str, Any]:
+    stat = path.stat()
+    rel_path = path.relative_to(PROJECT_ROOT)
+    return {
+        "path": rel_path.as_posix(),
+        "size_bytes": int(stat.st_size),
+        "mtime_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(stat.st_mtime)),
+    }
+
+
+def _validate_phs_sample_names(sample_names: Sequence[str], *, model_name: str) -> None:
+    invalid_samples: List[str] = []
+    for sample_name in sample_names:
+        sample_name = str(sample_name)
+        try:
+            parse_phs_sample(sample_name)
+        except ValueError:
+            invalid_samples.append(sample_name)
+            if len(invalid_samples) >= 5:
+                break
+    if invalid_samples:
+        raise ValueError(
+            f"Benchmarking_Synthetic loaded non-PHS sample names for {model_name}: "
+            f"{invalid_samples}. Check the source predictions file."
+        )
+
+
+def _benchmark_grid_sample_names(sample_names: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """Split PHS sample names into in-grid and ignored benchmarking samples."""
+    in_grid: List[str] = []
+    ignored: List[str] = []
+    allowed_depths = set(_BENCH_DEPTH_ORDER)
+    allowed_tfx = set(_BENCH_TFX_ORDER)
+
+    for sample_name in sample_names:
+        sample_name = str(sample_name)
+        info = parse_phs_sample(sample_name)
+        if info["coverage"] in allowed_depths and info["tfx"] in allowed_tfx:
+            in_grid.append(sample_name)
+        else:
+            ignored.append(sample_name)
+
+    return sorted(in_grid), sorted(ignored)
+
+
+def _validate_synthetic_sample_axes(
+    sample_axes: Dict[str, pd.Index],
+) -> Tuple[str, List[str], Dict[str, List[str]]]:
+    if not sample_axes:
+        raise ValueError("Benchmarking_Synthetic did not load any sample axes.")
+
+    reference_model = next(
+        (name for name in SYNTHETIC_PROTEUS_MODEL_PATHS if name in sample_axes),
+        next(iter(sample_axes)),
+    )
+    ignored_samples_by_model: Dict[str, List[str]] = {}
+
+    reference_raw_samples = sorted(str(sample_name) for sample_name in sample_axes[reference_model])
+    _validate_phs_sample_names(reference_raw_samples, model_name=reference_model)
+    reference_samples, ignored_reference_samples = _benchmark_grid_sample_names(reference_raw_samples)
+    ignored_samples_by_model[reference_model] = ignored_reference_samples
+    reference_set = set(reference_samples)
+
+    for model_name, sample_index in sample_axes.items():
+        sample_names = [str(sample_name) for sample_name in sample_index]
+        _validate_phs_sample_names(sample_names, model_name=model_name)
+        grid_sample_names, ignored_samples = _benchmark_grid_sample_names(sample_names)
+        ignored_samples_by_model[model_name] = ignored_samples
+        sample_set = set(grid_sample_names)
+        if sample_set == reference_set:
+            continue
+        missing = sorted(reference_set - sample_set)
+        extra = sorted(sample_set - reference_set)
+        raise ValueError(
+            f"Benchmarking_Synthetic sample mismatch for {model_name} relative to {reference_model}. "
+            f"Missing {len(missing)} in-grid samples and found {len(extra)} unexpected in-grid samples. "
+            f"Missing examples: {missing[:5]}. Extra examples: {extra[:5]}."
+        )
+
+    return reference_model, reference_samples, ignored_samples_by_model
 
 
 def _bench_worker(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -8918,19 +13039,11 @@ def run_benchmarking(args: argparse.Namespace) -> None:
     _write_run_manifest("Benchmarking_Synthetic", out_dir, args)
     n_workers = args.n_workers
 
-    canonical_truth = _build_plca_truth(args.minimum_tfx)
-    cv_bundle = _load_main_plca_cv_full(args.minimum_tfx)
-    interval_calibrator: Optional[RegimeCalibrator] = None
-    if cv_bundle is not None and not canonical_truth.empty:
-        cv_full = cv_bundle["cv_full"]
-        if args.calibrate_cis and cv_full.get("ci_lo_wide") is not None and cv_full.get("ci_hi_wide") is not None:
-            interval_calibrator = _fit_global_calibrator(canonical_truth, cv_full)
-            if interval_calibrator is not None:
-                print(f"  {interval_calibrator.summary()}")
-
     # ── Load model predictions and build truth ──────────────────────────
     model_preds: Dict[str, pd.DataFrame] = {}  # model_name -> wide (genes × samples)
     proteus_bundles: Dict[str, Dict[str, Any]] = {}
+    sample_axes: Dict[str, pd.Index] = {}
+    manifest_inputs: List[Dict[str, Any]] = []
 
     for model_name, rel_path in SYNTHETIC_PROTEUS_MODEL_PATHS.items():
         path = PROJECT_ROOT / rel_path
@@ -8941,14 +13054,32 @@ def run_benchmarking(args: argparse.Namespace) -> None:
         model_preds[model_name] = full_data["pred_wide"]
         proteus_bundles[model_name] = full_data
         pred_wide = full_data["pred_wide"]
-        print(f"  Loaded {model_name}: {pred_wide.shape[0]} genes × {pred_wide.shape[1]} samples")
+        sample_axes[model_name] = pred_wide.columns
+        manifest_inputs.append({
+            "model": model_name,
+            "source_type": "proteus",
+            "genes": int(pred_wide.shape[0]),
+            "samples": int(pred_wide.shape[1]),
+            "sample_names": [str(sample_name) for sample_name in pred_wide.columns],
+            **_file_manifest_entry(path),
+        })
+        print(f"  Loaded {model_name}: {pred_wide.shape[0]} genes × {pred_wide.shape[1]} samples [{path}]")
 
     # XGBoost uses a different column name ('prediction' not 'prediction_mean')
     xgb_path = PROJECT_ROOT / SYNTHETIC_XGB_PATH
     if xgb_path.exists():
         xgb_pred = load_holdout_predictions_xgboost(str(xgb_path))
         model_preds["XGBoost"] = xgb_pred
-        print(f"  Loaded XGBoost: {xgb_pred.shape[0]} genes × {xgb_pred.shape[1]} samples")
+        sample_axes["XGBoost"] = xgb_pred.columns
+        manifest_inputs.append({
+            "model": "XGBoost",
+            "source_type": "xgboost",
+            "genes": int(xgb_pred.shape[0]),
+            "samples": int(xgb_pred.shape[1]),
+            "sample_names": [str(sample_name) for sample_name in xgb_pred.columns],
+            **_file_manifest_entry(xgb_path),
+        })
+        print(f"  Loaded XGBoost: {xgb_pred.shape[0]} genes × {xgb_pred.shape[1]} samples [{xgb_path}]")
     else:
         print(f"  [skip] XGBoost: {SYNTHETIC_XGB_PATH} not found")
 
@@ -8956,9 +13087,26 @@ def run_benchmarking(args: argparse.Namespace) -> None:
         print("  [skip] No model predictions found for benchmarking")
         return
 
-    # Use the first model's sample set as reference
-    ref_pred = next(iter(model_preds.values()))
-    all_samples = sorted(ref_pred.columns)
+    reference_model, all_samples, ignored_samples_by_model = _validate_synthetic_sample_axes(sample_axes)
+    reference_sample_set = set(all_samples)
+    for model_name, ignored_samples in ignored_samples_by_model.items():
+        if not ignored_samples:
+            continue
+        print(
+            f"  {model_name}: ignoring {len(ignored_samples)} out-of-grid PHS samples "
+            f"before synthetic benchmarking alignment"
+        )
+    for manifest_entry in manifest_inputs:
+        manifest_entry["ignored_out_of_grid_samples"] = ignored_samples_by_model.get(
+            str(manifest_entry.get("model")),
+            [],
+        )
+    for model_name, pred_wide in list(model_preds.items()):
+        model_preds[model_name] = pred_wide.loc[:, all_samples].copy()
+        if model_name in proteus_bundles:
+            proteus_bundles[model_name] = _filter_prediction_bundle_to_samples(
+                proteus_bundles[model_name], all_samples,
+            )
 
     # Build truth from PDX expression labels
     truth_wide = load_pdx_truth_for_phs(all_samples)
@@ -8995,10 +13143,68 @@ def run_benchmarking(args: argparse.Namespace) -> None:
             # PFE here is the raw EPIC-Seq PFE output (column "PFE"),
             # not the normalized quantity used in GEP construction.
             display = CONFIG_EPIC_DISPLAY_NAMES.get(score_name, f"EPIC_{score_name}")
-            model_preds[display] = epw
-            print(f"  Loaded {display}: {epw.shape[0]} genes × {epw.shape[1]} samples")
+            sample_axes[display] = epw.columns
+            epic_sample_names = [str(sample_name) for sample_name in epw.columns]
+            _validate_phs_sample_names(epic_sample_names, model_name=display)
+            epic_grid_samples, epic_ignored_samples = _benchmark_grid_sample_names(epic_sample_names)
+            ignored_samples_by_model[display] = epic_ignored_samples
+            if epic_ignored_samples:
+                print(
+                    f"  {display}: ignoring {len(epic_ignored_samples)} out-of-grid PHS samples "
+                    f"before synthetic benchmarking alignment"
+                )
+            epic_sample_set = set(epic_grid_samples)
+            if epic_sample_set != reference_sample_set:
+                missing = sorted(reference_sample_set - epic_sample_set)
+                extra = sorted(epic_sample_set - reference_sample_set)
+                raise ValueError(
+                    f"Benchmarking_Synthetic sample mismatch for {display} relative to {reference_model}. "
+                    f"Missing {len(missing)} in-grid samples and found {len(extra)} unexpected in-grid samples. "
+                    f"Missing examples: {missing[:5]}. Extra examples: {extra[:5]}."
+                )
+            model_preds[display] = epw.loc[:, all_samples].copy()
+            manifest_inputs.append({
+                "model": display,
+                "source_type": "epic-seq",
+                "score_name": score_name,
+                "genes": int(epw.shape[0]),
+                "samples": int(epw.shape[1]),
+                "sample_names": [str(sample_name) for sample_name in epw.columns],
+                "ignored_out_of_grid_samples": ignored_samples_by_model.get(display, []),
+                **_file_manifest_entry(epic_path),
+            })
+            print(f"  Loaded {display}: {epw.shape[0]} genes × {epw.shape[1]} samples [{epic_path}]")
     else:
         print(f"  [skip] EPIC-Seq: {SYNTHETIC_EPIC_PATH} not found")
+
+    truth_sources = [
+        PROJECT_ROOT / "labels" / "PC-PDX_Log2CPMplus1.tsv",
+        PROJECT_ROOT / "labels" / "SCLC-PDX_Log2CPMplus1.tsv",
+    ]
+    _write_run_manifest(
+        "Benchmarking_Synthetic",
+        out_dir,
+        args,
+        extra={
+            "reference_model": reference_model,
+            "reference_sample_count": len(all_samples),
+            "reference_samples": all_samples,
+            "ignored_out_of_grid_samples_by_model": ignored_samples_by_model,
+            "excluded_depths": sorted(_BENCH_EXCLUDED_DEPTHS),
+            "input_files": manifest_inputs + [
+                {
+                    "model": "truth_PC-PDX",
+                    "source_type": "truth",
+                    **_file_manifest_entry(truth_sources[0]),
+                },
+                {
+                    "model": "truth_SCLC-PDX",
+                    "source_type": "truth",
+                    **_file_manifest_entry(truth_sources[1]),
+                },
+            ],
+        },
+    )
 
     # ── Parse sample metadata and build grid ────────────────────────────
     sample_meta = []
@@ -9221,6 +13427,84 @@ def _build_plca_truth(minimum_tfx: float = 0.0) -> pd.DataFrame:
     return pd.concat([p.loc[common_genes] for p in parts], axis=1)
 
 
+def _preflight_minimum_tfx_filters(group_names: Sequence[str], minimum_tfx: float) -> None:
+    """Emit all selected-group TFx sample-filter notices before any analysis-group banner."""
+    if minimum_tfx <= 0.0:
+        return
+
+    needs_plca_truth = any(
+        group_name in {
+            "Examples",
+            "Benchmarking_Patient",
+            "Calibration",
+            "Validation_PDX",
+            "Validation_Patient",
+            "Discovery_Patient",
+        }
+        for group_name in group_names
+    )
+    needs_patient_holdout_truth = any(
+        group_name in {"Benchmarking_Patient", "Validation_Patient"}
+        for group_name in group_names
+    )
+    needs_discovery = "Discovery_Patient" in group_names
+
+    if not (needs_plca_truth or needs_patient_holdout_truth or needs_discovery):
+        return
+
+    _print_input_filter_banner(minimum_tfx)
+
+    if needs_plca_truth:
+        splits = _load_plca_fold_splits()
+        split_samples = set(splits["Sample"])
+        for cohort in _PLCA_CV_COHORTS:
+            if not _is_patient_cohort(cohort):
+                continue
+            truth_path = PROJECT_ROOT / "labels" / f"{cohort}_Log2CPMplus1.tsv"
+            if not truth_path.exists():
+                continue
+            truth_wide = load_truth(cohort)
+            reference_index = pd.Index([sample_name for sample_name in truth_wide.columns if sample_name in split_samples])
+            if len(reference_index) == 0:
+                continue
+            _load_filtered_subtypes_for_reference(
+                cohort,
+                reference_index,
+                minimum_tfx=minimum_tfx,
+                report_context=cohort,
+            )
+
+    if needs_patient_holdout_truth:
+        for cohort in VALIDATION_PATIENT_HOLDOUT_COHORTS:
+            truth_path = PROJECT_ROOT / "labels" / f"{cohort}_Log2CPMplus1.tsv"
+            if not truth_path.exists():
+                continue
+            _load_filtered_subtypes_for_reference(
+                cohort,
+                load_truth(cohort).columns,
+                minimum_tfx=minimum_tfx,
+                report_context=cohort,
+            )
+
+    if needs_discovery:
+        for cohort, label_name in CONFIG_DISCOVERY_COHORTS:
+            if not _is_patient_cohort(cohort):
+                continue
+            resolved_label = label_name or cohort
+            subtype_path = PROJECT_ROOT / "labels" / f"{resolved_label}_TFX_Subtype.tsv"
+            if subtype_path.exists():
+                reference_index = pd.Index([str(sample_name) for sample_name in load_subtypes(resolved_label).index])
+            else:
+                reference_index = pd.Index([], dtype="object")
+            _load_filtered_subtypes_for_reference(
+                cohort,
+                reference_index,
+                minimum_tfx=minimum_tfx,
+                label_name=label_name,
+                report_context=cohort,
+            )
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -9236,6 +13520,11 @@ GROUPS = {
     "Validation_Patient": run_validation_patient,
     "Discovery_Patient": run_patient_discovery,
 }
+
+DEFAULT_ALL_GROUPS = [
+    name for name in GROUPS.keys()
+    if name != "Calibration"
+]
 
 
 def main() -> None:
@@ -9298,11 +13587,15 @@ def main() -> None:
     else:
         print(f"Available CPUs: {available_cpus}  |  Using {resolved_workers} workers")
 
+    selected_groups = DEFAULT_ALL_GROUPS if args.group == "all" else [args.group]
+    _preflight_minimum_tfx_filters(selected_groups, args.minimum_tfx)
+
     t_start = time.time()
 
     if args.group == "all":
-        for name, fn in GROUPS.items():
-            fn(args)
+        print("Skipping legacy Calibration in --group all; run --group Calibration explicitly for CI diagnostics.")
+        for name in selected_groups:
+            GROUPS[name](args)
     else:
         GROUPS[args.group](args)
 

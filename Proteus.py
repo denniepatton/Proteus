@@ -400,40 +400,11 @@ def train_model_cv(
     # Device setup (GPU-only)
     device = torch.device('cuda')
 
-    # Compute full-dataset (all folds) gene variance once for GVW evaluation.
-    # This gives validation metrics a stable, unbiased variance estimate.
-    # PHT samples are excluded: their truth labels duplicate their parent PDX
-    # samples, so including them would inflate sample counts and bias variance.
-    from proteus_utils.proteus_utils import compute_gene_weights_from_zarr, compute_gene_variances_unclipped
-    print('Computing full-dataset gene variance for GVW evaluation (excluding PHT)...')
-    all_zarr_paths = collect_zarr_paths(training_set_tsv, zarr_base, exclude_cohorts={'PHT'})
-    full_tumor_variance = compute_gene_variances_unclipped(
-        all_zarr_paths, label_key='flat/tumor_exp',
+    from proteus_utils.proteus_utils import (
+        compute_gene_weights_from_zarr,
+        compute_gene_variances_unclipped,
+        compute_gene_mean_std_from_zarr,
     )
-    if not full_tumor_variance:
-        raise ValueError(
-            f"No finite tumor expression values found across {len(all_zarr_paths)} "
-            f"samples in {training_set_tsv} — cannot compute GVW variance weights"
-        )
-    print(f'  Full-dataset tumor variance: {len(full_tumor_variance)} genes, '
-          f'n={len(all_zarr_paths)} samples, '
-          f'range [{min(full_tumor_variance.values()):.3f}, {max(full_tumor_variance.values()):.3f}]')
-
-    # Background variance: PHT samples are the only cohort with real
-    # background expression labels (from HD-L).  Non-PHT zarr stores have
-    # all-NaN flat/background_exp, which the variance computation skips.
-    # We use ALL samples here (not the PHT-excluded set) so PHT's HD-L
-    # background labels contribute.  Background variance is used only for
-    # validation GVW metrics, not for training gene weights.
-    all_zarr_paths_with_pht = collect_zarr_paths(training_set_tsv, zarr_base)
-    full_background_variance: Optional[Dict[str, float]] = compute_gene_variances_unclipped(
-        all_zarr_paths_with_pht, label_key='flat/background_exp',
-    ) or None
-    if full_background_variance is not None:
-        print(f'  Full-dataset background variance: {len(full_background_variance)} genes, '
-              f'range [{min(full_background_variance.values()):.3f}, {max(full_background_variance.values()):.3f}]')
-    else:
-        print('  No background expression labels found — background GVW weighting disabled')
 
     # Build sample-name → cohort mapping for per-cohort validation metrics.
     # Keys use full TSV sample names (with cohort prefix when present)
@@ -461,10 +432,6 @@ def train_model_cv(
     if source_groups:
         sample_to_source, _source_variance_paths = build_source_map_from_tsv(
             training_set_tsv, source_groups, zarr_base,
-        )
-        source_tumor_variance = compute_source_variance(
-            source_groups, _source_variance_paths,
-            compute_gene_variances_unclipped,
         )
 
     for fold_num in fold_list:
@@ -495,10 +462,33 @@ def train_model_cv(
             train_zarr_paths,
             label_key='flat/tumor_exp',
         )
+        train_gene_mean_total, train_gene_std_total = compute_gene_mean_std_from_zarr(
+            train_zarr_paths,
+            label_key='flat/tumor_exp',
+        )
         _raw_vals = list(train_fold_variance_raw.values())
         print(f'  {len(gene_weights)} genes, n={len(train_zarr_paths)} samples — '
               f'raw variance [{min(_raw_vals):.4f}, {max(_raw_vals):.4f}], '
               f'clipped to [0.100, 10.000]')
+
+        train_background_variance: Optional[Dict[str, float]] = compute_gene_variances_unclipped(
+            collect_zarr_paths(training_set_tsv, zarr_base, exclude_fold=fold_num),
+            label_key='flat/background_exp',
+        ) or None
+
+        fold_group_tumor_variance: Optional[Dict[str, Dict[str, float]]] = None
+        if source_groups:
+            _, fold_source_variance_paths = build_source_map_from_tsv(
+                training_set_tsv,
+                source_groups,
+                zarr_base,
+                exclude_fold=fold_num,
+            )
+            fold_group_tumor_variance = compute_source_variance(
+                source_groups,
+                fold_source_variance_paths,
+                compute_gene_variances_unclipped,
+            )
 
         # Build data loaders from TSV
         print('Building data loaders...')
@@ -555,10 +545,11 @@ def train_model_cv(
         
         # Train
         trainer = Trainer(model, fold_training_config, model_config, device)
-        trainer.val_gene_weight_map = full_tumor_variance
-        trainer.val_background_gene_weight_map = full_background_variance
+        trainer.set_srl_stats(train_gene_mean_total, train_gene_std_total)
+        trainer.val_gene_weight_map = train_fold_variance_raw
+        trainer.val_background_gene_weight_map = train_background_variance
         # Per-source gene variance for epoch-level per-source GVW-CRPS/GVW-r.
-        trainer.val_source_gene_weight_map = source_tumor_variance
+        trainer.val_source_gene_weight_map = fold_group_tumor_variance
         # Enable epoch-level per-group CRPS monitoring.  When source_groups
         # is active, group by source (4 groups); otherwise by cohort.
         trainer.val_sample_group_map = sample_to_source or sample_to_cohort or None
@@ -612,11 +603,11 @@ def train_model_cv(
             fold_dir,
             fold_num,
             device,
-            full_tumor_variance=full_tumor_variance,
-            full_background_variance=full_background_variance,
+            full_tumor_variance=train_fold_variance_raw,
+            full_background_variance=train_background_variance,
             sample_to_cohort=sample_to_cohort if sample_to_cohort else None,
             sample_to_source=sample_to_source,
-            source_tumor_variance=source_tumor_variance,
+            source_tumor_variance=fold_group_tumor_variance,
             selection_group_weights=selection_group_weights,
         )
 
@@ -632,12 +623,25 @@ def train_model_cv(
             # Loss curves
             fig = plt.figure(figsize=(7, 4))
             epochs_axis = np.arange(1, len(history.get('train_loss', [])) + 1)
+            val_epochs = np.asarray(history.get('val_epochs', []), dtype=np.int32)
+
+            def _plot_validation_series(series_name: str, label: str) -> None:
+                series = np.asarray(history.get(series_name, []), dtype=np.float64)
+                if val_epochs.size == 0 or series.size == 0:
+                    return
+                n_points = min(val_epochs.size, series.size)
+                x_vals = val_epochs[:n_points]
+                y_vals = series[:n_points]
+                finite = np.isfinite(y_vals)
+                if not np.any(finite):
+                    return
+                plt.plot(x_vals[finite], y_vals[finite], marker='o', linewidth=1.5, markersize=3.5, label=label)
+
             if len(epochs_axis) > 0:
                 plt.plot(epochs_axis, history.get('train_loss', []), label='train_loss')
-                if history.get('val_loss'):
-                    plt.plot(epochs_axis, history.get('val_loss', []), label='val_loss')
-                if history.get('val_tumor_gvw_crps'):
-                    plt.plot(epochs_axis, history.get('val_tumor_gvw_crps', []), label='val_tumor_gvw_crps')
+                _plot_validation_series('val_loss', 'val_loss')
+                _plot_validation_series('val_tumor_gvw_crps', 'val_tumor_gvw_crps')
+                _plot_validation_series('val_weighted_tumor_gvw_crps', 'val_weighted_tumor_gvw_crps')
                 plt.xlabel('epoch')
                 plt.ylabel('metric')
                 plt.title('Training / validation curves')
@@ -899,9 +903,17 @@ def full_train_from_splits(
     # Compute per-gene variance weights from ALL samples (before split).
     # Clipped variance weights for the loss function.
     print('Computing gene variance weights from all non-PHT tumor samples...')
-    from proteus_utils.proteus_utils import compute_gene_weights_from_zarr, compute_gene_variances_unclipped
+    from proteus_utils.proteus_utils import (
+        compute_gene_weights_from_zarr,
+        compute_gene_variances_unclipped,
+        compute_gene_mean_std_from_zarr,
+    )
     tumor_weight_paths = [p for p in all_paths if zarr_cohort_map[p] != 'PHT']
     train_fold_variance_raw = compute_gene_variances_unclipped(tumor_weight_paths, label_key='flat/tumor_exp')
+    train_gene_mean_total, train_gene_std_total = compute_gene_mean_std_from_zarr(
+        tumor_weight_paths,
+        label_key='flat/tumor_exp',
+    )
     gene_weights = compute_gene_weights_from_zarr(
         tumor_weight_paths,
         label_key='flat/tumor_exp',
@@ -1110,6 +1122,7 @@ def full_train_from_splits(
 
     # Train
     trainer = Trainer(model, training_config, model_config, device)
+    trainer.set_srl_stats(train_gene_mean_total, train_gene_std_total)
     if val_loader is not None:
         trainer.val_gene_weight_map = train_fold_variance_raw
         trainer.val_source_gene_weight_map = source_tumor_variance
@@ -1315,6 +1328,10 @@ def _build_configs_from_spec(experiment_spec, args, model_name: str = 'BioDVN') 
         beta_reconstruction=float(experiment_spec.structural.beta_reconstruction.fixed),
         beta_tfx=float(experiment_spec.structural.beta_tfx.fixed),
         beta_ccc=float(experiment_spec.structural.beta_ccc.fixed),
+        beta_srl_max=float(experiment_spec.structural.beta_srl_max.fixed),
+        srl_delta=float(experiment_spec.structural.srl_delta.fixed),
+        srl_start=int(experiment_spec.structural.srl_start.fixed),
+        srl_ramp=int(experiment_spec.structural.srl_ramp.fixed),
         beta_pht_consistency=float(experiment_spec.structural.beta_pht_consistency.fixed),
         beta_pht_uncertainty=float(experiment_spec.structural.beta_pht_uncertainty.fixed),
         cl_margin=float(experiment_spec.structural.cl_margin.fixed),
@@ -1385,7 +1402,7 @@ def main():
     
     # Training arguments
     parser.add_argument("--model_name", type=str, default="BioDVN", help="Model architecture name")
-    parser.add_argument("--run_mode", type=str, default='train', choices=['train', 'full-train', 'tune', 'tune-ask', 'tune-tell', 'tune-fold', 'tune-proxy-ask', 'tune-proxy-tell', 'tune-proxy-finalize', 'run'], help="train=CV training, full-train=final model, tune=Optuna CV tuning, tune-ask/tune-tell/tune-fold=coordinated fold-parallel tuning, tune-proxy-ask/tune-proxy-tell/tune-proxy-finalize=proxy-fold racing, run=inference")
+    parser.add_argument("--run_mode", type=str, default='train', choices=['train', 'full-train', 'tune', 'tune-rescue', 'tune-ask', 'tune-tell', 'tune-fold', 'tune-proxy-ask', 'tune-proxy-tell', 'tune-proxy-finalize', 'run'], help="train=CV training, full-train=final model, tune=Optuna CV tuning, tune-rescue=backfill completed Optuna trials from saved fold artifacts, tune-ask/tune-tell/tune-fold=coordinated fold-parallel tuning, tune-proxy-ask/tune-proxy-tell/tune-proxy-finalize=proxy-fold racing, run=inference")
     parser.add_argument("--test_fold", type=int, default=None, help="Specific fold to train (for HPC parallelization)")
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
 
@@ -1618,6 +1635,25 @@ def main():
                 study_name=(None if args.study_name is None else str(args.study_name)),
                 sampler_seed=int(args.sampler_seed),
             )
+
+    elif args.run_mode == 'tune-rescue':
+        if args.experiment is None:
+            raise ValueError("--run_mode tune-rescue requires --experiment <path/to/experiment.yaml>")
+
+        from tuning.optuna_tuner import rescue_failed_fold_trials
+
+        trial_nums = None
+        if args.trial_numbers is not None:
+            trial_nums = [int(x.strip()) for x in args.trial_numbers.split(",")]
+
+        rescued_trials = rescue_failed_fold_trials(
+            experiment_path=str(args.experiment),
+            storage=str(args.optuna_storage),
+            study_name=(None if args.study_name is None else str(args.study_name)),
+            trial_numbers=trial_nums,
+            sampler_seed=int(args.sampler_seed),
+        )
+        print(f"RESCUED_TRIAL_NUMBERS={','.join(str(t) for t in rescued_trials)}", flush=True)
 
     elif args.run_mode == 'tune-ask':
         if args.experiment is None:

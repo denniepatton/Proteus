@@ -182,8 +182,8 @@ def load_model(
             ``state_dict`` (as saved by ``torch.save(model.state_dict(), …)``).
         config_path: Optional path to ``model_config.json``.  If *None* the
             function looks for ``model_config.json`` in the same directory as
-            *weights_path*.  Falls back to ``BioDVNConfig()`` defaults when no
-            config file is found.
+            *weights_path*.  Interpretation requires that config file so the
+            saved architecture can be reconstructed exactly.
         device: Target device.  Defaults to CUDA if available, else CPU.
 
     Returns:
@@ -428,7 +428,7 @@ def save_npz(data: Dict[str, np.ndarray], filepath: str) -> None:
     """Persist interpretation data to a compressed ``.npz`` file."""
     import time as _time
     arrays = {k: v for k, v in data.items() if isinstance(v, np.ndarray)}
-    for k in ('gene_names', 'sample_names'):
+    for k in ('gene_names', 'sample_names', 'cohort_names'):
         if k in data and isinstance(data[k], list):
             arrays[k] = np.array(data[k], dtype=object)
     os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
@@ -552,7 +552,7 @@ class _TumorMeanWrapper(nn.Module):
 
 
 class _ZeroComponentWrapper(nn.Module):
-    """Wrapper that returns the zero-class mixture weight (log-probability).
+    """Wrapper that returns the zero-class mixture probability.
 
     Instead of returning the point estimate, this returns the model's
     predicted probability of zero expression — specifically ``exp(log_pi[:, 0])``,
@@ -579,8 +579,7 @@ class _ZeroComponentWrapper(nn.Module):
             'ref_scalars': ref_scalars,
         }
         predictions, _ = self.model(features, return_internal_loss=False)
-        # log_pi[:, 0] is the zero-component log-probability
-        return predictions['tumor_mdn']['log_pi'][:, 0]  # (batch,)
+        return torch.exp(predictions['tumor_mdn']['log_pi'][:, 0])  # (batch,)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1976,26 +1975,31 @@ def tfx_input_focus_analysis(
         data.get('sample_names', [f'gene_{idx}' for idx in range(len(data['TFX_label']))]),
         dtype=object,
     )
+    cohort_names = np.asarray(
+        data.get('cohort_names', ['Unknown'] * len(sample_names)),
+        dtype=object,
+    )
     tfx_vals = np.asarray(data['TFX_label'], dtype=np.float32)
 
-    unique_samples, inverse = np.unique(sample_names, return_inverse=True)
-    sample_rows: List[Dict[str, float]] = []
-    for sample_idx, sample_name in enumerate(unique_samples):
-        mask = inverse == sample_idx
-        if not bool(mask.any()):
-            continue
-        row: Dict[str, float] = {
-            'sample_name': str(sample_name),
-            'tfx': float(np.mean(tfx_vals[mask])),
-        }
-        for group_name, scores in group_scores.items():
-            row[f'{group_name}_mean_abs_attr'] = float(np.mean(scores[mask]))
-        sample_rows.append(row)
+    sample_df = pd.DataFrame({
+        'cohort_name': cohort_names,
+        'sample_name': sample_names,
+        'tfx': tfx_vals,
+    })
+    agg_spec: Dict[str, str] = {'tfx': 'mean'}
+    for group_name, scores in group_scores.items():
+        col = f'{group_name}_mean_abs_attr'
+        sample_df[col] = np.asarray(scores, dtype=np.float32)
+        agg_spec[col] = 'mean'
 
-    if not sample_rows:
+    sample_df = sample_df.groupby(
+        ['cohort_name', 'sample_name'],
+        as_index=False,
+        sort=True,
+    ).agg(agg_spec)
+
+    if sample_df.empty:
         return
-
-    sample_df = pd.DataFrame(sample_rows)
     _continuum_input_focus_analysis(
         sample_df=sample_df,
         continuum_col='tfx',
@@ -2661,7 +2665,7 @@ def zero_component_attribution(
     """Attribution targeting the zero-component probability.
 
     Uses :class:`_ZeroComponentWrapper` so that Captum attributes the
-    log-probability of the hurdle (zero expression) component instead of
+    probability of the hurdle (zero expression) component instead of
     the point estimate.  Analysis focuses on inactive genes where the
     zero component dominates.
     """
@@ -2719,17 +2723,15 @@ def attribution_analysis(
     run_reduction: bool = True,
     run_umap: bool = True,
 ) -> None:
-    """Run attribution analysis across gene subsets.
+    """Run interpretation analyses tied to the finalized BioDVN outputs.
 
-    For each of ``'all_genes'``, ``'active_genes'``, ``'inactive_genes'``:
+    Runs:
 
-    1. Sub-sample background and test sets.
-    2. Compute Captum attributions.
-    3. Generate polarity-impact, beeswarm, and bar-chart plots.
-     4. *(Optional)* Signal–sequence interaction, directional motif,
-         synergy, and TFX-focus analysis.
+    1. Tumor mean attributions on an ``all_genes`` sample.
+    2. Zero-component probability attributions on ``inactive_genes``.
+    3. Optional interaction analyses for joint signal/sequence models.
 
-    After the per-subset loop, optionally runs:
+    After the attribution passes, optionally runs:
     - ReductionBlock activation analysis.
     - Latent-space UMAP visualization.
 
@@ -2747,8 +2749,6 @@ def attribution_analysis(
         run_reduction: If True, run ReductionBlock activation analysis.
         run_umap: If True, run latent-space UMAP visualization.
     """
-    device = next(model.parameters()).device
-
     print('\n=== Attribution analysis: all_genes ===')
 
     folder_path = None
@@ -2815,6 +2815,19 @@ def attribution_analysis(
 
     del attributions
     print('  Done: all_genes')
+
+    print('\n=== Attribution analysis: zero_component ===')
+    zero_component_attribution(
+        model,
+        data,
+        background_size=background_size,
+        test_size=test_size,
+        method=method,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        folder_path=folder_path,
+        seed=seed,
+    )
 
     # ── Analyses that run once ──
 

@@ -39,7 +39,12 @@ from models.model_utils import (
     MaskedR2Metric, MetricsTracker,
     BioDVNMDNLoss
 )
-from proteus_utils.data_helpers import weighted_group_mean
+from proteus_utils.data_helpers import (
+    compute_cohort_objective,
+    compute_plcav4_2_objective,
+    compute_soft_objective,
+    weighted_group_mean,
+)
 
 
 @dataclass
@@ -89,6 +94,8 @@ class TrainingConfig:
     #   PLCAv2 source GVW-CRPS (0.3/0.3/0.2/0.2 across the 4 source buckets).
     # 'max_gvw_r_lower_bound': select epoch with highest
     #   balanced_tumor_gvw_r_lower_bound (mean − std across sources).
+    # 'max_cohort_v4_2_objective': select epoch with the highest continuous
+    #   PLCAv4-2 robust cohort objective.
     selection_metric: str = 'min_weighted_source_crps'
     
     # Checkpointing
@@ -304,13 +311,23 @@ class Trainer:
             self.scaler = GradScaler('cuda')
         else:
             self.scaler = None
+
+        use_sequence_only_objective = self.model_config.channel_mode == 'only_seq'
+        beta_ccc = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_ccc', 0.25)
+        beta_srl_max = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_srl_max', 0.0)
+        beta_pht_consistency = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_pht_consistency', 0.10)
+        beta_pht_uncertainty = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_pht_uncertainty', 0.05)
         
         # Loss functions
         self.external_loss_fn = BioDVNMDNLoss(
             beta_background=self.model_config.beta_background,
-            beta_ccc=getattr(self.model_config, 'beta_ccc', 0.25),
-            beta_pht_consistency=getattr(self.model_config, 'beta_pht_consistency', 0.10),
-            beta_pht_uncertainty=getattr(self.model_config, 'beta_pht_uncertainty', 0.05),
+            beta_ccc=beta_ccc,
+            beta_srl_max=beta_srl_max,
+            srl_delta=getattr(self.model_config, 'srl_delta', 1.0),
+            srl_start=getattr(self.model_config, 'srl_start', 5),
+            srl_ramp=getattr(self.model_config, 'srl_ramp', 10),
+            beta_pht_consistency=beta_pht_consistency,
+            beta_pht_uncertainty=beta_pht_uncertainty,
         )
         
         # Metrics
@@ -340,6 +357,13 @@ class Trainer:
         # Rich Live display and prevent cascade "Only one live display" errors.
         self._active_rich_progress = None
         self._active_pbar = None
+
+    def set_srl_stats(
+        self,
+        gene_mean_map: Dict[str, float],
+        gene_std_map: Dict[str, float],
+    ) -> None:
+        self.external_loss_fn.set_srl_stats(gene_mean_map, gene_std_map)
 
     def _create_optimizer(self) -> torch.optim.Optimizer:
         # Fused AdamW — always available on PyTorch 2.0+.
@@ -467,6 +491,7 @@ class Trainer:
         Returns:
             Dictionary of average metrics for the epoch
         """
+        self.external_loss_fn.set_epoch(epoch)
         self.model.train()
         if self.optimizer is None:
             raise RuntimeError('Trainer is not prepared: optimizer is None. Call fit() to initialize training state.')
@@ -544,17 +569,6 @@ class Trainer:
             for i, b in enumerate(data_iter, start=1):
                 yield i, b
 
-        # AMP non-finite tracking.  Float16 forward passes can produce
-        # non-finite results when intermediate conv outputs exceed fp16
-        # range (~65504).  PyTorch's GradScaler is designed to handle this:
-        # it detects non-finite gradients and skips the optimizer step,
-        # preventing weight corruption.  We allow a small number of
-        # consecutive non-finite batches before treating it as a fatal
-        # divergence (which would indicate a root-cause issue beyond
-        # transient fp16 overflow).
-        _MAX_CONSECUTIVE_NAN = 3
-        _consecutive_nan = 0
-
         # Reset timing origin now that we've accounted for first-batch wait.
         last_iter_end = time.time()
 
@@ -604,7 +618,6 @@ class Trainer:
             # ----------------------------------------------------------
             _loss_is_finite = torch.isfinite(total_loss)
             if not _loss_is_finite:
-                _consecutive_nan += 1
                 current_lr = (
                     self.scheduler.get_last_lr()[0]
                     if self.scheduler is not None
@@ -641,36 +654,13 @@ class Trainer:
                                 origin_parts.append(f'{pname}.{pk}({n_bad} non-finite)')
                 origin_info = '; '.join(origin_parts) if origin_parts else 'undetermined'
 
-                if not self.use_amp or _consecutive_nan > _MAX_CONSECUTIVE_NAN:
-                    # Without AMP there is no GradScaler to recover, so NaN
-                    # is always fatal.  With AMP, persistent NaN (beyond the
-                    # tolerance) indicates a root-cause issue rather than
-                    # transient fp16 overflow.
-                    raise RuntimeError(
-                        f'Non-finite total_loss={float(total_loss.detach().cpu().item())} '
-                        f'(external={ext_val}, internal={int_val}) '
-                        f'at batch {batch_idx} (lr={current_lr:.3e}). '
-                        f'Consecutive non-finite batches: {_consecutive_nan}. '
-                        f'Origin: {origin_info}. '
-                        f'Components: {breakdown}'
-                    )
-
-                # Transient fp16 overflow under AMP: skip this batch's
-                # weight update.  The GradScaler detects non-finite
-                # gradients after backward/unscale and skips the optimizer
-                # step automatically, then halves its internal scale to
-                # reduce future overflow probability.  Model weights are
-                # NOT modified — this is safe by design.
-                print(
-                    f'  [AMP] Non-finite loss at batch {batch_idx} '
-                    f'(lr={current_lr:.3e}, skip {_consecutive_nan}/{_MAX_CONSECUTIVE_NAN}). '
+                raise RuntimeError(
+                    f'Non-finite total_loss={float(total_loss.detach().cpu().item())} '
+                    f'(external={ext_val}, internal={int_val}) '
+                    f'at batch {batch_idx} (lr={current_lr:.3e}). '
                     f'Origin: {origin_info}. '
-                    f'GradScaler will skip optimizer step and reduce scale.',
-                    flush=True,
+                    f'Components: {breakdown}'
                 )
-                # Fall through to backward — GradScaler handles the rest.
-            else:
-                _consecutive_nan = 0
             
             # Backward pass — scale loss for gradient accumulation
             scaled_loss = total_loss / accum_steps
@@ -684,11 +674,47 @@ class Trainer:
             if is_accum_boundary:
                 if self.use_amp:
                     self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+
+                bad_grad_parts = []
+                for parameter_name, parameter in self.model.named_parameters():
+                    if parameter.grad is None:
+                        continue
+                    if not torch.isfinite(parameter.grad).all():
+                        n_bad = int((~torch.isfinite(parameter.grad)).sum().item())
+                        bad_grad_parts.append(f'{parameter_name}({n_bad} non-finite)')
+                        if len(bad_grad_parts) >= 8:
+                            break
+                if bad_grad_parts:
+                    current_lr = (
+                        self.scheduler.get_last_lr()[0]
+                        if self.scheduler is not None
+                        else self.config.max_lr
+                    )
+                    bad_grad_origin = '; '.join(bad_grad_parts)
+                    raise RuntimeError(
+                        f'Non-finite gradients before optimizer step at batch {batch_idx} '
+                        f'(lr={current_lr:.3e}). Origin: {bad_grad_origin}'
+                    )
+
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.max_grad_norm,
+                )
+                if not torch.isfinite(grad_norm):
+                    current_lr = (
+                        self.scheduler.get_last_lr()[0]
+                        if self.scheduler is not None
+                        else self.config.max_lr
+                    )
+                    raise RuntimeError(
+                        f'Non-finite gradient norm before optimizer step at batch {batch_idx} '
+                        f'(lr={current_lr:.3e}, grad_norm={float(grad_norm.detach().cpu().item())})'
+                    )
+
+                if self.use_amp:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                     self.optimizer.step()
                 if self.scheduler is not None:
                     self.scheduler.step()
@@ -1068,23 +1094,36 @@ class Trainer:
                     val = float((cs / cd).item())
                     per_group_vals[cname] = val
                     metrics[f'val_tumor_gvw_crps_{cname}'] = val
+                    metrics[f'val_cohort_tumor_gvw_crps_{cname}'] = val
             if per_group_vals:
                 per_group_list = list(per_group_vals.values())
                 balanced = sum(per_group_list) / len(per_group_list)
                 metrics['val_balanced_tumor_gvw_crps'] = balanced
+                crps_std = 0.0
                 if len(per_group_list) > 1:
                     mean_group_crps = balanced
-                    metrics['val_balanced_tumor_gvw_crps_std'] = math.sqrt(
+                    crps_std = math.sqrt(
                         sum((value - mean_group_crps) ** 2 for value in per_group_list)
                         / len(per_group_list)
                     )
+                    metrics['val_balanced_tumor_gvw_crps_std'] = crps_std
 
                 selection_group_weights = getattr(self, 'val_selection_group_weights', None)
+                weighted_group_crps = balanced
                 if selection_group_weights:
-                    metrics['val_weighted_tumor_gvw_crps'] = weighted_group_mean(
+                    weighted_group_crps = weighted_group_mean(
                         per_group_vals,
                         selection_group_weights,
                     )
+                    metrics['val_weighted_tumor_gvw_crps'] = weighted_group_crps
+
+                metrics['val_cohort_tumor_gvw_crps_mean'] = balanced
+                metrics['val_cohort_tumor_gvw_crps_std'] = crps_std
+                metrics['val_cohort_tumor_gvw_crps_balanced'] = (
+                    weighted_group_crps + 0.5 * crps_std
+                    if math.isfinite(weighted_group_crps)
+                    else float('nan')
+                )
 
         # GVW Pearson r: variance-weighted per-gene r across sources.
         if _gvw_r_accum:
@@ -1095,10 +1134,12 @@ class Trainer:
                     n, sx, sy, sx2, sy2, sxy = acc
                     if n < 3:
                         continue
-                    denom = math.sqrt((n * sx2 - sx * sx) * (n * sy2 - sy * sy))
-                    if denom < 1e-12:
+                    x_ss = max(float(n * sx2 - sx * sx), 0.0)
+                    y_ss = max(float(n * sy2 - sy * sy), 0.0)
+                    if x_ss <= 1e-12 or y_ss <= 1e-12:
                         continue
-                    r = (n * sxy - sx * sy) / denom
+                    denom = math.sqrt(x_ss * y_ss)
+                    r = max(min((n * sxy - sx * sy) / denom, 1.0), -1.0)
                     r_vals.append(r)
                     # Weight by gene variance from the appropriate source map.
                     if src_key != '__pooled__' and isinstance(source_var_maps, dict) and src_key in source_var_maps:
@@ -1119,20 +1160,72 @@ class Trainer:
                 metrics['val_tumor_gvw_r'] = source_gvw_r['__pooled__']
             # Per-source GVW-r and balanced mean.
             per_src_r = []
+            per_src_r_map = {}
             for src_key in sorted(source_gvw_r):
                 if src_key == '__pooled__':
                     continue
                 metrics[f'val_tumor_gvw_r_{src_key}'] = source_gvw_r[src_key]
+                metrics[f'val_cohort_tumor_gvw_r_{src_key}'] = source_gvw_r[src_key]
                 per_src_r.append(source_gvw_r[src_key])
+                per_src_r_map[src_key] = source_gvw_r[src_key]
             if per_src_r:
-                metrics['val_balanced_tumor_gvw_r'] = sum(per_src_r) / len(per_src_r)
+                mean_r = sum(per_src_r) / len(per_src_r)
+                metrics['val_balanced_tumor_gvw_r'] = mean_r
                 metrics['val_min_tumor_gvw_r'] = min(per_src_r)
+                r_std = 0.0
                 if len(per_src_r) > 1:
-                    _mean_r = sum(per_src_r) / len(per_src_r)
-                    _std_r = math.sqrt(
-                        sum((v - _mean_r) ** 2 for v in per_src_r) / len(per_src_r))
-                    metrics['val_balanced_tumor_gvw_r_std'] = _std_r
-                    metrics['val_balanced_tumor_gvw_r_lower_bound'] = _mean_r - _std_r
+                    r_std = math.sqrt(
+                        sum((v - mean_r) ** 2 for v in per_src_r) / len(per_src_r))
+                    metrics['val_balanced_tumor_gvw_r_std'] = r_std
+                    metrics['val_balanced_tumor_gvw_r_lower_bound'] = mean_r - r_std
+
+                selection_group_weights = getattr(self, 'val_selection_group_weights', None)
+                weighted_group_r = mean_r
+                if selection_group_weights:
+                    weighted_group_r = weighted_group_mean(
+                        per_src_r_map,
+                        selection_group_weights,
+                    )
+                    metrics['val_weighted_tumor_gvw_r'] = weighted_group_r
+
+                metrics['val_cohort_tumor_gvw_r_mean'] = mean_r
+                metrics['val_cohort_tumor_gvw_r_std'] = r_std
+                metrics['val_cohort_tumor_gvw_r_balanced'] = (
+                    weighted_group_r - 0.5 * r_std
+                    if math.isfinite(weighted_group_r)
+                    else float('nan')
+                )
+
+                cohort_crps_balanced = metrics.get('val_cohort_tumor_gvw_crps_balanced')
+                cohort_r_balanced = metrics.get('val_cohort_tumor_gvw_r_balanced')
+                if (
+                    isinstance(cohort_r_balanced, (int, float))
+                    and isinstance(cohort_crps_balanced, (int, float))
+                    and math.isfinite(float(cohort_r_balanced))
+                    and math.isfinite(float(cohort_crps_balanced))
+                ):
+                    robust_objective, crps_log_ratio, crps_smooth_excess = compute_plcav4_2_objective(
+                        float(cohort_r_balanced),
+                        float(cohort_crps_balanced),
+                    )
+                    metrics['val_cohort_tumor_gvw_v4_2_objective'] = robust_objective
+                    metrics['val_cohort_tumor_gvw_v4_2_crps_log_ratio'] = crps_log_ratio
+                    metrics['val_cohort_tumor_gvw_v4_2_crps_smooth_excess'] = crps_smooth_excess
+
+                per_src_crps_map = {
+                    key: float(value)
+                    for key, value in per_group_vals.items()
+                    if math.isfinite(float(value))
+                }
+                if set(per_src_crps_map) == set(per_src_r_map):
+                    soft_objective, soft_crps, soft_one_minus_r = compute_soft_objective(
+                        per_src_r_map,
+                        per_src_crps_map,
+                        required_names=sorted(per_src_r_map),
+                    )
+                    metrics['val_cohort_tumor_soft_objective'] = soft_objective
+                    metrics['val_cohort_tumor_soft_crps'] = soft_crps
+                    metrics['val_cohort_tumor_soft_one_minus_r'] = soft_one_minus_r
 
         if rich_progress is not None:
             rich_progress.stop()
@@ -1193,19 +1286,33 @@ class Trainer:
         # History tracking
         history = {
             'train_loss': [],
+            'val_epochs': [],
             'val_loss': [],
             'val_tumor_gvw_crps': [],
             'val_weighted_tumor_gvw_crps': [],
+            'val_cohort_tumor_gvw_crps_balanced': [],
             'val_tumor_aggregate_r2': [],
             'val_balanced_tumor_gvw_r': [],
+            'val_cohort_tumor_gvw_r_balanced': [],
+            'val_cohort_tumor_gvw_objective': [],
+            'val_cohort_tumor_gvw_v4_2_objective': [],
+            'val_cohort_tumor_soft_objective': [],
             'learning_rate': [],
         }
 
         best_val_score = float('inf')
+        best_epoch_cohort_crps = float('inf')
         selection_metric = str(self.config.selection_metric)
         # For maximize metrics, we track negative-of-score so that
         # "lower is better" logic works uniformly.
-        _maximize = selection_metric == 'max_gvw_r_lower_bound'
+        _use_cohort_objective = selection_metric == 'max_cohort_objective'
+        _use_cohort_v4_2_objective = selection_metric == 'max_cohort_v4_2_objective'
+        _use_cohort_soft_objective = selection_metric == 'min_cohort_soft_objective'
+        _maximize = selection_metric in (
+            'max_gvw_r_lower_bound',
+            'max_cohort_objective',
+            'max_cohort_v4_2_objective',
+        )
         _use_weighted_crps = selection_metric == 'min_weighted_source_crps'
         
         print(f'Starting training for {epochs} epochs')
@@ -1256,13 +1363,49 @@ class Trainer:
                     _ema_backup = self._ema.apply(self.model)
 
                 val_metrics = self.validate(val_loader)
+                cohort_balanced_crps = val_metrics.get('val_cohort_tumor_gvw_crps_balanced')
+                cohort_balanced_r = val_metrics.get('val_cohort_tumor_gvw_r_balanced')
+                if (
+                    isinstance(cohort_balanced_crps, (int, float))
+                    and math.isfinite(float(cohort_balanced_crps))
+                ):
+                    best_epoch_cohort_crps = min(
+                        best_epoch_cohort_crps,
+                        float(cohort_balanced_crps),
+                    )
+                if (
+                    isinstance(cohort_balanced_r, (int, float))
+                    and math.isfinite(float(cohort_balanced_r))
+                    and math.isfinite(best_epoch_cohort_crps)
+                    and isinstance(cohort_balanced_crps, (int, float))
+                    and math.isfinite(float(cohort_balanced_crps))
+                ):
+                    cohort_objective, crps_gate, crps_penalty = compute_cohort_objective(
+                        float(cohort_balanced_r),
+                        float(cohort_balanced_crps),
+                        best_epoch_cohort_crps,
+                    )
+                    val_metrics['val_cohort_tumor_gvw_objective'] = cohort_objective
+                    val_metrics['val_cohort_tumor_gvw_crps_gate'] = crps_gate
+                    val_metrics['val_cohort_tumor_gvw_crps_penalty'] = crps_penalty
                 
+                history['val_epochs'].append(epoch)
                 history['val_loss'].append(val_metrics['val_loss'])
                 history['val_tumor_gvw_crps'].append(val_metrics.get('val_tumor_gvw_crps', float('nan')))
                 history['val_weighted_tumor_gvw_crps'].append(
                     val_metrics.get('val_weighted_tumor_gvw_crps', float('nan')))
+                history['val_cohort_tumor_gvw_crps_balanced'].append(
+                    val_metrics.get('val_cohort_tumor_gvw_crps_balanced', float('nan')))
                 history['val_tumor_aggregate_r2'].append(val_metrics.get('val_tumor_aggregate_r2', 0))
                 history['val_balanced_tumor_gvw_r'].append(val_metrics.get('val_balanced_tumor_gvw_r', float('nan')))
+                history['val_cohort_tumor_gvw_r_balanced'].append(
+                    val_metrics.get('val_cohort_tumor_gvw_r_balanced', float('nan')))
+                history['val_cohort_tumor_gvw_objective'].append(
+                    val_metrics.get('val_cohort_tumor_gvw_objective', float('nan')))
+                history['val_cohort_tumor_gvw_v4_2_objective'].append(
+                    val_metrics.get('val_cohort_tumor_gvw_v4_2_objective', float('nan')))
+                history['val_cohort_tumor_soft_objective'].append(
+                    val_metrics.get('val_cohort_tumor_soft_objective', float('nan')))
                 if 'val_balanced_tumor_gvw_crps' in val_metrics:
                     history.setdefault('val_balanced_tumor_gvw_crps', []).append(
                         val_metrics['val_balanced_tumor_gvw_crps'])
@@ -1271,7 +1414,16 @@ class Trainer:
                 # balanced group metric, then the pooled metric.
                 weighted_crps = val_metrics.get('val_weighted_tumor_gvw_crps')
                 bal_crps = val_metrics.get('val_balanced_tumor_gvw_crps')
-                if weighted_crps is not None:
+                if _use_cohort_objective and cohort_balanced_crps is not None:
+                    crps_label = 'Cohort-CRPS'
+                    crps_value = cohort_balanced_crps
+                elif _use_cohort_v4_2_objective and cohort_balanced_crps is not None:
+                    crps_label = 'Cohort-CRPS'
+                    crps_value = cohort_balanced_crps
+                elif _use_cohort_soft_objective:
+                    crps_label = 'Bal-CRPS'
+                    crps_value = val_metrics.get('val_balanced_tumor_gvw_crps', float('nan'))
+                elif weighted_crps is not None:
                     crps_label = 'Weighted-CRPS'
                     crps_value = weighted_crps
                 elif bal_crps is not None:
@@ -1283,14 +1435,34 @@ class Trainer:
                 bal_r = val_metrics.get('val_balanced_tumor_gvw_r')
                 pooled_r = val_metrics.get('val_tumor_gvw_r')
                 r_str = ''
-                if bal_r is not None:
+                if (_use_cohort_objective or _use_cohort_v4_2_objective) and cohort_balanced_r is not None:
+                    r_str = f' | Cohort-r: {cohort_balanced_r:.4f}'
+                elif bal_r is not None:
                     r_str = f' | Bal-r: {bal_r:.4f}'
                 elif pooled_r is not None:
                     r_str = f' | GVW-r: {pooled_r:.4f}'
+                obj_str = ''
+                if _use_cohort_objective and 'val_cohort_tumor_gvw_objective' in val_metrics:
+                    obj_str = (
+                        f' | Cohort-obj: '
+                        f'{val_metrics["val_cohort_tumor_gvw_objective"]:.4f}'
+                    )
+                elif _use_cohort_v4_2_objective and 'val_cohort_tumor_gvw_v4_2_objective' in val_metrics:
+                    obj_str = (
+                        f' | Cohort-v4.2: '
+                        f'{val_metrics["val_cohort_tumor_gvw_v4_2_objective"]:.4f}'
+                    )
+                elif _use_cohort_soft_objective and 'val_cohort_tumor_soft_objective' in val_metrics:
+                    obj_str = (
+                        f' | Soft-obj: '
+                        f'{val_metrics["val_cohort_tumor_soft_objective"]:.4f}'
+                    )
                 # Per-source CRPS std for multi-cohort diagnostics.
                 src_crps_keys = [k for k in val_metrics if k.startswith('val_tumor_gvw_crps_')]
                 crps_std_str = ''
-                if len(src_crps_keys) > 1:
+                if (_use_cohort_objective or _use_cohort_v4_2_objective) and 'val_cohort_tumor_gvw_crps_std' in val_metrics:
+                    crps_std_str = f' (std={val_metrics["val_cohort_tumor_gvw_crps_std"]:.4f})'
+                elif len(src_crps_keys) > 1:
                     src_vals = [val_metrics[k] for k in src_crps_keys]
                     mu = sum(src_vals) / len(src_vals)
                     std = math.sqrt(sum((v - mu) ** 2 for v in src_vals) / len(src_vals))
@@ -1298,7 +1470,7 @@ class Trainer:
                 print(
                     f'  Val Loss: {val_metrics["val_loss"]:.4f} '
                     f'| {crps_label}: {crps_value:.4f}{crps_std_str}'
-                    f'{r_str} '
+                    f'{r_str}{obj_str} '
                     f'| Agg R²: {val_metrics.get("val_tumor_aggregate_r2", 0):.4f}'
                 )
 
@@ -1310,7 +1482,34 @@ class Trainer:
                     continue
 
                 # Model selection / early stopping metric.
-                if _maximize:
+                if _use_cohort_soft_objective:
+                    _cohort_obj = val_metrics.get('val_cohort_tumor_soft_objective')
+                    if _cohort_obj is not None:
+                        val_score = _cohort_obj
+                    else:
+                        val_score = val_metrics.get(
+                            'val_balanced_tumor_gvw_crps',
+                            val_metrics['val_loss'],
+                        )
+                elif _use_cohort_v4_2_objective:
+                    _cohort_obj = val_metrics.get('val_cohort_tumor_gvw_v4_2_objective')
+                    _cohort_r = val_metrics.get('val_cohort_tumor_gvw_r_balanced')
+                    if _cohort_obj is not None:
+                        val_score = -_cohort_obj
+                    elif _cohort_r is not None:
+                        val_score = -_cohort_r
+                    else:
+                        val_score = val_metrics['val_loss']
+                elif _use_cohort_objective:
+                    _cohort_obj = val_metrics.get('val_cohort_tumor_gvw_objective')
+                    _cohort_r = val_metrics.get('val_cohort_tumor_gvw_r_balanced')
+                    if _cohort_obj is not None:
+                        val_score = -_cohort_obj
+                    elif _cohort_r is not None:
+                        val_score = -_cohort_r
+                    else:
+                        val_score = val_metrics['val_loss']
+                elif _maximize:
                     # max_gvw_r_lower_bound: higher is better → negate for
                     # uniform "lower is better" comparison.
                     _lb = val_metrics.get('val_balanced_tumor_gvw_r_lower_bound')
@@ -1368,13 +1567,6 @@ class Trainer:
                 if _ema_backup is not None:
                     self._ema.restore(self.model, _ema_backup)
             elif val_loader is not None:
-                history['val_loss'].append(float('nan'))
-                history['val_tumor_gvw_crps'].append(float('nan'))
-                history['val_weighted_tumor_gvw_crps'].append(float('nan'))
-                history['val_tumor_aggregate_r2'].append(float('nan'))
-                history['val_balanced_tumor_gvw_r'].append(float('nan'))
-                if 'val_balanced_tumor_gvw_crps' in history:
-                    history['val_balanced_tumor_gvw_crps'].append(float('nan'))
                 print('  Validation skipped (scheduled every 5 epochs)')
         
         if val_loader is None:

@@ -13,7 +13,7 @@ set -euo pipefail
 # =====================================================================
 
 ENV_NAME="proteus"
-VARIANT="${1:-default}"
+VARIANT="${1:-only-seq}"
 
 COHORTS=(
     "BC-Ghana"

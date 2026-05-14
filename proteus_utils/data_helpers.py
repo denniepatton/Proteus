@@ -32,6 +32,25 @@ PLCA_WEIGHTED_SOURCE_WEIGHTS: Dict[str, float] = {
     'SCLC-Synthetic': 0.20,
 }
 
+# Fixed PLCAv4 cohort-objective constants requested for the fast sweep.
+# These are intentionally not exposed as new experiment knobs.
+COHORT_OBJECTIVE_ALPHA: float = 2.0
+COHORT_OBJECTIVE_ETA: float = 1.05
+
+# PLCAv4-2 continuous objective constants.  The CRPS reference reflects the
+# observed regime where good fold/source GVW-CRPS is approximately <= 1.0.
+PLCA_V4_2_CRPS_REFERENCE: float = 1.0
+PLCA_V4_2_CRPS_LOG_WEIGHT: float = 0.30
+PLCA_V4_2_CRPS_EXCESS_WEIGHT: float = 1.00
+PLCA_V4_2_CRPS_SOFTNESS: float = 0.03
+
+# PLCA soft-objective constants. This objective operates directly on the
+# four source-bucket GVW-CRPS and GVW-r values using an unnormalized
+# soft maximum (tau * log-sum-exp).
+PLCA_SOFT_OBJECTIVE_TAU: float = 0.10
+PLCA_SOFT_OBJECTIVE_ONE_MINUS_R_WEIGHT: float = 2.0
+PLCA_SOFT_OBJECTIVE_OFFSET: float = 2.0
+
 
 # ---------------------------------------------------------------------------
 # Zarr path primitives
@@ -210,6 +229,148 @@ def weighted_group_mean(
     return float(weighted_sum / total_weight)
 
 
+def compute_cohort_objective(
+    cohort_r_balanced: float,
+    cohort_crps_balanced: float,
+    best_observed_cohort_crps_balanced: float,
+) -> Tuple[float, float, float]:
+    """Return the gated PLCAv4 cohort objective, gate, and CRPS penalty.
+
+    Objective:
+        cohort_r_balanced - alpha * max(0, cohort_crps_balanced / crps_gate - 1)
+
+    where:
+        crps_gate = min(1.0, eta * best_observed_cohort_crps_balanced)
+    """
+    r_balanced = float(cohort_r_balanced)
+    crps_balanced = float(cohort_crps_balanced)
+    best_crps = float(best_observed_cohort_crps_balanced)
+    if not (
+        math.isfinite(r_balanced)
+        and math.isfinite(crps_balanced)
+        and math.isfinite(best_crps)
+    ):
+        return float('nan'), float('nan'), float('nan')
+
+    crps_gate = min(1.0, COHORT_OBJECTIVE_ETA * best_crps)
+    if crps_gate <= 0.0:
+        return float('nan'), float('nan'), float('nan')
+
+    crps_penalty = max(0.0, crps_balanced / crps_gate - 1.0)
+    objective = r_balanced - COHORT_OBJECTIVE_ALPHA * crps_penalty
+    return float(objective), float(crps_gate), float(crps_penalty)
+
+
+def _stable_softplus(value: float) -> float:
+    if value > 40.0:
+        return float(value)
+    if value < -40.0:
+        return float(math.exp(value))
+    return float(math.log1p(math.exp(value)))
+
+
+def _stable_logsumexp(values: List[float]) -> float:
+    if not values:
+        return float('nan')
+    max_value = max(values)
+    if not math.isfinite(max_value):
+        return float('nan')
+    return float(
+        max_value + math.log(sum(math.exp(value - max_value) for value in values))
+    )
+
+
+def _soft_logsumexp_max(
+    group_values: Dict[str, float],
+    required_names: Optional[List[str]] = None,
+    tau: float = PLCA_SOFT_OBJECTIVE_TAU,
+) -> float:
+    if tau <= 0.0 or not math.isfinite(tau):
+        return float('nan')
+
+    names = required_names if required_names is not None else sorted(group_values)
+    if not names:
+        return float('nan')
+
+    scaled_values: List[float] = []
+    for name in names:
+        raw_value = group_values.get(name)
+        if raw_value is None or not math.isfinite(float(raw_value)):
+            return float('nan')
+        scaled_values.append(float(raw_value) / tau)
+
+    return float(tau * _stable_logsumexp(scaled_values))
+
+
+def compute_plcav4_2_objective(
+    cohort_r_balanced: float,
+    cohort_crps_balanced: float,
+) -> Tuple[float, float, float]:
+    """Return the continuous PLCAv4-2 robust cohort objective.
+
+    ``cohort_r_balanced`` is the fixed-source weighted GVW-r minus half the
+    source standard deviation.  ``cohort_crps_balanced`` is the fixed-source
+    weighted GVW-CRPS plus half the source standard deviation.  The objective
+    rewards robust r, rewards lower robust CRPS continuously via log-ratio,
+    and applies a smooth centered excess penalty around CRPS=1.0.
+    """
+    robust_r = float(cohort_r_balanced)
+    robust_crps = float(cohort_crps_balanced)
+    if not (math.isfinite(robust_r) and math.isfinite(robust_crps)):
+        return float('nan'), float('nan'), float('nan')
+    if robust_crps <= 0.0:
+        return float('nan'), float('nan'), float('nan')
+
+    crps_ratio = robust_crps / PLCA_V4_2_CRPS_REFERENCE
+    crps_log_ratio = math.log(crps_ratio)
+    excess_scaled = (
+        robust_crps - PLCA_V4_2_CRPS_REFERENCE
+    ) / PLCA_V4_2_CRPS_SOFTNESS
+    centered_smooth_excess = PLCA_V4_2_CRPS_SOFTNESS * (
+        _stable_softplus(excess_scaled) - math.log(2.0)
+    )
+    objective = (
+        robust_r
+        - PLCA_V4_2_CRPS_LOG_WEIGHT * crps_log_ratio
+        - PLCA_V4_2_CRPS_EXCESS_WEIGHT * centered_smooth_excess
+    )
+    return float(objective), float(crps_log_ratio), float(centered_smooth_excess)
+
+
+def compute_soft_objective(
+    cohort_r_values: Dict[str, float],
+    cohort_crps_values: Dict[str, float],
+    required_names: Optional[List[str]] = None,
+) -> Tuple[float, float, float]:
+    """Return the source-level soft objective.
+
+    Objective:
+        S_tau(GVW-CRPS_i) + 2 * S_tau(1 - GVW-r_i) - 2
+
+    where ``S_tau`` is the unnormalized soft maximum ``tau * log-sum-exp``
+    across the source buckets.
+    """
+    names = required_names if required_names is not None else sorted(cohort_crps_values)
+    if not names or set(names) != set(cohort_r_values) or set(names) != set(cohort_crps_values):
+        return float('nan'), float('nan'), float('nan')
+
+    soft_crps = _soft_logsumexp_max(cohort_crps_values, names)
+    one_minus_r = {
+        name: 1.0 - float(cohort_r_values[name])
+        for name in names
+    }
+    soft_one_minus_r = _soft_logsumexp_max(one_minus_r, names)
+    if not (math.isfinite(soft_crps) and math.isfinite(soft_one_minus_r)):
+        return float('nan'), float('nan'), float('nan')
+
+    objective = (
+        soft_crps
+        + PLCA_SOFT_OBJECTIVE_ONE_MINUS_R_WEIGHT * soft_one_minus_r
+        - PLCA_SOFT_OBJECTIVE_OFFSET
+    )
+    return float(objective), float(soft_crps), float(soft_one_minus_r)
+
+
 # ---------------------------------------------------------------------------
 # Source-map construction from (key, sample_name, cohort) triples
 # ---------------------------------------------------------------------------
@@ -237,6 +398,7 @@ def build_source_map_from_tsv(
     training_set_tsv: str,
     source_groups: Dict[str, List[str]],
     zarr_base: str,
+    exclude_fold: Optional[int] = None,
 ) -> Tuple[
     Dict[str, str],             # sample_to_source
     Dict[str, List[str]],       # source_variance_paths (non-PHT only)
@@ -258,6 +420,8 @@ def build_source_map_from_tsv(
     with open(training_set_tsv, 'r', newline='') as f:
         reader = csv.DictReader(f, delimiter='\t')
         for row in reader:
+            if exclude_fold is not None and int(row['Fold']) == exclude_fold:
+                continue
             cohort = row['Cohort'].strip()
             sample = row['Sample'].strip()
             source = assign_source(cohort, sample, cohort_to_source,

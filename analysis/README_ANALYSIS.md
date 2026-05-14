@@ -12,7 +12,9 @@ The analysis package is organized around seven top-level sections under `analysi
 - `Validation_Patient`
 - `Discovery_Patient`
 
-Outside benchmarking, the analysis workflow defaults to the main PLCA Proteus model (`BioDVN`). The `NoSeq` and `OnlySeq` variants are retained for benchmarking comparisons only.
+Outside benchmarking, the analysis workflow uses the canonical BioDVN PLCA model only. The only Proteus variants consumed anywhere in this runner are `BioDVN`, `BioDVN_NoSeq`, and `BioDVN_OnlySeq`.
+
+When an analysis section executes, prediction inputs are read directly from hard-coded relative paths under `results_training/` and `results_holdout/`. `analysis/results/` is output-only and is never used as a prediction input source.
 
 `analysis/run_full_analysis.py` is the main analysis runner and section dispatcher. It is not a thin wrapper: the cohort-specific discovery workflows, calibration wiring, and a substantial amount of analysis orchestration currently live there.
 
@@ -48,11 +50,11 @@ python analysis/run_full_analysis.py --group all
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--group` | *(required)* | One of `Examples`, `Benchmarking_Synthetic`, `Benchmarking_Patient`, `Calibration`, `Validation_PDX`, `Validation_Patient`, `Discovery_Patient`, `all` |
-| `--overwrite` | `False` | Regenerate outputs even if target PDFs or cached section outputs already exist |
+| `--group` | *(required)* | One of `Examples`, `Benchmarking_Synthetic`, `Benchmarking_Patient`, `Calibration`, `Validation_PDX`, `Validation_Patient`, `Discovery_Patient`, `all`. `all` runs the standard non-legacy analysis stack and skips the standalone `Calibration` section unless `--group Calibration` is requested explicitly |
+| `--overwrite` | `False` | Rerun an analysis section even when its top-level output folder already exists |
 | `--minimum_tfx` | `0.0` | Drop patient samples with tumor fraction below this threshold during data loading before downstream analyses consume them |
 | `--calibrate_cis` | `False` | Replace Proteus raw 90% CIs with the CV-fitted conformal-calibrated 90% CIs for downstream analyses |
-| `--dim_ambiguous` | `False` | In single-gene plots/analyses, render ambiguous points as hollow markers and exclude them from reported single-gene statistics. For Proteus MDN outputs this now uses the activity odds ratio `log2(pi_normal / (pi_delta + pi_gamma))` together with the shared lower/upper thresholds learned from pooled patient CV OOF predictions, rather than CI overlap |
+| `--dim_ambiguous` | `False` | In single-gene plots/analyses, render ambiguous points as hollow markers and exclude them from reported single-gene statistics. For Proteus MDN outputs this now uses the activity odds ratio `log2((pi_normal + 1e-6) / (1 - pi_normal + 1e-6))` together with the shared lower/upper thresholds learned from pooled patient CV OOF predictions, rather than CI overlap |
 | `--scatter_ci` | `False` | Pass interval surfaces into scatter analyses; current single-gene and IHC scatter plots do not render per-point CI error bars |
 | `--n_workers` | all available CPUs | Worker processes to use for parallel analysis steps |
 
@@ -135,7 +137,7 @@ This section includes a pooled `CrossCohort` subdirectory that merges all truth-
 
 `Validation_Patient/CRPC-RA` now also writes a CRPC-RA-specific `MetastasisComposition/` subdirectory. That analysis combines the averaged patient truth labels from `labels/CRPC-RA_Log2CPMplus1.tsv`, met-level truth labels from `labels/CRPC-RA-METS_Log2CPMplus1.tsv`, Proteus OOF predictions, and the sampling metadata in `reference/CRPC-RA_METS.tsv` to quantify whether prediction error tracks metastatic sampling breadth, tissue composition, and within-patient met heterogeneity. It writes patient-level and patient-gene summary tables, closest-truth comparator tables, pathway summaries for the shortlist scores, and the corresponding CRPC-RA-only figures.
 
-Each truth-bearing patient cohort now also writes a `PAM50/pam50_scale/` subtree with predicted PAM50 classifications, RNA-seq-truth PAM50 classifications, per-subtype truth-vs-predicted score tables, score-correlation summaries and scatters, and RNA-seq-truth-vs-predicted confusion matrices.
+Each truth-bearing patient cohort now also writes a `PAM50/pam50_scale/` subtree with predicted PAM50 classifications, RNA-seq-truth PAM50 classifications, per-subtype truth-vs-predicted score tables, score-correlation summaries and scatters, and RNA-seq-truth-vs-predicted confusion matrices. The pooled `CrossCohort` patient validation output now also writes pooled truth-vs-predicted PAM50 subtype score comparisons across all matched patients.
 
 ### Discovery_Patient
 
@@ -221,7 +223,7 @@ Current practice in this repo:
 - Adjusted Hallmark ssGSEA, shortlist/CCP score workflows, and PAM50 classification propagate uncertainty by drawing Monte Carlo expression matrices from the full MDN predictive distribution and aggregating across draws. The CLI flag `--montecarlo_draws` controls the number of draws; the default is 100.
 - The shortlist workflow uses the `reference/gsva_genesets_shortlist.gmt` gene sets, but the scoring algorithm in this repo is ssGSEA rather than a separate GSVA implementation.
 - Adjusted limma workflows now use those same Monte Carlo expression draws rather than inverse-variance weights. The saved uncertainty-adjusted limma tables use Rubin-style pooling for `logFC`, `standard_error`, `t`, `P.Value`, and `adj.P.Val`, and report pooled 95% confidence intervals for `logFC`.
-- Proteus MDN outputs now expose an activity odds ratio surface `activity_odds_ratio = log2(pi_normal / (pi_delta + pi_gamma))` for every gene-sample prediction surface. Under this convention the normal branch is the active mass and the delta spike plus gamma branch together represent off-mass.
+- Proteus MDN outputs now expose an activity odds ratio surface `activity_odds_ratio = log2((pi_normal + 1e-6) / (1 - pi_normal + 1e-6))` for every gene-sample prediction surface. Under this convention the normal branch is the active mass and the complement of that mass represents off-state weight.
 - Calibration pools the patient CV OOF predictions from `CRPC-RA` and `SCLC` to derive a shared upper activity threshold where PPV first reaches 0.90 and a shared lower activity threshold where NPV first reaches 0.90.
 - Those shared lower/upper thresholds now drive downstream ambiguity masking in patient validation scatters and IHC analyses, and they define the uncertainty-informed Proteus abstention behavior in `Benchmarking_Patient`.
 - `Benchmarking_Patient` still writes dataset-specific active/inactive threshold sweep curves, but those are now descriptive AOR sweeps rather than the source of the shared operating point.

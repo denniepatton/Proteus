@@ -99,6 +99,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr, spearmanr
 
+from .analysis_utils import MIN_CORRELATION_N
+
 
 # ── Fisher z-transform ───────────────────────────────────────────────────
 
@@ -367,7 +369,12 @@ def _compute_gene_pearson_r(
     truth_wide: pd.DataFrame,
     pred_wide: pd.DataFrame,
 ) -> pd.Series:
-    """Per-gene Pearson r across samples.  Returns Series indexed by gene."""
+    """Per-gene Pearson r across samples. Returns Series indexed by gene.
+
+    Genes with fewer than ``MIN_CORRELATION_N`` valid samples or zero
+    truth variance are excluded. Genes with variable truth but constant
+    predictions receive 0.0.
+    """
     common_genes = truth_wide.index.intersection(pred_wide.index)
     common_samples = truth_wide.columns.intersection(pred_wide.columns)
     tw = truth_wide.loc[common_genes, common_samples]
@@ -378,12 +385,20 @@ def _compute_gene_pearson_r(
         t = tw.loc[gene].values.astype(np.float64)
         p = pw.loc[gene].values.astype(np.float64)
         mask = np.isfinite(t) & np.isfinite(p)
-        if mask.sum() < 3:
+        if mask.sum() < MIN_CORRELATION_N:
             r_values[gene] = np.nan
+            continue
+        tv = t[mask]
+        pv = p[mask]
+        if float(np.ptp(tv)) <= 0.0:
+            r_values[gene] = np.nan
+            continue
+        if float(np.ptp(pv)) <= 0.0:
+            r_values[gene] = 0.0
             continue
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            r_values[gene] = float(pearsonr(t[mask], p[mask])[0])
+            r_values[gene] = float(pearsonr(tv, pv)[0])
 
     return pd.Series(r_values, name="pearson_r")
 

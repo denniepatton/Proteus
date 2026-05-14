@@ -150,6 +150,10 @@ class StructuralSpec:
     beta_reconstruction: ParamSpec
     beta_tfx: ParamSpec
     beta_ccc: ParamSpec
+    beta_srl_max: ParamSpec
+    srl_delta: ParamSpec
+    srl_start: ParamSpec
+    srl_ramp: ParamSpec
     beta_pht_consistency: ParamSpec
     beta_pht_uncertainty: ParamSpec
     cl_margin: ParamSpec
@@ -161,6 +165,7 @@ class StructuralSpec:
         allowed = [
             "beta_background", "beta_kl", "beta_contrastive",
             "beta_reconstruction", "beta_tfx", "beta_ccc",
+            "beta_srl_max", "srl_delta", "srl_start", "srl_ramp",
             "beta_pht_consistency", "beta_pht_uncertainty", "cl_margin",
             "internal_weight",
         ]
@@ -176,6 +181,10 @@ class StructuralSpec:
             beta_reconstruction=p("beta_reconstruction", 0.50),
             beta_tfx=p("beta_tfx", 0.20),
             beta_ccc=p("beta_ccc", 0.25),
+            beta_srl_max=p("beta_srl_max", 0.0),
+            srl_delta=p("srl_delta", 1.0),
+            srl_start=p("srl_start", 5),
+            srl_ramp=p("srl_ramp", 10),
             beta_pht_consistency=p("beta_pht_consistency", 0.10),
             beta_pht_uncertainty=p("beta_pht_uncertainty", 0.05),
             cl_margin=p("cl_margin", 1.0),
@@ -359,13 +368,22 @@ class DataSpec:
 
     selection_metric (optional, str: 'min_balanced_crps' |
                                      'min_weighted_source_crps' |
-                                     'max_gvw_r_lower_bound'):
+                                     'min_cohort_soft_objective' |
+                                     'max_gvw_r_lower_bound' |
+                                     'max_cohort_objective' |
+                                     'max_cohort_v4_2_objective'):
         Model selection / early-stopping metric.  ``'min_balanced_crps'``
         (default) selects the epoch with lowest balanced GVW-CRPS.
         ``'min_weighted_source_crps'`` selects the epoch with lowest
         fixed-weight PLCAv2 source GVW-CRPS using the 4 source buckets.
+        ``'min_cohort_soft_objective'`` selects the epoch with the lowest
+        source-level soft objective.
         ``'max_gvw_r_lower_bound'`` selects the epoch with highest
         balanced GVW-r lower bound (mean − std across sources).
+        ``'max_cohort_objective'`` selects the epoch with the highest
+        gated PLCAv4 cohort objective.
+        ``'max_cohort_v4_2_objective'`` selects the epoch with the highest
+        continuous PLCAv4-2 robust cohort objective.
     """
     training_set: str
     zarr_base: str
@@ -454,23 +472,31 @@ class DataSpec:
         ).lower()
         if selection_metric_raw not in (
             "min_balanced_crps", "min_weighted_source_crps",
-            "max_gvw_r_lower_bound",
+            "min_cohort_soft_objective",
+            "max_gvw_r_lower_bound", "max_cohort_objective",
+            "max_cohort_v4_2_objective",
         ):
             _fail(f"data.selection_metric must be 'min_balanced_crps' "
-                  f"or 'min_weighted_source_crps' or 'max_gvw_r_lower_bound', "
+                  f"or 'min_weighted_source_crps' or 'min_cohort_soft_objective' or 'max_gvw_r_lower_bound' "
+                  f"or 'max_cohort_objective' or 'max_cohort_v4_2_objective', "
                   f"got '{selection_metric_raw}'")
 
-        if selection_metric_raw == 'min_weighted_source_crps':
+        if selection_metric_raw in (
+            'min_weighted_source_crps',
+            'min_cohort_soft_objective',
+            'max_cohort_objective',
+            'max_cohort_v4_2_objective',
+        ):
             if source_groups is None:
                 _fail(
-                    "data.selection_metric='min_weighted_source_crps' requires "
+                    f"data.selection_metric='{selection_metric_raw}' requires "
                     "data.source_groups"
                 )
             expected = set(PLCA_WEIGHTED_SOURCE_WEIGHTS)
             actual = set(source_groups)
             if actual != expected:
                 _fail(
-                    "Weighted PLCA selection requires source_groups with keys "
+                    "PLCA cohort selection requires source_groups with keys "
                     f"{sorted(expected)}, got {sorted(actual)}"
                 )
 

@@ -28,7 +28,8 @@ import sys
 import time
 import traceback
 import warnings
-from typing import Any, Dict, List, Literal, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import optuna
 from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
@@ -44,6 +45,9 @@ from config.experiment_spec import (
 )
 from tuning.metrics import (
     collect_fold_metrics,
+    compute_cohort_objective,
+    compute_plcav4_2_objective,
+    compute_soft_objective,
     compute_cv_objective,
     nanmean,
     nanstd,
@@ -63,6 +67,7 @@ from tuning.reporting import (
 __all__ = [
     "run_optuna_cv_tuning",
     "run_optuna_fold_tuning",
+    "rescue_failed_fold_trials",
     "coordinated_ask",
     "coordinated_proxy_ask",
     "coordinated_proxy_tell",
@@ -125,7 +130,91 @@ def _make_storage(url: str) -> Any:
                 time.sleep(2.0 + attempt)
         if last_error is not None:
             raise last_error
+
     return url
+
+
+def _best_completed_user_attr(
+    study: optuna.Study,
+    attr_name: str,
+    fallback: Optional[float] = None,
+) -> float:
+    """Return the best completed numeric user attr, minimizing the attr itself."""
+    values: List[float] = []
+    for trial in study.trials:
+        if trial.state != optuna.trial.TrialState.COMPLETE:
+            continue
+        value = trial.user_attrs.get(attr_name)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            values.append(float(value))
+    if values:
+        return min(values)
+    if fallback is not None and math.isfinite(float(fallback)):
+        return float(fallback)
+    return float('nan')
+
+
+def _inject_cohort_objective(obj: Dict[str, Any], study: optuna.Study) -> None:
+    """Add PLCAv4 cohort objective fields to an objective dict."""
+    cohort_r = obj.get('cohort_tumor_gvw_r_balanced')
+    cohort_crps = obj.get('cohort_tumor_gvw_crps_balanced')
+    if not (
+        isinstance(cohort_r, (int, float)) and math.isfinite(float(cohort_r))
+        and isinstance(cohort_crps, (int, float)) and math.isfinite(float(cohort_crps))
+    ):
+        return
+
+    best_crps = _best_completed_user_attr(
+        study,
+        'cohort_tumor_gvw_crps_balanced',
+        fallback=float(cohort_crps),
+    )
+    objective, crps_gate, crps_penalty = compute_cohort_objective(
+        float(cohort_r),
+        float(cohort_crps),
+        best_crps,
+    )
+    if math.isfinite(objective):
+        obj['cohort_tumor_gvw_objective'] = objective
+        obj['cohort_tumor_gvw_crps_gate'] = crps_gate
+        obj['cohort_tumor_gvw_crps_penalty'] = crps_penalty
+        obj['cohort_tumor_gvw_crps_best_observed'] = best_crps
+
+    robust_objective, crps_log_ratio, crps_smooth_excess = compute_plcav4_2_objective(
+        float(cohort_r),
+        float(cohort_crps),
+    )
+    if math.isfinite(robust_objective):
+        obj['cohort_tumor_gvw_v4_2_objective'] = robust_objective
+        obj['cohort_tumor_gvw_v4_2_crps_log_ratio'] = crps_log_ratio
+        obj['cohort_tumor_gvw_v4_2_crps_smooth_excess'] = crps_smooth_excess
+
+    source_crps = {
+        str(key[len('tumor_gvw_crps_'):]): float(value)
+        for key, value in obj.items()
+        if isinstance(key, str)
+        and key.startswith('tumor_gvw_crps_')
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    }
+    source_r = {
+        str(key[len('tumor_gvw_r_'):]): float(value)
+        for key, value in obj.items()
+        if isinstance(key, str)
+        and key.startswith('tumor_gvw_r_')
+        and isinstance(value, (int, float))
+        and math.isfinite(float(value))
+    }
+    if source_crps and set(source_crps) == set(source_r):
+        soft_objective, soft_crps, soft_one_minus_r = compute_soft_objective(
+            source_r,
+            source_crps,
+            required_names=sorted(source_r),
+        )
+        if math.isfinite(soft_objective):
+            obj['cohort_tumor_soft_objective'] = soft_objective
+            obj['cohort_tumor_soft_crps'] = soft_crps
+            obj['cohort_tumor_soft_one_minus_r'] = soft_one_minus_r
 
 
 def _min_patience_from_spec(spec: ParamSpec, default: int = 3) -> int:
@@ -177,12 +266,317 @@ def _write_json_atomic(path: str, obj: Any) -> None:
     os.replace(tmp, path)
 
 
+def _param_spec_to_distribution(spec: ParamSpec) -> optuna.distributions.BaseDistribution:
+    """Convert a ParamSpec suggest block into an Optuna distribution."""
+    if spec.suggest is None:
+        raise ValueError("Only suggested parameters have Optuna distributions")
+
+    suggest = dict(spec.suggest)
+    stype = str(suggest.get("type", "")).strip().lower()
+    if stype == "categorical":
+        choices = suggest.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("Categorical ParamSpec requires non-empty choices")
+        return optuna.distributions.CategoricalDistribution(choices=choices)
+    if stype == "int":
+        low = suggest.get("low")
+        high = suggest.get("high")
+        if low is None or high is None:
+            raise ValueError("Int ParamSpec requires low/high")
+        return optuna.distributions.IntDistribution(
+            low=int(low),
+            high=int(high),
+            step=int(suggest.get("step", 1)),
+            log=bool(suggest.get("log", False)),
+        )
+    if stype == "float":
+        low = suggest.get("low")
+        high = suggest.get("high")
+        if low is None or high is None:
+            raise ValueError("Float ParamSpec requires low/high")
+        step = suggest.get("step")
+        return optuna.distributions.FloatDistribution(
+            low=float(low),
+            high=float(high),
+            step=(None if step is None else float(step)),
+            log=bool(suggest.get("log", False)),
+        )
+    raise ValueError(f"Unsupported ParamSpec suggest.type '{stype}'")
+
+
+def _trial_cfg_to_params_and_distributions(
+    exp: ExperimentSpec,
+    trial_cfg: Dict[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, optuna.distributions.BaseDistribution]]:
+    """Flatten a saved trial_config.json into Optuna params/distributions."""
+    params: Dict[str, Any] = {}
+    distributions: Dict[str, optuna.distributions.BaseDistribution] = {}
+
+    groups = (
+        ("structural", exp.structural, trial_cfg.get("structural", {})),
+        ("training", exp.training, trial_cfg.get("training", {})),
+        ("scale", exp.scale, trial_cfg.get("scale", {})),
+    )
+    for prefix, spec_group, values in groups:
+        for field_name, spec in vars(spec_group).items():
+            if not isinstance(spec, ParamSpec) or spec.suggest is None:
+                continue
+            if field_name not in values:
+                raise KeyError(
+                    f"Saved trial config is missing suggested parameter '{prefix}.{field_name}'"
+                )
+            flat_name = f"{prefix}.{field_name}"
+            params[flat_name] = values[field_name]
+            distributions[flat_name] = _param_spec_to_distribution(spec)
+
+    return params, distributions
+
+
+def _current_suggested_distributions(
+    exp: ExperimentSpec,
+) -> Dict[str, optuna.distributions.BaseDistribution]:
+    """Build Optuna distributions for the parameters still tunable in this phase."""
+    distributions: Dict[str, optuna.distributions.BaseDistribution] = {}
+    groups = (
+        ("structural", exp.structural),
+        ("training", exp.training),
+        ("scale", exp.scale),
+    )
+    for prefix, spec_group in groups:
+        for field_name, spec in vars(spec_group).items():
+            if not isinstance(spec, ParamSpec) or spec.suggest is None:
+                continue
+            flat_name = f"{prefix}.{field_name}"
+            distributions[flat_name] = _param_spec_to_distribution(spec)
+    return distributions
+
+
+def _value_matches_distribution(
+    value: Any,
+    distribution: optuna.distributions.BaseDistribution,
+) -> bool:
+    """Return whether a fixed seed value is valid for a target Optuna distribution."""
+    if isinstance(distribution, optuna.distributions.CategoricalDistribution):
+        return value in distribution.choices
+
+    if isinstance(distribution, optuna.distributions.IntDistribution):
+        if isinstance(value, bool) or not isinstance(value, int):
+            return False
+        if value < distribution.low or value > distribution.high:
+            return False
+        return (value - distribution.low) % distribution.step == 0
+
+    if isinstance(distribution, optuna.distributions.FloatDistribution):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return False
+        numeric_value = float(value)
+        if numeric_value < distribution.low or numeric_value > distribution.high:
+            return False
+        if distribution.step is None:
+            return True
+        steps = (numeric_value - distribution.low) / float(distribution.step)
+        return math.isclose(steps, round(steps), rel_tol=0.0, abs_tol=1e-8)
+
+    return False
+
+
+def _filter_seed_params_for_experiment(
+    exp: ExperimentSpec,
+    params: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[str]]:
+    """Keep only previous-study params that are still tunable and in-range now."""
+    current_distributions = _current_suggested_distributions(exp)
+    filtered: Dict[str, Any] = {}
+    dropped: List[str] = []
+    for name, value in params.items():
+        distribution = current_distributions.get(name)
+        if distribution is None:
+            dropped.append(name)
+            continue
+        if not _value_matches_distribution(value, distribution):
+            dropped.append(name)
+            continue
+        filtered[name] = value
+    return filtered, dropped
+
+
+def _history_best_index(history: Dict[str, Any]) -> int:
+    """Return the best validation index for a rescued fold-only trial."""
+    soft_objective_vals = history.get("val_cohort_tumor_soft_objective")
+    if not isinstance(soft_objective_vals, list):
+        soft_objective_vals = history.get("val_cohort_tumor_gvw_v4_3_objective")
+    if isinstance(soft_objective_vals, list):
+        finite = [
+            (idx, float(value))
+            for idx, value in enumerate(soft_objective_vals)
+            if isinstance(value, (int, float)) and math.isfinite(float(value))
+        ]
+        if finite:
+            return min(finite, key=lambda item: item[1])[0]
+
+    v4_2_objective_vals = history.get("val_cohort_tumor_gvw_v4_2_objective")
+    if isinstance(v4_2_objective_vals, list):
+        finite = [
+            (idx, float(value))
+            for idx, value in enumerate(v4_2_objective_vals)
+            if isinstance(value, (int, float)) and math.isfinite(float(value))
+        ]
+        if finite:
+            return max(finite, key=lambda item: item[1])[0]
+
+    objective_vals = history.get("val_cohort_tumor_gvw_objective")
+    if isinstance(objective_vals, list):
+        finite = [
+            (idx, float(value))
+            for idx, value in enumerate(objective_vals)
+            if isinstance(value, (int, float)) and math.isfinite(float(value))
+        ]
+        if finite:
+            return max(finite, key=lambda item: item[1])[0]
+
+    cohort_r_vals = history.get("val_cohort_tumor_gvw_r_balanced")
+    if isinstance(cohort_r_vals, list):
+        finite = [
+            (idx, float(value))
+            for idx, value in enumerate(cohort_r_vals)
+            if isinstance(value, (int, float)) and math.isfinite(float(value))
+        ]
+        if finite:
+            return max(finite, key=lambda item: item[1])[0]
+
+    raise ValueError("No finite validation objective found in training history")
+
+
+def _history_value(history: Dict[str, Any], key: str, best_index: int) -> float:
+    values = history.get(key)
+    if not isinstance(values, list) or best_index >= len(values):
+        return float("nan")
+    value = values[best_index]
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return float("nan")
+    return float(value)
+
+
+def _history_first_value(history: Dict[str, Any], keys: List[str], best_index: int) -> float:
+    for key in keys:
+        value = _history_value(history, key, best_index)
+        if math.isfinite(value):
+            return value
+    return float("nan")
+
+
+def _build_rescued_objective_from_history(
+    history: Dict[str, Any],
+    study: optuna.Study,
+) -> Dict[str, float]:
+    """Reconstruct the single-fold objective dict from training history."""
+    best_index = _history_best_index(history)
+    objective: Dict[str, float] = {
+        "balanced_tumor_gvw_crps_mean": _history_value(
+            history, "val_balanced_tumor_gvw_crps", best_index,
+        ),
+        "balanced_tumor_gvw_r_mean": _history_value(
+            history, "val_balanced_tumor_gvw_r", best_index,
+        ),
+        "weighted_tumor_gvw_crps_mean": _history_value(
+            history, "val_weighted_tumor_gvw_crps", best_index,
+        ),
+        "weighted_tumor_gvw_crps_max": _history_value(
+            history, "val_weighted_tumor_gvw_crps", best_index,
+        ),
+        "cohort_tumor_gvw_crps_balanced": _history_value(
+            history, "val_cohort_tumor_gvw_crps_balanced", best_index,
+        ),
+        "cohort_tumor_gvw_r_balanced": _history_value(
+            history, "val_cohort_tumor_gvw_r_balanced", best_index,
+        ),
+        "tumor_gvw_crps_mean": _history_value(
+            history, "val_tumor_gvw_crps", best_index,
+        ),
+        "cohort_tumor_soft_objective": _history_first_value(
+            history,
+            ["val_cohort_tumor_soft_objective", "val_cohort_tumor_gvw_v4_3_objective"],
+            best_index,
+        ),
+        "val_loss": _history_value(history, "val_loss", best_index),
+    }
+
+    _inject_cohort_objective(objective, study)
+    objective["rescued_best_val_epoch"] = _history_value(
+        history, "val_epochs", best_index,
+    )
+    objective["rescued_history_index"] = float(best_index)
+    return objective
+
+
 def _fold_metrics_path(run_dir: str, fold_num: int) -> str:
     return os.path.join(
         run_dir,
         f"CV-fold_{int(fold_num)}",
         f"validation-fold_{int(fold_num)}_metrics.json",
     )
+
+
+def _trial_numbers_from_output_dir(output_dir: str) -> List[int]:
+    trial_numbers: List[int] = []
+    if not os.path.isdir(output_dir):
+        return trial_numbers
+    for entry in sorted(os.listdir(output_dir)):
+        if not entry.startswith("trial_"):
+            continue
+        try:
+            trial_numbers.append(int(entry.split("_")[-1]))
+        except ValueError:
+            continue
+    return trial_numbers
+
+
+def _rewrite_fold_metrics_soft_objective(metrics_path: str) -> None:
+    with open(metrics_path, "r") as handle:
+        fold_metrics = json.load(handle)
+
+    per_source = fold_metrics.get("per_source", {})
+    if not isinstance(per_source, dict) or not per_source:
+        return
+
+    source_r: Dict[str, float] = {}
+    source_crps: Dict[str, float] = {}
+    for source_name, source_metrics in per_source.items():
+        if not isinstance(source_metrics, dict):
+            return
+        tumor_metrics = source_metrics.get("tumor", {})
+        if not isinstance(tumor_metrics, dict):
+            return
+        source_r_value = tumor_metrics.get("gvw_r")
+        source_crps_value = tumor_metrics.get("gvw_crps")
+        if not (
+            isinstance(source_r_value, (int, float))
+            and math.isfinite(float(source_r_value))
+            and isinstance(source_crps_value, (int, float))
+            and math.isfinite(float(source_crps_value))
+        ):
+            return
+        source_key = str(source_name)
+        source_r[source_key] = float(source_r_value)
+        source_crps[source_key] = float(source_crps_value)
+
+    soft_objective, soft_crps, soft_one_minus_r = compute_soft_objective(
+        source_r,
+        source_crps,
+        required_names=sorted(source_r),
+    )
+    if not math.isfinite(soft_objective):
+        return
+
+    fold_metrics.pop("cohort_tumor_gvw_v4_3_objective", None)
+    fold_metrics.pop("cohort_tumor_gvw_v4_3_soft_crps", None)
+    fold_metrics.pop("cohort_tumor_gvw_v4_3_soft_one_minus_r", None)
+    fold_metrics["cohort_tumor_soft_objective"] = float(soft_objective)
+    fold_metrics["cohort_tumor_soft_crps"] = float(soft_crps)
+    fold_metrics["cohort_tumor_soft_one_minus_r"] = float(soft_one_minus_r)
+
+    with open(metrics_path, "w") as handle:
+        json.dump(fold_metrics, handle, indent=2)
 
 
 def _primary_fold_weighted_crps(fold_metrics: Dict[str, Any]) -> float:
@@ -303,10 +697,24 @@ def _create_study_with_seeding(
             top_fraction=exp.tuning.top_fraction,
             enqueue_top_k=exp.tuning.enqueue_top_k,
         )
+        dropped_seed_params: set[str] = set()
+        seeded_count = 0
         for params in top_params:
-            study.enqueue_trial(params)
-        if top_params:
-            print(f"[Tuning] Seeded {len(top_params)} top configs from "
+            filtered_params, dropped_params = _filter_seed_params_for_experiment(exp, params)
+            dropped_seed_params.update(dropped_params)
+            if not filtered_params:
+                continue
+            study.enqueue_trial(filtered_params)
+            seeded_count += 1
+        if dropped_seed_params:
+            dropped_names = ", ".join(sorted(dropped_seed_params))
+            print(
+                f"[Tuning] Dropped incompatible previous-study seed params: {dropped_names}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if seeded_count:
+            print(f"[Tuning] Seeded {seeded_count} top configs from "
                   f"'{exp.tuning.prev_study}'", file=sys.stderr, flush=True)
 
     return study
@@ -419,6 +827,7 @@ def run_optuna_cv_tuning(
             return float("inf") if direction == "minimize" else float("-inf")
 
         obj = compute_cv_objective(run_dir)
+        _inject_cohort_objective(obj, study)
         for k, v in obj.items():
             if isinstance(v, (int, float)) and math.isfinite(float(v)):
                 trial.set_user_attr(k, float(v))
@@ -525,9 +934,10 @@ def run_optuna_fold_tuning(
             - maximize → report a metric where higher = better
             - minimize → report a metric where lower = better
 
-            For maximize: prefer val_min_tumor_gvw_r (min across sources,
-            higher = better), fall back to val_balanced_tumor_gvw_r, then
-            val_score.  For minimize: prefer the weighted source metric when
+            For maximize: use the configured cohort objective when available;
+            otherwise prefer val_min_tumor_gvw_r, fall back to
+            val_balanced_tumor_gvw_r, then val_score.  For minimize: prefer
+            the weighted source metric when
             that is the study objective, else fall back to balanced / pooled
             GVW-CRPS.
 
@@ -535,14 +945,39 @@ def run_optuna_fold_tuning(
             model has time to complete warmup and stabilize.
             """
             if direction == 'maximize':
-                # Prefer min-source GVW-r when available (direct proxy
-                # for min_tumor_gvw_r objective); fall back to balanced.
-                metric_val = val_metrics.get(
-                    'val_min_tumor_gvw_r',
-                    val_metrics.get('val_balanced_tumor_gvw_r', val_score),
-                )
+                if exp.objective.metric == 'cohort_tumor_gvw_v4_2_objective':
+                    metric_val = val_metrics.get(
+                        'val_cohort_tumor_gvw_v4_2_objective',
+                        val_metrics.get(
+                            'val_cohort_tumor_gvw_r_balanced',
+                            val_metrics.get('val_balanced_tumor_gvw_r', val_score),
+                        ),
+                    )
+                elif exp.objective.metric == 'cohort_tumor_gvw_objective':
+                    metric_val = val_metrics.get(
+                        'val_cohort_tumor_gvw_objective',
+                        val_metrics.get(
+                            'val_cohort_tumor_gvw_r_balanced',
+                            val_metrics.get('val_balanced_tumor_gvw_r', val_score),
+                        ),
+                    )
+                else:
+                    # Prefer min-source GVW-r when available (direct proxy
+                    # for min_tumor_gvw_r objective); fall back to balanced.
+                    metric_val = val_metrics.get(
+                        'val_min_tumor_gvw_r',
+                        val_metrics.get('val_balanced_tumor_gvw_r', val_score),
+                    )
             else:
                 if exp.objective.metric in (
+                    'cohort_tumor_soft_objective',
+                    'cohort_tumor_soft_objective_mean',
+                ):
+                    metric_val = val_metrics.get(
+                        'val_cohort_tumor_soft_objective',
+                        val_metrics.get('val_balanced_tumor_gvw_crps', val_score),
+                    )
+                elif exp.objective.metric in (
                     'weighted_tumor_gvw_crps_mean',
                     'weighted_tumor_gvw_crps_max',
                 ):
@@ -633,6 +1068,35 @@ def run_optuna_fold_tuning(
         if balanced_r is not None:
             obj["balanced_tumor_gvw_r_mean"] = float(balanced_r)
             obj["balanced_tumor_gvw_r_std"] = float(fold_metrics.get("balanced_tumor_gvw_r_std", float("nan")))
+        cohort_r_mean = fold_metrics.get("cohort_tumor_gvw_r_mean", None)
+        if cohort_r_mean is not None:
+            obj["cohort_tumor_gvw_r_mean"] = float(cohort_r_mean)
+        cohort_r_std = fold_metrics.get("cohort_tumor_gvw_r_std", None)
+        if cohort_r_std is not None:
+            obj["cohort_tumor_gvw_r_std"] = float(cohort_r_std)
+        cohort_r_balanced = fold_metrics.get("cohort_tumor_gvw_r_balanced", None)
+        if cohort_r_balanced is not None:
+            obj["cohort_tumor_gvw_r_balanced"] = float(cohort_r_balanced)
+        cohort_crps_mean = fold_metrics.get("cohort_tumor_gvw_crps_mean", None)
+        if cohort_crps_mean is not None:
+            obj["cohort_tumor_gvw_crps_mean"] = float(cohort_crps_mean)
+        cohort_crps_std = fold_metrics.get("cohort_tumor_gvw_crps_std", None)
+        if cohort_crps_std is not None:
+            obj["cohort_tumor_gvw_crps_std"] = float(cohort_crps_std)
+        cohort_crps_balanced = fold_metrics.get("cohort_tumor_gvw_crps_balanced", None)
+        if cohort_crps_balanced is not None:
+            obj["cohort_tumor_gvw_crps_balanced"] = float(cohort_crps_balanced)
+        for key in (
+            "cohort_tumor_gvw_v4_2_objective",
+            "cohort_tumor_gvw_v4_2_crps_log_ratio",
+            "cohort_tumor_gvw_v4_2_crps_smooth_excess",
+            "cohort_tumor_soft_objective",
+            "cohort_tumor_soft_crps",
+            "cohort_tumor_soft_one_minus_r",
+        ):
+            value = fold_metrics.get(key)
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                obj[key] = float(value)
 
         # Composite lower-bound / upper-bound objectives
         _r_m = obj.get("balanced_tumor_gvw_r_mean")
@@ -657,8 +1121,23 @@ def run_optuna_fold_tuning(
             ]
             if src_r_vals:
                 obj["min_tumor_gvw_r"] = min(src_r_vals)
+            for source_name, source_metrics in per_source.items():
+                tumor_metrics = (
+                    source_metrics.get("tumor", {})
+                    if isinstance(source_metrics, dict)
+                    else {}
+                )
+                source_key = str(source_name)
+                source_r = tumor_metrics.get("gvw_r")
+                if isinstance(source_r, (int, float)) and math.isfinite(float(source_r)):
+                    obj[f"tumor_gvw_r_{source_key}"] = float(source_r)
+                source_crps = tumor_metrics.get("gvw_crps")
+                if isinstance(source_crps, (int, float)) and math.isfinite(float(source_crps)):
+                    obj[f"tumor_gvw_crps_{source_key}"] = float(source_crps)
         elif fold_metrics.get("min_tumor_gvw_r") is not None:
             obj["min_tumor_gvw_r"] = float(fold_metrics["min_tumor_gvw_r"])
+
+        _inject_cohort_objective(obj, study)
 
         for k, v in obj.items():
             if isinstance(v, (int, float)) and math.isfinite(float(v)):
@@ -672,6 +1151,189 @@ def run_optuna_fold_tuning(
     run_promotion_phase(study, exp, fold_num, direction, train_model_cv)
 
     write_study_report(study, exp.output_dir)
+
+
+def rescue_failed_fold_trials(
+    experiment_path: str,
+    storage: str,
+    study_name: Optional[str] = None,
+    trial_numbers: Optional[List[int]] = None,
+    sampler_seed: int = 42,
+) -> List[int]:
+    """Backfill trials from saved fold artifacts without retraining."""
+    exp = load_experiment_spec(experiment_path)
+    resolved_study_name = str(study_name) if study_name is not None else exp.name
+    direction = exp.objective.direction
+
+    sampler = optuna.samplers.TPESampler(
+        seed=int(sampler_seed),
+        multivariate=True,
+        constant_liar=True,
+        warn_independent_sampling=False,
+    )
+    study = optuna.create_study(
+        study_name=resolved_study_name,
+        direction=direction,
+        storage=_make_storage(storage),
+        load_if_exists=True,
+        sampler=sampler,
+        pruner=optuna.pruners.NopPruner(),
+    )
+
+    completed_hashes = {
+        str(trial.user_attrs.get("config_hash"))
+        for trial in study.trials
+        if trial.state == optuna.trial.TrialState.COMPLETE
+        and trial.user_attrs.get("config_hash") is not None
+    }
+    candidates = (
+        _trial_numbers_from_output_dir(exp.output_dir)
+        if trial_numbers is None
+        else sorted(set(int(number) for number in trial_numbers))
+    )
+
+    rescued_numbers: List[int] = []
+    for source_trial_number in candidates:
+        run_dir = os.path.join(exp.output_dir, f"trial_{source_trial_number:05d}")
+        trial_cfg_path = os.path.join(run_dir, "trial_config.json")
+        if not os.path.exists(trial_cfg_path):
+            continue
+
+        with open(trial_cfg_path, "r") as handle:
+            trial_cfg = json.load(handle)
+
+        cfg_hash = config_hash(trial_cfg)
+        if cfg_hash in completed_hashes:
+            continue
+
+        expected_folds = _folds_from_tsv(exp.data.training_set)
+        fold_metric_paths = [
+            _fold_metrics_path(run_dir, fold_num)
+            for fold_num in expected_folds
+        ]
+        has_full_cv_metrics = bool(fold_metric_paths) and all(
+            os.path.exists(path) for path in fold_metric_paths
+        )
+
+        if has_full_cv_metrics:
+            for metrics_path in fold_metric_paths:
+                _rewrite_fold_metrics_soft_objective(metrics_path)
+
+            objective = compute_cv_objective(run_dir)
+            _inject_cohort_objective(objective, study)
+            try:
+                value = objective_value(
+                    objective,
+                    metric=exp.objective.metric,
+                    direction=direction,
+                )
+            except ExperimentSpecError:
+                continue
+            if not math.isfinite(float(value)):
+                continue
+
+            try:
+                params, distributions = _trial_cfg_to_params_and_distributions(exp, trial_cfg)
+            except (KeyError, ValueError):
+                continue
+
+            user_attrs = {
+                key: float(val)
+                for key, val in objective.items()
+                if isinstance(val, (int, float)) and math.isfinite(float(val))
+            }
+            user_attrs.update({
+                "config_hash": cfg_hash,
+                "rescued_from_trial_number": int(source_trial_number),
+                "rescue_source": "cv_metrics",
+                "rescued_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
+            })
+
+            frozen = optuna.trial.create_trial(
+                params=params,
+                distributions=distributions,
+                value=float(value),
+                user_attrs=user_attrs,
+                state=optuna.trial.TrialState.COMPLETE,
+            )
+            study.add_trial(frozen)
+            completed_hashes.add(cfg_hash)
+            rescued_numbers.append(int(source_trial_number))
+            print(
+                f"[Tune-rescue] rebuilt trial_{source_trial_number:05d} "
+                f"as COMPLETE with {exp.objective.metric}={float(value):.4f}",
+                flush=True,
+            )
+            continue
+
+        fold_num = None
+        fold_dir = None
+        for entry in sorted(os.listdir(run_dir)):
+            if not entry.startswith("CV-fold_"):
+                continue
+            fold_dir = os.path.join(run_dir, entry)
+            try:
+                fold_num = int(entry.split("_")[-1])
+            except ValueError:
+                fold_num = None
+            break
+        if fold_num is None or fold_dir is None:
+            continue
+
+        history_path = os.path.join(fold_dir, "training_history.json")
+        if not os.path.exists(history_path):
+            continue
+        with open(history_path, "r") as handle:
+            history = json.load(handle)
+
+        objective = _build_rescued_objective_from_history(history, study)
+        try:
+            value = objective_value(
+                objective,
+                metric=exp.objective.metric,
+                direction=direction,
+            )
+        except ExperimentSpecError:
+            continue
+        if not math.isfinite(float(value)):
+            continue
+
+        try:
+            params, distributions = _trial_cfg_to_params_and_distributions(exp, trial_cfg)
+        except (KeyError, ValueError):
+            continue
+
+        user_attrs = {
+            key: float(val)
+            for key, val in objective.items()
+            if isinstance(val, (int, float)) and math.isfinite(float(val))
+        }
+        user_attrs.update({
+            "fold_num": int(fold_num),
+            "config_hash": cfg_hash,
+            "rescued_from_trial_number": int(source_trial_number),
+            "rescue_source": "training_history",
+            "rescued_at_utc": datetime.utcnow().isoformat(timespec="seconds"),
+        })
+
+        frozen = optuna.trial.create_trial(
+            params=params,
+            distributions=distributions,
+            value=float(value),
+            user_attrs=user_attrs,
+            state=optuna.trial.TrialState.COMPLETE,
+        )
+        study.add_trial(frozen)
+        completed_hashes.add(cfg_hash)
+        rescued_numbers.append(int(source_trial_number))
+        print(
+            f"[Tune-rescue] rescued trial_{source_trial_number:05d} "
+            f"as COMPLETE with {exp.objective.metric}={float(value):.4f}",
+            flush=True,
+        )
+
+    write_study_report(study, exp.output_dir)
+    return rescued_numbers
 
 
 # =============================================================================
@@ -1138,6 +1800,8 @@ def coordinated_tell(
             study.tell(trial_num, state=optuna.trial.TrialState.FAIL)
             continue
 
+        _inject_cohort_objective(obj, study)
+
         try:
             value = objective_value(obj, metric=metric, direction=direction)
         except ExperimentSpecError as exc:
@@ -1157,6 +1821,21 @@ def coordinated_tell(
                         'weighted_tumor_gvw_crps_max',
                     ):
                         fold_value = row.get('weighted_tumor_gvw_crps')
+                    elif metric == 'cohort_tumor_gvw_objective':
+                        row_obj = dict(row)
+                        _inject_cohort_objective(row_obj, study)
+                        fold_value = row_obj.get('cohort_tumor_gvw_objective')
+                    elif metric == 'cohort_tumor_gvw_v4_2_objective':
+                        row_obj = dict(row)
+                        _inject_cohort_objective(row_obj, study)
+                        fold_value = row_obj.get('cohort_tumor_gvw_v4_2_objective')
+                    elif metric in (
+                        'cohort_tumor_soft_objective',
+                        'cohort_tumor_soft_objective_mean',
+                    ):
+                        row_obj = dict(row)
+                        _inject_cohort_objective(row_obj, study)
+                        fold_value = row_obj.get('cohort_tumor_soft_objective')
                     elif direction == 'maximize':
                         fold_value = row.get('balanced_tumor_gvw_r')
                     else:

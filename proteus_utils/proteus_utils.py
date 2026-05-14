@@ -918,54 +918,141 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
             if self._path_has_gene(path, gene_idx) and self._passes_val_mask(path, gene_idx)
         ]
 
-    def _draw_real_paths(self, src: str, gene_idx: int, n_draws: int, rng: random.Random) -> List[str]:
-        candidates = self._valid_paths_for_gene(self._source_real_paths[src], gene_idx)
+    def _sample_unique_paths(
+        self,
+        candidates: List[str],
+        n_draws: int,
+        rng: random.Random,
+    ) -> List[str]:
         if not candidates or n_draws <= 0:
             return []
-        return [rng.choice(candidates) for _ in range(n_draws)]
+        if len(candidates) <= n_draws:
+            drawn = list(candidates)
+            rng.shuffle(drawn)
+            return drawn
+        return rng.sample(candidates, n_draws)
 
-    def _draw_pht_paths(self, src: str, gene_idx: int, n_draws: int, rng: random.Random) -> List[str]:
+    def _synthetic_origin_key(self, zarr_path: str) -> str:
+        if self._sample_is_pht.get(zarr_path, False):
+            parent_id = self._sample_pht_parent.get(zarr_path, '')
+            if parent_id:
+                return f'origin:{parent_id}'
+        return f"origin:{Path(zarr_path).stem.replace('.zarr', '')}"
+
+    def _draw_synthetic_paths(self, src: str, gene_idx: int, n_draws: int, rng: random.Random) -> List[str]:
         if n_draws <= 0:
             return []
-        grouped = self._source_pht_by_parent[src] if rng.random() < 0.5 else self._source_pht_by_donor[src]
-        valid_groups = []
-        for group_paths in grouped.values():
-            valid = self._valid_paths_for_gene(group_paths, gene_idx)
-            if len(valid) >= 2:
-                valid_groups.append(valid)
-        if valid_groups:
-            chosen_group = rng.choice(valid_groups)
-            if len(chosen_group) >= n_draws:
-                return rng.sample(chosen_group, n_draws)
-            return chosen_group + [rng.choice(chosen_group) for _ in range(n_draws - len(chosen_group))]
-        candidates = self._valid_paths_for_gene(self._source_pht_paths[src], gene_idx)
-        if not candidates:
+        combined_candidates = self._valid_paths_for_gene(self.sample_paths_by_source[src], gene_idx)
+        if not combined_candidates:
             return []
-        return [rng.choice(candidates) for _ in range(n_draws)]
+
+        paths_by_origin: Dict[str, List[str]] = {}
+        for path in combined_candidates:
+            origin_key = self._synthetic_origin_key(path)
+            paths_by_origin.setdefault(origin_key, []).append(path)
+
+        chosen_origins = self._sample_unique_paths(list(paths_by_origin.keys()), n_draws, rng)
+        drawn: List[str] = []
+        for origin_key in chosen_origins:
+            origin_candidates = paths_by_origin[origin_key]
+            drawn.append(rng.choice(origin_candidates))
+        rng.shuffle(drawn)
+        return drawn
+
+    def _sample_gene_indices(
+        self,
+        gene_population: List[int],
+        gene_sampling_probs: List[float],
+        rng: random.Random,
+    ) -> List[int]:
+        if not gene_population or self.genes_per_batch <= 0:
+            return []
+        if len(gene_population) <= self.genes_per_batch:
+            drawn = list(gene_population)
+            rng.shuffle(drawn)
+            return drawn
+
+        # Original implementation kept for reference:
+        # return rng.choices(
+        #     gene_population,
+        #     weights=gene_sampling_probs,
+        #     k=self.genes_per_batch,
+        # )
+        # Sample genes without replacement so a batch never contains the same
+        # gene twice, which would otherwise reopen same-sample/origin repeats
+        # inside a single CCC group.
+        np_rng = np.random.default_rng(rng.randrange(2**32))
+        drawn = np_rng.choice(
+            np.asarray(gene_population, dtype=np.int64),
+            size=self.genes_per_batch,
+            replace=False,
+            p=np.asarray(gene_sampling_probs, dtype=np.float64),
+        )
+        return [int(idx) for idx in drawn.tolist()]
+
+    def _draw_real_paths(self, src: str, gene_idx: int, n_draws: int, rng: random.Random) -> List[str]:
+        candidates = self._valid_paths_for_gene(self._source_real_paths[src], gene_idx)
+        # Original implementation kept for reference:
+        # if not candidates or n_draws <= 0:
+        #     return []
+        # return [rng.choice(candidates) for _ in range(n_draws)]
+        # Draw real samples without replacement so a gene group never repeats
+        # the same biological sample within one batch.
+        return self._sample_unique_paths(candidates, n_draws, rng)
+
+    def _draw_pht_paths(self, src: str, gene_idx: int, n_draws: int, rng: random.Random) -> List[str]:
+        # Original implementation kept for reference:
+        # if n_draws <= 0:
+        #     return []
+        # grouped = self._source_pht_by_parent[src] if rng.random() < 0.5 else self._source_pht_by_donor[src]
+        # valid_groups = []
+        # for group_paths in grouped.values():
+        #     valid = self._valid_paths_for_gene(group_paths, gene_idx)
+        #     if len(valid) >= 2:
+        #         valid_groups.append(valid)
+        # if valid_groups:
+        #     chosen_group = rng.choice(valid_groups)
+        #     if len(chosen_group) >= n_draws:
+        #         return rng.sample(chosen_group, n_draws)
+        #     return chosen_group + [rng.choice(chosen_group) for _ in range(n_draws - len(chosen_group))]
+        # candidates = self._valid_paths_for_gene(self._source_pht_paths[src], gene_idx)
+        # if not candidates:
+        #     return []
+        # return [rng.choice(candidates) for _ in range(n_draws)]
+        # PHT-only draws now also respect without-replacement semantics.
+        candidates = self._valid_paths_for_gene(self._source_pht_paths[src], gene_idx)
+        return self._sample_unique_paths(candidates, n_draws, rng)
 
     def _draw_source_paths(self, src: str, gene_idx: int, n_draws: int, rng: random.Random) -> List[str]:
         if n_draws <= 0:
             return []
         pht_available = bool(self._valid_paths_for_gene(self._source_pht_paths[src], gene_idx))
-        real_available = bool(self._valid_paths_for_gene(self._source_real_paths[src], gene_idx))
-        if pht_available and real_available:
-            n_pht = max(1, n_draws // 4)
-            n_real = n_draws - n_pht
-        elif pht_available:
-            n_pht = n_draws
-            n_real = 0
-        else:
-            n_pht = 0
-            n_real = n_draws
-        drawn = self._draw_real_paths(src, gene_idx, n_real, rng)
-        drawn.extend(self._draw_pht_paths(src, gene_idx, n_pht, rng))
-        while len(drawn) < n_draws:
-            filler = self._draw_real_paths(src, gene_idx, 1, rng) or self._draw_pht_paths(src, gene_idx, 1, rng)
-            if not filler:
-                break
-            drawn.extend(filler)
-        rng.shuffle(drawn)
-        return drawn[:n_draws]
+        # Original implementation kept for reference:
+        # real_available = bool(self._valid_paths_for_gene(self._source_real_paths[src], gene_idx))
+        # if pht_available and real_available:
+        #     n_pht = max(1, n_draws // 4)
+        #     n_real = n_draws - n_pht
+        # elif pht_available:
+        #     n_pht = n_draws
+        #     n_real = 0
+        # else:
+        #     n_pht = 0
+        #     n_real = n_draws
+        # drawn = self._draw_real_paths(src, gene_idx, n_real, rng)
+        # drawn.extend(self._draw_pht_paths(src, gene_idx, n_pht, rng))
+        # while len(drawn) < n_draws:
+        #     filler = self._draw_real_paths(src, gene_idx, 1, rng) or self._draw_pht_paths(src, gene_idx, 1, rng)
+        #     if not filler:
+        #         break
+        #     drawn.extend(filler)
+        # rng.shuffle(drawn)
+        # return drawn[:n_draws]
+        # Mixed synthetic sources now draw from the combined PDX/PHT pool with
+        # no explicit non-PHT preference.  We sample distinct model origins
+        # without replacement, then choose one concrete path per origin.
+        if pht_available:
+            return self._draw_synthetic_paths(src, gene_idx, n_draws, rng)
+        return self._draw_real_paths(src, gene_idx, n_draws, rng)
 
     # -- Core iteration --
 
@@ -995,10 +1082,10 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         items_per_gene = self.batch_size // self.genes_per_batch
 
         for _batch_idx in range(worker_batches):
-            batch_gene_indices = rng.choices(
+            batch_gene_indices = self._sample_gene_indices(
                 gene_population,
-                weights=gene_sampling_probs,
-                k=self.genes_per_batch,
+                gene_sampling_probs,
+                rng,
             )
 
             feat_signals = []
@@ -1061,7 +1148,9 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                             torch.from_numpy(sd['ref_scalars'][g_idx]))
                         lab_tfx.append(float(sd['TFX_label'][g_idx]))
                         lab_weight.append(gene_weight)
-                        lab_ccc_weight.append(0.0 if is_pht else gene_weight)
+                        # CCC includes all samples, including PHT-derived
+                        # synthetic mixtures, with the same per-gene weight.
+                        lab_ccc_weight.append(gene_weight)
 
                         if self.labeled:
                             lab_tumor.append(float(sd['tumor_exp'][g_idx]))
@@ -1210,7 +1299,7 @@ class ProteusHoldoutValDataset(IterableDataset):
             buf_tfx.append(float(sd['TFX_label'][g_idx]))
             buf_weight.append(gene_weight)
             is_pht = ds._sample_is_pht.get(zarr_path, False)
-            buf_ccc_weight.append(0.0 if is_pht else gene_weight)
+            buf_ccc_weight.append(gene_weight)
             buf_tumor.append(float(sd['tumor_exp'][g_idx]))
             buf_bg.append(float(sd['background_exp'][g_idx]))
             buf_samples.append(ds._get_sample_name(zarr_path))
@@ -1794,6 +1883,48 @@ def compute_gene_variances_unclipped(
     """
     raw, _ = _compute_gene_variances(zarr_paths, label_key)
     return raw
+
+
+def compute_gene_mean_std_from_zarr(
+    zarr_paths: List[str],
+    label_key: str = 'flat/tumor_exp',
+) -> tuple[Dict[str, float], Dict[str, float]]:
+    """Compute per-gene mean and std from Zarr stores.
+
+    Uses the same accumulation path as the variance helpers so SRL lookup
+    tables are defined over the identical training-only truth pool used for
+    the existing gene-variance weights.
+    """
+    import zarr
+
+    gene_sum: Dict[str, float] = {}
+    gene_sum_sq: Dict[str, float] = {}
+    gene_count: Dict[str, int] = {}
+
+    for zpath in zarr_paths:
+        store = zarr.open(zpath, mode='r')
+        gene_names = list(store['gene_names'][:])
+        labels = store[label_key][:]
+
+        for i, gname in enumerate(gene_names):
+            g = str(gname)
+            val = float(labels[i])
+            if not np.isfinite(val):
+                continue
+            gene_sum[g] = gene_sum.get(g, 0.0) + val
+            gene_sum_sq[g] = gene_sum_sq.get(g, 0.0) + val * val
+            gene_count[g] = gene_count.get(g, 0) + 1
+
+    gene_mean: Dict[str, float] = {}
+    gene_std: Dict[str, float] = {}
+    for g in gene_sum:
+        n = gene_count[g]
+        mean = gene_sum[g] / n
+        var = max(0.0, gene_sum_sq[g] / n - mean * mean)
+        gene_mean[g] = float(mean)
+        gene_std[g] = float(np.sqrt(var))
+
+    return gene_mean, gene_std
 
 
 def _compute_gene_variances(

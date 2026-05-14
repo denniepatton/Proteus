@@ -110,6 +110,10 @@ def resolve_trial_configs(
     internal_weight = s("internal_weight", exp.structural.internal_weight)
     beta_tfx = s("beta_tfx", exp.structural.beta_tfx)
     beta_ccc = s("beta_ccc", exp.structural.beta_ccc)
+    beta_srl_max = s("beta_srl_max", exp.structural.beta_srl_max)
+    srl_delta = s("srl_delta", exp.structural.srl_delta)
+    srl_start = s("srl_start", exp.structural.srl_start)
+    srl_ramp = s("srl_ramp", exp.structural.srl_ramp)
     beta_pht_consistency = s("beta_pht_consistency", exp.structural.beta_pht_consistency)
     beta_pht_uncertainty = s("beta_pht_uncertainty", exp.structural.beta_pht_uncertainty)
 
@@ -193,6 +197,10 @@ def resolve_trial_configs(
         internal_weight=float(internal_weight),
         beta_tfx=float(beta_tfx),
         beta_ccc=float(beta_ccc),
+        beta_srl_max=float(beta_srl_max),
+        srl_delta=float(srl_delta),
+        srl_start=int(srl_start),
+        srl_ramp=int(srl_ramp),
         beta_pht_consistency=float(beta_pht_consistency),
         beta_pht_uncertainty=float(beta_pht_uncertainty),
         # Training HPs stored in model config (legacy coupling)
@@ -233,6 +241,10 @@ def resolve_trial_configs(
             "internal_weight": float(internal_weight),
             "beta_tfx": float(beta_tfx),
             "beta_ccc": float(beta_ccc),
+            "beta_srl_max": float(beta_srl_max),
+            "srl_delta": float(srl_delta),
+            "srl_start": int(srl_start),
+            "srl_ramp": int(srl_ramp),
             "beta_pht_consistency": float(beta_pht_consistency),
             "beta_pht_uncertainty": float(beta_pht_uncertainty),
         },

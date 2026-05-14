@@ -34,6 +34,8 @@ BENCHMARK_SUBSET_MODELS: List[str] = [
 ]
 
 
+# Prediction inputs are resolved relative to PROJECT_ROOT and are restricted
+# to the canonical training/holdout result trees.
 SYNTHETIC_PROTEUS_MODEL_PATHS: Dict[str, str] = {
     "Proteus": "results_holdout/BioDVN/PHS/predictions_tumor.tsv",
     "Proteus_NoSeq": "results_holdout/BioDVN_NoSeq/PHS/predictions_tumor.tsv",
@@ -87,11 +89,21 @@ VALIDATION_PATIENT_CV_COHORTS: List[str] = ["CRPC-RA", "SCLC"]
 VALIDATION_PDX_COHORTS: List[str] = ["PC-PDX", "SCLC-PDX"]
 
 
-VALIDATION_PATIENT_HOLDOUT_PATH_TEMPLATE: str = (
-    "results_holdout/BioDVN/{cohort}/predictions_tumor.tsv"
-)
-VALIDATION_PATIENT_CV_RESULTS_DIR: str = "results_training/proteus_plca-model_cv"
-VALIDATION_PDX_CV_RESULTS_DIR: str = "results_training/proteus_base-model_cv"
+VALIDATION_PATIENT_HOLDOUT_PATHS: Dict[str, str] = {
+    "CRPC-WCDT": "results_holdout/BioDVN/CRPC-WCDT/predictions_tumor.tsv",
+    "BLCA-RA": "results_holdout/BioDVN/BLCA-RA/predictions_tumor.tsv",
+}
+
+
+# Canonical pooled PLCA OOF predictions used by patient validation,
+# PDX validation, and calibration. These are the exact fold files.
+PLCA_CV_FOLD_TUMOR_PREDICTION_PATHS: Dict[int, str] = {
+    1: "results_training/proteus_plca-model_cv/CV-fold_1/validation-fold_1_predictions_tumor.tsv",
+    2: "results_training/proteus_plca-model_cv/CV-fold_2/validation-fold_2_predictions_tumor.tsv",
+    3: "results_training/proteus_plca-model_cv/CV-fold_3/validation-fold_3_predictions_tumor.tsv",
+    4: "results_training/proteus_plca-model_cv/CV-fold_4/validation-fold_4_predictions_tumor.tsv",
+    5: "results_training/proteus_plca-model_cv/CV-fold_5/validation-fold_5_predictions_tumor.tsv",
+}
 
 
 VALIDATION_PDX_HOLDOUT_PATHS: Dict[str, str] = {
@@ -108,9 +120,12 @@ DISCOVERY_COHORTS: List[Tuple[str, str | None]] = [
 ]
 
 
-DISCOVERY_MODEL_PATHS: List[Tuple[str, str]] = [
-    ("Proteus", "results_holdout/BioDVN/{cohort}/predictions_tumor.tsv"),
-]
+DISCOVERY_PROTEUS_PATHS: Dict[str, str] = {
+    "CRPC-Pfizer": "results_holdout/BioDVN/CRPC-Pfizer/predictions_tumor.tsv",
+    "CRPC-Pluvicto": "results_holdout/BioDVN/CRPC-Pluvicto/predictions_tumor.tsv",
+    "CRPC-UW": "results_holdout/BioDVN/CRPC-UW/predictions_tumor.tsv",
+    "BC-Ghana": "results_holdout/BioDVN/BC-Ghana/predictions_tumor.tsv",
+}
 
 
 DISCOVERY_CROSS_COHORT_DIRNAME: str = "CrossCohort"

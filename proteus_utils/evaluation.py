@@ -8,6 +8,7 @@ orchestrator lean.  The single public entry point is
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -26,7 +27,11 @@ from proteus_utils.metrics import (
     gvw_r,
     scatter_stats,
 )
-from proteus_utils.data_helpers import weighted_group_mean
+from proteus_utils.data_helpers import (
+    compute_plcav4_2_objective,
+    compute_soft_objective,
+    weighted_group_mean,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +156,7 @@ def _run_inference(
             _accumulate_group_crps(
                 cohort_crps, features, 'sample_name', sample_to_cohort,
                 t_mdn, lab_dev['tumor_exp'], w_tumor, device,
+                group_var_maps=source_tumor_variance,
             )
 
             # ---- Per-source GVW-CRPS (tumor, per-source variance weights) ----
@@ -377,7 +383,7 @@ def _compute_group_summary_metrics(
     group_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """Summarize GVW-CRPS and GVW-r across groups."""
-    items = per_group.items()
+    items = list(per_group.items())
     if exclude_prefix:
         items = [(k, v) for k, v in items if not k.startswith(exclude_prefix)]
 
@@ -385,14 +391,19 @@ def _compute_group_summary_metrics(
     gvw_r_vals = [v['tumor'].get('gvw_r', float('nan')) for _, v in items]
     finite_crps = [x for x in gvw_crps_vals if np.isfinite(x)]
     finite_r = [x for x in gvw_r_vals if np.isfinite(x)]
+    crps_std = float(np.std(finite_crps)) if finite_crps else float('nan')
+    r_std = float(np.std(finite_r)) if finite_r else float('nan')
 
     summary = {
         'balanced_tumor_gvw_crps': float(np.mean(finite_crps)) if finite_crps else float('nan'),
-        'balanced_tumor_gvw_crps_std': float(np.std(finite_crps)) if len(finite_crps) > 1 else float('nan'),
+        'balanced_tumor_gvw_crps_std': crps_std if len(finite_crps) > 1 else float('nan'),
         'balanced_tumor_gvw_r': float(np.mean(finite_r)) if finite_r else float('nan'),
-        'balanced_tumor_gvw_r_std': float(np.std(finite_r)) if len(finite_r) > 1 else float('nan'),
+        'balanced_tumor_gvw_r_std': r_std if len(finite_r) > 1 else float('nan'),
         'min_tumor_gvw_r': float(np.min(finite_r)) if finite_r else float('nan'),
     }
+
+    weighted_crps_mean = summary['balanced_tumor_gvw_crps']
+    weighted_r_mean = summary['balanced_tumor_gvw_r']
 
     if group_weights:
         source_crps = {
@@ -400,10 +411,64 @@ def _compute_group_summary_metrics(
             for name, group_data in items
             if np.isfinite(group_data['tumor'].get('gvw_crps', float('nan')))
         }
-        summary['weighted_tumor_gvw_crps'] = weighted_group_mean(
+        weighted_crps_mean = weighted_group_mean(
             source_crps,
             group_weights,
         )
+        summary['weighted_tumor_gvw_crps'] = weighted_crps_mean
+
+        source_r = {
+            name: float(group_data['tumor']['gvw_r'])
+            for name, group_data in items
+            if np.isfinite(group_data['tumor'].get('gvw_r', float('nan')))
+        }
+        weighted_r_mean = weighted_group_mean(
+            source_r,
+            group_weights,
+        )
+        summary['weighted_tumor_gvw_r'] = weighted_r_mean
+
+    summary['cohort_tumor_gvw_crps_mean'] = summary['balanced_tumor_gvw_crps']
+    summary['cohort_tumor_gvw_crps_std'] = crps_std
+    summary['cohort_tumor_gvw_crps_balanced'] = (
+        weighted_crps_mean + 0.5 * crps_std
+        if math.isfinite(float(weighted_crps_mean)) and math.isfinite(crps_std)
+        else float('nan')
+    )
+    summary['cohort_tumor_gvw_r_mean'] = summary['balanced_tumor_gvw_r']
+    summary['cohort_tumor_gvw_r_std'] = r_std
+    summary['cohort_tumor_gvw_r_balanced'] = (
+        weighted_r_mean - 0.5 * r_std
+        if math.isfinite(float(weighted_r_mean)) and math.isfinite(r_std)
+        else float('nan')
+    )
+
+    robust_objective, crps_log_ratio, crps_smooth_excess = compute_plcav4_2_objective(
+        summary['cohort_tumor_gvw_r_balanced'],
+        summary['cohort_tumor_gvw_crps_balanced'],
+    )
+    summary['cohort_tumor_gvw_v4_2_objective'] = robust_objective
+    summary['cohort_tumor_gvw_v4_2_crps_log_ratio'] = crps_log_ratio
+    summary['cohort_tumor_gvw_v4_2_crps_smooth_excess'] = crps_smooth_excess
+
+    source_crps = {
+        name: float(group_data['tumor']['gvw_crps'])
+        for name, group_data in items
+        if np.isfinite(group_data['tumor'].get('gvw_crps', float('nan')))
+    }
+    source_r = {
+        name: float(group_data['tumor']['gvw_r'])
+        for name, group_data in items
+        if np.isfinite(group_data['tumor'].get('gvw_r', float('nan')))
+    }
+    soft_objective, soft_crps, soft_one_minus_r = compute_soft_objective(
+        source_r,
+        source_crps,
+        required_names=sorted(name for name, _ in items),
+    )
+    summary['cohort_tumor_soft_objective'] = soft_objective
+    summary['cohort_tumor_soft_crps'] = soft_crps
+    summary['cohort_tumor_soft_one_minus_r'] = soft_one_minus_r
 
     return summary
 
@@ -601,7 +666,7 @@ def save_fold_predictions(
         )
         per_cohort = _compute_group_metrics(
             df_tumor, df_background, all_genes, cohort_arr,
-            cohort_crps, var_maps=None,
+            cohort_crps, var_maps=source_tumor_variance,
         )
         if per_cohort:
             metrics['per_cohort'] = per_cohort

@@ -27,6 +27,7 @@ from scipy.stats import kstest, pearsonr, spearmanr
 from .analysis_utils import (
     format_pval,
     load_palette,
+    MIN_CORRELATION_N,
 )
 
 # ---------------------------------------------------------------------------
@@ -87,7 +88,7 @@ def _compute_correlation_stats(
         "spearman_rho": np.nan,
         "spearman_p": np.nan,
     }
-    if len(x) < 3 or float(np.ptp(x)) <= 0.0 or float(np.ptp(y)) <= 0.0:
+    if len(x) < MIN_CORRELATION_N or float(np.ptp(x)) <= 0.0 or float(np.ptp(y)) <= 0.0:
         return stats
 
     with warnings.catch_warnings():
@@ -109,6 +110,46 @@ def _format_correlation_line(label: str, corr_value: float, p_value: float) -> s
     return f"{label} = {corr_text}  ({p_text})"
 
 
+def _nice_step_for_five_ticks(span: float) -> float:
+    """Return a simple step size that yields four clean intervals."""
+    if not np.isfinite(span) or span <= 0.0:
+        return 1.0
+    target = span / 4.0
+    steps = [
+        0.01, 0.02, 0.05,
+        0.1, 0.2, 0.25, 0.5,
+        1.0, 2.0, 2.5, 4.0, 5.0,
+        10.0, 20.0, 25.0, 50.0,
+    ]
+    for step in steps:
+        if step >= target:
+            return step
+    return steps[-1]
+
+
+def _set_explicit_ticks(
+    ax: plt.Axes,
+    *,
+    x_ticks: Optional[Sequence[float]] = None,
+    y_ticks: Optional[Sequence[float]] = None,
+) -> None:
+    if x_ticks is not None:
+        ax.set_xticks(list(x_ticks))
+    if y_ticks is not None:
+        ax.set_yticks(list(y_ticks))
+
+
+def _set_five_y_ticks(ax: plt.Axes) -> None:
+    """Set exactly five clean y ticks spanning the current y range."""
+    y_lo, y_hi = ax.get_ylim()
+    lower = 0.0 if y_lo <= 0.0 <= y_hi else y_lo
+    span = max(float(y_hi - lower), 1e-9)
+    step = _nice_step_for_five_ticks(span)
+    upper = lower + 4.0 * step
+    ax.set_ylim(lower, upper)
+    ax.set_yticks(np.linspace(lower, upper, 5))
+
+
 # ---------------------------------------------------------------------------
 # Sample-level scatter (single sample: genes as dots)
 # ---------------------------------------------------------------------------
@@ -123,6 +164,17 @@ def sample_scatter(
     tfx: Optional[float] = None,
     depth: Optional[float] = None,
     is_holdout: bool = False,
+    point_style: str = "hexbin",
+    point_color: str = "#7F7F7F",
+    point_alpha: float = 0.75,
+    point_size: float = 8.0,
+    axis_max: float = 15.0,
+    diagonal_color: str = "black",
+    diagonal_lw: float = 1.0,
+    diagonal_alpha: float = 0.5,
+    diagonal_zorder: float = 5.0,
+    x_ticks: Optional[Sequence[float]] = None,
+    y_ticks: Optional[Sequence[float]] = None,
 ) -> None:
     """Scatter for one sample: genes as dots with hexbin density background.
 
@@ -140,7 +192,7 @@ def sample_scatter(
     mask = np.isfinite(t) & np.isfinite(p)
     t, p = t[mask], p[mask]
 
-    if len(t) < 3:
+    if len(t) < MIN_CORRELATION_N:
         return
 
     corr_stats = _compute_correlation_stats(t.values, p.values)
@@ -149,13 +201,24 @@ def sample_scatter(
 
     fig, ax = plt.subplots(figsize=(8, 8))
 
-    # Fixed axis range
-    axis_max = 15.0
-    hb = ax.hexbin(
-        t.values, p.values, gridsize=100, cmap="viridis_r", bins="log",
-        extent=(0, axis_max, 0, axis_max),
-    )
-    cb = fig.colorbar(hb, ax=ax, shrink=0.8, label=r"$\log_{10}(N+1)$")
+    if point_style == "hexbin":
+        hb = ax.hexbin(
+            t.values, p.values, gridsize=100, cmap="viridis_r", bins="log",
+            extent=(0, axis_max, 0, axis_max),
+        )
+        fig.colorbar(hb, ax=ax, shrink=0.8, label=r"$\log_{10}(N+1)$")
+    elif point_style == "scatter":
+        ax.scatter(
+            t.values,
+            p.values,
+            color=point_color,
+            s=point_size,
+            alpha=point_alpha,
+            linewidths=0,
+            zorder=2,
+        )
+    else:
+        raise ValueError(f"Unsupported point_style '{point_style}'")
 
     # GOI highlights colored by subtype
     pal = _palette()
@@ -190,9 +253,18 @@ def sample_scatter(
                     zorder=4,
                 )
 
-    ax.plot([0, axis_max], [0, axis_max], "k--", alpha=0.5, lw=1)
+    ax.plot(
+        [0, axis_max],
+        [0, axis_max],
+        ls="--",
+        color=diagonal_color,
+        alpha=diagonal_alpha,
+        lw=diagonal_lw,
+        zorder=diagonal_zorder,
+    )
     ax.set_xlim(0, axis_max)
     ax.set_ylim(0, axis_max)
+    _set_explicit_ticks(ax, x_ticks=x_ticks, y_ticks=y_ticks)
     ax.set_box_aspect(1)
     ax.set_xlabel(r"RNA-Seq log$_2$(CPM+1)")
     ax.set_ylabel(r"Predicted log$_2$(CPM+1)")
@@ -268,7 +340,7 @@ def gene_target_scatter(
     mask = np.isfinite(t) & np.isfinite(p)
     t, p = t[mask], p[mask]
 
-    if len(t) < 3:
+    if len(t) < MIN_CORRELATION_N:
         return
 
     activity_odds_ratio_gene: Optional[pd.Series] = None
@@ -322,8 +394,8 @@ def gene_target_scatter(
         metric_t = t_conf
         metric_p = p_conf
     else:
-        metric_t = t_conf if len(t_conf) >= 3 else t
-        metric_p = p_conf if len(p_conf) >= 3 else p
+        metric_t = t_conf if len(t_conf) >= MIN_CORRELATION_N else t
+        metric_p = p_conf if len(p_conf) >= MIN_CORRELATION_N else p
     corr_stats = _compute_correlation_stats(metric_t.values, metric_p.values)
     r_val = corr_stats["pearson_r"]
     p_val = corr_stats["pearson_p"]
@@ -338,9 +410,14 @@ def gene_target_scatter(
         fit_t = t_conf
         fit_p = p_conf
     else:
-        fit_t = t_conf if len(t_conf) >= 3 else t
-        fit_p = p_conf if len(p_conf) >= 3 else p
-    can_fit = _has_spread(fit_t) and len(fit_t) >= 2 and np.isfinite(fit_p.to_numpy(dtype=np.float64)).all()
+        fit_t = t_conf if len(t_conf) >= MIN_CORRELATION_N else t
+        fit_p = p_conf if len(p_conf) >= MIN_CORRELATION_N else p
+    can_fit = (
+        _has_spread(fit_t)
+        and _has_spread(fit_p)
+        and len(fit_t) >= MIN_CORRELATION_N
+        and np.isfinite(fit_p.to_numpy(dtype=np.float64)).all()
+    )
 
     # Dynamic axis range from displayed values only.
     all_vals = np.concatenate([t.values, p.values])
@@ -728,9 +805,21 @@ def metric_distribution(
     name: str,
     *,
     xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
     square: bool = False,
     log_y: bool = False,
     draw_stat_lines: bool = True,
+    hist_color: Optional[str] = None,
+    kde_color: Optional[str] = None,
+    hist_alpha: float = 0.6,
+    kde_linewidth: float = 1.5,
+    reference_line_color: str = "gray",
+    reference_line_lw: float = 0.8,
+    reference_line_alpha: float = 0.6,
+    reference_line_zorder: float = 5.0,
+    x_ticks: Optional[Sequence[float]] = None,
+    y_ticks: Optional[Sequence[float]] = None,
+    enforce_five_y_ticks: bool = False,
 ) -> None:
     """Histogram + KDE of a per-gene or per-sample metric.
 
@@ -747,7 +836,25 @@ def metric_distribution(
 
     size = (6, 6) if square else (7, 4)
     fig, ax = plt.subplots(figsize=size)
-    sns.histplot(vals, kde=True, stat="density", bins=40, ax=ax)
+    if hist_color is None and kde_color is None and np.isclose(kde_linewidth, 1.5):
+        sns.histplot(vals, kde=True, stat="density", bins=40, ax=ax)
+    else:
+        sns.histplot(
+            vals,
+            kde=False,
+            stat="density",
+            bins=40,
+            ax=ax,
+            color=hist_color,
+            alpha=hist_alpha,
+            edgecolor=None,
+        )
+        sns.kdeplot(
+            vals,
+            ax=ax,
+            color=(kde_color or hist_color or "#4C72B0"),
+            lw=kde_linewidth,
+        )
     ax.set_xlabel(metric_name.replace("_", " ").title())
     ax.set_ylabel("Density")
     if draw_stat_lines:
@@ -758,14 +865,26 @@ def metric_distribution(
         ax.plot([], [], ' ', label=f"mean={vals.mean():.3f}")
         ax.plot([], [], ' ', label=f"median={vals.median():.3f}")
     if square:
-        ax.axvline(0, color="gray", ls="--", lw=0.8, alpha=0.6)
+        ax.axvline(
+            0,
+            color=reference_line_color,
+            ls="--",
+            lw=reference_line_lw,
+            alpha=reference_line_alpha,
+            zorder=reference_line_zorder,
+        )
     ax.legend(fontsize=9)
     if xlim:
         ax.set_xlim(xlim)
+    if ylim:
+        ax.set_ylim(ylim)
     if log_y:
         ax.set_yscale("log")
     if square:
         ax.set_box_aspect(1)
+    _set_explicit_ticks(ax, x_ticks=x_ticks, y_ticks=y_ticks)
+    if enforce_five_y_ticks and y_ticks is None and not log_y:
+        _set_five_y_ticks(ax)
     ax.set_title(f"Distribution of {metric_name} (n={len(vals):,})")
 
     fig.tight_layout()
@@ -895,7 +1014,7 @@ def plot_calibration_coverage(
 
     fig, ax = plt.subplots(figsize=(6, 6))
     ax.plot([0, 1], [0, 1], "k--", lw=0.8, alpha=0.5, label="Perfect calibration")
-    ax.plot(base_levels, base_vals, "o-", color="#0077BB", label="Base model", markersize=6)
+    ax.plot(base_levels, base_vals, "o-", color="#0077BB", label="Uncalibrated", markersize=6)
     ax.plot(conf_levels, conf_vals, "s-", color="#EE3377", label="CQR calibrated", markersize=6)
     ax.set_xlabel("Nominal coverage level")
     ax.set_ylabel("Empirical coverage")
@@ -1034,7 +1153,7 @@ def plot_shrinkage_scatter(
     raw = pd.to_numeric(raw_values, errors="coerce").to_numpy(dtype=np.float64)
     shrunk = pd.to_numeric(shrunk_values, errors="coerce").to_numpy(dtype=np.float64)
     valid = np.isfinite(raw) & np.isfinite(shrunk)
-    if int(valid.sum()) < 3:
+    if int(valid.sum()) < MIN_CORRELATION_N:
         return
 
     raw = raw[valid]
@@ -1752,7 +1871,7 @@ def benchmark_grid_histograms(
                     color = cmap.get(model, "#BBBBBB")
                     sns.kdeplot(
                         vals, ax=ax, color=color, linewidth=1.5,
-                        fill=False, clip=(-1, 1),
+                        fill=False, clip=(-1, 1), warn_singular=False,
                     )
                     legend_entries.append(f"{model} (n≥0.7={n_good})")
                 if legend_entries:
@@ -1831,16 +1950,32 @@ def benchmark_depth_lines(
         fig.set_size_inches(*fig_size)
 
     legend_handles = []
+    preferred_draw_order = ["Naive", "EPIC", "XGBoost", "Proteus"]
+    model_order_index = {model_name: idx for idx, model_name in enumerate(model_order)}
+
+    def _draw_priority(model_name: str) -> tuple[int, int]:
+        lower_name = model_name.lower()
+        if lower_name == "naive":
+            return (0, model_order_index.get(model_name, len(model_order_index)))
+        if "epic" in lower_name:
+            return (1, model_order_index.get(model_name, len(model_order_index)))
+        if "xgboost" in lower_name:
+            return (2, model_order_index.get(model_name, len(model_order_index)))
+        if "proteus" in lower_name:
+            return (3, model_order_index.get(model_name, len(model_order_index)))
+        return (len(preferred_draw_order), model_order_index.get(model_name, len(model_order_index)))
+
+    ordered_models = sorted(model_order, key=_draw_priority)
     for idx, (col, label) in enumerate(metric_defs):
         ri, ci = divmod(idx, n_cols)
         ax = axes[ri, ci]
-        for model in model_order:
+        for model in ordered_models:
             msub = sub[sub["model"] == model].sort_values("tfx_numeric")
             if msub.empty or col not in msub.columns or msub[col].isna().all():
                 continue
             color = cmap.get(model, "#BBBBBB")
             line, = ax.plot(msub["tfx_numeric"], msub[col], "o-",
-                            color=color, markersize=16, linewidth=1.4,
+                            color=color, markersize=8, linewidth=1.4,
                             markeredgecolor=_darken(color),
                             markeredgewidth=1.2)
             if idx == 0:
@@ -2747,7 +2882,11 @@ def clinical_correlation_scatter(
         mask &= y > 0.0
     x, y = x[mask], y[mask]
 
-    if len(x) < 3:
+    if len(x) < MIN_CORRELATION_N:
+        return
+
+    corr_stats = _compute_correlation_stats(x, y)
+    if not np.isfinite(corr_stats["pearson_r"]) or not np.isfinite(corr_stats["spearman_rho"]):
         return
 
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -2762,10 +2901,10 @@ def clinical_correlation_scatter(
             lw=1.8, ls="-", alpha=0.8)
 
     # Correlation annotations
-    r_p, p_p = pearsonr(x, y)
-    r_s, p_s = spearmanr(x, y)
-    annot = (f"Pearson r = {r_p:.3f}  ({format_pval(p_p)})\n"
-             f"Spearman ρ = {r_s:.3f}  ({format_pval(p_s)})")
+    annot = (
+        f"Pearson r = {corr_stats['pearson_r']:.3f}  ({format_pval(corr_stats['pearson_p'])})\n"
+        f"Spearman ρ = {corr_stats['spearman_rho']:.3f}  ({format_pval(corr_stats['spearman_p'])})"
+    )
     ax.text(0.03, 0.97, annot, transform=ax.transAxes,
             va="top", ha="left", fontsize=8,
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))

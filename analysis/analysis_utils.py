@@ -26,11 +26,13 @@ _GENE_ALIAS_FALLBACKS: Dict[str, str] = {
 }
 
 _MDN_GAMMA_SHAPE: float = 0.75
+_AOR_EPSILON: float = 1e-6
 _PAM50_GENEFU_MODEL_NAMES: Tuple[str, ...] = ("pam50.scale",)
 _PAM50_LABEL_MAP: Dict[str, str] = {
     "Her2": "HER2",
 }
 _GENEFU_BRIDGE_CACHE: Optional[Tuple[Any, Any, Any]] = None
+MIN_CORRELATION_N: int = 5
 
 
 def _augment_missing_gene_aliases(expr_df: pd.DataFrame) -> pd.DataFrame:
@@ -343,11 +345,26 @@ def load_cv_predictions_proteus_full(
         ``gamma_beta_wide``   — genes × samples merged gamma_beta (or None)
         ``normal_mean_wide``  — genes × samples merged normal_mean (or None)
         ``normal_stdev_wide`` — genes × samples merged normal_stdev (or None)
-        ``activity_odds_ratio_wide`` — genes × samples log2(pi_normal / (pi_delta + pi_gamma)) (or None)
+        ``activity_odds_ratio_wide`` — genes × samples log2((pi_normal + eps) / (1 - pi_normal + eps)) (or None)
         ``active_confidence_wide`` — genes × samples P(Y >= 2.0) from the raw MDN (or None)
         ``fold_data``         — {fold_int: dict of per-fold wide DFs}
         ``sample_fold``       — {sample_name: fold_int}
     """
+    fold_prediction_paths = {
+        int(fold): os.path.join(
+            trial_dir,
+            f"CV-fold_{int(fold)}",
+            f"validation-fold_{int(fold)}_predictions_tumor.tsv",
+        )
+        for fold in folds
+    }
+    return load_cv_predictions_proteus_full_from_paths(fold_prediction_paths)
+
+
+def load_cv_predictions_proteus_full_from_paths(
+    fold_prediction_paths: Dict[int, Union[str, Path]],
+) -> Dict[str, Any]:
+    """Load Proteus CV predictions from an explicit fold→file path mapping."""
     # Column name in TSV → key in result dict
     _OPTIONAL_COLS = {
         "ci_q5": "ci_lo_wide",
@@ -366,9 +383,8 @@ def load_cv_predictions_proteus_full(
     fold_data: Dict[int, Dict[str, pd.DataFrame]] = {}
     sample_fold: Dict[str, int] = {}
 
-    for fold in folds:
-        fold_dir = os.path.join(trial_dir, f"CV-fold_{fold}")
-        path = os.path.join(fold_dir, f"validation-fold_{fold}_predictions_tumor.tsv")
+    for fold, path_like in sorted(fold_prediction_paths.items()):
+        path = os.fspath(path_like)
         if not os.path.exists(path):
             raise FileNotFoundError(f"Missing Proteus CV prediction: {path}")
 
@@ -456,7 +472,7 @@ def load_holdout_predictions_proteus_full(
         ``gamma_beta_wide``   — genes × samples gamma_beta (or None)
         ``normal_mean_wide``  — genes × samples normal_mean (or None)
         ``normal_stdev_wide`` — genes × samples normal_stdev (or None)
-        ``activity_odds_ratio_wide`` — genes × samples log2(pi_normal / (pi_delta + pi_gamma)) (or None)
+        ``activity_odds_ratio_wide`` — genes × samples log2((pi_normal + eps) / (1 - pi_normal + eps)) (or None)
         ``active_confidence_wide`` — genes × samples P(Y >= 2.0) from the raw MDN (or None)
     """
     _OPTIONAL_COLS = {
@@ -526,7 +542,12 @@ def load_holdout_predictions_proteus(
 
 def load_holdout_predictions_xgboost(path: str) -> pd.DataFrame:
     """Load a single XGBoost holdout predictions_tumor.tsv → pred_wide."""
-    df = pd.read_csv(path, sep="\t", index_col=0)
+    try:
+        df = pd.read_csv(path, sep="\t", index_col=0)
+    except pd.errors.ParserError:
+        # Some HPC-backed filesystems intermittently fail the C parser on
+        # otherwise valid TSVs; the Python engine is slower but more robust.
+        df = pd.read_csv(path, sep="\t", index_col=0, engine="python")
     return _long_to_wide(df, "prediction")
 
 
@@ -608,6 +629,13 @@ def gene_level_metrics(
     Fully vectorised — computes all ~19K genes in a single pass using
     NumPy broadcasting.  No per-gene Python loops or multiprocessing.
     Returns DataFrame indexed by gene name.
+
+    Genes with fewer than ``MIN_CORRELATION_N`` valid truth/prediction
+    pairs remain undefined (NaN). Genes with insufficient truth variance
+    are excluded (NaN). Genes with sufficient valid pairs and variable
+    truth but zero spread in predictions are treated as correlation
+    failures and assigned 0.0 so aggregate summaries compare the same
+    gene set across models.
     """
     common_genes = truth_wide.index.intersection(pred_wide.index)
     common_samples = truth_wide.columns.intersection(pred_wide.columns)
@@ -620,7 +648,7 @@ def gene_level_metrics(
     n_samples = T.shape[1]
     genes = tw.index
 
-    if n_samples < 3:
+    if n_samples < MIN_CORRELATION_N:
         return pd.DataFrame({
             "n": n_samples, "pearson_r": np.nan, "spearman_rho": np.nan,
             "rmse": np.nan, "mae": np.nan, "truth_var": np.nan,
@@ -630,10 +658,19 @@ def gene_level_metrics(
     # Mask NaN: use per-gene valid counts so that samples with NaN for
     # a given gene are excluded from that gene's sums.
     finite_mask = np.isfinite(T) & np.isfinite(P)  # (G, S)
+    T_valid = np.where(finite_mask, T, np.nan)
+    P_valid = np.where(finite_mask, P, np.nan)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
+        truth_variable = np.nanmax(T_valid, axis=1) > np.nanmin(T_valid, axis=1)
+        pred_variable = np.nanmax(P_valid, axis=1) > np.nanmin(P_valid, axis=1)
     T_clean = np.where(finite_mask, T, 0.0)
     P_clean = np.where(finite_mask, P, 0.0)
     n_valid = finite_mask.sum(axis=1).astype(np.float64)  # per-gene
-    n_valid = np.where(n_valid >= 3, n_valid, np.nan)     # need >=3
+    n_valid = np.where(n_valid >= MIN_CORRELATION_N, n_valid, np.nan)
+    sufficient_pairs = np.isfinite(n_valid)
+    truth_defined = sufficient_pairs & truth_variable
+    pred_constant_pair = truth_defined & ~pred_variable
     sum_t = T_clean.sum(axis=1)
     sum_p = P_clean.sum(axis=1)
     sum_tt = (T_clean * T_clean).sum(axis=1)
@@ -646,12 +683,14 @@ def gene_level_metrics(
         den = np.sqrt(den_t * den_p)
     with np.errstate(divide="ignore", invalid="ignore"):
         pearson_r = np.where(den > 0, num / den, np.nan)
+    pearson_r[pred_constant_pair] = 0.0
+    pearson_r[~truth_defined] = np.nan
 
     # ── Spearman rho (vectorised via NaN-aware ranking) ──
     # Rank each gene's truth/pred across samples, excluding NaN entries
     # so that NaN values don't inflate ranks for valid observations.
-    T_masked_sp = np.where(finite_mask, T, np.nan)
-    P_masked_sp = np.where(finite_mask, P, np.nan)
+    T_masked_sp = T_valid
+    P_masked_sp = P_valid
     T_ranked = _rankdata_columns_nan(T_masked_sp.T)  # (S, G)
     P_ranked = _rankdata_columns_nan(P_masked_sp.T)
     # Replace NaN ranks with 0; use per-gene valid count for Pearson-on-ranks
@@ -659,7 +698,7 @@ def gene_level_metrics(
     T_rk = np.where(rank_valid, T_ranked, 0.0)
     P_rk = np.where(rank_valid, P_ranked, 0.0)
     n_rk = rank_valid.sum(axis=0).astype(np.float64)  # per-gene valid count
-    n_rk_safe = np.where(n_rk >= 3, n_rk, np.nan)
+    n_rk_safe = np.where(n_rk >= MIN_CORRELATION_N, n_rk, np.nan)
     sum_tr = T_rk.sum(axis=0)
     sum_pr = P_rk.sum(axis=0)
     sum_trtr = (T_rk * T_rk).sum(axis=0)
@@ -672,6 +711,8 @@ def gene_level_metrics(
         den_s = np.sqrt(den_tr * den_pr)
     with np.errstate(divide="ignore", invalid="ignore"):
         spearman_rho = np.where(den_s > 0, num_s / den_s, np.nan)
+    spearman_rho[pred_constant_pair] = 0.0
+    spearman_rho[~truth_defined] = np.nan
 
     # ── RMSE, MAE, truth variance (vectorised, NaN-safe) ──
     # Genes where all samples are NaN produce empty slices; handle
@@ -719,7 +760,7 @@ def sample_level_metrics(
     n_genes = T.shape[0]
     samples = tw.columns
 
-    if n_genes < 3:
+    if n_genes < MIN_CORRELATION_N:
         return pd.DataFrame({
             "n": n_genes, "pearson_r": np.nan, "spearman_rho": np.nan,
             "rmse": np.nan, "mae": np.nan,
@@ -729,10 +770,19 @@ def sample_level_metrics(
     # Mask NaN: use nansum so that genes with NaN in a given sample
     # are excluded from that sample's sums rather than poisoning them.
     finite_mask = np.isfinite(T) & np.isfinite(P)  # (G, S)
+    T_valid = np.where(finite_mask, T, np.nan)
+    P_valid = np.where(finite_mask, P, np.nan)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="All-NaN slice encountered", category=RuntimeWarning)
+        truth_variable = np.nanmax(T_valid, axis=0) > np.nanmin(T_valid, axis=0)
+        pred_variable = np.nanmax(P_valid, axis=0) > np.nanmin(P_valid, axis=0)
     T_clean = np.where(finite_mask, T, 0.0)
     P_clean = np.where(finite_mask, P, 0.0)
     n_valid = finite_mask.sum(axis=0).astype(np.float64)  # per-sample
-    n_valid = np.where(n_valid >= 3, n_valid, np.nan)     # need >=3
+    n_valid = np.where(n_valid >= MIN_CORRELATION_N, n_valid, np.nan)
+    sufficient_pairs = np.isfinite(n_valid)
+    truth_defined = sufficient_pairs & truth_variable
+    pred_constant_pair = truth_defined & ~pred_variable
     sum_t = (T_clean).sum(axis=0)
     sum_p = (P_clean).sum(axis=0)
     sum_tt = (T_clean * T_clean).sum(axis=0)
@@ -742,17 +792,19 @@ def sample_level_metrics(
     den = np.sqrt((n_valid * sum_tt - sum_t ** 2) * (n_valid * sum_pp - sum_p ** 2))
     with np.errstate(divide="ignore", invalid="ignore"):
         pearson_r = np.where(den > 0, num / den, np.nan)
+    pearson_r[pred_constant_pair] = 0.0
+    pearson_r[~truth_defined] = np.nan
 
     # ── Spearman rho per sample — NaN-aware rank along gene axis ──
-    T_masked_sp = np.where(finite_mask, T, np.nan)
-    P_masked_sp = np.where(finite_mask, P, np.nan)
+    T_masked_sp = T_valid
+    P_masked_sp = P_valid
     T_ranked = _rankdata_columns_nan(T_masked_sp)   # (G, S) — rank each column along genes
     P_ranked = _rankdata_columns_nan(P_masked_sp)
     rank_valid = np.isfinite(T_ranked) & np.isfinite(P_ranked)  # (G, S)
     T_rk = np.where(rank_valid, T_ranked, 0.0)
     P_rk = np.where(rank_valid, P_ranked, 0.0)
     n_rk = rank_valid.sum(axis=0).astype(np.float64)  # per-sample valid count
-    n_rk_safe = np.where(n_rk >= 3, n_rk, np.nan)
+    n_rk_safe = np.where(n_rk >= MIN_CORRELATION_N, n_rk, np.nan)
     sum_tr = T_rk.sum(axis=0)
     sum_pr = P_rk.sum(axis=0)
     sum_trtr = (T_rk * T_rk).sum(axis=0)
@@ -763,6 +815,8 @@ def sample_level_metrics(
         den_s = np.sqrt((n_rk_safe * sum_trtr - sum_tr ** 2) * (n_rk_safe * sum_prpr - sum_pr ** 2))
     with np.errstate(divide="ignore", invalid="ignore"):
         spearman_rho = np.where(den_s > 0, num_s / den_s, np.nan)
+    spearman_rho[pred_constant_pair] = 0.0
+    spearman_rho[~truth_defined] = np.nan
 
     # ── RMSE, MAE (NaN-safe) ──
     any_valid = finite_mask.any(axis=0)  # (S,) — True if sample has ≥1 valid pair
@@ -833,9 +887,11 @@ def _gvw_rho_from_wide(
     w_gene : (n_genes,) per-gene variance weights.
 
     For each gene, computes the exact Spearman rho across samples,
-    dropping any NaN observations.  Genes with fewer than 5 valid
-    sample-pairs are excluded entirely.  The final result is the
-    variance-weighted average of per-gene rho values.
+    dropping any NaN observations. Genes with fewer than
+    ``MIN_CORRELATION_N`` valid sample-pairs are excluded entirely.
+    Genes with zero truth variance are excluded. Genes with enough valid
+    pairs and variable truth but zero prediction spread contribute 0.0.
+    The final result is the variance-weighted average of per-gene rho values.
     """
     from scipy.stats import spearmanr as _spearmanr
 
@@ -846,10 +902,13 @@ def _gvw_rho_from_wide(
     rho_per_gene = np.full(n_genes, np.nan)
     for g in range(n_genes):
         valid = np.isfinite(T[g]) & np.isfinite(P[g])
-        if valid.sum() < 5:
+        if valid.sum() < MIN_CORRELATION_N:
             continue
         tv, pv = T[g, valid], P[g, valid]
-        if np.ptp(tv) == 0 or np.ptp(pv) == 0:
+        if np.ptp(tv) == 0:
+            continue
+        if np.ptp(pv) == 0:
+            rho_per_gene[g] = 0.0
             continue
         rho_per_gene[g] = _spearmanr(tv, pv).statistic
 
@@ -876,9 +935,11 @@ def _gvw_r_from_wide(
     w_gene : (n_genes,) per-gene variance weights.
 
     For each gene, computes the exact Pearson r across samples,
-    dropping any NaN observations.  Genes with fewer than 5 valid
-    sample-pairs are excluded entirely.  The final result is the
-    variance-weighted average of per-gene r values.
+    dropping any NaN observations. Genes with fewer than
+    ``MIN_CORRELATION_N`` valid sample-pairs are excluded entirely.
+    Genes with zero truth variance are excluded. Genes with enough valid
+    pairs and variable truth but zero prediction spread contribute 0.0.
+    The final result is the variance-weighted average of per-gene r values.
     """
     n_genes, n_samples = T.shape
     if n_samples < 2 or n_genes < 1:
@@ -888,7 +949,7 @@ def _gvw_r_from_wide(
     for g in range(n_genes):
         valid = np.isfinite(T[g]) & np.isfinite(P[g])
         n = valid.sum()
-        if n < 5:
+        if n < MIN_CORRELATION_N:
             continue
         t = T[g, valid]
         p = P[g, valid]
@@ -896,8 +957,11 @@ def _gvw_r_from_wide(
         mean_p = p.mean()
         dt = t - mean_t
         dp = p - mean_p
+        if np.dot(dt, dt) < 1e-12:
+            continue
         denom = np.sqrt(np.dot(dt, dt) * np.dot(dp, dp))
         if denom < 1e-12:
+            r_per_gene[g] = 0.0
             continue
         r_per_gene[g] = np.dot(dt, dp) / denom
 
@@ -925,7 +989,7 @@ def gvw_r(
     t = truth_flat[mask]
     p = pred_flat[mask]
     g = genes_flat[mask]
-    if len(t) < 3:
+    if len(t) < MIN_CORRELATION_N:
         return np.nan
 
     unique_genes = np.unique(g)
@@ -960,7 +1024,7 @@ def gvw_rho(
     t = truth_flat[mask]
     p = pred_flat[mask]
     g = genes_flat[mask]
-    if len(t) < 3:
+    if len(t) < MIN_CORRELATION_N:
         return np.nan
 
     unique_genes = np.unique(g)
@@ -1329,20 +1393,20 @@ def _mdn_activity_odds_ratio(
     pi_gamma_flat: np.ndarray,
     pi_normal_flat: np.ndarray,
     *,
-    min_mass: float = 1e-12,
+    epsilon: float = _AOR_EPSILON,
 ) -> np.ndarray:
-    """Compute log2(pi_normal / (pi_delta + pi_gamma)).
+    """Compute log2((pi_normal + eps) / (1 - pi_normal + eps)).
 
-    Under this definition the normal branch is the active mass and the delta
-    spike plus gamma branch together form the off mass.
+    The MDN mixture weights should sum to 1, so the off mass is represented by
+    ``1 - pi_normal`` rather than recomputing ``pi_delta + pi_gamma``.
     """
-    off_mass = np.clip(
-        p0_flat.astype(np.float64) + pi_gamma_flat.astype(np.float64),
-        min_mass,
-        None,
-    )
-    normal_mass = np.clip(pi_normal_flat.astype(np.float64), min_mass, None)
-    return np.log2(normal_mass / off_mass)
+    del p0_flat, pi_gamma_flat
+
+    normal_mass = np.clip(pi_normal_flat.astype(np.float64), 0.0, 1.0)
+    off_mass = np.clip(1.0 - normal_mass, 0.0, 1.0)
+    numerator = normal_mass + float(epsilon)
+    denominator = off_mass + float(epsilon)
+    return np.log2(numerator / denominator)
 
 
 def _dedupe_wide_axes(df: pd.DataFrame) -> pd.DataFrame:
@@ -1576,7 +1640,7 @@ def compute_subset_metrics(
     tw = truth_wide.loc[common_genes, common_samples]
     pw = pred_wide.loc[common_genes, common_samples]
 
-    if len(common_samples) < 2 or len(common_genes) < 3:
+    if len(common_samples) < MIN_CORRELATION_N or len(common_genes) < MIN_CORRELATION_N:
         return empty
 
     # Suppress benign warnings from np.nanmean / np.nanpercentile on
@@ -1593,9 +1657,9 @@ def compute_subset_metrics(
         T_arr = tw.values.astype(np.float64)
         P_arr = pw.values.astype(np.float64)
 
-        # Per-gene valid pair count; exclude genes with < 5 valid samples
+        # Per-gene valid pair count; exclude genes with < MIN_CORRELATION_N valid samples
         n_valid_per_gene = (np.isfinite(T_arr) & np.isfinite(P_arr)).sum(axis=1)
-        usable_genes = n_valid_per_gene >= 5
+        usable_genes = n_valid_per_gene >= MIN_CORRELATION_N
 
         # Fully-vectorised gene-level and sample-level metrics
         gmet = gene_level_metrics(tw, pw)

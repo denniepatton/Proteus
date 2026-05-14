@@ -135,6 +135,10 @@ class BioDVNConfig:
     cl_margin: float = 1.0
     beta_tfx: float = 2.0
     beta_ccc: float = 1.0
+    beta_srl_max: float = 0.0
+    srl_delta: float = 1.0
+    srl_start: int = 5
+    srl_ramp: int = 10
     beta_pht_consistency: float = 0.0
     beta_pht_uncertainty: float = 1.5
     
@@ -403,7 +407,6 @@ class ReducedSequenceSignalEncoder(nn.Module):
                 f'length/channels {(int(x.shape[1]), int(x.shape[2]))}, '
                 f'expected {(self.input_length, self.input_channels)}'
             )
-
         return self.readout(torch.flatten(x, start_dim=1))
 
 
@@ -453,16 +456,13 @@ class Encoder(nn.Module):
             z_log_var: Log variance of latent distribution (batch, latent_dim)
         """
         h = self.layers(x)
-        # Force float32 before the mean/logvar projections.  Under AMP the
-        # upstream MLP runs in float16; if activations drift large, the
-        # Linear output can overflow float16 (max ~65504).  z_mean is
+        # Force float32 before the mean/logvar projections.  z_mean is
         # unbounded and feeds Sampling, contrastive_loss, KL, and the MDN
         # heads — all of which assume finite input.
         #
-        # IMPORTANT: h.float() alone is NOT sufficient — under an enclosing
-        # torch.amp.autocast context, nn.Linear is on the "allow" list and
-        # silently recasts the float32 input back to float16.  We must
-        # explicitly disable autocast for the two projection layers.
+        # IMPORTANT: h.float() alone is NOT sufficient under an enclosing
+        # torch.amp.autocast context; nn.Linear is on the autocast allow list.
+        # Disable autocast for the two projection layers.
         h = h.float()
         with torch.amp.autocast('cuda', enabled=False):
             z_mean = self.fc_mean(h)
@@ -562,6 +562,7 @@ class BioDVN(nn.Module):
         if config is None:
             config = BioDVNConfig()
         self.config = config
+        self._use_sequence_only_objective = config.channel_mode == 'only_seq'
         
         # Signal processing block — channel_mode controls which
         # convolutions are built (bio signals, nucleotides, or both).
@@ -817,33 +818,46 @@ class BioDVN(nn.Module):
         z_tumor = self.training_choice(z_tumor_sample, z_tumor_mean)
         z_background = self.training_choice(z_background_sample, z_background_mean)
         
-        predicted_tfx = self.tfx_predictor(z_tumor_mean, z_background_mean)
-
+        predicted_tfx = z_tumor_mean.new_zeros((z_tumor_mean.shape[0], 1))
         tfx_loss = None
-        if self.training:
-            if tfx is None:
-                raise ValueError(
-                    "tfx (ground-truth tumor fraction) must be provided "
-                    "during training for auxiliary TFx supervision."
-                )
-            tfx_loss = F.mse_loss(predicted_tfx.float(), tfx.float())
+        y_reconstructed = None
 
-        tfx_for_merge = predicted_tfx
+        if not self._use_sequence_only_objective:
+            predicted_tfx = self.tfx_predictor(z_tumor_mean, z_background_mean)
 
-        merge_input = torch.cat([
-            tfx_for_merge, z_tumor_mean, z_tumor_log_var,
-            z_background_mean, z_background_log_var,
-        ], dim=1)
-        weights = self.weight_predictor(merge_input)
-        
-        z_merged_mean, z_merged_log_var = self.merge_latents(
-            weights, z_tumor_mean, z_tumor_log_var, z_background_mean, z_background_log_var
-        )
-        z_merged_sample = self.sampling(z_merged_mean, z_merged_log_var)
-        z_merged = self.training_choice(z_merged_sample, z_merged_mean)
-        
-        # Reconstruction
-        y_reconstructed = self.decoder(z_merged)
+            if self.training:
+                if tfx is None:
+                    raise ValueError(
+                        "tfx (ground-truth tumor fraction) must be provided "
+                        "during training for auxiliary TFx supervision."
+                    )
+                predicted_tfx_flat = predicted_tfx.float().view(-1)
+                tfx_flat = tfx.float().view(-1)
+                finite_tfx = torch.isfinite(tfx_flat)
+                if finite_tfx.any():
+                    tfx_loss = F.mse_loss(
+                        predicted_tfx_flat[finite_tfx],
+                        tfx_flat[finite_tfx],
+                    )
+                else:
+                    tfx_loss = predicted_tfx_flat.new_tensor(0.0)
+
+            merge_input = torch.cat([
+                predicted_tfx, z_tumor_mean, z_tumor_log_var,
+                z_background_mean, z_background_log_var,
+            ], dim=1)
+            weights = self.weight_predictor(merge_input)
+
+            z_merged_mean, z_merged_log_var = self.merge_latents(
+                weights, z_tumor_mean, z_tumor_log_var, z_background_mean, z_background_log_var
+            )
+            z_merged_sample = self.sampling(z_merged_mean, z_merged_log_var)
+            z_merged = self.training_choice(z_merged_sample, z_merged_mean)
+
+            # Sequence-only can only learn a gene-conditioned cohort mean, so
+            # sample-level TFx supervision and merged-latent reconstruction are
+            # intentionally disabled for that ablation.
+            y_reconstructed = self.decoder(z_merged)
         
         # MDN output heads follow the same training/inference choice as the
         # decoder path: samples during training, means during inference.
@@ -863,7 +877,7 @@ class BioDVN(nn.Module):
         }
         
         # Internal loss
-        if return_internal_loss and self.training:
+        if return_internal_loss and self.training and not self._use_sequence_only_objective:
             internal_loss, internal_metrics = self.internal_loss_fn(
                 z_tumor, z_background,
                 z_tumor_mean, z_tumor_log_var,

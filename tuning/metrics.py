@@ -14,9 +14,17 @@ import os
 from typing import Any, Dict, List
 
 from config.experiment_spec import ExperimentSpecError
+from proteus_utils.data_helpers import (
+    compute_cohort_objective,
+    compute_plcav4_2_objective,
+    compute_soft_objective,
+)
 
 __all__ = [
     "collect_fold_metrics",
+    "compute_cohort_objective",
+    "compute_plcav4_2_objective",
+    "compute_soft_objective",
     "nanmean",
     "nanstd",
     "compute_cv_objective",
@@ -154,6 +162,128 @@ def compute_cv_objective(run_dir: str) -> Dict[str, Any]:
     ]
     if balanced_gvw_r_std:
         obj["balanced_tumor_gvw_r_std_mean"] = nanmean(balanced_gvw_r_std)
+
+    cohort_gvw_r_mean = [
+        float(r["cohort_tumor_gvw_r_mean"])
+        for r in rows
+        if r.get("cohort_tumor_gvw_r_mean") is not None
+    ]
+    if cohort_gvw_r_mean:
+        obj["cohort_tumor_gvw_r_mean"] = nanmean(cohort_gvw_r_mean)
+
+    cohort_gvw_r_std = [
+        float(r["cohort_tumor_gvw_r_std"])
+        for r in rows
+        if r.get("cohort_tumor_gvw_r_std") is not None
+    ]
+    if cohort_gvw_r_std:
+        obj["cohort_tumor_gvw_r_std"] = nanmean(cohort_gvw_r_std)
+
+    cohort_gvw_r_balanced = [
+        float(r["cohort_tumor_gvw_r_balanced"])
+        for r in rows
+        if r.get("cohort_tumor_gvw_r_balanced") is not None
+    ]
+    if cohort_gvw_r_balanced:
+        obj["cohort_tumor_gvw_r_balanced"] = nanmean(cohort_gvw_r_balanced)
+        obj["cohort_tumor_gvw_r_balanced_fold_std"] = nanstd(cohort_gvw_r_balanced)
+
+    cohort_gvw_crps_mean = [
+        float(r["cohort_tumor_gvw_crps_mean"])
+        for r in rows
+        if r.get("cohort_tumor_gvw_crps_mean") is not None
+    ]
+    if cohort_gvw_crps_mean:
+        obj["cohort_tumor_gvw_crps_mean"] = nanmean(cohort_gvw_crps_mean)
+
+    cohort_gvw_crps_std = [
+        float(r["cohort_tumor_gvw_crps_std"])
+        for r in rows
+        if r.get("cohort_tumor_gvw_crps_std") is not None
+    ]
+    if cohort_gvw_crps_std:
+        obj["cohort_tumor_gvw_crps_std"] = nanmean(cohort_gvw_crps_std)
+
+    cohort_gvw_crps_balanced = [
+        float(r["cohort_tumor_gvw_crps_balanced"])
+        for r in rows
+        if r.get("cohort_tumor_gvw_crps_balanced") is not None
+    ]
+    if cohort_gvw_crps_balanced:
+        obj["cohort_tumor_gvw_crps_balanced"] = nanmean(cohort_gvw_crps_balanced)
+        obj["cohort_tumor_gvw_crps_balanced_fold_std"] = nanstd(cohort_gvw_crps_balanced)
+
+    robust_fold_objectives: List[float] = []
+    for row in rows:
+        row_value = row.get("cohort_tumor_gvw_v4_2_objective")
+        if isinstance(row_value, (int, float)) and math.isfinite(float(row_value)):
+            robust_fold_objectives.append(float(row_value))
+            continue
+        row_r = row.get("cohort_tumor_gvw_r_balanced")
+        row_crps = row.get("cohort_tumor_gvw_crps_balanced")
+        if not (
+            isinstance(row_r, (int, float))
+            and isinstance(row_crps, (int, float))
+            and math.isfinite(float(row_r))
+            and math.isfinite(float(row_crps))
+        ):
+            continue
+        row_objective, _, _ = compute_plcav4_2_objective(
+            float(row_r),
+            float(row_crps),
+        )
+        if math.isfinite(row_objective):
+            robust_fold_objectives.append(row_objective)
+    if robust_fold_objectives:
+        fold_mean = nanmean(robust_fold_objectives)
+        fold_std = nanstd(robust_fold_objectives)
+        if not math.isfinite(fold_std):
+            fold_std = 0.0
+        obj["cohort_tumor_gvw_v4_2_objective_mean"] = fold_mean
+        obj["cohort_tumor_gvw_v4_2_objective_fold_std"] = fold_std
+        obj["cohort_tumor_gvw_v4_2_objective"] = fold_mean - 0.5 * fold_std
+
+    soft_fold_objectives: List[float] = []
+    for row in rows:
+        row_value = row.get("cohort_tumor_soft_objective")
+        if not (isinstance(row_value, (int, float)) and math.isfinite(float(row_value))):
+            row_value = row.get("cohort_tumor_gvw_v4_3_objective")
+        if isinstance(row_value, (int, float)) and math.isfinite(float(row_value)):
+            soft_fold_objectives.append(float(row_value))
+            continue
+        row_source_crps = {
+            str(key[len("tumor_gvw_crps_"):]): float(value)
+            for key, value in row.items()
+            if isinstance(key, str)
+            and key.startswith("tumor_gvw_crps_")
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+        }
+        row_source_r = {
+            str(key[len("tumor_gvw_r_"):]): float(value)
+            for key, value in row.items()
+            if isinstance(key, str)
+            and key.startswith("tumor_gvw_r_")
+            and isinstance(value, (int, float))
+            and math.isfinite(float(value))
+        }
+        if set(row_source_crps) != set(row_source_r) or not row_source_crps:
+            continue
+        row_objective, _, _ = compute_soft_objective(
+            row_source_r,
+            row_source_crps,
+            required_names=sorted(row_source_r),
+        )
+        if math.isfinite(row_objective):
+            soft_fold_objectives.append(row_objective)
+    if soft_fold_objectives:
+        fold_mean = nanmean(soft_fold_objectives)
+        fold_std = nanstd(soft_fold_objectives)
+        if not math.isfinite(fold_std):
+            fold_std = 0.0
+        obj["cohort_tumor_soft_objective_mean"] = fold_mean
+        obj["cohort_tumor_soft_objective_fold_std"] = fold_std
+        obj["cohort_tumor_soft_objective"] = fold_mean
 
     # Composite lower-bound / upper-bound objectives
     # GVW-r lower bound: mean − std (maximize to raise worst-source floor)
