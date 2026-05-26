@@ -110,10 +110,10 @@ class BioDVNConfig:
     """Configuration for BioDVN model architecture and training."""
     # Architecture hyperparameters
     channel_mode: str = 'all'  # 'all', 'no_seq', or 'only_seq'
-    signal_filters: int = 8
-    signal_ksize: int = 6
-    interaction_ksize: int = 3
-    initial_reduction_channels: int = 32
+    signal_filters: int = 16
+    signal_ksize: int = 3
+    interaction_ksize: int = 5
+    initial_reduction_channels: int = 64
     n_reductions: int = 3
     funnel_reduction_factor: int = 4
     reduction_dilation: int = 3
@@ -124,27 +124,27 @@ class BioDVNConfig:
     
     # MDN output head hyperparameters
     mdn_hidden: int = 64       # Hidden dim inside MixtureDensityHead
-    mdn_final: int = 16        # Final hidden dim before 6-output projection
+    mdn_final: int = 32        # Final hidden dim before 6-output projection
     
     # Loss function hyperparameters
     beta_kl: float = 1.0
     beta_contrastive: float = 1.0
-    beta_reconstruction: float = 1.25
+    beta_reconstruction: float = 3.0
     beta_background: float = 1.0
     internal_weight: float = 0.5
     cl_margin: float = 1.0
-    beta_tfx: float = 2.0
-    beta_ccc: float = 1.0
-    beta_srl_max: float = 0.0
-    srl_delta: float = 1.0
-    srl_start: int = 5
-    srl_ramp: int = 10
-    beta_pht_consistency: float = 0.0
-    beta_pht_uncertainty: float = 1.5
+    beta_tfx: float = 0.5
+    beta_srl_max: float = 2.0
+    beta_dynamic_pair_max: float = 0.0
+    srl_delta: float = 5.0
+    srl_start: int = 0
+    srl_ramp: int = 50
+    beta_pht_consistency: float = 1.0
+    beta_pht_uncertainty: float = 1.0
     
     # Training hyperparameters
-    weight_decay: float = 2e-8
-    max_lr: float = 4e-4  # Peak learning rate
+    weight_decay: float = 0.0
+    max_lr: float = 1.5e-4  # Peak learning rate
 
     # Gradient clipping
     max_grad_norm: float = 10.0

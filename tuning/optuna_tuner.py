@@ -45,8 +45,6 @@ from config.experiment_spec import (
 )
 from tuning.metrics import (
     collect_fold_metrics,
-    compute_cohort_objective,
-    compute_plcav4_2_objective,
     compute_soft_objective,
     compute_cv_objective,
     nanmean,
@@ -79,6 +77,9 @@ __all__ = [
 
 PROXY_OBJECTIVE_FILENAME = "proxy_objective.json"
 PROMOTED_CV_SUMMARY_FILENAME = "promoted_cv_summary.json"
+TRIAL_CONFIG_FILENAME = "trial_config.json"
+COORDINATED_ACTIVE_FILENAME = "coordinated_active.json"
+COORDINATED_PENDING_FILENAME = "coordinated_pending.json"
 DEFAULT_PROXY_FOLDS = (3, 5)
 
 
@@ -88,6 +89,7 @@ DEFAULT_PROXY_FOLDS = (3, 5)
 
 HYPERBAND_MIN_RESOURCE = 3
 HYPERBAND_REDUCTION_FACTOR = 3
+TUNER_VALIDATION_CADENCE_EPOCHS = 5
 
 
 # =============================================================================
@@ -134,61 +136,8 @@ def _make_storage(url: str) -> Any:
     return url
 
 
-def _best_completed_user_attr(
-    study: optuna.Study,
-    attr_name: str,
-    fallback: Optional[float] = None,
-) -> float:
-    """Return the best completed numeric user attr, minimizing the attr itself."""
-    values: List[float] = []
-    for trial in study.trials:
-        if trial.state != optuna.trial.TrialState.COMPLETE:
-            continue
-        value = trial.user_attrs.get(attr_name)
-        if isinstance(value, (int, float)) and math.isfinite(float(value)):
-            values.append(float(value))
-    if values:
-        return min(values)
-    if fallback is not None and math.isfinite(float(fallback)):
-        return float(fallback)
-    return float('nan')
-
-
-def _inject_cohort_objective(obj: Dict[str, Any], study: optuna.Study) -> None:
-    """Add PLCAv4 cohort objective fields to an objective dict."""
-    cohort_r = obj.get('cohort_tumor_gvw_r_balanced')
-    cohort_crps = obj.get('cohort_tumor_gvw_crps_balanced')
-    if not (
-        isinstance(cohort_r, (int, float)) and math.isfinite(float(cohort_r))
-        and isinstance(cohort_crps, (int, float)) and math.isfinite(float(cohort_crps))
-    ):
-        return
-
-    best_crps = _best_completed_user_attr(
-        study,
-        'cohort_tumor_gvw_crps_balanced',
-        fallback=float(cohort_crps),
-    )
-    objective, crps_gate, crps_penalty = compute_cohort_objective(
-        float(cohort_r),
-        float(cohort_crps),
-        best_crps,
-    )
-    if math.isfinite(objective):
-        obj['cohort_tumor_gvw_objective'] = objective
-        obj['cohort_tumor_gvw_crps_gate'] = crps_gate
-        obj['cohort_tumor_gvw_crps_penalty'] = crps_penalty
-        obj['cohort_tumor_gvw_crps_best_observed'] = best_crps
-
-    robust_objective, crps_log_ratio, crps_smooth_excess = compute_plcav4_2_objective(
-        float(cohort_r),
-        float(cohort_crps),
-    )
-    if math.isfinite(robust_objective):
-        obj['cohort_tumor_gvw_v4_2_objective'] = robust_objective
-        obj['cohort_tumor_gvw_v4_2_crps_log_ratio'] = crps_log_ratio
-        obj['cohort_tumor_gvw_v4_2_crps_smooth_excess'] = crps_smooth_excess
-
+def _inject_cohort_objective(obj: Dict[str, Any], _study: optuna.Study) -> None:
+    """Add the finalized source-weighted soft-objective fields to an objective dict."""
     source_crps = {
         str(key[len('tumor_gvw_crps_'):]): float(value)
         for key, value in obj.items()
@@ -235,6 +184,28 @@ def _min_patience_from_spec(spec: ParamSpec, default: int = 3) -> int:
     return default
 
 
+def _max_numeric_from_spec(spec: ParamSpec, default: float) -> float:
+    """Extract the maximum numeric value from a ParamSpec.
+
+    Pruning floors should be conservative across a search space: if the
+    schedule varies by trial, use the largest plausible warmup so Optuna
+    never prunes a trial before its own LR warmup has finished.
+    """
+    if spec.fixed is not None:
+        return float(spec.fixed)  # type: ignore[arg-type]
+    if spec.suggest is not None:
+        s = dict(spec.suggest)
+        stype = str(s.get("type", "")).strip().lower()
+        if stype in {"int", "float"}:
+            if s.get("high") is not None:
+                return float(s["high"])
+            if s.get("low") is not None:
+                return float(s["low"])
+        if stype == "categorical" and isinstance(s.get("choices"), list) and s["choices"]:
+            return max(float(choice) for choice in s["choices"])
+    return float(default)
+
+
 def _infer_hyperband_max_resource(exp: ExperimentSpec) -> int:
     """Infer max_resource for Hyperband from experiment.training.epochs."""
     epochs_spec = exp.training.epochs
@@ -248,6 +219,36 @@ def _infer_hyperband_max_resource(exp: ExperimentSpec) -> int:
         if stype == 'categorical' and isinstance(s.get('choices'), list) and s['choices']:
             return int(max(s['choices']))
     return 30
+
+
+def _infer_pruner_warmup_epochs(exp: ExperimentSpec) -> int:
+    """Infer the first epoch where pruning decisions are allowed.
+
+    This is tied to training-schedule warmup and validation cadence, not to
+    early-stopping patience. Using patience here can disable effective
+    pruning entirely when experiments intentionally set patience=epochs.
+    """
+    max_epochs = _infer_hyperband_max_resource(exp)
+    if max_epochs <= 1:
+        return 1
+
+    warmup_frac = _max_numeric_from_spec(exp.training.warmup_frac, 0.05)
+    schedule_frac = _max_numeric_from_spec(exp.training.schedule_frac, 0.90)
+    warmup_epochs = int(math.ceil(max_epochs * schedule_frac * warmup_frac))
+    first_post_warmup_validation = int(
+        math.ceil(
+            max(warmup_epochs, TUNER_VALIDATION_CADENCE_EPOCHS)
+            / float(TUNER_VALIDATION_CADENCE_EPOCHS)
+        )
+    ) * TUNER_VALIDATION_CADENCE_EPOCHS
+
+    return max(
+        1,
+        min(
+            max_epochs - 1,
+            max(HYPERBAND_MIN_RESOURCE, first_post_warmup_validation),
+        ),
+    )
 
 
 def _folds_from_tsv(training_set_tsv: str) -> List[int]:
@@ -264,6 +265,63 @@ def _write_json_atomic(path: str, obj: Any) -> None:
     with open(tmp, 'w') as f:
         json.dump(obj, f, indent=2)
     os.replace(tmp, path)
+
+
+def _read_json(path: str) -> Any:
+    with open(path, 'r') as handle:
+        return json.load(handle)
+
+
+def _trial_run_dir(output_dir: str, trial_number: int) -> str:
+    return os.path.join(output_dir, f"trial_{trial_number:05d}")
+
+
+def _trial_config_path(run_dir: str) -> str:
+    return os.path.join(run_dir, TRIAL_CONFIG_FILENAME)
+
+
+def _coordinated_pending_path(run_dir: str) -> str:
+    return os.path.join(run_dir, COORDINATED_PENDING_FILENAME)
+
+
+def _coordinated_active_path(output_dir: str) -> str:
+    return os.path.join(output_dir, COORDINATED_ACTIVE_FILENAME)
+
+
+def _write_trial_config(run_dir: str, trial_cfg: Dict[str, Any]) -> None:
+    _write_json_atomic(_trial_config_path(run_dir), trial_cfg)
+
+
+def _write_coordinated_pending(
+    run_dir: str,
+    *,
+    trial_number: int,
+    status: str,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        'trial_number': int(trial_number),
+        'status': str(status),
+    }
+    if extra:
+        payload.update(extra)
+    _write_json_atomic(_coordinated_pending_path(run_dir), payload)
+
+
+def _write_active_trial_numbers(output_dir: str, trial_numbers: List[int]) -> None:
+    _write_json_atomic(
+        _coordinated_active_path(output_dir),
+        {'trial_numbers': [int(trial_number) for trial_number in trial_numbers]},
+    )
+
+
+def _read_active_trial_numbers(output_dir: str, *, log_prefix: str) -> Optional[List[int]]:
+    active_path = _coordinated_active_path(output_dir)
+    if not os.path.exists(active_path):
+        print(f"[{log_prefix}] No {COORDINATED_ACTIVE_FILENAME} found.", flush=True)
+        return None
+    payload = _read_json(active_path)
+    return [int(trial_number) for trial_number in payload['trial_numbers']]
 
 
 def _param_spec_to_distribution(spec: ParamSpec) -> optuna.distributions.BaseDistribution:
@@ -413,26 +471,6 @@ def _history_best_index(history: Dict[str, Any]) -> int:
         ]
         if finite:
             return min(finite, key=lambda item: item[1])[0]
-
-    v4_2_objective_vals = history.get("val_cohort_tumor_gvw_v4_2_objective")
-    if isinstance(v4_2_objective_vals, list):
-        finite = [
-            (idx, float(value))
-            for idx, value in enumerate(v4_2_objective_vals)
-            if isinstance(value, (int, float)) and math.isfinite(float(value))
-        ]
-        if finite:
-            return max(finite, key=lambda item: item[1])[0]
-
-    objective_vals = history.get("val_cohort_tumor_gvw_objective")
-    if isinstance(objective_vals, list):
-        finite = [
-            (idx, float(value))
-            for idx, value in enumerate(objective_vals)
-            if isinstance(value, (int, float)) and math.isfinite(float(value))
-        ]
-        if finite:
-            return max(finite, key=lambda item: item[1])[0]
 
     cohort_r_vals = history.get("val_cohort_tumor_gvw_r_balanced")
     if isinstance(cohort_r_vals, list):
@@ -599,12 +637,11 @@ def _existing_config_hashes(output_dir: str) -> set[str]:
     for entry in os.listdir(output_dir):
         if not entry.startswith("trial_"):
             continue
-        cfg_path = os.path.join(output_dir, entry, "trial_config.json")
+        cfg_path = _trial_config_path(os.path.join(output_dir, entry))
         if not os.path.exists(cfg_path):
             continue
         try:
-            with open(cfg_path, "r") as f:
-                cfg = json.load(f)
+            cfg = _read_json(cfg_path)
         except (OSError, json.JSONDecodeError):
             continue
         hashes.add(config_hash(cfg))
@@ -757,8 +794,9 @@ def run_optuna_cv_tuning(
     # Resolve pruner: explicit argument > experiment YAML > default
     effective_pruner_type = pruner_type if pruner_type is not None else exp.tuning.pruner_type
 
-    # Minimum epochs before pruning: respect patience from experiment spec
-    min_patience = _min_patience_from_spec(exp.training.patience)
+    # Minimum epochs before pruning: respect LR warmup + validation cadence,
+    # not early-stopping patience.
+    pruner_warmup_epochs = _infer_pruner_warmup_epochs(exp)
 
     sampler = optuna.samplers.TPESampler(
         seed=int(sampler_seed),
@@ -769,12 +807,15 @@ def run_optuna_cv_tuning(
 
     if effective_pruner_type == "hyperband":
         pruner = optuna.pruners.HyperbandPruner(
-            min_resource=max(HYPERBAND_MIN_RESOURCE, min_patience),
+            min_resource=pruner_warmup_epochs,
             max_resource=_infer_hyperband_max_resource(exp),
             reduction_factor=HYPERBAND_REDUCTION_FACTOR,
         )
     elif effective_pruner_type == "median":
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=min_patience)
+        pruner = optuna.pruners.MedianPruner(
+            n_startup_trials=5,
+            n_warmup_steps=pruner_warmup_epochs,
+        )
     else:
         pruner = optuna.pruners.NopPruner()
 
@@ -782,16 +823,15 @@ def run_optuna_cv_tuning(
         exp, study_name, direction, storage, sampler, pruner,
     )
 
-    from Proteus import train_model_cv  # local import to avoid circulars
+    from proteus_workflows.train import train_model_cv
 
     def objective(trial: optuna.Trial) -> float:
         model_cfg, train_cfg, trial_cfg = resolve_trial_configs(exp, trial)
 
-        run_dir = os.path.join(exp.output_dir, f"trial_{trial.number:05d}")
+        run_dir = _trial_run_dir(exp.output_dir, trial.number)
         os.makedirs(run_dir, exist_ok=True)
 
-        with open(os.path.join(run_dir, "trial_config.json"), "w") as f:
-            json.dump(trial_cfg, f, indent=2)
+        _write_trial_config(run_dir, trial_cfg)
 
         try:
             train_model_cv(
@@ -884,8 +924,9 @@ def run_optuna_fold_tuning(
     # Resolve pruner: explicit argument > experiment YAML > default
     effective_pruner_type = pruner_type if pruner_type is not None else exp.tuning.pruner_type
 
-    # Minimum epochs before pruning: respect patience from experiment spec
-    min_patience = _min_patience_from_spec(exp.training.patience)
+    # Minimum epochs before pruning: respect LR warmup + validation cadence,
+    # not early-stopping patience.
+    pruner_warmup_epochs = _infer_pruner_warmup_epochs(exp)
 
     # Seed varies per fold so each worker explores different regions
     fold_seed = int(sampler_seed) + int(fold_num)
@@ -898,12 +939,15 @@ def run_optuna_fold_tuning(
 
     if effective_pruner_type == 'hyperband':
         pruner = optuna.pruners.HyperbandPruner(
-            min_resource=max(HYPERBAND_MIN_RESOURCE, min_patience),
+            min_resource=pruner_warmup_epochs,
             max_resource=_infer_hyperband_max_resource(exp),
             reduction_factor=HYPERBAND_REDUCTION_FACTOR,
         )
     elif effective_pruner_type == 'median':
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=min_patience)
+        pruner = optuna.pruners.MedianPruner(
+            n_startup_trials=5,
+            n_warmup_steps=pruner_warmup_epochs,
+        )
     else:
         pruner = optuna.pruners.NopPruner()
 
@@ -911,16 +955,16 @@ def run_optuna_fold_tuning(
         exp, study_name, direction, storage, sampler, pruner,
     )
 
-    from Proteus import train_model_cv  # local import to avoid circulars
+    from proteus_workflows.train import train_model_cv
 
     def objective(trial: optuna.Trial) -> float:
         model_cfg, train_cfg, trial_cfg = resolve_trial_configs(exp, trial)
+        pruning_start_epoch = _infer_pruner_warmup_epochs(exp)
 
-        run_dir = os.path.join(exp.output_dir, f"trial_{trial.number:05d}")
+        run_dir = _trial_run_dir(exp.output_dir, trial.number)
         os.makedirs(run_dir, exist_ok=True)
 
-        with open(os.path.join(run_dir, "trial_config.json"), "w") as f:
-            json.dump(trial_cfg, f, indent=2)
+        _write_trial_config(run_dir, trial_cfg)
 
         # Tag trial with fold metadata
         trial.set_user_attr("fold_num", int(fold_num))
@@ -934,65 +978,41 @@ def run_optuna_fold_tuning(
             - maximize → report a metric where higher = better
             - minimize → report a metric where lower = better
 
-            For maximize: use the configured cohort objective when available;
-            otherwise prefer val_min_tumor_gvw_r, fall back to
-            val_balanced_tumor_gvw_r, then val_score.  For minimize: prefer
-            the weighted source metric when
-            that is the study objective, else fall back to balanced / pooled
-            GVW-CRPS.
+            For minimize: prefer the configured soft objective when available;
+            otherwise fall back to balanced / pooled GVW-CRPS.
 
-            Pruning is suppressed for the first ``patience`` epochs so the
-            model has time to complete warmup and stabilize.
+            Pruning is suppressed through schedule warmup and never on the
+            terminal epoch so a full-cost run is recorded as COMPLETE/FAIL,
+            not PRUNED.
             """
-            if direction == 'maximize':
-                if exp.objective.metric == 'cohort_tumor_gvw_v4_2_objective':
-                    metric_val = val_metrics.get(
-                        'val_cohort_tumor_gvw_v4_2_objective',
-                        val_metrics.get(
-                            'val_cohort_tumor_gvw_r_balanced',
-                            val_metrics.get('val_balanced_tumor_gvw_r', val_score),
-                        ),
-                    )
-                elif exp.objective.metric == 'cohort_tumor_gvw_objective':
-                    metric_val = val_metrics.get(
-                        'val_cohort_tumor_gvw_objective',
-                        val_metrics.get(
-                            'val_cohort_tumor_gvw_r_balanced',
-                            val_metrics.get('val_balanced_tumor_gvw_r', val_score),
-                        ),
-                    )
-                else:
-                    # Prefer min-source GVW-r when available (direct proxy
-                    # for min_tumor_gvw_r objective); fall back to balanced.
-                    metric_val = val_metrics.get(
-                        'val_min_tumor_gvw_r',
-                        val_metrics.get('val_balanced_tumor_gvw_r', val_score),
-                    )
+            if exp.objective.metric in (
+                'cohort_tumor_soft_objective',
+                'cohort_tumor_soft_objective_mean',
+            ):
+                metric_val = val_metrics.get(
+                    'val_cohort_tumor_soft_objective',
+                    val_metrics.get('val_balanced_tumor_gvw_crps', val_score),
+                )
+            elif exp.objective.metric in (
+                'weighted_tumor_gvw_crps_mean',
+                'weighted_tumor_gvw_crps_max',
+            ):
+                metric_val = val_metrics.get(
+                    'val_weighted_tumor_gvw_crps',
+                    val_metrics.get('val_balanced_tumor_gvw_crps', val_score),
+                )
             else:
-                if exp.objective.metric in (
-                    'cohort_tumor_soft_objective',
-                    'cohort_tumor_soft_objective_mean',
-                ):
-                    metric_val = val_metrics.get(
-                        'val_cohort_tumor_soft_objective',
-                        val_metrics.get('val_balanced_tumor_gvw_crps', val_score),
-                    )
-                elif exp.objective.metric in (
-                    'weighted_tumor_gvw_crps_mean',
-                    'weighted_tumor_gvw_crps_max',
-                ):
-                    metric_val = val_metrics.get(
-                        'val_weighted_tumor_gvw_crps',
-                        val_metrics.get('val_balanced_tumor_gvw_crps', val_score),
-                    )
-                else:
-                    metric_val = val_metrics.get(
-                        'val_balanced_tumor_gvw_crps',
-                        val_metrics.get('val_tumor_gvw_crps', val_score),
-                    )
+                metric_val = val_metrics.get(
+                    'val_balanced_tumor_gvw_crps',
+                    val_metrics.get('val_tumor_gvw_crps', val_score),
+                )
             if metric_val is not None and isinstance(metric_val, (int, float)):
                 trial.report(float(metric_val), step=int(epoch))
-                if epoch >= int(train_cfg.patience) and trial.should_prune():
+                if (
+                    epoch >= pruning_start_epoch
+                    and epoch < int(train_cfg.epochs)
+                    and trial.should_prune()
+                ):
                     raise optuna.TrialPruned(f'Pruned at epoch {epoch}')
 
         try:
@@ -1087,9 +1107,6 @@ def run_optuna_fold_tuning(
         if cohort_crps_balanced is not None:
             obj["cohort_tumor_gvw_crps_balanced"] = float(cohort_crps_balanced)
         for key in (
-            "cohort_tumor_gvw_v4_2_objective",
-            "cohort_tumor_gvw_v4_2_crps_log_ratio",
-            "cohort_tumor_gvw_v4_2_crps_smooth_excess",
             "cohort_tumor_soft_objective",
             "cohort_tumor_soft_crps",
             "cohort_tumor_soft_one_minus_r",
@@ -1194,13 +1211,12 @@ def rescue_failed_fold_trials(
 
     rescued_numbers: List[int] = []
     for source_trial_number in candidates:
-        run_dir = os.path.join(exp.output_dir, f"trial_{source_trial_number:05d}")
-        trial_cfg_path = os.path.join(run_dir, "trial_config.json")
+        run_dir = _trial_run_dir(exp.output_dir, source_trial_number)
+        trial_cfg_path = _trial_config_path(run_dir)
         if not os.path.exists(trial_cfg_path):
             continue
 
-        with open(trial_cfg_path, "r") as handle:
-            trial_cfg = json.load(handle)
+        trial_cfg = _read_json(trial_cfg_path)
 
         cfg_hash = config_hash(trial_cfg)
         if cfg_hash in completed_hashes:
@@ -1394,38 +1410,53 @@ def coordinated_ask(
         exp, study_name, direction, storage, sampler, pruner,
     )
 
+    existing_hashes = _existing_config_hashes(exp.output_dir)
     trial_numbers: List[int] = []
-    for _ in range(n_configs):
-        trial = study.ask()
-        try:
-            _, _, trial_cfg = resolve_trial_configs(exp, trial)
-        except optuna.TrialPruned as exc:
-            # Config is geometrically invalid — tell Optuna and skip.
-            study.tell(trial, state=optuna.trial.TrialState.PRUNED)
-            print(f"[Coordinated] Trial {trial.number} pruned: {exc}", flush=True)
-            continue
+    for _ in range(int(n_configs)):
+        accepted = False
+        for _attempt in range(32):
+            trial = study.ask()
+            try:
+                _, _, trial_cfg = resolve_trial_configs(exp, trial)
+            except optuna.TrialPruned as exc:
+                # Config is geometrically invalid — tell Optuna and skip.
+                study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+                print(f"[Coordinated] Trial {trial.number} pruned: {exc}", flush=True)
+                continue
 
-        run_dir = os.path.join(exp.output_dir, f"trial_{trial.number:05d}")
-        os.makedirs(run_dir, exist_ok=True)
+            cfg_hash = config_hash(trial_cfg)
+            if cfg_hash in existing_hashes:
+                study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+                print(
+                    f"[Coordinated] Trial {trial.number:05d} duplicates an existing config "
+                    f"({cfg_hash}); pruning.",
+                    flush=True,
+                )
+                continue
 
-        _write_json_atomic(
-            os.path.join(run_dir, "trial_config.json"), trial_cfg
-        )
+            trial.set_user_attr("config_hash", cfg_hash)
 
-        # Write pending sentinel with trial metadata
-        _write_json_atomic(
-            os.path.join(run_dir, "coordinated_pending.json"),
-            {"trial_number": trial.number, "status": "pending"},
-        )
+            run_dir = _trial_run_dir(exp.output_dir, trial.number)
+            os.makedirs(run_dir, exist_ok=True)
 
-        trial_numbers.append(trial.number)
-        print(f"[Coordinated] Asked trial {trial.number:05d} → {run_dir}", flush=True)
+            _write_trial_config(run_dir, trial_cfg)
+            _write_coordinated_pending(
+                run_dir,
+                trial_number=trial.number,
+                status='pending',
+            )
+
+            existing_hashes.add(cfg_hash)
+            trial_numbers.append(trial.number)
+            print(f"[Coordinated] Asked trial {trial.number:05d} → {run_dir}", flush=True)
+            accepted = True
+            break
+
+        if not accepted:
+            print("[Coordinated] Exhausted attempts to find a non-duplicate config.", flush=True)
 
     # Persist trial numbers for the SLURM script
-    _write_json_atomic(
-        os.path.join(exp.output_dir, "coordinated_active.json"),
-        {"trial_numbers": trial_numbers},
-    )
+    _write_active_trial_numbers(exp.output_dir, trial_numbers)
 
     return trial_numbers
 
@@ -1495,16 +1526,16 @@ def coordinated_proxy_ask(
             trial.set_user_attr("config_hash", cfg_hash)
             trial.set_user_attr("proxy_folds", list(DEFAULT_PROXY_FOLDS))
 
-            run_dir = os.path.join(exp.output_dir, f"trial_{trial.number:05d}")
+            run_dir = _trial_run_dir(exp.output_dir, trial.number)
             os.makedirs(run_dir, exist_ok=True)
 
-            _write_json_atomic(os.path.join(run_dir, "trial_config.json"), trial_cfg)
-            _write_json_atomic(
-                os.path.join(run_dir, "coordinated_pending.json"),
-                {
-                    "trial_number": trial.number,
-                    "status": "proxy_pending",
-                    "proxy_folds": list(DEFAULT_PROXY_FOLDS),
+            _write_trial_config(run_dir, trial_cfg)
+            _write_coordinated_pending(
+                run_dir,
+                trial_number=trial.number,
+                status='proxy_pending',
+                extra={
+                    'proxy_folds': list(DEFAULT_PROXY_FOLDS),
                 },
             )
 
@@ -1517,10 +1548,7 @@ def coordinated_proxy_ask(
         if not accepted:
             print("[Proxy-ask] Exhausted attempts to find a non-duplicate config.", flush=True)
 
-    _write_json_atomic(
-        os.path.join(exp.output_dir, "coordinated_active.json"),
-        {"trial_numbers": trial_numbers},
-    )
+    _write_active_trial_numbers(exp.output_dir, trial_numbers)
 
     return trial_numbers
 
@@ -1559,12 +1587,9 @@ def coordinated_proxy_tell(
     )
 
     if trial_numbers is None:
-        active_path = os.path.join(exp.output_dir, "coordinated_active.json")
-        if not os.path.exists(active_path):
-            print("[Proxy-tell] No coordinated_active.json found.", flush=True)
+        trial_numbers = _read_active_trial_numbers(exp.output_dir, log_prefix='Proxy-tell')
+        if trial_numbers is None:
             return
-        with open(active_path, "r") as f:
-            trial_numbers = json.load(f)["trial_numbers"]
 
     frozen_id_map: Dict[int, int] = {
         trial.number: trial._trial_id for trial in study.trials  # type: ignore[attr-defined]
@@ -1572,7 +1597,7 @@ def coordinated_proxy_tell(
 
     reported: List[int] = []
     for trial_num in trial_numbers:
-        run_dir = os.path.join(exp.output_dir, f"trial_{trial_num:05d}")
+        run_dir = _trial_run_dir(exp.output_dir, trial_num)
         try:
             obj = compute_proxy_objective(run_dir, folds)
         except (FileNotFoundError, KeyError, ValueError, json.JSONDecodeError) as exc:
@@ -1640,12 +1665,9 @@ def coordinated_proxy_finalize(
     folds = _folds_from_tsv(exp.data.training_set)
 
     if trial_numbers is None:
-        active_path = os.path.join(exp.output_dir, "coordinated_active.json")
-        if not os.path.exists(active_path):
-            print("[Proxy-finalize] No coordinated_active.json found.", flush=True)
+        trial_numbers = _read_active_trial_numbers(exp.output_dir, log_prefix='Proxy-finalize')
+        if trial_numbers is None:
             return
-        with open(active_path, "r") as f:
-            trial_numbers = json.load(f)["trial_numbers"]
 
     summary_path = os.path.join(exp.output_dir, PROMOTED_CV_SUMMARY_FILENAME)
     existing: Dict[int, Dict[str, Any]] = {}
@@ -1661,7 +1683,7 @@ def coordinated_proxy_finalize(
 
     finalized: List[int] = []
     for trial_num in trial_numbers:
-        run_dir = os.path.join(exp.output_dir, f"trial_{trial_num:05d}")
+        run_dir = _trial_run_dir(exp.output_dir, trial_num)
         if not all(os.path.exists(_fold_metrics_path(run_dir, fold_num)) for fold_num in folds):
             print(f"[Proxy-finalize] Trial {trial_num:05d}: full CV not complete — skipping.", flush=True)
             continue
@@ -1754,12 +1776,9 @@ def coordinated_tell(
 
     # Read active trial numbers if not provided
     if trial_numbers is None:
-        active_path = os.path.join(exp.output_dir, "coordinated_active.json")
-        if not os.path.exists(active_path):
-            print("[Coordinated-tell] No coordinated_active.json found.", flush=True)
+        trial_numbers = _read_active_trial_numbers(exp.output_dir, log_prefix='Coordinated-tell')
+        if trial_numbers is None:
             return
-        with open(active_path, "r") as f:
-            trial_numbers = json.load(f)["trial_numbers"]
 
     # Build trial number → internal ID map for intermediate value reporting.
     # Intermediate values (per-fold metrics) must be set while the trial is
@@ -1770,7 +1789,19 @@ def coordinated_tell(
     }
 
     for trial_num in trial_numbers:
-        run_dir = os.path.join(exp.output_dir, f"trial_{trial_num:05d}")
+        run_dir = _trial_run_dir(exp.output_dir, trial_num)
+        pending = _coordinated_pending_path(run_dir)
+
+        frozen = next((trial for trial in study.trials if trial.number == trial_num), None)
+        if frozen is not None and frozen.state == optuna.trial.TrialState.COMPLETE:
+            print(
+                f"[Coordinated-tell] Trial {trial_num:05d}: already reported in study; "
+                f"marking as complete.",
+                flush=True,
+            )
+            if os.path.exists(pending):
+                os.remove(pending)
+            continue
 
         # Check that all folds completed
         folds = _folds_from_tsv(exp.data.training_set)
@@ -1821,14 +1852,6 @@ def coordinated_tell(
                         'weighted_tumor_gvw_crps_max',
                     ):
                         fold_value = row.get('weighted_tumor_gvw_crps')
-                    elif metric == 'cohort_tumor_gvw_objective':
-                        row_obj = dict(row)
-                        _inject_cohort_objective(row_obj, study)
-                        fold_value = row_obj.get('cohort_tumor_gvw_objective')
-                    elif metric == 'cohort_tumor_gvw_v4_2_objective':
-                        row_obj = dict(row)
-                        _inject_cohort_objective(row_obj, study)
-                        fold_value = row_obj.get('cohort_tumor_gvw_v4_2_objective')
                     elif metric in (
                         'cohort_tumor_soft_objective',
                         'cohort_tumor_soft_objective_mean',
@@ -1836,8 +1859,6 @@ def coordinated_tell(
                         row_obj = dict(row)
                         _inject_cohort_objective(row_obj, study)
                         fold_value = row_obj.get('cohort_tumor_soft_objective')
-                    elif direction == 'maximize':
-                        fold_value = row.get('balanced_tumor_gvw_r')
                     else:
                         fold_value = row.get('balanced_tumor_gvw_crps')
                     if (fold_value is not None
@@ -1851,13 +1872,27 @@ def coordinated_tell(
 
         # Report to Optuna — cv_objective.json on disk preserves full
         # cross-fold metrics; the study only stores the scalar objective.
-        study.tell(trial_num, value)
+        try:
+            study.tell(trial_num, value)
+        except (RuntimeError, ValueError) as exc:
+            frozen = next((trial for trial in study.trials if trial.number == trial_num), None)
+            if frozen is None or frozen.state != optuna.trial.TrialState.COMPLETE:
+                raise RuntimeError(
+                    f"[Coordinated-tell] Trial {trial_num:05d}: tell failed: {exc}"
+                ) from exc
+            print(
+                f"[Coordinated-tell] Trial {trial_num:05d}: already reported in study; "
+                f"marking as complete.",
+                flush=True,
+            )
+            if os.path.exists(pending):
+                os.remove(pending)
+            continue
 
         print(f"[Coordinated-tell] Trial {trial_num:05d}: "
               f"{metric}={value:.4f}", flush=True)
 
         # Remove pending sentinel
-        pending = os.path.join(run_dir, "coordinated_pending.json")
         if os.path.exists(pending):
             os.remove(pending)
 
@@ -1877,8 +1912,8 @@ def run_coordinated_fold(
     specified fold.  No Optuna interaction — pure training.
     """
     exp = load_experiment_spec(experiment_path)
-    run_dir = os.path.join(exp.output_dir, f"trial_{trial_number:05d}")
-    config_path = os.path.join(run_dir, "trial_config.json")
+    run_dir = _trial_run_dir(exp.output_dir, trial_number)
+    config_path = _trial_config_path(run_dir)
 
     if not os.path.exists(config_path):
         raise FileNotFoundError(
@@ -1886,13 +1921,12 @@ def run_coordinated_fold(
             f"Run 'tune-ask' first to generate configs."
         )
 
-    with open(config_path, "r") as f:
-        trial_cfg = json.load(f)
+    trial_cfg = _read_json(config_path)
 
     model_cfg, train_cfg = configs_from_trial_json(trial_cfg, exp)
     use_fixed_schedule_oof = str(exp.tuning.phase).strip().lower().endswith("finalize")
 
-    from Proteus import train_model_cv  # local import to avoid circulars
+    from proteus_workflows.train import train_model_cv
 
     print(f"[Coordinated] Training trial {trial_number:05d}, fold {fold_num}",
           flush=True)

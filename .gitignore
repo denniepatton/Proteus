@@ -1,8 +1,5 @@
 # ── Project-specific ─────────────────────────────────────────
 
-# Machine-specific path config
-config/paths.yaml
-
 # Large output directories (training results, holdout predictions, training logs)
 results_training/
 results_holdout/
@@ -29,9 +26,6 @@ data/*/
 
 # SLURM node blacklist (runtime artifact)
 runs/bad_nodes.txt
-
-# Micromamba environment dump (machine-specific snapshot)
-proteus.env
 
 # ── Python bytecode ──────────────────────────────────────────
 

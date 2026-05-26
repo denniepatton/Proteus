@@ -44,6 +44,7 @@ _PALETTE: Optional[Dict[str, str]] = None
 _ONOFF_COLOR = "#E68613"
 _ONOFF_OFF_COLOR = "#3B76AF"
 _WITHHELD_COLOR = "#D9D9D9"
+_SENSITIVITY_COLOR = "#2E8B57"
 _SPECIFICITY_COLOR = "#3F3F3F"
 
 
@@ -70,61 +71,11 @@ def _ensure_dir(path: str) -> None:
         os.makedirs(d, exist_ok=True)
 
 
-def _compute_correlation_stats(
-    x_vals: Sequence[float] | np.ndarray | pd.Series,
-    y_vals: Sequence[float] | np.ndarray | pd.Series,
-) -> Dict[str, float]:
-    """Return Pearson/Spearman correlation statistics for aligned finite pairs."""
-    x = np.asarray(x_vals, dtype=np.float64)
-    y = np.asarray(y_vals, dtype=np.float64)
-    valid = np.isfinite(x) & np.isfinite(y)
-    x = x[valid]
-    y = y[valid]
-
-    stats = {
-        "n": float(len(x)),
-        "pearson_r": np.nan,
-        "pearson_p": np.nan,
-        "spearman_rho": np.nan,
-        "spearman_p": np.nan,
-    }
-    if len(x) < MIN_CORRELATION_N or float(np.ptp(x)) <= 0.0 or float(np.ptp(y)) <= 0.0:
-        return stats
-
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        pearson_result = pearsonr(x, y)
-        spearman_result = spearmanr(x, y)
-
-    stats["pearson_r"] = float(pearson_result.statistic)
-    stats["pearson_p"] = float(pearson_result.pvalue)
-    stats["spearman_rho"] = float(spearman_result.statistic)
-    stats["spearman_p"] = float(spearman_result.pvalue)
-    return stats
-
-
-def _format_correlation_line(label: str, corr_value: float, p_value: float) -> str:
-    """Format one correlation line with an explicit p-value."""
-    corr_text = f"{corr_value:.3f}" if np.isfinite(corr_value) else "NA"
+def _format_correlation_line(label: str, value: float, p_value: float) -> str:
+    if not np.isfinite(value):
+        return f"{label}=NA"
     p_text = format_pval(float(p_value)) if np.isfinite(p_value) else "p=NA"
-    return f"{label} = {corr_text}  ({p_text})"
-
-
-def _nice_step_for_five_ticks(span: float) -> float:
-    """Return a simple step size that yields four clean intervals."""
-    if not np.isfinite(span) or span <= 0.0:
-        return 1.0
-    target = span / 4.0
-    steps = [
-        0.01, 0.02, 0.05,
-        0.1, 0.2, 0.25, 0.5,
-        1.0, 2.0, 2.5, 4.0, 5.0,
-        10.0, 20.0, 25.0, 50.0,
-    ]
-    for step in steps:
-        if step >= target:
-            return step
-    return steps[-1]
+    return f"{label}={value:.3f} ({p_text})"
 
 
 def _set_explicit_ticks(
@@ -139,20 +90,53 @@ def _set_explicit_ticks(
         ax.set_yticks(list(y_ticks))
 
 
-def _set_five_y_ticks(ax: plt.Axes) -> None:
-    """Set exactly five clean y ticks spanning the current y range."""
-    y_lo, y_hi = ax.get_ylim()
-    lower = 0.0 if y_lo <= 0.0 <= y_hi else y_lo
-    span = max(float(y_hi - lower), 1e-9)
-    step = _nice_step_for_five_ticks(span)
+def _nice_step_for_five_ticks(span: float) -> float:
+    if not np.isfinite(span) or span <= 0.0:
+        return 1.0
+    target = span / 4.0
+    steps = [0.05, 0.1, 0.2, 0.25, 0.5, 1.0, 2.0, 2.5, 4.0, 5.0, 10.0, 20.0]
+    for step in steps:
+        if step >= target:
+            return step
+    return steps[-1]
+
+
+def _set_five_y_ticks(ax: plt.Axes, *, lower: float = 0.0) -> None:
+    y_hi = float(ax.get_ylim()[1])
+    step = _nice_step_for_five_ticks(max(y_hi - lower, 1e-9))
     upper = lower + 4.0 * step
     ax.set_ylim(lower, upper)
     ax.set_yticks(np.linspace(lower, upper, 5))
 
 
-# ---------------------------------------------------------------------------
-# Sample-level scatter (single sample: genes as dots)
-# ---------------------------------------------------------------------------
+def _compute_correlation_stats(
+    x_vals: Sequence[float] | np.ndarray | pd.Series,
+    y_vals: Sequence[float] | np.ndarray | pd.Series,
+) -> Dict[str, float]:
+    """Return Pearson/Spearman correlation statistics for aligned finite pairs."""
+    x = np.asarray(x_vals, dtype=np.float64)
+    y = np.asarray(y_vals, dtype=np.float64)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x = x[valid]
+    y = y[valid]
+    if len(x) < MIN_CORRELATION_N or float(np.ptp(x)) == 0.0 or float(np.ptp(y)) == 0.0:
+        return {
+            "pearson_r": np.nan,
+            "pearson_p": np.nan,
+            "spearman_rho": np.nan,
+            "spearman_p": np.nan,
+            "n": float(len(x)),
+        }
+    pearson_stat = pearsonr(x, y)
+    spearman_stat = spearmanr(x, y)
+    return {
+        "pearson_r": float(pearson_stat.statistic),
+        "pearson_p": float(pearson_stat.pvalue),
+        "spearman_rho": float(spearman_stat.statistic),
+        "spearman_p": float(spearman_stat.pvalue),
+        "n": float(len(x)),
+    }
+
 
 def sample_scatter(
     truth_col: pd.Series,
@@ -164,90 +148,75 @@ def sample_scatter(
     tfx: Optional[float] = None,
     depth: Optional[float] = None,
     is_holdout: bool = False,
-    point_style: str = "hexbin",
-    point_color: str = "#7F7F7F",
-    point_alpha: float = 0.75,
-    point_size: float = 8.0,
-    axis_max: float = 15.0,
+    point_style: str = "scatter",
+    point_color: str = "#7A7A7A",
+    point_size: float = 7.0,
+    axis_max: Optional[float] = None,
     diagonal_color: str = "black",
     diagonal_lw: float = 1.0,
-    diagonal_alpha: float = 0.5,
-    diagonal_zorder: float = 5.0,
+    diagonal_alpha: float = 0.6,
+    diagonal_zorder: float = 1.0,
     x_ticks: Optional[Sequence[float]] = None,
     y_ticks: Optional[Sequence[float]] = None,
 ) -> None:
-    """Scatter for one sample: genes as dots with hexbin density background.
-
-    GOI genes are highlighted and colored by subtype (from goi dict keys).
-    ``goi`` maps subtype name → list of gene names.
-
-    If ``is_holdout`` is True, GOI dots are drawn as filled diamonds
-    instead of filled circles.  Axes are fixed to [0, 15].
-    """
+    """Scatter one sample's truth and predicted expression across genes."""
     _ensure_dir(name)
-
-    common = truth_col.index.intersection(pred_col.index)
-    t = truth_col.loc[common].astype(np.float64)
-    p = pred_col.loc[common].astype(np.float64)
-    mask = np.isfinite(t) & np.isfinite(p)
-    t, p = t[mask], p[mask]
-
-    if len(t) < MIN_CORRELATION_N:
+    truth = pd.to_numeric(pd.Series(truth_col), errors="coerce")
+    pred = pd.to_numeric(pd.Series(pred_col), errors="coerce").reindex(truth.index)
+    valid = truth.notna() & pred.notna()
+    truth = truth.loc[valid]
+    pred = pred.loc[valid]
+    if len(truth) < MIN_CORRELATION_N:
         return
 
-    corr_stats = _compute_correlation_stats(t.values, p.values)
-    rmse = float(np.sqrt(np.mean((t.values - p.values) ** 2)))
-    mae = float(np.mean(np.abs(t.values - p.values)))
+    corr_stats = _compute_correlation_stats(truth.values, pred.values)
+    residual = pred.values - truth.values
+    rmse = float(np.sqrt(np.mean(np.square(residual))))
+    mae = float(np.mean(np.abs(residual)))
+    if axis_max is None:
+        max_value = float(np.nanmax([truth.max(), pred.max(), 1.0]))
+        axis_max = max(15.0, np.ceil(max_value))
 
-    fig, ax = plt.subplots(figsize=(8, 8))
-
-    if point_style == "hexbin":
-        hb = ax.hexbin(
-            t.values, p.values, gridsize=100, cmap="viridis_r", bins="log",
-            extent=(0, axis_max, 0, axis_max),
-        )
-        fig.colorbar(hb, ax=ax, shrink=0.8, label=r"$\log_{10}(N+1)$")
-    elif point_style == "scatter":
-        ax.scatter(
-            t.values,
-            p.values,
-            color=point_color,
-            s=point_size,
-            alpha=point_alpha,
-            linewidths=0,
-            zorder=2,
-        )
+    fig, ax = plt.subplots(figsize=(6, 6))
+    if point_style == "hexbin" and len(truth) >= 200:
+        ax.hexbin(truth.values, pred.values, gridsize=65, extent=(0, axis_max, 0, axis_max), cmap="Greys", mincnt=1)
     else:
-        raise ValueError(f"Unsupported point_style '{point_style}'")
+        ax.scatter(
+            truth.values,
+            pred.values,
+            s=point_size,
+            color=point_color,
+            alpha=0.35,
+            edgecolors="none",
+            rasterized=True,
+        )
 
-    # GOI highlights colored by subtype
-    pal = _palette()
     if goi:
-        for subtype, genes_in_subtype in goi.items():
-            present = [g for g in genes_in_subtype if g in t.index]
+        for subtype, genes in goi.items():
+            present = [gene for gene in genes if gene in truth.index]
             if not present:
                 continue
-            gt = t.loc[present]
-            gp = p.loc[present]
-
-            color = pal.get(subtype, "#999999")
-            if is_holdout:
-                # Filled diamond for holdout samples
-                ax.scatter(
-                    gt.values, gp.values,
-                    s=300, edgecolors="black", linewidths=0.5, color=color,
-                    marker="D", zorder=3,
-                )
-            else:
-                # Filled circle for validation samples
-                ax.scatter(
-                    gt.values, gp.values,
-                    s=300, edgecolors="black", linewidths=0.5, color=color, zorder=3,
-                )
-            for g in present:
+            gt = truth.loc[present]
+            gp = pred.loc[present]
+            color = _color(subtype)
+            marker = "D" if is_holdout else "o"
+            ax.scatter(
+                gt.values,
+                gp.values,
+                s=300,
+                edgecolors="black",
+                linewidths=0.5,
+                color=color,
+                marker=marker,
+                zorder=3,
+            )
+            for gene in present:
                 ax.annotate(
-                    g, (gt[g], gp[g]),
-                    xytext=(5, 5), textcoords="offset points", fontsize=12,
+                    gene,
+                    (gt[gene], gp[gene]),
+                    xytext=(5, 5),
+                    textcoords="offset points",
+                    fontsize=12,
                     color=color,
                     path_effects=[PathEffects.withStroke(linewidth=0.75, foreground="black")],
                     zorder=4,
@@ -275,21 +244,9 @@ def sample_scatter(
         info_lines[0] += f"  TFx={tfx:.2f}"
     if depth is not None:
         info_lines[0] += f"  depth={depth:.1f}x"
-    info_lines.append(
-        _format_correlation_line(
-            "Pearson r",
-            corr_stats["pearson_r"],
-            corr_stats["pearson_p"],
-        )
-    )
-    info_lines.append(
-        _format_correlation_line(
-            "Spearman ρ",
-            corr_stats["spearman_rho"],
-            corr_stats["spearman_p"],
-        )
-    )
-    info_lines.append(f"n={len(t):,}  RMSE={rmse:.3f}  MAE={mae:.3f}")
+    info_lines.append(_format_correlation_line("Pearson r", corr_stats["pearson_r"], corr_stats["pearson_p"]))
+    info_lines.append(_format_correlation_line("Spearman rho", corr_stats["spearman_rho"], corr_stats["spearman_p"]))
+    info_lines.append(f"n={len(truth):,}  RMSE={rmse:.3f}  MAE={mae:.3f}")
     ax.set_title("\n".join(info_lines), fontsize=9)
 
     fig.tight_layout()
@@ -672,7 +629,7 @@ def double_heatmap(
         cb = ax2.collections[0].colorbar
         if cb:
             cb.ax.tick_params(labelsize=7)
-            cb.set_label("GSVA Score" if gsea else r"log$_2$(CPM+1)", size=8)
+            cb.set_label("ssGSEA Score" if gsea else r"log$_2$(CPM+1)", size=8)
 
     if breaks:
         for b in breaks:
@@ -741,7 +698,7 @@ def single_heatmap(
     sns.heatmap(
         df, cmap=cmap, ax=ax_hm, linewidths=0.1, linecolor="black",
         cbar=True, vmin=vmin, vmax=vmax,
-        cbar_kws={"shrink": 0.6, "label": "GSVA Score" if gsea else r"log$_2$(CPM+1)"},
+        cbar_kws={"shrink": 0.6, "label": "ssGSEA Score" if gsea else r"log$_2$(CPM+1)"},
     )
     ax_hm.set_aspect("equal")
     ax_hm.set_xticklabels(ax_hm.get_xticklabels(), rotation=90, fontsize=max(4, min(10, 200 // n_samp)))
@@ -980,56 +937,6 @@ def metric_distribution_by_variance(
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Calibration coverage comparison
-# ---------------------------------------------------------------------------
-
-def plot_calibration_coverage(
-    base_curve: Dict,
-    conf_curve: Dict,
-    name: str,
-    *,
-    title: Optional[str] = None,
-) -> None:
-    """Plot empirical coverage vs nominal level for base and CQR-calibrated CIs.
-
-    Accepts two curve formats:
-      - old style: ``{level: coverage}`` dict
-      - new style: ``{"nominal": [...], "empirical": [...], ...}`` dict
-        (as returned by ``calibration.evaluate_calibration``).
-
-    A diagonal identity line indicates perfect calibration.
-    """
-    _ensure_dir(name)
-
-    # Normalise both curves to (levels, values) lists
-    def _unpack(curve):
-        if "nominal" in curve:
-            return list(curve["nominal"]), list(curve["empirical"])
-        levels = sorted(curve.keys())
-        return levels, [curve[l] for l in levels]
-
-    base_levels, base_vals = _unpack(base_curve)
-    conf_levels, conf_vals = _unpack(conf_curve)
-
-    fig, ax = plt.subplots(figsize=(6, 6))
-    ax.plot([0, 1], [0, 1], "k--", lw=0.8, alpha=0.5, label="Perfect calibration")
-    ax.plot(base_levels, base_vals, "o-", color="#0077BB", label="Uncalibrated", markersize=6)
-    ax.plot(conf_levels, conf_vals, "s-", color="#EE3377", label="CQR calibrated", markersize=6)
-    ax.set_xlabel("Nominal coverage level")
-    ax.set_ylabel("Empirical coverage")
-    ax.set_xlim(0.45, 1.0)
-    ax.set_ylim(0.45, 1.05)
-    ax.set_box_aspect(1)
-    ax.legend(fontsize=9, loc="lower right")
-    ax.set_title(title or "Calibration Coverage")
-    ax.grid(True, alpha=0.2)
-
-    fig.tight_layout()
-    fig.savefig(f"{name}.pdf", bbox_inches="tight")
-    plt.close(fig)
-
-
 def plot_pit_histogram(
     pit_values: Sequence[float] | np.ndarray | pd.Series,
     name: str,
@@ -1195,66 +1102,6 @@ def plot_shrinkage_scatter(
     plt.close(fig)
 
 
-def plot_regime_coverage_heatmap(
-    regime_coverage: Dict[str, float],
-    name: str,
-    *,
-    n_var_bins: int = 4,
-    n_zero_bins: int = 4,
-    target_coverage: float = 0.90,
-    title: Optional[str] = None,
-) -> None:
-    """Heatmap of empirical coverage by (variance quartile × zero-rate quartile).
-
-    ``regime_coverage`` maps regime labels like "(2, 3)" to empirical
-    coverage floats.  The heatmap shows how well calibration performs
-    in each gene regime, with the target coverage level annotated.
-    """
-    _ensure_dir(name)
-
-    grid = np.full((n_var_bins, n_zero_bins), np.nan)
-    for label, cov in regime_coverage.items():
-        # Parse "(var_q, zero_q)"
-        parts = label.strip("()").split(",")
-        if len(parts) != 2:
-            continue
-        vq, zq = int(parts[0].strip()), int(parts[1].strip())
-        if 0 <= vq < n_var_bins and 0 <= zq < n_zero_bins:
-            grid[vq, zq] = cov
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(grid, cmap="RdYlGn", vmin=0.80, vmax=1.0,
-                   aspect="auto", origin="lower")
-
-    # Annotate cells
-    for i in range(n_var_bins):
-        for j in range(n_zero_bins):
-            val = grid[i, j]
-            if np.isfinite(val):
-                color = "white" if val < 0.88 else "black"
-                ax.text(j, i, f"{val:.2f}", ha="center", va="center",
-                        fontsize=10, fontweight="bold", color=color)
-
-    ax.set_xticks(range(n_zero_bins))
-    ax.set_xticklabels([f"Q{q+1}" for q in range(n_zero_bins)])
-    ax.set_yticks(range(n_var_bins))
-    ax.set_yticklabels([f"Q{q+1}" for q in range(n_var_bins)])
-    ax.set_xlabel("Zero-Rate Quartile")
-    ax.set_ylabel("Variance Quartile")
-
-    cb = fig.colorbar(im, ax=ax, shrink=0.8)
-    cb.set_label("Empirical Coverage")
-
-    # Target reference line on colorbar
-    cb.ax.axhline(y=target_coverage, color="black", linewidth=1.5, linestyle="--")
-
-    ax.set_title(title or f"Regime Coverage (target={target_coverage:.0%})")
-
-    fig.tight_layout()
-    fig.savefig(f"{name}.pdf", bbox_inches="tight")
-    plt.close(fig)
-
-
 def plot_reliability_scatter(
     predicted_r: pd.Series,
     true_r: pd.Series,
@@ -1374,61 +1221,6 @@ def plot_retention_curve(
     plt.close(fig)
 
 
-def plot_regime_qhat_heatmap(
-    q_hats: Dict[str, float],
-    name: str,
-    *,
-    n_var_bins: int = 4,
-    n_zero_bins: int = 4,
-    title: Optional[str] = None,
-) -> None:
-    """Heatmap of per-regime q̂ values (the normalized conformal quantile).
-
-    Visualises how much calibration correction each gene regime requires.
-    Higher q̂ means the model's base intervals were more under-covering
-    in that regime.
-    """
-    _ensure_dir(name)
-
-    grid = np.full((n_var_bins, n_zero_bins), np.nan)
-    for label, qval in q_hats.items():
-        parts = label.strip("()").split(",")
-        if len(parts) != 2:
-            continue
-        vq, zq = int(parts[0].strip()), int(parts[1].strip())
-        if 0 <= vq < n_var_bins and 0 <= zq < n_zero_bins:
-            grid[vq, zq] = qval
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    vmax = max(0.5, np.nanmax(grid) * 1.1) if np.any(np.isfinite(grid)) else 1.0
-    im = ax.imshow(grid, cmap="YlOrRd", vmin=0, vmax=vmax,
-                   aspect="auto", origin="lower")
-
-    for i in range(n_var_bins):
-        for j in range(n_zero_bins):
-            val = grid[i, j]
-            if np.isfinite(val):
-                color = "white" if val > vmax * 0.7 else "black"
-                ax.text(j, i, f"{val:.3f}", ha="center", va="center",
-                        fontsize=10, fontweight="bold", color=color)
-
-    ax.set_xticks(range(n_zero_bins))
-    ax.set_xticklabels([f"Q{q+1}" for q in range(n_zero_bins)])
-    ax.set_yticks(range(n_var_bins))
-    ax.set_yticklabels([f"Q{q+1}" for q in range(n_var_bins)])
-    ax.set_xlabel("Zero-Rate Quartile")
-    ax.set_ylabel("Variance Quartile")
-
-    cb = fig.colorbar(im, ax=ax, shrink=0.8)
-    cb.set_label("Normalized q̂")
-
-    ax.set_title(title or "Per-Regime Conformal q̂")
-
-    fig.tight_layout()
-    fig.savefig(f"{name}.pdf", bbox_inches="tight")
-    plt.close(fig)
-
-
 def plot_reliability_weights(
     feature_columns: List[str],
     weights: np.ndarray,
@@ -1439,109 +1231,26 @@ def plot_reliability_weights(
     """Horizontal bar chart of ridge regression feature weights.
 
     Shows which prediction features contribute most to the gene-level
-    reliability estimate.
+    reliability model.
     """
     _ensure_dir(name)
-
-    # Human-readable display names for reliability model features.
-    _DISPLAY_NAMES: Dict[str, str] = {
-        "f1_mean_width": "Mean CI Width",
-        "f2_median_width": "Median CI Width",
-        "f3_mean_entropy": "Mixture Entropy (δ/γ/n)",
-        "f4_mean_hurdle_amb": "Hurdle Ambiguity (πδ·(1−πδ))",
-        "f5_mean_cont_amb": "Continuous Ambiguity (πγ·πn)",
-        "f6_mean_pmax": "Mean Max Component π",
-        "f7_median_pmax": "Median Max Component π",
-        "f8_mean_gap": "Component Gap (πmax − π2nd)",
-        "f9_mean_u_normal": "Normal Variance (πn·σ²n)",
-        "f10_mean_u_gamma": "Gamma Variance (πγ·k/β²)",
-        "f11_mean_d_mu": "Fold-to-Fold SD(μ)",
-        "f12_mean_d_width": "Fold-to-Fold SD(CI Width)",
-        "f13_mean_d_delta": "Fold-to-Fold SD(πδ)",
-        "f14_pred_sd": "Prediction SD (across samples)",
-        "f15_gene_zero_rate": "Gene Zero-Rate",
-        "f16_gene_variance": "Gene Expression Variance",
-    }
-
-    n = len(feature_columns)
-    if n == 0:
+    if len(feature_columns) == 0 or len(weights) == 0:
         return
 
-    # Sort by absolute weight for visual clarity
-    order = np.argsort(np.abs(weights))[::-1]
-    cols = [feature_columns[i] for i in order]
-    vals = weights[order]
-    display_cols = [_DISPLAY_NAMES.get(c, c) for c in cols]
-
-    fig, ax = plt.subplots(figsize=(7, max(3, 0.5 * n + 1)))
-    colors = ["#EE3377" if v < 0 else "#0077BB" for v in vals]
-    ax.barh(range(n), vals, color=colors, edgecolor="none", height=0.6)
-    ax.set_yticks(range(n))
-    ax.set_yticklabels(display_cols, fontsize=9)
-    ax.axvline(0, color="black", linewidth=0.8)
-    ax.set_xlabel("Ridge Weight")
-    ax.set_title(title or "Reliability Model — Feature Weights")
-    ax.invert_yaxis()
-    ax.grid(True, alpha=0.2, axis="x")
-
-    fig.tight_layout()
-    fig.savefig(f"{name}.pdf", bbox_inches="tight")
-    plt.close(fig)
-
-
-def plot_error_vs_width(
-    width_base: pd.Series,
-    width_conf: pd.Series,
-    gene_metrics: pd.DataFrame,
-    name: str,
-    *,
-    title: Optional[str] = None,
-) -> None:
-    """Scatter: mean CI width per gene vs gene-level metric (Spearman rho).
-
-    Two series: base and conformal-adjusted widths.  ``gene_metrics`` must
-    have a ``spearman_rho`` column indexed by gene name.
-    """
-    _ensure_dir(name)
-    common = width_base.index.intersection(gene_metrics.index)
-    if len(common) < 10:
+    weight_series = pd.Series(weights, index=feature_columns, dtype=float).replace([np.inf, -np.inf], np.nan).dropna()
+    if weight_series.empty:
         return
+    weight_series = weight_series.reindex(weight_series.abs().sort_values(ascending=True).index)
 
-    wb = width_base.loc[common]
-    wc = width_conf.loc[common]
-    rho = gene_metrics.loc[common, "spearman_rho"]
-    base_corr = _compute_correlation_stats(wb.values, rho.values)
-    conf_corr = _compute_correlation_stats(wc.values, rho.values)
-
-    fig, ax = plt.subplots(figsize=(7, 6))
-    ax.scatter(wb.values, rho.values, s=8, alpha=0.3, color="#0077BB", label="Base width")
-    ax.scatter(wc.values, rho.values, s=8, alpha=0.3, color="#EE3377", label="Conformal width")
-    ax.set_xlabel("Mean CI width (per gene)")
-    ax.set_ylabel("Gene Spearman ρ")
-    ax.legend(fontsize=9)
-    ax.set_title(title or "Interval Width vs Gene Spearman ρ")
-    ax.grid(True, alpha=0.2)
-    ax.text(
-        0.05,
-        0.95,
-        "\n".join([
-            _format_correlation_line(
-                "Base Spearman ρ",
-                base_corr["spearman_rho"],
-                base_corr["spearman_p"],
-            ),
-            _format_correlation_line(
-                "Conformal Spearman ρ",
-                conf_corr["spearman_rho"],
-                conf_corr["spearman_p"],
-            ),
-            f"n = {int(base_corr['n'])}",
-        ]),
-        transform=ax.transAxes,
-        fontsize=9,
-        va="top",
-        bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8),
-    )
+    fig_height = max(4.0, 0.35 * len(weight_series) + 1.2)
+    fig, ax = plt.subplots(figsize=(7.2, fig_height))
+    colors = np.where(weight_series.values >= 0.0, "#4477AA", "#CC6677")
+    ax.barh(weight_series.index.astype(str), weight_series.values, color=colors, alpha=0.85)
+    ax.axvline(0.0, color="#555555", linewidth=0.9)
+    ax.set_xlabel("Standardized coefficient")
+    ax.set_ylabel("Feature")
+    ax.set_title(title or "Reliability Model Feature Weights")
+    ax.grid(axis="x", alpha=0.2)
 
     fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
@@ -1737,159 +1446,6 @@ def _bench_color_map(model_names: Sequence[str]) -> Dict[str, str]:
             cmap[m] = _BENCH_FALLBACK_COLORS[fb_idx % len(_BENCH_FALLBACK_COLORS)]
             fb_idx += 1
     return cmap
-
-
-def benchmark_grid_boxplots(
-    metrics_table: pd.DataFrame,
-    name: str,
-    *,
-    metric_col: str,
-    ylabel: str,
-    title: str,
-    tfx_order: Sequence[str],
-    depth_order: Sequence[str],
-    model_order: Sequence[str],
-    naive_model: str = "Naive",
-) -> None:
-    """TFx x Depth grid of box plots, one box per model/score.
-
-    ``metrics_table`` must have columns: tfx, depth, model, and ``metric_col``.
-    A dashed gray horizontal line is drawn at the Naive model's mean value
-    (or single value) in each panel for reference.
-    """
-    _ensure_dir(name)
-    cmap = _bench_color_map(model_order)
-    n_rows = len(tfx_order)
-    n_cols = len(depth_order)
-
-    fig, axes = plt.subplots(
-        n_rows, n_cols, figsize=(6 * n_cols + 1, 3.2 * n_rows + 1),
-        sharex=True, sharey=True, squeeze=False,
-    )
-
-    for ri, tfx in enumerate(tfx_order):
-        for ci, depth in enumerate(depth_order):
-            ax = axes[ri, ci]
-            sub = metrics_table[
-                (metrics_table["tfx"] == tfx) & (metrics_table["depth"] == depth)
-            ]
-            if sub.empty:
-                ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
-                        ha="center", va="center", fontsize=9, color="gray")
-            else:
-                # Naive reference line — dashed gray spanning full x-extent
-                naive_vals = sub.loc[sub["model"] == naive_model, metric_col].dropna().values
-                if len(naive_vals) > 0:
-                    naive_ref = float(np.mean(naive_vals))
-                    ax.axhline(naive_ref, color="#BBBBBB", ls="--", lw=1.2, zorder=0)
-
-                plot_data = []
-                labels = []
-                colors = []
-                for model in model_order:
-                    vals = sub.loc[sub["model"] == model, metric_col].dropna().values
-                    if len(vals) > 0:
-                        plot_data.append(vals)
-                        labels.append(model)
-                        colors.append(cmap.get(model, "#BBBBBB"))
-                if plot_data:
-                    # If every model has exactly 1 value, use dot plot
-                    all_scalar = all(len(v) == 1 for v in plot_data)
-                    if all_scalar:
-                        for i, (vals, c) in enumerate(zip(plot_data, colors), start=1):
-                            ax.plot(i, vals[0], "o", color=c, markersize=24,
-                                    markeredgecolor=_darken(c), markeredgewidth=1.5,
-                                    zorder=3)
-                        ax.set_xticks(range(1, len(labels) + 1))
-                        ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=6)
-                    else:
-                        bp = ax.boxplot(
-                            plot_data, patch_artist=True, widths=0.6,
-                            medianprops=dict(color="black", linewidth=1.2),
-                            flierprops=dict(markersize=2),
-                        )
-                        for patch, c in zip(bp["boxes"], colors):
-                            patch.set_facecolor(c)
-                            patch.set_alpha(0.7)
-                        # Increase outlier dot size
-                        for flier in bp.get("fliers", []):
-                            flier.set_markersize(4)
-                        ax.set_xticks(range(1, len(labels) + 1))
-                        ax.set_xticklabels(labels, rotation=55, ha="right", fontsize=6)
-
-            if ri == 0:
-                ax.set_title(depth, fontsize=10, fontweight="bold")
-            if ci == 0:
-                ax.set_ylabel(f"TFx {tfx}\n{ylabel}", fontsize=8)
-
-    fig.suptitle(title, fontsize=13, fontweight="bold", y=1.01)
-    fig.tight_layout()
-    fig.savefig(f"{name}.pdf", bbox_inches="tight")
-    plt.close(fig)
-
-
-def benchmark_grid_histograms(
-    gene_rho_table: pd.DataFrame,
-    name: str,
-    *,
-    tfx_order: Sequence[str],
-    depth_order: Sequence[str],
-    model_order: Sequence[str],
-    title: Optional[str] = None,
-) -> None:
-    """TFx x Depth grid of overlaid Spearman rho histograms across models.
-
-    ``gene_rho_table`` has columns: tfx, depth, model, spearman_rho, n_rho_ge070.
-    Each row is one gene.
-    """
-    _ensure_dir(name)
-    cmap = _bench_color_map(model_order)
-    n_rows = len(tfx_order)
-    n_cols = len(depth_order)
-
-    fig, axes = plt.subplots(
-        n_rows, n_cols, figsize=(4.5 * n_cols + 1, 4 * n_rows + 1),
-        sharex=True, sharey=False, squeeze=False,
-    )
-
-    for ri, tfx in enumerate(tfx_order):
-        for ci, depth in enumerate(depth_order):
-            ax = axes[ri, ci]
-            sub = gene_rho_table[
-                (gene_rho_table["tfx"] == tfx) & (gene_rho_table["depth"] == depth)
-            ]
-            if sub.empty:
-                ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
-                        ha="center", va="center", fontsize=9, color="gray")
-            else:
-                legend_entries = []
-                for model in model_order:
-                    vals = sub.loc[sub["model"] == model, "spearman_rho"].dropna().values
-                    if len(vals) < 3:
-                        continue
-                    n_good = int((vals >= 0.70).sum())
-                    color = cmap.get(model, "#BBBBBB")
-                    sns.kdeplot(
-                        vals, ax=ax, color=color, linewidth=1.5,
-                        fill=False, clip=(-1, 1), warn_singular=False,
-                    )
-                    legend_entries.append(f"{model} (n≥0.7={n_good})")
-                if legend_entries:
-                    ax.legend(legend_entries, fontsize=5, loc="upper left",
-                              framealpha=0.6)
-            ax.set_xlim(-1, 1)
-            if ri == 0:
-                ax.set_title(depth, fontsize=10, fontweight="bold")
-            if ci == 0:
-                ax.set_ylabel(f"TFx {tfx}\nDensity", fontsize=8)
-            if ri == n_rows - 1:
-                ax.set_xlabel("Spearman ρ", fontsize=8)
-
-    fig.suptitle(title or "Per-Gene Spearman ρ Distribution", fontsize=13,
-                 fontweight="bold", y=1.01)
-    fig.tight_layout()
-    fig.savefig(f"{name}.pdf", bbox_inches="tight")
-    plt.close(fig)
 
 
 def benchmark_depth_lines(
@@ -2090,16 +1646,16 @@ def benchmark_cohort_boxplots(
                 x = mi + 1 + offsets[ci_idx]
                 y = float(vals[0])
                 alpha = cohort_alpha.get(cohort, 0.7)
-                ax.plot(x, y, marker=marker, markersize=10,
+                ax.plot(x, y, marker=marker, markersize=14,
                         color=color, markeredgecolor=_darken(color),
-                        markeredgewidth=1.2, alpha=alpha, zorder=3,
+                    markeredgewidth=1.4, alpha=alpha, zorder=3,
                         linestyle="none")
 
         # Legend: proxy patches
         legend_patches = []
         for ci_idx, cohort in enumerate(cohort_order):
             marker = _cohort_markers[ci_idx % len(_cohort_markers)]
-            p = ax.plot([], [], marker=marker, markersize=8,
+            p = ax.plot([], [], marker=marker, markersize=10,
                         color="#888888", alpha=cohort_alpha.get(cohort, 0.7),
                         markeredgecolor="#555555", linestyle="none",
                         label=cohort)[0]
@@ -2859,62 +2415,150 @@ def kaplan_meier_plot(
 # =====================================================================
 
 def clinical_correlation_scatter(
-    x_vals: np.ndarray,
-    y_vals: np.ndarray,
+    x_vals: Sequence[float] | np.ndarray | pd.Series,
+    y_vals: Sequence[float] | np.ndarray | pd.Series,
     name: str,
     *,
     xlabel: str = "Clinical Variable",
     ylabel: str = "Predicted Expression",
     title: str = "",
-    y_log_scale: bool = False,
+    sample_meta: Optional[pd.DataFrame] = None,
+    color_column: str = "cohort",
+    legend_title: str = "Cohort",
+    x_log10: bool = False,
+    y_log10: bool = False,
 ) -> None:
     """Scatter with regression line and correlation annotation.
 
-    Displays both Pearson and Spearman correlation coefficients and
-    a least-squares regression line with 95% confidence band.
+    When sample metadata are provided, points follow the shared scatter style:
+    cohort coloring, TFx-sized markers, and a square plotting panel. Optional
+    log10 transforms are applied directly to the variables before fitting.
     """
     _ensure_dir(name)
 
-    x = np.asarray(x_vals, dtype=float)
-    y = np.asarray(y_vals, dtype=float)
-    mask = np.isfinite(x) & np.isfinite(y)
-    if y_log_scale:
-        mask &= y > 0.0
-    x, y = x[mask], y[mask]
+    x_series = pd.to_numeric(pd.Series(x_vals), errors="coerce")
+    y_series = pd.to_numeric(pd.Series(y_vals), errors="coerce")
+    if isinstance(x_vals, pd.Series):
+        x_series.index = x_vals.index
+    if isinstance(y_vals, pd.Series):
+        y_series.index = y_vals.index
 
-    if len(x) < MIN_CORRELATION_N:
+    shared = x_series.index.intersection(y_series.index)
+    meta = None
+    if sample_meta is not None:
+        shared = shared.intersection(sample_meta.index)
+        meta = sample_meta.loc[shared].copy()
+
+    if len(shared) < MIN_CORRELATION_N:
         return
 
-    corr_stats = _compute_correlation_stats(x, y)
+    x_series = x_series.loc[shared]
+    y_series = y_series.loc[shared]
+
+    mask = np.isfinite(x_series.values) & np.isfinite(y_series.values)
+    if x_log10:
+        mask &= x_series.values > 0.0
+    if y_log10:
+        mask &= y_series.values > 0.0
+    if int(mask.sum()) < MIN_CORRELATION_N:
+        return
+
+    shared = shared[mask]
+    x_series = x_series.loc[shared]
+    y_series = y_series.loc[shared]
+    if meta is not None:
+        meta = meta.loc[shared]
+
+    if x_log10:
+        x_series = pd.Series(np.log10(x_series.values), index=shared)
+    if y_log10:
+        y_series = pd.Series(np.log10(y_series.values), index=shared)
+
+    corr_stats = _compute_correlation_stats(x_series.values, y_series.values)
     if not np.isfinite(corr_stats["pearson_r"]) or not np.isfinite(corr_stats["spearman_rho"]):
         return
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.scatter(x, y, color="#0077BB", edgecolor="white", s=50,
-               alpha=0.8, linewidths=0.5)
+    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    seen_groups: Dict[str, str] = {}
+    if meta is not None and color_column in meta.columns:
+        palette = _palette()
+        for sample_name in shared:
+            group_name = str(meta.loc[sample_name, color_column])
+            tfx_val = (
+                pd.to_numeric(pd.Series([meta.loc[sample_name, "tfx"]]), errors="coerce").iloc[0]
+                if "tfx" in meta.columns
+                else np.nan
+            )
+            marker = (
+                "D"
+                if "status" in meta.columns and str(meta.loc[sample_name, "status"]) == "holdout"
+                else "o"
+            )
+            color = palette.get(group_name, "#999999")
+            size = max(40.0, 260.0 * float(tfx_val)) if np.isfinite(tfx_val) else 60.0
+            ax.scatter(
+                float(x_series.loc[sample_name]),
+                float(y_series.loc[sample_name]),
+                s=size,
+                c=color,
+                marker=marker,
+                edgecolors="black",
+                linewidths=0.5,
+                alpha=0.78,
+            )
+            seen_groups[group_name] = color
+    else:
+        ax.scatter(
+            x_series.values,
+            y_series.values,
+            color="#0077BB",
+            edgecolor="black",
+            s=60,
+            alpha=0.8,
+            linewidths=0.5,
+        )
 
     # Regression line
     from scipy.stats import linregress as _lr
-    slope, intercept, _, _, _ = _lr(x, y)
-    x_line = np.linspace(float(np.min(x)), float(np.max(x)), 100)
+    slope, intercept, _, _, _ = _lr(x_series.values, y_series.values)
+    x_line = np.linspace(float(np.min(x_series.values)), float(np.max(x_series.values)), 100)
     ax.plot(x_line, slope * x_line + intercept, color="#CC3311",
             lw=1.8, ls="-", alpha=0.8)
 
     # Correlation annotations
     annot = (
         f"Pearson r = {corr_stats['pearson_r']:.3f}  ({format_pval(corr_stats['pearson_p'])})\n"
-        f"Spearman ρ = {corr_stats['spearman_rho']:.3f}  ({format_pval(corr_stats['spearman_p'])})"
+        f"Spearman ρ = {corr_stats['spearman_rho']:.3f}  ({format_pval(corr_stats['spearman_p'])})\n"
+        f"n = {int(corr_stats['n'])}"
     )
     ax.text(0.03, 0.97, annot, transform=ax.transAxes,
             va="top", ha="left", fontsize=8,
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
 
+    if seen_groups:
+        handles = [
+            plt.Line2D(
+                [0], [0], marker="o", color="w", label=group_name,
+                markerfacecolor=color, markeredgecolor="black", markersize=8,
+            )
+            for group_name, color in sorted(seen_groups.items())
+        ]
+        ax.legend(
+            handles=handles,
+            title=legend_title,
+            bbox_to_anchor=(1.02, 1.0),
+            loc="upper left",
+            fontsize=8,
+        )
+
     ax.set_xlabel(xlabel, fontsize=11)
     ax.set_ylabel(ylabel, fontsize=11)
-    if y_log_scale:
-        ax.set_yscale("log")
     if title:
         ax.set_title(title, fontsize=13, fontweight="bold")
+    if meta is not None and "tfx" in meta.columns and pd.to_numeric(meta["tfx"], errors="coerce").notna().any():
+        ax.text(0.98, 0.03, "size ∝ TFx", transform=ax.transAxes,
+                ha="right", va="bottom", fontsize=8)
+    ax.set_box_aspect(1)
 
     fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
@@ -2948,8 +2592,9 @@ def roc_gene_calling(
     """
     _ensure_dir(name)
     cmap = _bench_color_map(model_order)
+    tick_values = np.linspace(0.0, 1.0, 5)
 
-    fig, ax = plt.subplots(figsize=(7, 7))
+    fig, ax = plt.subplots(figsize=(7.8, 7.8))
 
     # Diagonal reference
     ax.plot([0, 1], [0, 1], ls="--", color="#BBBBBB", lw=1.2, zorder=0)
@@ -2977,14 +2622,15 @@ def roc_gene_calling(
 
     ax.set_xlabel("False Positive Rate", fontsize=11)
     ax.set_ylabel("True Positive Rate", fontsize=11)
-    ax.set_xlim([-0.01, 1.01])
-    ax.set_ylim([-0.01, 1.01])
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.0])
+    _set_explicit_ticks(ax, x_ticks=tick_values, y_ticks=tick_values)
     ax.set_title(title, fontsize=13, fontweight="bold")
-    ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), fontsize=8, framealpha=0.9)
     ax.grid(True, alpha=0.2)
-    ax.set_aspect("equal")
+    ax.set_box_aspect(1)
 
-    fig.tight_layout()
+    fig.tight_layout(rect=[0.0, 0.0, 0.82, 1.0])
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
 
@@ -3232,9 +2878,10 @@ def onoff_confusion_summary_plot(
 
     The figure has two side-by-side panels:
 
-    1. **Horizontal stacked bars** — confident ON / confident OFF /
-       withheld due to uncertainty.
-    2. **Dot plot** — PPV, NPV, FPR, and coverage for each model.
+     1. **Paired horizontal stacked bars** — model call partition and the
+         corresponding truth ON/OFF composition.
+     2. **Dot plot** — PPV, NPV, sensitivity, specificity, and coverage
+         for each model.
 
     Parameters
     ----------
@@ -3249,25 +2896,17 @@ def onoff_confusion_summary_plot(
         Preferred ordering for the model rows.
     """
     _ensure_dir(name)
-    preferred_models = [
-        "Proteus (binary)",
-        "Proteus (uncertainty-informed)",
-        "EPIC_GEP",
-        "XGBoost",
-        "Proteus_NoSeq (binary)",
-        "Proteus_NoSeq (uncertainty-informed)",
-        "Proteus_OnlySeq (binary)",
-        "Proteus_OnlySeq (uncertainty-informed)",
-        "EPIC_NDR",
-        "EPIC_PFE",
-    ]
     tie_break_order = {model: idx for idx, model in enumerate(model_order)}
-    preferred_rank = {model: idx for idx, model in enumerate(preferred_models)}
     rows: List[Dict[str, Any]] = []
     for model_name, summary in confusion_data.items():
         n_total = summary.get("n_total", 0)
         if n_total == 0:
             continue
+        fnr_value = summary.get("fnr", float("nan"))
+        if np.isfinite(fnr_value):
+            sensitivity_value = 1.0 - float(fnr_value)
+        else:
+            sensitivity_value = summary.get("sensitivity", float("nan"))
         rows.append(
             {
                 "model": model_name,
@@ -3275,13 +2914,15 @@ def onoff_confusion_summary_plot(
                 "frac_on": summary.get("n_on", 0) / n_total,
                 "frac_off": summary.get("n_off", 0) / n_total,
                 "frac_withheld": summary.get("n_indet", 0) / n_total,
+                "frac_truth_on": summary.get("n_truth_on", 0) / n_total,
+                "frac_truth_off": summary.get("n_truth_off", 0) / n_total,
                 "ppv": summary.get("ppv", float("nan")),
                 "npv": summary.get("npv", float("nan")),
+                "sensitivity": sensitivity_value,
                 "fpr": summary.get("fpr", float("nan")),
                 "specificity": (1.0 - summary.get("fpr", float("nan")))
                 if np.isfinite(summary.get("fpr", float("nan"))) else float("nan"),
                 "coverage": summary.get("coverage", float("nan")),
-                "sort_rank": preferred_rank.get(model_name, len(preferred_rank)),
                 "tie_break": tie_break_order.get(model_name, len(tie_break_order)),
             }
         )
@@ -3291,8 +2932,8 @@ def onoff_confusion_summary_plot(
 
     rows.sort(
         key=lambda row: (
-            row["sort_rank"],
             row["tie_break"],
+            row["display_label"],
         )
     )
 
@@ -3300,48 +2941,73 @@ def onoff_confusion_summary_plot(
     fig, (ax_comp, ax_metrics) = plt.subplots(
         ncols=2,
         sharey=True,
-        figsize=(13.2, max(4.8, 0.8 * n_models + 2.4)),
-        gridspec_kw={"width_ratios": [2.2, 1.0]},
+        figsize=(12.4, max(5.2, 0.95 * n_models + 2.8)),
+        gridspec_kw={"width_ratios": [1.0, 1.0]},
     )
 
     y = np.arange(n_models)
-    bar_height = 0.6
+    call_y = y - 0.16
+    truth_y = y + 0.16
+    call_bar_height = 0.26
+    truth_bar_height = 0.22
     withheld_edge = "#8E8E8E"
 
     frac_on = np.array([row["frac_on"] for row in rows], dtype=np.float64)
     frac_off = np.array([row["frac_off"] for row in rows], dtype=np.float64)
     frac_withheld = np.array([row["frac_withheld"] for row in rows], dtype=np.float64)
+    frac_truth_on = np.array([row["frac_truth_on"] for row in rows], dtype=np.float64)
+    frac_truth_off = np.array([row["frac_truth_off"] for row in rows], dtype=np.float64)
 
     ax_comp.barh(
-        y,
+        call_y,
         frac_on,
-        height=bar_height,
+        height=call_bar_height,
         color=_ONOFF_COLOR,
         edgecolor="white",
         linewidth=0.8,
         label="ON (confident)",
     )
     ax_comp.barh(
-        y,
+        call_y,
         frac_off,
         left=frac_on,
-        height=bar_height,
+        height=call_bar_height,
         color=_ONOFF_OFF_COLOR,
         edgecolor="white",
         linewidth=0.8,
         label="OFF (confident)",
     )
     ax_comp.barh(
-        y,
+        call_y,
         frac_withheld,
         left=frac_on + frac_off,
-        height=bar_height,
+        height=call_bar_height,
         color=_WITHHELD_COLOR,
         edgecolor=withheld_edge,
         linewidth=0.8,
         hatch="//",
         alpha=0.8,
-        label="Withheld due to uncertainty",
+        label="Withheld",
+    )
+
+    ax_comp.barh(
+        truth_y,
+        frac_truth_on,
+        height=truth_bar_height,
+        color=_ONOFF_COLOR,
+        edgecolor="white",
+        linewidth=0.8,
+        alpha=0.45,
+    )
+    ax_comp.barh(
+        truth_y,
+        frac_truth_off,
+        left=frac_truth_on,
+        height=truth_bar_height,
+        color=_ONOFF_OFF_COLOR,
+        edgecolor="white",
+        linewidth=0.8,
+        alpha=0.45,
     )
 
     def _segment_label(
@@ -3375,43 +3041,57 @@ def onoff_confusion_summary_plot(
         text.set_path_effects([PathEffects.withStroke(linewidth=1.4, foreground=stroke_color, alpha=0.35)])
 
     for idx, row in enumerate(rows):
-        _segment_label(ax_comp, 0.0, row["frac_on"], idx, f"ON\n{row['frac_on']:.0%}", "on")
-        _segment_label(ax_comp, row["frac_on"], row["frac_off"], idx, f"OFF\n{row['frac_off']:.0%}", "off")
+        _segment_label(ax_comp, 0.0, row["frac_on"], call_y[idx], f"ON\n{row['frac_on']:.0%}", "on")
+        _segment_label(ax_comp, row["frac_on"], row["frac_off"], call_y[idx], f"OFF\n{row['frac_off']:.0%}", "off")
         if row["frac_withheld"] > 0.0:
             _segment_label(
                 ax_comp,
                 row["frac_on"] + row["frac_off"],
                 row["frac_withheld"],
-                idx,
+                call_y[idx],
                 f"Withheld\n{row['frac_withheld']:.0%}",
                 "withheld",
             )
+        _segment_label(ax_comp, 0.0, row["frac_truth_on"], truth_y[idx], f"ON\n{row['frac_truth_on']:.0%}", "on")
+        _segment_label(ax_comp, row["frac_truth_on"], row["frac_truth_off"], truth_y[idx], f"OFF\n{row['frac_truth_off']:.0%}", "off")
+        ax_comp.text(
+            -0.03,
+            call_y[idx],
+            "Calls",
+            ha="right",
+            va="center",
+            fontsize=8.5,
+            color="#5A5A5A",
+            clip_on=False,
+        )
+        ax_comp.text(
+            -0.03,
+            truth_y[idx],
+            "Truth",
+            ha="right",
+            va="center",
+            fontsize=8.5,
+            color="#5A5A5A",
+            clip_on=False,
+        )
 
     ax_comp.set_yticks(y)
     ax_comp.set_yticklabels([row["display_label"] for row in rows], fontsize=10)
     ax_comp.invert_yaxis()
     ax_comp.set_xlim(0.0, 1.0)
+    _set_explicit_ticks(ax_comp, x_ticks=np.linspace(0.0, 1.0, 5))
     ax_comp.set_xlabel("Fraction of gene-sample pairs", fontsize=11)
-    ax_comp.set_title("Decision partition (confident vs withheld)", fontsize=11, fontweight="bold")
-    ax_comp.text(
-        0.0,
-        1.02,
-        "Withheld calls reflect uncertainty-aware abstention",
-        transform=ax_comp.transAxes,
-        ha="left",
-        va="bottom",
-        fontsize=9,
-        color="#5A5A5A",
-    )
+    ax_comp.set_title("Calls vs truth composition", fontsize=11, fontweight="bold")
     ax_comp.grid(True, axis="x", alpha=0.2)
 
     metric_specs = [
         ("PPV", "ppv", _ONOFF_COLOR, "o"),
         ("NPV", "npv", _ONOFF_OFF_COLOR, "s"),
-        ("Coverage", "coverage", "#7A7A7A", "^"),
+        ("Sensitivity", "sensitivity", _SENSITIVITY_COLOR, "^"),
         ("Specificity", "specificity", _SPECIFICITY_COLOR, "D"),
+        ("Coverage", "coverage", "#7A7A7A", "P"),
     ]
-    offsets = np.array([-0.24, -0.08, 0.08, 0.24], dtype=np.float64)
+    offsets = np.linspace(-0.24, 0.24, len(metric_specs), dtype=np.float64)
     legend_handles: List[Any] = []
     for offset, (metric_label, metric_key, color, marker) in zip(offsets, metric_specs):
         metric_vals = np.array([row[metric_key] for row in rows], dtype=np.float64)
@@ -3440,33 +3120,12 @@ def onoff_confusion_summary_plot(
             )
         )
 
-    finite_metric_values = np.concatenate(
-        [
-            np.asarray([row[metric_key] for row in rows], dtype=np.float64)[
-                np.isfinite(np.asarray([row[metric_key] for row in rows], dtype=np.float64))
-            ]
-            for _, metric_key, _, _ in metric_specs
-        ]
-    )
-    if finite_metric_values.size > 0:
-        metric_min = float(np.nanmin(finite_metric_values))
-        metric_max = float(np.nanmax(finite_metric_values))
-        metric_pad = max(0.02, (metric_max - metric_min) * 0.08)
-        metric_left = max(0.0, metric_min - metric_pad)
-        metric_right = min(1.0, metric_max + metric_pad)
-        if metric_right - metric_left < 0.2:
-            center = 0.5 * (metric_left + metric_right)
-            metric_left = max(0.0, center - 0.1)
-            metric_right = min(1.0, center + 0.1)
-    else:
-        metric_left = 0.0
-        metric_right = 1.0
     for ref_line in (0.5, 0.75):
-        if metric_left <= ref_line <= metric_right:
-            ax_metrics.axvline(ref_line, linestyle="--", alpha=0.2, color="#4A4A4A", linewidth=1.0)
-    ax_metrics.set_xlim(metric_left, metric_right)
+        ax_metrics.axvline(ref_line, linestyle="--", alpha=0.2, color="#4A4A4A", linewidth=1.0)
+    ax_metrics.set_xlim(0.0, 1.0)
+    _set_explicit_ticks(ax_metrics, x_ticks=np.linspace(0.0, 1.0, 5))
     ax_metrics.set_xlabel("Metric value", fontsize=11)
-    ax_metrics.set_title("Selective prediction performance", fontsize=11, fontweight="bold")
+    ax_metrics.set_title("Performance on confident calls", fontsize=11, fontweight="bold")
     ax_metrics.grid(True, axis="x", alpha=0.2)
     ax_metrics.tick_params(axis="y", left=False, labelleft=False)
     ax_metrics.legend(
@@ -3491,7 +3150,7 @@ def onoff_confusion_summary_plot(
         if np.isfinite(delta_ppv) and np.isfinite(delta_npv):
             ua_idx = next(i for i, row in enumerate(rows) if row["model"] == ua_row["model"])
             ax_metrics.text(
-                metric_right + max(0.01, (metric_right - metric_left) * 0.04),
+                1.04,
                 ua_idx,
                 f"↑ PPV {delta_ppv:+.02f}\n↑ NPV {delta_npv:+.02f}",
                 ha="left",
@@ -3502,7 +3161,7 @@ def onoff_confusion_summary_plot(
             )
 
     fig.suptitle(title, fontsize=13, fontweight="bold", y=0.99)
-    fig.tight_layout(rect=[0.0, 0.0, 0.88, 0.96])
+    fig.tight_layout(rect=[0.0, 0.0, 0.9, 0.96])
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
 

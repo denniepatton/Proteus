@@ -109,8 +109,10 @@ def resolve_trial_configs(
     cl_margin = s("cl_margin", exp.structural.cl_margin)
     internal_weight = s("internal_weight", exp.structural.internal_weight)
     beta_tfx = s("beta_tfx", exp.structural.beta_tfx)
-    beta_ccc = s("beta_ccc", exp.structural.beta_ccc)
     beta_srl_max = s("beta_srl_max", exp.structural.beta_srl_max)
+    beta_dynamic_pair_max = s(
+        "beta_dynamic_pair_max", exp.structural.beta_dynamic_pair_max,
+    )
     srl_delta = s("srl_delta", exp.structural.srl_delta)
     srl_start = s("srl_start", exp.structural.srl_start)
     srl_ramp = s("srl_ramp", exp.structural.srl_ramp)
@@ -196,8 +198,8 @@ def resolve_trial_configs(
         cl_margin=float(cl_margin),
         internal_weight=float(internal_weight),
         beta_tfx=float(beta_tfx),
-        beta_ccc=float(beta_ccc),
         beta_srl_max=float(beta_srl_max),
+        beta_dynamic_pair_max=float(beta_dynamic_pair_max),
         srl_delta=float(srl_delta),
         srl_start=int(srl_start),
         srl_ramp=int(srl_ramp),
@@ -240,8 +242,8 @@ def resolve_trial_configs(
             "cl_margin": float(cl_margin),
             "internal_weight": float(internal_weight),
             "beta_tfx": float(beta_tfx),
-            "beta_ccc": float(beta_ccc),
             "beta_srl_max": float(beta_srl_max),
+            "beta_dynamic_pair_max": float(beta_dynamic_pair_max),
             "srl_delta": float(srl_delta),
             "srl_start": int(srl_start),
             "srl_ramp": int(srl_ramp),
@@ -354,7 +356,11 @@ def configs_from_trial_json(
         cl_margin=float(s["cl_margin"]),
         internal_weight=float(s["internal_weight"]),
         beta_tfx=float(s["beta_tfx"]),
-        beta_ccc=float(s["beta_ccc"]),
+        beta_srl_max=float(s.get("beta_srl_max", 2.0)),
+        beta_dynamic_pair_max=float(s.get("beta_dynamic_pair_max", 0.0)),
+        srl_delta=float(s.get("srl_delta", 5.0)),
+        srl_start=int(s.get("srl_start", 0)),
+        srl_ramp=int(s.get("srl_ramp", 50)),
         beta_pht_consistency=float(s["beta_pht_consistency"]),
         beta_pht_uncertainty=float(s["beta_pht_uncertainty"]),
         dropout_rate=float(sc["dropout_rate"]),

@@ -20,7 +20,7 @@ import os
 import json
 import random
 import re
-from typing import Dict, List, Optional, Tuple, Union, Any
+from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +40,59 @@ def _collate_identity(batch: List[Any]) -> Any:
     return batch[0]
 
 
+def _seed_dataloader_worker(worker_id: int) -> None:
+    """Seed Python, NumPy, and Torch RNGs for a worker process."""
+    worker_seed = torch.initial_seed() % (2**32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+    torch.manual_seed(worker_seed)
+
+
+def create_single_item_loader(
+    dataset: Union[Dataset, IterableDataset],
+    *,
+    num_workers: int,
+    seed: int,
+    collate_fn: Callable[[List[Any]], Any] = _collate_identity,
+    persistent_workers: bool = True,
+    prefetch_factor: int = 4,
+) -> DataLoader:
+    """Build a deterministic `batch_size=1` DataLoader with shared worker setup."""
+    base_generator = torch.Generator()
+    base_generator.manual_seed(int(seed))
+
+    return DataLoader(
+        dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        persistent_workers=persistent_workers and num_workers > 0,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        worker_init_fn=_seed_dataloader_worker if num_workers > 0 else None,
+        generator=base_generator,
+        drop_last=False,
+        pin_memory=True,
+    )
+
+
+def _write_temp_index_files(prefix: str, named_paths: Dict[str, List[str]]) -> Dict[str, str]:
+    """Write one or more temporary JSON index files and return their paths."""
+    import tempfile
+
+    temp_dir = tempfile.mkdtemp(prefix=prefix)
+    index_paths: Dict[str, str] = {}
+    for name, paths in named_paths.items():
+        index_path = os.path.join(temp_dir, f'{name}.json')
+        with open(index_path, 'w') as handle:
+            json.dump(paths, handle)
+        index_paths[name] = index_path
+    return index_paths
+
+
 _PHT_META_RE = re.compile(r'^PHT-Fold-\d+_(.+)-(BP[^_]+)(?:_.*)?$')
+_SRL_VARIANCE_FLOOR = 0.1
+_SRL_STD_FLOOR = float(np.sqrt(_SRL_VARIANCE_FLOOR))
 
 
 def _parse_pht_metadata(sample_name: str) -> Tuple[bool, str, str]:
@@ -614,7 +666,7 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         sample_paths_by_source: Dict[str, List[str]],
         gene_variance: Dict[str, float],
         n_eff_per_source: int = 24,
-        genes_per_batch: int = 4,
+        genes_per_batch: int = 2,
         batch_size: int = 64,
         steps_per_epoch: int = 4000,
         gene_weight_min: float = 0.5,
@@ -642,6 +694,10 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         self.include_metadata = include_metadata
         self._epoch_counter = 0
         self.val_mask = val_mask  # shape [n_samples, n_union_genes] or None
+
+        # Temporary narrower multi-source panel default: 2 genes × 32 rows/gene
+        # = 64 rows total, which preserves the prior batch size while halving
+        # the number of genes represented in each stochastic batch.
 
         # Build gene universe: union of all sources' gene sets.
         all_paths = [p for paths in self.sample_paths_by_source.values()
@@ -1096,7 +1152,6 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
             lab_tumor = []
             lab_bg = []
             lab_weight = []
-            lab_ccc_weight = []
             lab_tfx = []
             meta_samples: List[str] = []
             meta_genes: List[str] = []
@@ -1148,9 +1203,6 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                             torch.from_numpy(sd['ref_scalars'][g_idx]))
                         lab_tfx.append(float(sd['TFX_label'][g_idx]))
                         lab_weight.append(gene_weight)
-                        # CCC includes all samples, including PHT-derived
-                        # synthetic mixtures, with the same per-gene weight.
-                        lab_ccc_weight.append(gene_weight)
 
                         if self.labeled:
                             lab_tumor.append(float(sd['tumor_exp'][g_idx]))
@@ -1196,8 +1248,6 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
                     'background_exp': torch.tensor(
                         lab_bg, dtype=torch.float32).unsqueeze(-1),
                     'sample_weight': w_t.unsqueeze(-1),
-                    'ccc_weight': torch.tensor(
-                        lab_ccc_weight, dtype=torch.float32).unsqueeze(-1),
                     'TFX_label': t_t.unsqueeze(-1),
                 }
             else:
@@ -1223,7 +1273,7 @@ class ProteusHoldoutValDataset(IterableDataset):
         self,
         train_dataset: 'ProteusMultiSourceBatchDataset',
         val_mask: np.ndarray,
-        batch_size: int = 32,
+        batch_size: int = 64,
         seed: int = 42,
     ):
         super().__init__()
@@ -1274,7 +1324,6 @@ class ProteusHoldoutValDataset(IterableDataset):
         buf_tumor = []
         buf_bg = []
         buf_weight = []
-        buf_ccc_weight = []
         buf_tfx = []
         buf_samples: List[str] = []
         buf_genes: List[str] = []
@@ -1299,7 +1348,6 @@ class ProteusHoldoutValDataset(IterableDataset):
             buf_tfx.append(float(sd['TFX_label'][g_idx]))
             buf_weight.append(gene_weight)
             is_pht = ds._sample_is_pht.get(zarr_path, False)
-            buf_ccc_weight.append(gene_weight)
             buf_tumor.append(float(sd['tumor_exp'][g_idx]))
             buf_bg.append(float(sd['background_exp'][g_idx]))
             buf_samples.append(ds._get_sample_name(zarr_path))
@@ -1330,8 +1378,6 @@ class ProteusHoldoutValDataset(IterableDataset):
                         buf_bg, dtype=torch.float32).unsqueeze(-1),
                     'sample_weight': torch.tensor(
                         buf_weight, dtype=torch.float32).unsqueeze(-1),
-                    'ccc_weight': torch.tensor(
-                        buf_ccc_weight, dtype=torch.float32).unsqueeze(-1),
                     'TFX_label': torch.tensor(
                         buf_tfx, dtype=torch.float32).unsqueeze(-1),
                 }
@@ -1345,7 +1391,6 @@ class ProteusHoldoutValDataset(IterableDataset):
                 buf_tumor.clear()
                 buf_bg.clear()
                 buf_weight.clear()
-                buf_ccc_weight.clear()
                 buf_tfx.clear()
                 buf_samples.clear()
                 buf_genes.clear()
@@ -1446,6 +1491,66 @@ def _parse_splits_tsv(
     return train_paths, val_paths, zarr_path_to_cohort, zarr_path_to_sample_name
 
 
+def _print_multisource_split_audit(
+    training_set_tsv: str,
+    val_fold: int,
+    train_paths: List[str],
+    val_paths: List[str],
+    zarr_path_to_sample_name: Dict[str, str],
+) -> None:
+    import csv
+    from collections import Counter
+
+    fold_counts: Counter[int] = Counter()
+    sample_to_fold: Dict[str, int] = {}
+
+    with open(training_set_tsv, 'r', newline='') as f:
+        reader = csv.DictReader(f, delimiter='\t')
+        for row in reader:
+            sample = row['Sample'].strip()
+            fold = int(row['Fold'])
+            fold_counts[fold] += 1
+            sample_to_fold[sample] = fold
+
+    train_samples = {
+        zarr_path_to_sample_name[zpath]
+        for zpath in train_paths
+        if zpath in zarr_path_to_sample_name
+    }
+    val_samples = {
+        zarr_path_to_sample_name[zpath]
+        for zpath in val_paths
+        if zpath in zarr_path_to_sample_name
+    }
+    train_fold_counts = Counter(
+        sample_to_fold[sample]
+        for sample in train_samples
+        if sample in sample_to_fold
+    )
+    val_fold_counts = Counter(
+        sample_to_fold[sample]
+        for sample in val_samples
+        if sample in sample_to_fold
+    )
+
+    def _fmt_counts(counts: Counter[int]) -> str:
+        return ', '.join(
+            f'{fold}:{counts[fold]}' for fold in sorted(counts)
+        )
+
+    print(
+        f"  [SplitAudit] held-out fold {val_fold}: "
+        f"train={len(train_paths)} val={len(val_paths)}"
+    )
+    print(f"  [SplitAudit] TSV fold counts: {_fmt_counts(fold_counts)}")
+    if 2 in fold_counts:
+        print(
+            "  [SplitAudit] Fold 2 membership in this run: "
+            f"train={train_fold_counts.get(2, 0)} "
+            f"val={val_fold_counts.get(2, 0)}"
+        )
+
+
 def create_data_loader(
     index_file: str,
     num_workers: int = 4,
@@ -1489,15 +1594,6 @@ def create_data_loader(
     Returns:
         (DataLoader, n_batches)
     """
-    base_generator = torch.Generator()
-    base_generator.manual_seed(int(seed))
-
-    def _seed_worker(worker_id: int) -> None:
-        worker_seed = torch.initial_seed() % (2**32)
-        random.seed(worker_seed)
-        np.random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
-
     dataset = ProteusGeneChunkIterableDataset(
         index_file=index_file,
         seed=seed,
@@ -1515,18 +1611,13 @@ def create_data_loader(
         sample_name_map=sample_name_map,
     )
 
-    loader = DataLoader(
+    loader = create_single_item_loader(
         dataset,
-        batch_size=1,
-        shuffle=False,
         num_workers=num_workers,
+        seed=seed,
         collate_fn=_collate_identity,
-        persistent_workers=persistent_workers and num_workers > 0,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        worker_init_fn=_seed_worker if num_workers > 0 else None,
-        generator=base_generator,
-        drop_last=False,
-        pin_memory=True,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
 
     return loader, len(dataset)
@@ -1550,7 +1641,7 @@ def create_inference_loader(
     
     loader = DataLoader(
         dataset,
-        batch_size=32,
+        batch_size=64,
         shuffle=False,  # Keep gene order for output
         num_workers=num_workers,
         collate_fn=collate_inference,
@@ -1636,16 +1727,15 @@ def build_loaders_from_splits(
         print(f"  [Source groups] {dict(src_counts)}, "
               f"target_n_per_source={target_n_per_source}")
 
-    # Write temp index files (required by chunk loader)
-    import tempfile
-    temp_dir = tempfile.mkdtemp(prefix='proteus_splits_')
-    train_index = os.path.join(temp_dir, f'train_excl_fold{val_fold}.json')
-    val_index = os.path.join(temp_dir, f'val_fold{val_fold}.json')
-
-    with open(train_index, 'w') as f:
-        json.dump(train_paths, f)
-    with open(val_index, 'w') as f:
-        json.dump(val_paths, f)
+    index_paths = _write_temp_index_files(
+        'proteus_splits_',
+        {
+            f'train_excl_fold{val_fold}': train_paths,
+            f'val_fold{val_fold}': val_paths,
+        },
+    )
+    train_index = index_paths[f'train_excl_fold{val_fold}']
+    val_index = index_paths[f'val_fold{val_fold}']
 
     # Log subsampling info if active
     if subsample_frac is not None and subsample_frac < 1.0:
@@ -1685,7 +1775,7 @@ def build_multisource_loaders_from_splits(
     source_groups: Dict[str, List[str]],
     gene_variance: Dict[str, float],
     n_eff_per_source: int = 24,
-    genes_per_batch: int = 4,
+    genes_per_batch: int = 2,
     batch_size: int = 64,
     steps_per_epoch: int = 4000,
     gene_weight_min: float = 0.5,
@@ -1712,7 +1802,7 @@ def build_multisource_loaders_from_splits(
         gene_variance: Per-gene raw variance (for loss weights).
         n_eff_per_source: Retained for caller compatibility; fixed stochastic
             epochs are controlled by ``steps_per_epoch``.
-        genes_per_batch: Unique genes drawn per batch (default 4).
+        genes_per_batch: Unique genes drawn per batch (default 2).
         batch_size: Total items per batch (default 64).
         steps_per_epoch: Fixed stochastic batches per epoch (default 4000).
         gene_weight_min: Minimum compressed loss weight (default 0.5).
@@ -1730,6 +1820,13 @@ def build_multisource_loaders_from_splits(
     """
     train_paths, val_paths, zarr_path_to_cohort, zarr_path_to_sample_name = (
         _parse_splits_tsv(training_set_tsv, zarr_base, val_fold, train_only_cohorts)
+    )
+    _print_multisource_split_audit(
+        training_set_tsv,
+        val_fold,
+        train_paths,
+        val_paths,
+        zarr_path_to_sample_name,
     )
 
     # -- Assign training paths to source groups (including PHT → parent PDX) --
@@ -1768,36 +1865,21 @@ def build_multisource_loaders_from_splits(
         subsample_frac=subsample_frac,
     )
 
-    base_generator = torch.Generator()
-    base_generator.manual_seed(seed)
-
-    def _seed_worker(worker_id: int) -> None:
-        worker_seed = torch.initial_seed() % (2**32)
-        random.seed(worker_seed)
-        np.random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
-
-    train_loader = DataLoader(
+    train_loader = create_single_item_loader(
         train_dataset,
-        batch_size=1,
-        shuffle=False,
         num_workers=num_workers,
+        seed=seed,
         collate_fn=_collate_identity,
-        persistent_workers=persistent_workers and num_workers > 0,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        worker_init_fn=_seed_worker if num_workers > 0 else None,
-        generator=base_generator,
-        drop_last=False,
-        pin_memory=True,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
     train_steps = len(train_dataset)
 
     # -- Validation loader (chunk-based, exhaustive) --
-    import tempfile
-    temp_dir = tempfile.mkdtemp(prefix='proteus_msplits_')
-    val_index = os.path.join(temp_dir, f'val_fold{val_fold}.json')
-    with open(val_index, 'w') as f:
-        json.dump(val_paths, f)
+    val_index = _write_temp_index_files(
+        'proteus_msplits_',
+        {f'val_fold{val_fold}': val_paths},
+    )[f'val_fold{val_fold}']
 
     val_loader, val_steps = create_data_loader(
         index_file=val_index,
@@ -1893,7 +1975,9 @@ def compute_gene_mean_std_from_zarr(
 
     Uses the same accumulation path as the variance helpers so SRL lookup
     tables are defined over the identical training-only truth pool used for
-    the existing gene-variance weights.
+    the existing gene-variance weights. The SRL std is floored to the same
+    minimum-variance convention used elsewhere so near-constant genes cannot
+    explode standardized residual magnitudes.
     """
     import zarr
 
@@ -1922,7 +2006,7 @@ def compute_gene_mean_std_from_zarr(
         mean = gene_sum[g] / n
         var = max(0.0, gene_sum_sq[g] / n - mean * mean)
         gene_mean[g] = float(mean)
-        gene_std[g] = float(np.sqrt(var))
+        gene_std[g] = float(max(np.sqrt(var), _SRL_STD_FLOOR))
 
     return gene_mean, gene_std
 

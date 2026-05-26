@@ -1,94 +1,64 @@
 #!/bin/bash
 set -euo pipefail
 
-# =====================================================================
-# Launch PLCA inference for a selected BioDVN variant on one L40S GPU.
-#
-# Usage:
-#   bash runs/launch_inference.sh [default|no-seq|only-seq]
-#
-# This submits one SLURM job that runs inference sequentially across the
-# pre-specified cohort list below. The script points inference at the
-# PLCA full-train checkpoint for the selected variant.
-# =====================================================================
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${REPO_ROOT}"
 
-ENV_NAME="proteus"
-VARIANT="${1:-only-seq}"
+ENV_NAME="${ENV_NAME:-proteus}"
+ACCOUNT="${ACCOUNT:-nelson_p}"
+PARTITION="${PARTITION:-chorus}"
+GPU="${GPU:-l40s:1}"
+TIME_LIMIT="${TIME_LIMIT:-12:00:00}"
+CPUS_PER_TASK="${CPUS_PER_TASK:-4}"
+MODEL_NAME="${MODEL_NAME:-BioDVN}"
+EXPERIMENT="${EXPERIMENT:-}"
+PYTHON_BIN="${PYTHON_BIN:-python}"
+JOB_PREFIX="${JOB_PREFIX:-proteus_infer}"
 
-COHORTS=(
-    "BC-Ghana"
-    "BLCA-RA"
-    "Crompton"
-    "CRPC-Pfizer"
-    "CRPC-Pluvicto"
-    "CRPC-UW"
-    "CRPC-WCDT"
-    "PC-PDX"
-    "PHS"
-    "SCLC-PDX"
-)
+if [[ $# -lt 1 ]]; then
+    echo "Usage: bash runs/launch_inference.sh <DATASET> [DATASET ...]" >&2
+    echo "Optional env: MODEL_NAME, EXPERIMENT, PARTITION, GPU, TIME_LIMIT, ACCOUNT, ENV_NAME" >&2
+    exit 1
+fi
 
-case "${VARIANT}" in
-    default)
-        YAML="config/experiments/plca_final-training.yaml"
-        MODEL="BioDVN"
-        TAG="plca_final_inference"
-        ;;
-    no-seq)
-        YAML="config/experiments/plca-no-seq_final-training.yaml"
-        MODEL="BioDVN_NoSeq"
-        TAG="plca-noseq_inference"
-        ;;
-    only-seq)
-        YAML="config/experiments/plca-only-seq_final-training.yaml"
-        MODEL="BioDVN_OnlySeq"
-        TAG="plca-onlyseq_inference"
-        ;;
-    *)
-        echo "Unknown variant: ${VARIANT}" >&2
-        echo "Usage: bash runs/launch_inference.sh [default|no-seq|only-seq]" >&2
-        exit 1
-        ;;
-esac
+DATASET_LIST="$*"
+mkdir -p logs
+job_script=$(mktemp "${JOB_PREFIX}_XXXXXX.sh")
 
-COHORT_LIST="${COHORTS[*]}"
-
-job_script=$(mktemp "job_${TAG}_XXXXXX.sh")
 cat > "${job_script}" <<EOL
 #!/bin/bash
-#SBATCH --job-name=${TAG}
-#SBATCH --output=logs/${TAG}_%j.out
-#SBATCH --error=logs/${TAG}_%j.err
-#SBATCH --partition=chorus
-#SBATCH --cpus-per-task=4
-#SBATCH --gpus=l40s:1
-#SBATCH --time=12:00:00
-#SBATCH -A nelson_p
+#SBATCH --job-name=${JOB_PREFIX}
+#SBATCH --output=logs/${JOB_PREFIX}_%j.out
+#SBATCH --error=logs/${JOB_PREFIX}_%j.err
+#SBATCH --partition=${PARTITION}
+#SBATCH --cpus-per-task=${CPUS_PER_TASK}
+#SBATCH --gpus=${GPU}
+#SBATCH --time=${TIME_LIMIT}
+#SBATCH -A ${ACCOUNT}
 
+set -euo pipefail
+cd "${REPO_ROOT}"
 eval "\$(micromamba shell hook -s bash)"
 micromamba activate ${ENV_NAME}
 
-COHORTS=(${COHORT_LIST})
+MODEL_NAME="${MODEL_NAME}"
+EXPERIMENT="${EXPERIMENT}"
+DATASETS=(${DATASET_LIST})
 
-echo "Running PLCA inference variant: ${VARIANT}"
-echo "Model name: ${MODEL}"
-echo "Experiment YAML: ${YAML}"
-echo "Cohorts: \${COHORTS[*]}"
-echo "Predictions will be written under: results_holdout/${MODEL}/<COHORT>/"
+echo "[proteus-inference] model=${MODEL_NAME} datasets=\${DATASETS[*]} experiment=\${EXPERIMENT:-<bundled checkpoint>}"
 
-for cohort in "\${COHORTS[@]}"; do
-    echo "=== Inference: \${cohort} ==="
-        python Proteus.py \
-                --run_mode run \
-                --experiment ${YAML} \
-                --model_name ${MODEL} \
-        --use_set "\${cohort}"
+for dataset in "\${DATASETS[@]}"; do
+    cmd=("${PYTHON_BIN}" Proteus.py --run_mode run --model_name "\${MODEL_NAME}" --use_set "\${dataset}")
+    if [[ -n "\${EXPERIMENT}" ]]; then
+        cmd+=(--experiment "\${EXPERIMENT}")
+    fi
+    echo "[proteus-inference] dataset=\${dataset}"
+    "\${cmd[@]}"
 done
 EOL
 
 sbatch "${job_script}"
 rm -f "${job_script}"
 
-echo "Submitted inference job for ${TAG} (${MODEL})"
-echo "Configured cohorts: ${COHORT_LIST}"
-echo "Per-cohort prediction outputs will go to: results_holdout/${MODEL}/<COHORT>/"
+echo "Submitted inference job ${JOB_PREFIX} for datasets: ${DATASET_LIST}"
+

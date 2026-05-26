@@ -16,7 +16,7 @@ Outside benchmarking, the analysis workflow uses the canonical BioDVN PLCA model
 
 When an analysis section executes, prediction inputs are read directly from hard-coded relative paths under `results_training/` and `results_holdout/`. `analysis/results/` is output-only and is never used as a prediction input source.
 
-`analysis/run_full_analysis.py` is the main analysis runner and section dispatcher. It is not a thin wrapper: the cohort-specific discovery workflows, calibration wiring, and a substantial amount of analysis orchestration currently live there.
+`analysis/run_full_analysis.py` is the main analysis runner and section dispatcher. It is not a thin wrapper: the cohort-specific discovery workflows, OOF diagnostics, and a substantial amount of analysis orchestration currently live there.
 
 ## Quick Start
 
@@ -50,13 +50,13 @@ python analysis/run_full_analysis.py --group all
 
 | Flag | Default | Notes |
 |---|---|---|
-| `--group` | *(required)* | One of `Examples`, `Benchmarking_Synthetic`, `Benchmarking_Patient`, `Calibration`, `Validation_PDX`, `Validation_Patient`, `Discovery_Patient`, `all`. `all` runs the standard non-legacy analysis stack and skips the standalone `Calibration` section unless `--group Calibration` is requested explicitly |
-| `--overwrite` | `False` | Rerun an analysis section even when its top-level output folder already exists |
+| `--group` | *(required)* | One of `Examples`, `Benchmarking_Synthetic`, `Benchmarking_Patient`, `Calibration`, `Validation_PDX`, `Validation_Patient`, `Discovery_Patient`, `all`. `all` runs the full standard analysis stack, including `Calibration` |
+| `--overwrite` | `False` | Rerun an analysis section even when its top-level output folder already exists. Without this flag, an existing section directory is left untouched and that section is skipped rather than overwritten |
 | `--minimum_tfx` | `0.0` | Drop patient samples with tumor fraction below this threshold during data loading before downstream analyses consume them |
-| `--calibrate_cis` | `False` | Replace Proteus raw 90% CIs with the CV-fitted conformal-calibrated 90% CIs for downstream analyses |
 | `--dim_ambiguous` | `False` | In single-gene plots/analyses, render ambiguous points as hollow markers and exclude them from reported single-gene statistics. For Proteus MDN outputs this now uses the activity odds ratio `log2((pi_normal + 1e-6) / (1 - pi_normal + 1e-6))` together with the shared lower/upper thresholds learned from pooled patient CV OOF predictions, rather than CI overlap |
 | `--scatter_ci` | `False` | Pass interval surfaces into scatter analyses; current single-gene and IHC scatter plots do not render per-point CI error bars |
 | `--n_workers` | all available CPUs | Worker processes to use for parallel analysis steps |
+| `--montecarlo_draws` | `100` | Number of MDN expression draws used only for 90% score intervals |
 
 The runner defaults to all visible CPUs and prints both the total available threads and the resolved worker count. Use `--n_workers` to override that default explicitly.
 
@@ -64,7 +64,8 @@ The runner defaults to all visible CPUs and prints both the total available thre
 
 ## Analysis Dependencies
 
-The analysis workflow requires more than the core training dependencies.
+The analysis workflow requires more than the core training dependencies. The
+repo-level [proteus.env](/Volumes/rpatton/TritonCNN/Proteus/proteus.env) file is the canonical micromamba environment spec for this paper-reproduction stack.
 
 - Python packages: `lifelines`, `gseapy`, `rpy2`
 - R packages: `limma`, `genefu`
@@ -76,6 +77,8 @@ The analysis workflow requires more than the core training dependencies.
 
 If the R bridge is unavailable, workflows that call limma through `rpy2` will fail. This currently affects discovery analyses that run limma/GSEA or R-side mixed models.
 
+Configured prediction files, label tables, GMT files, and cohort metadata are treated as required inputs. Missing artifacts now fail loudly instead of being skipped.
+
 ## Package Layout
 
 | File | Role |
@@ -84,7 +87,7 @@ If the R bridge is unavailable, workflows that call limma through `rpy2` will fa
 | `analysis/pipeline_config.py` | Canonical section names, model registries, and path policy |
 | `analysis/examples.py` | Example plots and expression-mixture fitting workflow |
 | `analysis/analysis_utils.py` | Data loading, metrics, cohort utilities, uncertainty helpers, survival helpers, and genefu-backed PAM50 classification |
-| `analysis/calibration.py` | Asymmetric regime-based conformal interval calibration |
+| `analysis/enrichment_utils.py` | Shared GMT parsing, Entrez-to-symbol conversion, and ssGSEA helper primitives extracted from the main runner |
 | `analysis/reliability.py` | Post-hoc gene reliability modelling |
 | `analysis/plot_utils.py` | Plotting helpers used across all sections |
 | `analysis/limma_de.R` | R-side limma bridge called via `rpy2` |
@@ -93,7 +96,7 @@ If the R bridge is unavailable, workflows that call limma through `rpy2` will fa
 
 ### Examples
 
-Produces the illustrative `NaiveExample` plots and the RNA-seq mixture fit used for method exposition. The mixture fit uses the in-workspace PLCA truth pool.
+Produces the illustrative naive-baseline plots and the RNA-seq mixture fit used for method exposition directly in `analysis/results/Examples/`. The mixture fit uses the in-workspace PLCA truth pool.
 
 ### Benchmarking_Synthetic
 
@@ -102,8 +105,7 @@ Benchmarks Proteus, `Proteus_NoSeq`, `Proteus_OnlySeq`, XGBoost, EPIC-Seq, and a
 - `COMPLETE`: `Proteus`, `Proteus_NoSeq`, `Proteus_OnlySeq`, `XGBoost`, `EPIC_GEP`, `EPIC_NDR`, `EPIC_PFE`, `Naive`
 - `SUBSET`: `Proteus`, `XGBoost`, `EPIC_GEP`, `Naive`
 
-The `SUBSET` view also includes a Hallmark ssGSEA recapitulation benchmark that reports only mean Hallmark $
-ho$ within each TFx/depth cell. Those outputs now include both the raw score surfaces and an uncertainty-adjusted Proteus score surface obtained by Monte Carlo aggregation across MDN draws.
+The `SUBSET` view also includes a Hallmark ssGSEA recapitulation benchmark that reports mean Hallmark rho within each TFx/depth cell. Synthetic benchmark plots keep the TFx/depth line summaries and no longer write benchmark-grid boxplot/histogram figures.
 
 ### Benchmarking_Patient
 
@@ -113,12 +115,11 @@ For Proteus MDN models, this section now writes dataset-specific `ActiveConfiden
 
 ### Calibration
 
-Runs standalone calibration diagnostics on the PLCA OOF prediction pool and matching PDX holdout data.
+Runs standalone diagnostics on the PLCA OOF prediction pool. It does not fit or apply post-hoc interval calibration.
 
-- Interval calibration uses asymmetric regime-based conformal calibration of the MDN-derived 90% interval, with separate lower-tail and upper-tail conformal corrections.
-- PIT diagnostics are computed from the full hurdle-gamma-normal MDN predictive CDF and written for both pooled OOF and pooled PDX holdout evaluation sets.
-- OOF evaluation uses leave-one-fold-out cross-fitting so calibrated CV diagnostics do not reuse the same fold for both fitting and evaluation.
-- The section also derives pooled patient-CV activity odds ratio thresholds from the CRPC-RA and SCLC OOF predictions: an upper bound where PPV first reaches 0.90 and a lower bound where NPV first reaches 0.90. Those thresholds are written to `PatientCV_ActivityOddsRatioThresholds.tsv` and accompanied by `ActiveConfidenceThreshold_*` and `InactiveConfidenceThreshold_*` sweep plots/TSVs.
+- PIT diagnostics are computed from the full hurdle-gamma-normal MDN predictive CDF for pooled OOF samples.
+- OOF residual diagnostics are written for the pooled PLCA OOF set and each PLCA cohort: AOR vs signed residual, AOR distributions with shared cut-points, CI width vs signed residual, CI width distributions, and gene-level RMSE versus MANE gene meta-features.
+- The section derives pooled patient-CV activity odds ratio thresholds from the CRPC-RA and SCLC OOF predictions, restricted to genes whose truth values cross the active-expression cutoff of 2.0 log2(CPM+1). The upper bound is where PPV first reaches 0.90, and the lower bound is where NPV first reaches 0.90.
 
 ### Validation_PDX
 
@@ -141,11 +142,11 @@ Each truth-bearing patient cohort now also writes a `PAM50/pam50_scale/` subtree
 
 ### Discovery_Patient
 
-Configured discovery cohorts currently include `CRPC-Pfizer`, `CRPC-Pluvicto`, `CRPC-UW`, and `BC-Ghana`.
+Configured discovery cohorts currently include `CRPC-Pfizer`, `CRPC-Pluvicto_MC`, `CRPC-Pluvicto_Full`, `CRPC-UW`, and `BC-Ghana`.
 
-This section runs truth-free downstream analyses on discovery cohorts using the main PLCA Proteus model only. Outputs include expression profiles, curated heatmaps, and cohort-specific downstream analyses such as limma/GSEA, PAM50, ssGSEA, survival, and longitudinal marker analyses where applicable.
+This section runs truth-free downstream analyses on discovery cohorts using the main PLCA Proteus model only. Outputs include expression profiles, curated heatmaps, and cohort-specific downstream analyses such as limma/GSEA, PAM50, ssGSEA, survival, and longitudinal marker analyses where applicable. The two Pluvicto outputs both restrict to baseline (`C1`) samples: `CRPC-Pluvicto_MC` keeps the original `FH*` / not `FHL*` subset, while `CRPC-Pluvicto_Full` uses all available baseline samples.
 
-All discovery patient cohorts now also write predicted `PAM50/pam50_scale/` score and classification tables. BC-Ghana retains the metadata-subtype confusion view and its uncertainty-adjusted PAM50 outputs because there is no matched RNA-seq truth matrix for that cohort in the repo.
+All discovery patient cohorts write predicted `PAM50/pam50_scale/` score and classification tables. Genefu `Normal` calls and `Normal` score columns are filtered out of downstream PAM50 summaries. BC-Ghana retains the metadata-subtype confusion view and adds receptor-status AOR boxplots alongside receptor-expression boxplots.
 
 All discovery analyses are exploratory. Survival, subgroup comparisons, and downstream enrichment outputs should be interpreted as hypothesis-generating rather than confirmatory.
 
@@ -154,8 +155,8 @@ All discovery analyses are exploratory. Survival, subgroup comparisons, and down
 ```text
 analysis/results/
 ├── Examples/
-│   ├── NaiveExample/
-│   └── run_manifest.json
+│   ├── run_manifest.json
+│   └── ...
 ├── Benchmarking_Synthetic/
 │   ├── COMPLETE/
 │   ├── SUBSET/
@@ -167,6 +168,12 @@ analysis/results/
 │   ├── run_manifest.json
 │   └── summary_benchmarking_all.tsv
 ├── Calibration/
+│   ├── OOF_All/
+│   ├── OOF_CRPC-RA/
+│   ├── OOF_PC-PDX/
+│   ├── OOF_SCLC/
+│   ├── OOF_SCLC-PDX/
+│   ├── PatientCV_ActivityOddsRatioThresholds.tsv
 │   └── run_manifest.json
 ├── Validation_PDX/
 │   ├── PC-PDX/
@@ -186,7 +193,8 @@ analysis/results/
 └── Discovery_Patient/
         ├── BC-Ghana/
         ├── CRPC-Pfizer/
-        ├── CRPC-Pluvicto/
+    ├── CRPC-Pluvicto_Full/
+    ├── CRPC-Pluvicto_MC/
         ├── CRPC-UW/
         └── run_manifest.json
 ```
@@ -220,9 +228,10 @@ The analysis code uses two complementary uncertainty views:
 
 Current practice in this repo:
 
-- Adjusted Hallmark ssGSEA, shortlist/CCP score workflows, and PAM50 classification propagate uncertainty by drawing Monte Carlo expression matrices from the full MDN predictive distribution and aggregating across draws. The CLI flag `--montecarlo_draws` controls the number of draws; the default is 100.
+- Hallmark and shortlist point scores are computed once from the predictive mean surface. Monte Carlo expression draws are used only to write q5/q95 90% score intervals around those point scores. PAM50 classification uses the predictive mean surface only.
 - The shortlist workflow uses the `reference/gsva_genesets_shortlist.gmt` gene sets, but the scoring algorithm in this repo is ssGSEA rather than a separate GSVA implementation.
-- Adjusted limma workflows now use those same Monte Carlo expression draws rather than inverse-variance weights. The saved uncertainty-adjusted limma tables use Rubin-style pooling for `logFC`, `standard_error`, `t`, `P.Value`, and `adj.P.Val`, and report pooled 95% confidence intervals for `logFC`.
+- Limma workflows use expression means only as the response surface (Proteus predictive mean or RNA-seq truth when available). Predicted-expression limma fits include `TFx` as a covariate when metadata are available; truth-mode fits can run without TFx. The shared default output modes are `unweighted`, `weighted_ci90`, `weighted_aor`, and `weighted_var`, where CI-width, `abs(log2(AOR))`, and posterior variance are each mapped into bounded observation weights in `[0.1, 1.0]` via pooled 5th/95th percentile scaling.
+- The shared limma input filter drops genes with any NA in the aligned fit matrix, then requires `log2(CPM+1) > 1.0` in at least 3 samples before fitting.
 - Proteus MDN outputs now expose an activity odds ratio surface `activity_odds_ratio = log2((pi_normal + 1e-6) / (1 - pi_normal + 1e-6))` for every gene-sample prediction surface. Under this convention the normal branch is the active mass and the complement of that mass represents off-state weight.
 - Calibration pools the patient CV OOF predictions from `CRPC-RA` and `SCLC` to derive a shared upper activity threshold where PPV first reaches 0.90 and a shared lower activity threshold where NPV first reaches 0.90.
 - Those shared lower/upper thresholds now drive downstream ambiguity masking in patient validation scatters and IHC analyses, and they define the uncertainty-informed Proteus abstention behavior in `Benchmarking_Patient`.
@@ -234,9 +243,7 @@ Pluvicto survival outputs are exploratory. Cox tables now include proportional-h
 
 ### Calibration
 
-`Validation_PDX` and `Calibration` fit an asymmetric regime-based conformal calibrator on PLCA OOF intervals and evaluate it on holdout PDX samples.
-
-Important caveat: only the calibrated 90% interval is directly produced by the conformal procedure here, because the underlying Proteus interval inputs are q0.05/q0.95. Lower nominal coverage curves are generated by symmetrically rescaling that calibrated 90% interval around the point prediction. This is useful as a width-versus-coverage diagnostic, but it is not equivalent to fitting separate conformal calibrators for each nominal level.
+The `Calibration` section is diagnostics-only. It uses raw Proteus prediction means, raw 90% CIs, the MDN predictive CDF, and AOR surfaces to characterize OOF behavior; no post-hoc interval calibration is fit or applied.
 
 ### Reliability
 
@@ -246,7 +253,7 @@ The post-hoc reliability model is trained on fold-wise OOF features and evaluate
 
 The analysis now standardizes on `genefu::intrinsic.cluster.predict` with the `pam50.scale` model only. Continuous PAM50 score outputs use the genefu centroid-correlation fields (`corr_*`) when available, with subtype probabilities (`proba_*`) retained in the classification tables.
 
-For truth-bearing patient cohorts, PAM50 is computed on both RNA-seq truth and Proteus predictions, then compared through per-subtype score-correlation summaries/scatters and confusion matrices driven by the RNA-seq-derived PAM50 calls. Discovery cohorts still receive predicted PAM50 score/classification outputs even without truth; BC-Ghana additionally compares those predictions against its metadata subtype labels and keeps the uncertainty-adjusted Monte Carlo PAM50 aggregation.
+For truth-bearing patient cohorts, PAM50 is computed on both RNA-seq truth and Proteus predictions, then compared through per-subtype score-correlation summaries/scatters and confusion matrices driven by the RNA-seq-derived PAM50 calls. Discovery cohorts still receive predicted PAM50 score/classification outputs even without truth; BC-Ghana additionally compares those predictions against its metadata subtype labels. `Normal` calls are filtered out because these downstream cohorts are cancer samples.
 
 ## Inputs and Assumptions
 

@@ -12,12 +12,12 @@ Provides:
     - Kernel visualization (grouped Conv1d signals, Conv2d nucleotides,
       ReductionBlock cross-channel filters)
     - PWM / motif analysis from learned nucleotide convolutional filters
-    - Attribution analysis via Captum (IntegratedGradients, GradientShap)
+        - Attribution analysis via SHAP / gradient methods
     - Polarity-impact and summary attribution plots
     - Signal–sequence interaction analysis (fragment-end ↔ nucleotide)
     - ReductionBlock activation analysis (cross-channel interaction)
     - Latent-space visualization (UMAP of z_tumor)
-    - Mixture-component attribution (zero-class probability)
+        - Attribution summaries across complementary gene subsets
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import warnings
+import zlib
 
 import logomaker
 import numpy as np
@@ -36,12 +38,14 @@ import torch.nn.functional as F
 import zarr
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+from scipy.ndimage import gaussian_filter1d
 
 # ---------------------------------------------------------------------------
 # Deferred optional imports — only loaded when the relevant functions are
 # called, so the rest of the module works without them installed.
 # ---------------------------------------------------------------------------
 _captum_available: Optional[bool] = None
+_shap_available: Optional[bool] = None
 _umap_available: Optional[bool] = None
 
 
@@ -77,6 +81,22 @@ def _ensure_umap() -> None:
         ) from exc
 
 
+def _ensure_shap() -> None:
+    """Import SHAP on first use; raise a clear error if unavailable."""
+    global _shap_available
+    if _shap_available is True:
+        return
+    try:
+        import shap  # noqa: F401
+        _shap_available = True
+    except ImportError as exc:
+        _shap_available = False
+        raise ImportError(
+            "shap is required for SHAP attribution analysis.  "
+            "Install with:  pip install shap"
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # Project imports
 # ---------------------------------------------------------------------------
@@ -94,6 +114,7 @@ from models.models import (  # noqa: E402
     get_model_instance,
 )
 from models.model_utils import mixture_mean  # noqa: E402
+from proteus_utils.metrics import pearson_r  # noqa: E402
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -164,6 +185,14 @@ SHAP_CMAP = LinearSegmentedColormap.from_list(
     ],
     N=256,
 )
+
+TARGET_DYNAMIC_GENE_NAMES: List[str] = [
+    'AR',
+    'ASCL1',
+    'KLK3',
+    'NEUROD1',
+    'FOLH1',
+]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -269,6 +298,8 @@ def load_interpretation_data(
 
     The *max_genes* budget is distributed evenly across stores so that
     every sample contributes proportionally without exceeding memory.
+    Within each store, genes are selected by a deterministic random subset
+    rather than taking the first rows only.
     With 130 BTS stores and the default of 200,000 genes, each store
     contributes ~1,538 genes (≈20 GB RAM total).
 
@@ -324,29 +355,36 @@ def load_interpretation_data(
         store = zarr.open(zpath, mode='r')
         flat = store['flat'] if 'flat' in store else store
 
-        n_genes = min(int(flat['TSS_signals'].shape[0]), genes_per_store)
+        store_gene_count = int(flat['TSS_signals'].shape[0])
+        n_genes = min(store_gene_count, genes_per_store)
+        store_seed = zlib.crc32(str(zpath).encode('utf-8')) & 0xFFFFFFFF
+        store_rng = np.random.default_rng(store_seed)
+        gene_indices = np.sort(
+            store_rng.choice(store_gene_count, size=n_genes, replace=False)
+        )
 
-        all_arrays['TSS_signals'].append(flat['TSS_signals'][:n_genes].astype(np.float32))
-        all_arrays['TSS_nucleotides'].append(flat['TSS_nucleotides'][:n_genes].astype(np.float32))
+        all_arrays['TSS_signals'].append(flat['TSS_signals'][gene_indices].astype(np.float32))
+        all_arrays['TSS_nucleotides'].append(flat['TSS_nucleotides'][gene_indices].astype(np.float32))
         # Backward-compatible: old Zarr stores have 17 TSS features; use first 11.
-        tss_feat = flat['TSS_features'][:n_genes].astype(np.float32)
+        tss_feat = flat['TSS_features'][gene_indices].astype(np.float32)
         all_arrays['TSS_features'].append(tss_feat[:, :11])
-        all_arrays['GB_features'].append(flat['GB_features'][:n_genes].astype(np.float32))
-        all_arrays['ref_scalars'].append(flat['ref_scalars'][:n_genes].astype(np.float32))
-        all_arrays['TFX_label'].append(flat['TFX_label'][:n_genes].astype(np.float32))
+        all_arrays['GB_features'].append(flat['GB_features'][gene_indices].astype(np.float32))
+        all_arrays['ref_scalars'].append(flat['ref_scalars'][gene_indices].astype(np.float32))
+        all_arrays['TFX_label'].append(flat['TFX_label'][gene_indices].astype(np.float32))
 
         if 'tumor_exp' in flat:
-            all_arrays['tumor_exp'].append(flat['tumor_exp'][:n_genes].astype(np.float32))
+            all_arrays['tumor_exp'].append(flat['tumor_exp'][gene_indices].astype(np.float32))
         else:
             all_arrays['tumor_exp'].append(np.full(n_genes, np.nan, dtype=np.float32))
         if 'background_exp' in flat:
-            all_arrays['background_exp'].append(flat['background_exp'][:n_genes].astype(np.float32))
+            all_arrays['background_exp'].append(flat['background_exp'][gene_indices].astype(np.float32))
         else:
             all_arrays['background_exp'].append(np.full(n_genes, np.nan, dtype=np.float32))
 
         # Gene names
         if 'gene_names' in store:
-            names = [str(g) for g in store['gene_names'][:n_genes]]
+            gene_names_arr = store['gene_names'][gene_indices]
+            names = [str(g) for g in gene_names_arr]
         else:
             names = [f'gene_{i}' for i in range(n_genes)]
         all_gene_names.extend(names)
@@ -424,6 +462,46 @@ def subsample(
     return out
 
 
+def subsample_disjoint_pair(
+    data: Dict[str, np.ndarray],
+    background_size: int,
+    test_size: int,
+    *,
+    seed: int = 200,
+    restriction: str = 'all_genes',
+    min_depth: float = 10.0,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    """Return disjoint background/test subsamples from a shared valid pool."""
+    rng = np.random.default_rng(seed)
+
+    depth_col = data['TSS_features'][:, 10]
+    log_min = np.log1p(min_depth) if min_depth > 0 else -np.inf
+    tumor_exp = data['tumor_exp']
+
+    if restriction == 'active_genes':
+        valid = np.where((depth_col > log_min) & (tumor_exp >= 2.0))[0]
+    elif restriction == 'inactive_genes':
+        valid = np.where((depth_col > log_min) & (tumor_exp < 2.0))[0]
+    else:
+        valid = np.where(depth_col > log_min)[0]
+
+    if background_size + test_size > len(valid):
+        print(
+            f'Warning: requested disjoint background/test sizes '
+            f'({background_size}+{test_size}) exceed valid genes ({len(valid)}). '
+            'Capping to the available pool.'
+        )
+
+    n_background = min(int(background_size), len(valid))
+    remaining = len(valid) - n_background
+    n_test = min(int(test_size), remaining)
+
+    permuted = rng.permutation(valid)
+    background_indices = np.sort(permuted[:n_background])
+    test_indices = np.sort(permuted[n_background:n_background + n_test])
+    return _slice_data_dict(data, background_indices), _slice_data_dict(data, test_indices)
+
+
 def save_npz(data: Dict[str, np.ndarray], filepath: str) -> None:
     """Persist interpretation data to a compressed ``.npz`` file."""
     import time as _time
@@ -485,7 +563,7 @@ def _data_to_tensors(
     data: Dict[str, np.ndarray],
     device: torch.device,
 ) -> Tuple[torch.Tensor, ...]:
-    """Convert a numpy data dict to the 5-tensor tuple expected by Captum.
+    """Convert a numpy data dict to the 5-tensor tuple used by attribution engines.
 
     Returns:
         ``(TSS_signals, TSS_nucleotides, TSS_features, GB_features, ref_scalars)``
@@ -500,7 +578,7 @@ def _data_to_tensors(
 
 
 def _tensors_to_feature_dict(tensors: Tuple[torch.Tensor, ...]) -> Dict[str, torch.Tensor]:
-    """Build the feature dict that BioDVN.forward expects from a Captum tuple."""
+    """Build the feature dict that BioDVN.forward expects from an attribution tuple."""
     return {
         'TSS_signals': tensors[0],
         'TSS_nucleotides': tensors[1],
@@ -511,13 +589,13 @@ def _tensors_to_feature_dict(tensors: Tuple[torch.Tensor, ...]) -> Dict[str, tor
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#         CAPTUM MODEL WRAPPER  (dict inputs → scalar output)
+#         ATTRIBUTION MODEL WRAPPER  (dict inputs → scalar output)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _TumorMeanWrapper(nn.Module):
-    """Thin wrapper around :class:`BioDVN` for Captum compatibility.
+    """Thin wrapper around :class:`BioDVN` for attribution compatibility.
 
-    Captum attribution methods require models that accept positional
+    Attribution libraries used here expect models that accept positional
     tensor arguments and return a single scalar output per sample.
     This wrapper:
 
@@ -551,17 +629,8 @@ class _TumorMeanWrapper(nn.Module):
         return predictions['tumor_exp'].squeeze(-1)  # (batch,)
 
 
-class _ZeroComponentWrapper(nn.Module):
-    """Wrapper that returns the zero-class mixture probability.
-
-    Instead of returning the point estimate, this returns the model's
-    predicted probability of zero expression — specifically ``exp(log_pi[:, 0])``,
-    the hurdle/zero-component weight from the tumor MDN.
-    """
-
-    def __init__(self, model: nn.Module) -> None:
-        super().__init__()
-        self.model = model
+class _TumorMeanColumnWrapper(_TumorMeanWrapper):
+    """Return tumor predictions with an explicit singleton output dimension."""
 
     def forward(
         self,
@@ -571,15 +640,13 @@ class _ZeroComponentWrapper(nn.Module):
         gb_features: torch.Tensor,
         ref_scalars: torch.Tensor,
     ) -> torch.Tensor:
-        features = {
-            'TSS_signals': tss_signals,
-            'TSS_nucleotides': tss_nucleotides,
-            'TSS_features': tss_features,
-            'GB_features': gb_features,
-            'ref_scalars': ref_scalars,
-        }
-        predictions, _ = self.model(features, return_internal_loss=False)
-        return torch.exp(predictions['tumor_mdn']['log_pi'][:, 0])  # (batch,)
+        return super().forward(
+            tss_signals,
+            tss_nucleotides,
+            tss_features,
+            gb_features,
+            ref_scalars,
+        ).unsqueeze(-1)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1007,30 +1074,63 @@ def kernel_visualization(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#                  ATTRIBUTION ANALYSIS (CAPTUM)
+#                  ATTRIBUTION ANALYSIS
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _coerce_attribution_batch(batch_attr: Any) -> List[np.ndarray]:
+    """Normalise attribution outputs from SHAP/Captum into a list of arrays."""
+    if isinstance(batch_attr, torch.Tensor):
+        return [batch_attr.detach().cpu().numpy()]
+    if isinstance(batch_attr, np.ndarray):
+        return [np.asarray(batch_attr)]
+    if isinstance(batch_attr, (list, tuple)):
+        if batch_attr and isinstance(batch_attr[0], (list, tuple)):
+            if len(batch_attr) != 1:
+                raise ValueError(
+                    'Expected a single-output attribution result, got '
+                    f'{len(batch_attr)} outputs.'
+                )
+            batch_attr = batch_attr[0]
+        coerced: List[np.ndarray] = []
+        for item in batch_attr:
+            if isinstance(item, torch.Tensor):
+                coerced.append(item.detach().cpu().numpy())
+            else:
+                coerced.append(np.asarray(item))
+        return coerced
+    raise TypeError(f'Unsupported attribution batch type: {type(batch_attr)!r}')
+
+
+def _canonicalize_attribution_method(method: str) -> str:
+    """Map user-facing method names onto internal attribution backends."""
+    if method in ('shap', 'deep_shap'):
+        return 'shap'
+    return method
 
 def _run_attribution(
     model: BioDVN,
     test_tensors: Tuple[torch.Tensor, ...],
     baseline_tensors: Tuple[torch.Tensor, ...],
-    method: str = 'integrated_gradients',
+    method: str = 'shap',
     n_steps: int = 50,
     batch_size: int = 32,
+    seed: int = 200,
     wrapper_cls: type = _TumorMeanWrapper,
 ) -> List[np.ndarray]:
-    """Run Captum attribution and return per-input-group numpy arrays.
+    """Run attribution and return per-input-group numpy arrays.
 
     Args:
         model: Trained BioDVN in eval mode.
         test_tensors: 5-tuple of test input tensors.
         baseline_tensors: 5-tuple of baseline (background) tensors.
-        method: ``'integrated_gradients'`` or ``'gradient_shap'``.
+        method: ``'shap'``/``'deep_shap'``, ``'integrated_gradients'``, or
+            ``'gradient_shap'``.
         n_steps: Number of interpolation steps (IntegratedGradients) or
-            samples (GradientShap).
+            samples (SHAP expected gradients / GradientShap).
         batch_size: Number of test genes per outer loop iteration.
             Each batch is internally expanded by *n_steps* interpolation
             points, so VRAM usage scales as ``batch_size × n_steps``.
+        seed: Random seed for stochastic attribution engines.
         wrapper_cls: Wrapper class to use (default: _TumorMeanWrapper).
             Must accept a model and return a scalar per sample.
 
@@ -1038,14 +1138,31 @@ def _run_attribution(
         List of 5 numpy arrays (one per input group) with the same shape as
         the corresponding test tensors.
     """
-    _ensure_captum()
-    from captum.attr import IntegratedGradients, GradientShap
+    method = _canonicalize_attribution_method(method)
 
     device = next(model.parameters()).device
-    wrapper = wrapper_cls(model).to(device)
+    if method == 'shap':
+        _ensure_shap()
+        import shap
+        wrapper = _TumorMeanColumnWrapper(model).to(device)
+    else:
+        _ensure_captum()
+        from captum.attr import IntegratedGradients, GradientShap
+        wrapper = wrapper_cls(model).to(device)
     wrapper.eval()
 
-    if method == 'integrated_gradients':
+    if method == 'shap':
+        background_pool_size = min(128, baseline_tensors[0].shape[0])
+        baseline_summary = [
+            tensor[:background_pool_size].to(device)
+            for tensor in baseline_tensors
+        ]
+        attr_method = shap.GradientExplainer(wrapper, baseline_summary)
+        print(
+            f'  SHAP expected-gradients background pool capped at {background_pool_size:,} genes '
+            'for GPU stability'
+        )
+    elif method == 'integrated_gradients':
         attr_method = IntegratedGradients(wrapper)
         baseline_summary = tuple(
             tensor.mean(dim=0, keepdim=True).to(device)
@@ -1072,7 +1189,13 @@ def _run_attribution(
         end = min(start + batch_size, n_test)
         batch_inputs = tuple(t[start:end].to(device) for t in test_tensors)
 
-        if method == 'integrated_gradients':
+        if method == 'shap':
+            batch_attr = attr_method.shap_values(
+                list(batch_inputs),
+                nsamples=n_steps,
+                rseed=seed + start,
+            )
+        elif method == 'integrated_gradients':
             baselines = tuple(
                 baseline.expand_as(batch_input)
                 for baseline, batch_input in zip(baseline_summary, batch_inputs)
@@ -1086,7 +1209,24 @@ def _run_attribution(
                 batch_inputs, baselines=baseline_summary, n_samples=n_steps,
             )
 
-        batch_np = [a.detach().cpu().numpy() for a in batch_attr]
+        batch_np = _coerce_attribution_batch(batch_attr)
+        expected_shapes = [tuple(batch_input.shape) for batch_input in batch_inputs]
+        if len(batch_np) != len(expected_shapes):
+            raise ValueError(
+                'Attribution engine returned the wrong number of input groups: '
+                f'{len(batch_np)} vs {len(expected_shapes)}'
+            )
+        normalised_batch: List[np.ndarray] = []
+        for arr, expected_shape in zip(batch_np, expected_shapes):
+            if arr.shape == expected_shape + (1,):
+                arr = np.squeeze(arr, axis=-1)
+            if tuple(arr.shape) != expected_shape:
+                raise ValueError(
+                    'Attribution shape mismatch for input group: '
+                    f'got {tuple(arr.shape)}, expected {expected_shape}'
+                )
+            normalised_batch.append(arr)
+        batch_np = normalised_batch
 
         if attr_accum is None:
             attr_accum = batch_np
@@ -1156,6 +1296,66 @@ def _mean_group_attribution_per_gene(attributions: List[np.ndarray]) -> Dict[str
         'GB Scalars': np.abs(attributions[3]).mean(axis=1),
         'Ref Scalars': np.abs(attributions[4]).mean(axis=1),
     }
+
+
+def _signed_group_contributions(attributions: List[np.ndarray]) -> Dict[str, np.ndarray]:
+    """Return signed per-gene attribution totals for each input group."""
+    return {
+        'Signals': attributions[0][:, :, :8].sum(axis=(1, 2)),
+        'Sequence': attributions[1].sum(axis=(1, 2)),
+        'TSS Scalars': attributions[2].sum(axis=1),
+        'GB Scalars': attributions[3].sum(axis=1),
+        'Ref Scalars': attributions[4].sum(axis=1),
+    }
+
+
+def _signed_channel_contributions(attributions: List[np.ndarray]) -> Tuple[List[str], np.ndarray]:
+    """Return signed per-gene contributions for signal channels and sequence."""
+    signal_vals = attributions[0][:, :, :8].sum(axis=1)
+    sequence_vals = attributions[1].sum(axis=(1, 2))[:, np.newaxis]
+    return (
+        BIOLOGICAL_SIGNAL_NAMES + ['Reference Sequence'],
+        np.concatenate([signal_vals, sequence_vals], axis=1),
+    )
+
+
+def _signed_scalar_contributions(attributions: List[np.ndarray]) -> Tuple[List[str], np.ndarray]:
+    """Return signed per-gene contributions for all scalar features."""
+    names = (
+        [f'TSS: {name}' for name in TSS_FEATURE_NAMES]
+        + [f'GB: {name}' for name in GB_FEATURE_NAMES]
+        + [f'Ref: {name}' for name in REF_SCALAR_NAMES]
+    )
+    values = np.concatenate([attributions[2], attributions[3], attributions[4]], axis=1)
+    return names, values
+
+
+def _weighted_mean(array: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Return the weighted mean over the leading axis."""
+    weights = np.asarray(weights, dtype=np.float64)
+    if array.shape[0] != weights.shape[0]:
+        raise ValueError(
+            'Array and weight lengths must match on axis 0: '
+            f'{array.shape[0]} vs {weights.shape[0]}'
+        )
+    weight_sum = float(weights.sum())
+    if weight_sum <= 0:
+        raise ValueError('weights must sum to a positive value')
+    reshape = (weights.shape[0],) + (1,) * (array.ndim - 1)
+    return (array * weights.reshape(reshape)).sum(axis=0) / weight_sum
+
+
+def _expression_state_label(value: float) -> str:
+    """Map an expression value to a coarse off/low/mid/high label."""
+    if not np.isfinite(value):
+        return 'nan'
+    if value < 1.0:
+        return 'off'
+    if value < 3.0:
+        return 'low'
+    if value < 6.0:
+        return 'mid'
+    return 'high'
 
 
 def _top_spaced_positions(profile: np.ndarray, top_k: int, spacing: int) -> List[int]:
@@ -1278,6 +1478,78 @@ def plot_signal_polarity(
     seq_len = sig_attr.shape[1]
     impact_polarity = np.zeros((n_channels, seq_len))
 
+    def _plot_polarity_heatmaps(
+        impact_matrix: np.ndarray,
+        title_suffix: str,
+        file_suffix: str,
+    ) -> None:
+        fig, axs = plt.subplots(n_channels, 1,
+                                figsize=(12, 0.7 * n_channels),
+                                constrained_layout=True)
+        norm = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
+        for ch in range(n_channels):
+            im = axs[ch].imshow(
+                impact_matrix[ch:ch + 1], cmap=CUSTOM_CMAP,
+                aspect='auto', interpolation='nearest', norm=norm,
+            )
+            axs[ch].set_yticks([])
+            axs[ch].set_ylabel(
+                BIOLOGICAL_SIGNAL_NAMES[ch], rotation=0,
+                labelpad=10, ha='right', fontsize=7,
+            )
+            if ch < n_channels - 1:
+                axs[ch].set_xticks([])
+            else:
+                ticks = np.linspace(0, seq_len - 1, 9)
+                axs[ch].set_xticks(ticks)
+                axs[ch].set_xticklabels(
+                    [f'{int(x)}' for x in np.linspace(-1000, 1000, 9)])
+
+        fig.suptitle(
+            f'Attribution Polarity-Impact (Signals{title_suffix})',
+            fontsize=13,
+        )
+        fig.colorbar(im, ax=axs.ravel().tolist(), label='Direction & impact')
+        _save_or_show(
+            fig,
+            folder_path,
+            f'TSS_signal_polarity_impact{file_suffix}.png',
+        )
+
+        subset_indices = [0, 3, 6, 1]  # depth, nucleosome, diversity, coverage
+        n_sub = len(subset_indices)
+        fig2, axs2 = plt.subplots(n_sub, 1,
+                                  figsize=(12, 0.7 * n_sub),
+                                  constrained_layout=True)
+        for row, ch in enumerate(subset_indices):
+            im2 = axs2[row].imshow(
+                impact_matrix[ch:ch + 1], cmap=CUSTOM_CMAP,
+                aspect='auto', interpolation='nearest', norm=norm,
+            )
+            axs2[row].set_yticks([])
+            axs2[row].set_ylabel(
+                BIOLOGICAL_SIGNAL_NAMES[ch], rotation=0,
+                labelpad=10, ha='right', fontsize=7,
+            )
+            if row < n_sub - 1:
+                axs2[row].set_xticks([])
+            else:
+                ticks = np.linspace(0, seq_len - 1, 9)
+                axs2[row].set_xticks(ticks)
+                axs2[row].set_xticklabels(
+                    [f'{int(x)}' for x in np.linspace(-1000, 1000, 9)])
+
+        fig2.suptitle(
+            f'Attribution Polarity-Impact (Key Signals{title_suffix})',
+            fontsize=13,
+        )
+        fig2.colorbar(im2, ax=axs2.ravel().tolist(), label='Direction & impact')
+        _save_or_show(
+            fig2,
+            folder_path,
+            f'TSS_signal_polarity_impact_subset{file_suffix}.png',
+        )
+
     for ch in range(n_channels):
         attr_ch = sig_attr[:, :, ch]   # (N, 2000)
         vals_ch = sig_vals[:, :, ch]   # (N, 2000)
@@ -1305,59 +1577,21 @@ def plot_signal_polarity(
 
         impact_polarity[ch] = impact
 
-    fig, axs = plt.subplots(n_channels, 1,
-                            figsize=(12, 0.7 * n_channels),
-                            constrained_layout=True)
-    norm = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
-    for ch in range(n_channels):
-        im = axs[ch].imshow(
-            impact_polarity[ch:ch + 1], cmap=CUSTOM_CMAP,
-            aspect='auto', interpolation='nearest', norm=norm,
-        )
-        axs[ch].set_yticks([])
-        axs[ch].set_ylabel(
-            BIOLOGICAL_SIGNAL_NAMES[ch], rotation=0,
-            labelpad=10, ha='right', fontsize=7,
-        )
-        if ch < n_channels - 1:
-            axs[ch].set_xticks([])
-        else:
-            ticks = np.linspace(0, seq_len - 1, 9)
-            axs[ch].set_xticks(ticks)
-            axs[ch].set_xticklabels(
-                [f'{int(x)}' for x in np.linspace(-1000, 1000, 9)])
+    smoothed_impact_polarity = gaussian_filter1d(
+        impact_polarity,
+        sigma=4.0,
+        axis=1,
+        mode='reflect',
+    )
+    smoothed_impact_polarity = np.clip(smoothed_impact_polarity, -1.0, 1.0)
 
-    fig.suptitle('Attribution Polarity-Impact (Signals)', fontsize=13)
-    fig.colorbar(im, ax=axs.ravel().tolist(), label='Direction & impact')
-    _save_or_show(fig, folder_path, 'TSS_signal_polarity_impact.png')
-
-    # ── Subset version: curated signal order ──
-    subset_indices = [0, 3, 6, 1]  # depth, nucleosome, diversity, coverage
-    n_sub = len(subset_indices)
-    fig2, axs2 = plt.subplots(n_sub, 1,
-                               figsize=(12, 0.7 * n_sub),
-                               constrained_layout=True)
-    for row, ch in enumerate(subset_indices):
-        im2 = axs2[row].imshow(
-            impact_polarity[ch:ch + 1], cmap=CUSTOM_CMAP,
-            aspect='auto', interpolation='nearest', norm=norm,
-        )
-        axs2[row].set_yticks([])
-        axs2[row].set_ylabel(
-            BIOLOGICAL_SIGNAL_NAMES[ch], rotation=0,
-            labelpad=10, ha='right', fontsize=7,
-        )
-        if row < n_sub - 1:
-            axs2[row].set_xticks([])
-        else:
-            ticks = np.linspace(0, seq_len - 1, 9)
-            axs2[row].set_xticks(ticks)
-            axs2[row].set_xticklabels(
-                [f'{int(x)}' for x in np.linspace(-1000, 1000, 9)])
-
-    fig2.suptitle('Attribution Polarity-Impact (Key Signals)', fontsize=13)
-    fig2.colorbar(im2, ax=axs2.ravel().tolist(), label='Direction & impact')
-    _save_or_show(fig2, folder_path, 'TSS_signal_polarity_impact_subset.png')
+    _plot_polarity_heatmaps(impact_polarity, ' - Raw', '')
+    # Smooth only the final visualization score so raw polarity remains intact.
+    _plot_polarity_heatmaps(
+        smoothed_impact_polarity,
+        ' - Gaussian Smoothed',
+        '_smoothed',
+    )
 
 
 def plot_scalar_summary(
@@ -1394,10 +1628,15 @@ def plot_scalar_summary(
     # Bottom-to-top: pn (least→most), fl (least→most), depth
     shared_11_order = np.array(_pn_sorted + _fl_sorted + _depth_idx)
 
-    # Shared x-axis limits for TSS and GB beeswarms (use the wider GB range)
+    # Shared x-axis limits for TSS and GB beeswarms.
+    # Keep them symmetric and only as wide as needed to include all points.
     gb_attr = attributions[3]
     tss_attr = attributions[2]
-    _xmax = max(np.abs(gb_attr).max(), np.abs(tss_attr).max()) * 1.05
+    _xmax = max(np.abs(gb_attr).max(), np.abs(tss_attr).max())
+    if _xmax <= 0:
+        _xmax = 1e-6
+    else:
+        _xmax = np.nextafter(_xmax, np.inf)
     shared_xlim = (-_xmax, _xmax)
 
     for group_name, attr_vals, feat_vals, feat_names in groups:
@@ -1434,7 +1673,7 @@ def plot_scalar_summary(
         )
         norm = TwoSlopeNorm(vmin=-vlim, vcenter=0, vmax=vlim)
 
-        fig, ax = plt.subplots(figsize=(8, max(3, 0.5 * n_features)),
+        fig, ax = plt.subplots(figsize=(6, max(3, 0.5 * n_features)),
                                constrained_layout=True)
         rng = np.random.default_rng(42)
         sc = None  # for colorbar
@@ -1458,7 +1697,7 @@ def plot_scalar_summary(
 
             sc = ax.scatter(vals[perm], y[perm],
                             c=feat[perm], cmap=SHAP_CMAP, norm=norm,
-                            s=2, alpha=0.5, edgecolors='none',
+                            s=8, alpha=0.5, edgecolors='none',
                             rasterized=True)
 
         ax.set_yticks(range(n_features))
@@ -1560,6 +1799,1136 @@ def plot_scalar_bars(
     ax2.set_xlabel('Total Mean |Attribution| — Log₂(CPM+1)', fontsize=9)
     ax2.set_title('Input Group Importance', fontsize=12)
     _save_or_show(fig2, folder_path, 'group_importance_summary.png')
+
+
+def local_prediction_decision_analysis(
+    attributions: List[np.ndarray],
+    data: Dict[str, np.ndarray],
+    test_predictions: np.ndarray,
+    reference_output: float,
+    folder_path: Optional[str] = None,
+    *,
+    method: str,
+) -> None:
+    """Summarize representative local prediction decisions for individual rows."""
+    local_folder = None
+    if folder_path is not None:
+        local_folder = os.path.join(folder_path, 'local_prediction_decisions')
+        os.makedirs(local_folder, exist_ok=True)
+
+    truth = np.asarray(data['tumor_exp'], dtype=np.float32)
+    preds = np.asarray(test_predictions, dtype=np.float32)
+    residuals = preds - truth
+    finite = np.isfinite(truth) & np.isfinite(preds)
+    if not finite.any():
+        return
+
+    case_specs = [
+        ('off_correct', finite & (preds < 1.0) & (truth < 1.0), 'min_abs_resid'),
+        ('low_correct', finite & (preds >= 1.0) & (preds < 3.0) & (truth >= 1.0) & (truth < 3.0), 'min_abs_resid'),
+        ('mid_correct', finite & (preds >= 3.0) & (preds < 6.0) & (truth >= 3.0) & (truth < 6.0), 'min_abs_resid'),
+        ('high_correct', finite & (preds >= 6.0) & (truth >= 6.0), 'min_abs_resid'),
+        ('over_predicted', finite & (residuals > 0), 'max_resid'),
+        ('under_predicted', finite & (residuals < 0), 'min_resid'),
+        ('off_to_on', finite & (preds >= 3.0) & (truth < 1.0), 'max_abs_resid'),
+        ('on_to_off', finite & (preds < 1.0) & (truth >= 3.0), 'max_abs_resid'),
+    ]
+
+    used_indices: set[int] = set()
+    selected_rows: List[Dict[str, Any]] = []
+
+    def _choose_index(indices: np.ndarray, strategy: str) -> Optional[int]:
+        if indices.size == 0:
+            return None
+        if strategy == 'min_abs_resid':
+            ranked = indices[np.argsort(np.abs(residuals[indices]))]
+        elif strategy == 'max_resid':
+            ranked = indices[np.argsort(-residuals[indices])]
+        elif strategy == 'min_resid':
+            ranked = indices[np.argsort(residuals[indices])]
+        elif strategy == 'max_abs_resid':
+            ranked = indices[np.argsort(-np.abs(residuals[indices]))]
+        else:
+            raise ValueError(f'Unknown case selection strategy: {strategy}')
+        for idx in ranked:
+            idx_int = int(idx)
+            if idx_int not in used_indices:
+                return idx_int
+        return int(ranked[0])
+
+    for case_name, mask, strategy in case_specs:
+        chosen = _choose_index(np.flatnonzero(mask), strategy)
+        if chosen is None:
+            continue
+        used_indices.add(chosen)
+        selected_rows.append({
+            'case_name': case_name,
+            'row_index': chosen,
+            'sample_name': str(data['sample_names'][chosen]),
+            'gene_name': str(data['gene_names'][chosen]),
+            'cohort_name': str(data['cohort_names'][chosen]),
+            'truth': float(truth[chosen]),
+            'prediction': float(preds[chosen]),
+            'residual': float(residuals[chosen]),
+            'pred_state': _expression_state_label(float(preds[chosen])),
+            'truth_state': _expression_state_label(float(truth[chosen])),
+        })
+
+    if not selected_rows:
+        return
+
+    selected_df = pd.DataFrame(selected_rows)
+    if local_folder is not None:
+        selected_df.to_csv(
+            os.path.join(local_folder, 'selected_cases.tsv'),
+            sep='\t',
+            index=False,
+        )
+
+    group_contribs = _signed_group_contributions(attributions)
+    channel_names, channel_contribs = _signed_channel_contributions(attributions)
+    scalar_names, scalar_contribs = _signed_scalar_contributions(attributions)
+    group_names = list(group_contribs.keys())
+
+    overview_rows: List[np.ndarray] = []
+    overview_labels: List[str] = []
+
+    for row in selected_rows:
+        idx = int(row['row_index'])
+        group_vals = np.array([group_contribs[name][idx] for name in group_names], dtype=np.float32)
+        overview_rows.append(group_vals)
+        overview_labels.append(row['case_name'])
+
+        channel_vals = channel_contribs[idx]
+        scalar_vals = scalar_contribs[idx]
+        top_scalar_idx = np.argsort(np.abs(scalar_vals))[-12:]
+        top_scalar_idx = top_scalar_idx[np.argsort(np.abs(scalar_vals[top_scalar_idx]))]
+        signal_map = attributions[0][idx, :, :8].T
+        vlim = float(np.nanpercentile(np.abs(signal_map), 99))
+        if not np.isfinite(vlim) or vlim <= 0:
+            vlim = 1e-6
+
+        fig = plt.figure(figsize=(14, 10), constrained_layout=True)
+        gs = fig.add_gridspec(2, 2, height_ratios=[1.0, 1.2])
+
+        ax_group = fig.add_subplot(gs[0, 0])
+        ax_group.barh(group_names, group_vals, color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd'])
+        ax_group.axvline(0, color='grey', linewidth=0.7, linestyle='--')
+        ax_group.set_xlabel('Signed contribution to prediction')
+        ax_group.set_title('Input-group contributions', fontsize=11)
+
+        ax_channel = fig.add_subplot(gs[0, 1])
+        ax_channel.barh(channel_names, channel_vals, color='#4c72b0')
+        ax_channel.axvline(0, color='grey', linewidth=0.7, linestyle='--')
+        ax_channel.set_xlabel('Signed contribution to prediction')
+        ax_channel.set_title('Signal / sequence contributions', fontsize=11)
+
+        ax_scalar = fig.add_subplot(gs[1, 0])
+        ax_scalar.barh(
+            [scalar_names[i] for i in top_scalar_idx],
+            scalar_vals[top_scalar_idx],
+            color='#55a868',
+        )
+        ax_scalar.axvline(0, color='grey', linewidth=0.7, linestyle='--')
+        ax_scalar.set_xlabel('Signed contribution to prediction')
+        ax_scalar.set_title('Top scalar feature contributions', fontsize=11)
+
+        ax_signal = fig.add_subplot(gs[1, 1])
+        im = ax_signal.imshow(
+            signal_map,
+            cmap='RdBu_r',
+            aspect='auto',
+            interpolation='nearest',
+            norm=TwoSlopeNorm(vmin=-vlim, vcenter=0.0, vmax=vlim),
+        )
+        ax_signal.set_yticks(range(len(BIOLOGICAL_SIGNAL_NAMES)))
+        ax_signal.set_yticklabels(BIOLOGICAL_SIGNAL_NAMES, fontsize=8)
+        ticks = np.linspace(0, signal_map.shape[1] - 1, 9)
+        ax_signal.set_xticks(ticks)
+        ax_signal.set_xticklabels([f'{int(x)}' for x in np.linspace(-1000, 1000, 9)])
+        ax_signal.set_title('Single-gene TSS signal attribution map', fontsize=11)
+        fig.colorbar(im, ax=ax_signal, pad=0.02, aspect=25)
+
+        total_attr = float(group_vals.sum())
+        fig.suptitle(
+            f"{row['case_name']} | {row['cohort_name']} / {row['sample_name']} / {row['gene_name']}\n"
+            f"truth={row['truth']:.2f}, pred={row['prediction']:.2f}, residual={row['residual']:.2f}, "
+            f"background_mean={reference_output:.2f}, total_attr={total_attr:.2f}, method={method}",
+            fontsize=12,
+        )
+        _save_or_show(fig, local_folder, f"local_decision_{row['case_name']}.png")
+
+    overview = np.vstack(overview_rows)
+    vmax = float(np.nanmax(np.abs(overview)))
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1e-6
+    fig_overview, ax_overview = plt.subplots(
+        figsize=(8, max(4, 0.7 * len(overview_labels))),
+        constrained_layout=True,
+    )
+    im = ax_overview.imshow(
+        overview,
+        cmap='RdBu_r',
+        aspect='auto',
+        interpolation='nearest',
+        norm=TwoSlopeNorm(vmin=-vmax, vcenter=0.0, vmax=vmax),
+    )
+    ax_overview.set_xticks(range(len(group_names)))
+    ax_overview.set_xticklabels(group_names, rotation=30, ha='right')
+    ax_overview.set_yticks(range(len(overview_labels)))
+    ax_overview.set_yticklabels(overview_labels)
+    ax_overview.set_title('Representative local decision cases — group contributions', fontsize=12)
+    fig_overview.colorbar(im, ax=ax_overview, pad=0.02, aspect=30)
+    _save_or_show(fig_overview, local_folder, 'local_decision_case_overview.png')
+
+
+def _non_pht_row_mask(data: Dict[str, np.ndarray]) -> np.ndarray:
+    """Return a mask excluding synthetic PHT rows from dynamic-gene analyses."""
+    sample_names = np.asarray(data.get('sample_names', []), dtype=object)
+    cohort_names = np.asarray(data.get('cohort_names', []), dtype=object)
+    return np.array([
+        not (
+            str(sample).upper().startswith('PHT')
+            or str(cohort).upper().startswith('PHT')
+        )
+        for sample, cohort in zip(sample_names, cohort_names)
+    ], dtype=bool)
+
+
+def _build_dynamic_gene_frame(
+    data: Dict[str, np.ndarray],
+    tumor_pred: np.ndarray,
+    *,
+    min_depth: float = 10.0,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Build row-level and gene-level truth-centered dynamic summaries."""
+    depth_col = np.asarray(data['TSS_features'][:, 10], dtype=np.float32)
+    truth = np.asarray(data['tumor_exp'], dtype=np.float32)
+    pred = np.asarray(tumor_pred, dtype=np.float32)
+    log_min = np.log1p(min_depth) if min_depth > 0 else -np.inf
+    valid_mask = (depth_col > log_min) & np.isfinite(truth) & np.isfinite(pred)
+    analysis_mask = valid_mask & _non_pht_row_mask(data)
+    if not analysis_mask.any():
+        return pd.DataFrame(), pd.DataFrame()
+
+    row_df = pd.DataFrame({
+        'row_index': np.flatnonzero(analysis_mask),
+        'gene_name': np.asarray(data['gene_names'], dtype=object)[analysis_mask],
+        'sample_name': np.asarray(data['sample_names'], dtype=object)[analysis_mask],
+        'cohort_name': np.asarray(data['cohort_names'], dtype=object)[analysis_mask],
+        'truth': truth[analysis_mask],
+        'pred': pred[analysis_mask],
+    })
+    if row_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    summary_rows: List[Dict[str, Any]] = []
+    for gene_name, sub in row_df.groupby('gene_name', sort=False):
+        truth_vals = sub['truth'].to_numpy(dtype=np.float64)
+        pred_vals = sub['pred'].to_numpy(dtype=np.float64)
+        n_stats = int(len(sub))
+        truth_mean = float(np.mean(truth_vals))
+        truth_std = float(np.std(truth_vals, ddof=0))
+        truth_variance = float(np.var(truth_vals, ddof=0))
+        truth_median = float(np.median(truth_vals))
+        pred_median = float(np.median(pred_vals))
+        recoverability = float('nan')
+        if n_stats >= 3:
+            recoverability = pearson_r(
+                truth_vals.astype(np.float32),
+                pred_vals.astype(np.float32),
+            )
+        if not np.isfinite(recoverability):
+            recoverability = 0.0
+        recoverability = max(recoverability, 0.0)
+        summary_rows.append({
+            'gene_name': str(gene_name),
+            'n_stats': n_stats,
+            'truth_mean': truth_mean,
+            'truth_std': truth_std,
+            'truth_variance': truth_variance,
+            'truth_median': truth_median,
+            'pred_median': pred_median,
+            'recoverability': recoverability,
+        })
+
+    gene_summary = pd.DataFrame(summary_rows)
+    if gene_summary.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    gene_summary['weight_raw'] = (
+        gene_summary['truth_variance'] * gene_summary['recoverability']
+    )
+    total_weight = float(gene_summary['weight_raw'].sum())
+    if total_weight > 0:
+        gene_summary['weight_norm'] = gene_summary['weight_raw'] / total_weight
+    else:
+        gene_summary['weight_norm'] = 0.0
+
+    row_df = row_df.merge(gene_summary, on='gene_name', how='left', validate='many_to_one')
+    std_vals = row_df['truth_std'].to_numpy(dtype=np.float64)
+    centered_truth = row_df['truth'].to_numpy(dtype=np.float64) - row_df['truth_mean'].to_numpy(dtype=np.float64)
+    centered_pred = row_df['pred'].to_numpy(dtype=np.float64) - row_df['truth_mean'].to_numpy(dtype=np.float64)
+    z_truth = np.full(len(row_df), np.nan, dtype=np.float64)
+    z_pred = np.full(len(row_df), np.nan, dtype=np.float64)
+    stable = std_vals > 1e-6
+    z_truth[stable] = centered_truth[stable] / std_vals[stable]
+    z_pred[stable] = centered_pred[stable] / std_vals[stable]
+    row_df['truth_centered'] = centered_truth
+    row_df['pred_centered'] = centered_pred
+    row_df['truth_z'] = z_truth
+    row_df['pred_z'] = z_pred
+    row_df['z_residual'] = z_pred - z_truth
+    row_df['abs_truth_z'] = np.abs(z_truth)
+    row_df['abs_pred_z'] = np.abs(z_pred)
+    row_df['sign_agree'] = (z_truth * z_pred) > 0
+    return row_df, gene_summary.sort_values('weight_raw', ascending=False).reset_index(drop=True)
+
+
+def _select_gene_relative_row_sets(
+    gene_rows: pd.DataFrame,
+    *,
+    background_per_gene: int,
+    test_per_direction: int,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Choose same-gene baseline, up, and down rows from truth-based z scores."""
+    work = gene_rows[np.isfinite(gene_rows['truth_z']) & np.isfinite(gene_rows['pred_z'])].copy()
+    if work.empty:
+        return work, work, work
+
+    work['abs_z_residual'] = np.abs(work['z_residual'])
+    work['baseline_score'] = (
+        work['abs_truth_z']
+        + work['abs_pred_z']
+        + 0.5 * work['abs_z_residual']
+    )
+
+    if len(work) <= 1:
+        return work.copy(), work.iloc[0:0].copy(), work.iloc[0:0].copy()
+
+    if len(work) >= 6:
+        min_background_rows = 3
+    elif len(work) >= 3:
+        min_background_rows = 2
+    else:
+        min_background_rows = 1
+    max_test_rows = max(len(work) - min_background_rows, 1)
+    target_test_rows = min(2 * max(int(test_per_direction), 1), max_test_rows)
+    background_count = min(background_per_gene, len(work) - target_test_rows)
+    background_count = max(background_count, min_background_rows)
+    background_count = min(background_count, len(work) - 1)
+
+    bg_rows = work.nsmallest(
+        background_count,
+        ['baseline_score', 'abs_truth_z', 'abs_pred_z'],
+    ).copy()
+    remaining = work.loc[~work['row_index'].isin(bg_rows['row_index'])].copy()
+    if remaining.empty:
+        return bg_rows, remaining, remaining
+
+    def _pick_direction_rows(direction: str) -> pd.DataFrame:
+        same_sign = remaining['sign_agree'].to_numpy(dtype=bool)
+        if direction == 'up':
+            tier_masks = [
+                same_sign & (remaining['truth_z'] >= 0.5) & (remaining['pred_z'] >= 0.5),
+                same_sign & ((remaining['truth_z'] > 0.0) | (remaining['pred_z'] > 0.0)),
+                (remaining['truth_z'] > 0.0) | (remaining['pred_z'] > 0.0),
+            ]
+            sort_cols = ['pred_z', 'truth_z', 'abs_z_residual']
+            ascending = [False, False, True]
+        else:
+            tier_masks = [
+                same_sign & (remaining['truth_z'] <= -0.5) & (remaining['pred_z'] <= -0.5),
+                same_sign & ((remaining['truth_z'] < 0.0) | (remaining['pred_z'] < 0.0)),
+                (remaining['truth_z'] < 0.0) | (remaining['pred_z'] < 0.0),
+            ]
+            sort_cols = ['pred_z', 'truth_z', 'abs_z_residual']
+            ascending = [True, True, True]
+
+        ranked_parts: List[pd.DataFrame] = []
+        used_row_indices: set[int] = set()
+        for tier_mask in tier_masks:
+            tier_rows = remaining.loc[
+                tier_mask & ~remaining['row_index'].isin(list(used_row_indices))
+            ].copy()
+            if tier_rows.empty:
+                continue
+            tier_rows = tier_rows.sort_values(sort_cols, ascending=ascending)
+            ranked_parts.append(tier_rows)
+            used_row_indices.update(tier_rows['row_index'].astype(int).tolist())
+
+        if not ranked_parts:
+            return remaining.iloc[0:0].copy()
+        ranked = pd.concat(ranked_parts, axis=0, ignore_index=True)
+        return ranked.head(test_per_direction).copy()
+
+    up_rows = _pick_direction_rows('up')
+    down_rows = _pick_direction_rows('down')
+
+    return bg_rows.reset_index(drop=True), up_rows.reset_index(drop=True), down_rows.reset_index(drop=True)
+
+
+def _run_same_gene_relative_attribution(
+    model: BioDVN,
+    data: Dict[str, np.ndarray],
+    gene_rows: pd.DataFrame,
+    *,
+    method: str,
+    n_steps: int,
+    batch_size: int,
+    background_per_gene: int,
+    test_per_direction: int,
+) -> Optional[Dict[str, Any]]:
+    """Run same-gene relative attribution around a truth-centered baseline."""
+    bg_rows, up_rows, down_rows = _select_gene_relative_row_sets(
+        gene_rows,
+        background_per_gene=background_per_gene,
+        test_per_direction=test_per_direction,
+    )
+    if bg_rows.empty:
+        return None
+
+    test_parts: List[pd.DataFrame] = []
+    if not up_rows.empty:
+        up_tagged = up_rows.copy()
+        up_tagged['direction'] = 'up'
+        test_parts.append(up_tagged)
+    if not down_rows.empty:
+        down_tagged = down_rows.copy()
+        down_tagged['direction'] = 'down'
+        test_parts.append(down_tagged)
+    if not test_parts:
+        return None
+
+    test_rows = pd.concat(test_parts, axis=0, ignore_index=True)
+    gene_name = str(gene_rows['gene_name'].iloc[0])
+    bg_indices = bg_rows['row_index'].to_numpy(dtype=np.int64)
+    test_indices = test_rows['row_index'].to_numpy(dtype=np.int64)
+    bg_data = _slice_data_dict(data, bg_indices)
+    test_data = _slice_data_dict(data, test_indices)
+    bg_tensors = _data_to_tensors(bg_data, torch.device('cpu'))
+    test_tensors = _data_to_tensors(test_data, torch.device('cpu'))
+    seed = zlib.crc32(gene_name.encode('utf-8')) & 0xFFFFFFFF
+    attributions = _run_attribution(
+        model,
+        test_tensors,
+        bg_tensors,
+        method=method,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        seed=seed,
+    )
+    del bg_tensors, test_tensors, bg_data, test_data
+    torch.cuda.empty_cache()
+    return {
+        'background_rows': bg_rows,
+        'test_rows': test_rows,
+        'attributions': attributions,
+    }
+
+
+def _plot_relative_direction_bars(
+    value_map: Dict[str, np.ndarray],
+    labels: List[str],
+    folder_path: Optional[str],
+    title: str,
+    filename: str,
+) -> None:
+    """Plot side-by-side up/down bar summaries with a shared symmetric scale."""
+    available = [direction for direction in ('up', 'down') if direction in value_map]
+    if not available:
+        return
+    fig, axes = plt.subplots(
+        1,
+        len(available),
+        figsize=(6 * len(available), max(4, 0.3 * len(labels) + 1.5)),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    vmax = max(float(np.max(np.abs(value_map[direction]))) for direction in available)
+    if not np.isfinite(vmax) or vmax <= 0:
+        vmax = 1e-6
+    for ax, direction in zip(axes[0], available):
+        values = value_map[direction]
+        order = np.argsort(values)
+        ax.barh(
+            range(len(labels)),
+            values[order],
+            color='#c44e52' if direction == 'up' else '#4c72b0',
+        )
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels([labels[i] for i in order], fontsize=8)
+        ax.axvline(0, color='grey', linewidth=0.7, linestyle='--')
+        ax.set_xlim(-vmax, vmax)
+        ax.set_title(direction.title(), fontsize=11)
+    fig.suptitle(title, fontsize=12)
+    _save_or_show(fig, folder_path, filename)
+
+
+def _plot_dynamic_gene_weight_overview(
+    gene_summary: pd.DataFrame,
+    folder_path: Optional[str],
+) -> None:
+    """Visualize which genes drive the dynamic-centered analysis weighting."""
+    if gene_summary.empty:
+        return
+
+    top_summary = gene_summary.head(20).iloc[::-1].copy()
+    fig_bar, ax_bar = plt.subplots(
+        figsize=(8, max(5, 0.32 * len(top_summary))),
+        constrained_layout=True,
+    )
+    ax_bar.barh(
+        top_summary['gene_name'],
+        top_summary['weight_raw'],
+        color='#4c72b0',
+    )
+    ax_bar.set_xlabel('Variance x recoverability weight', fontsize=9)
+    ax_bar.set_title('Top dynamic genes by centered-analysis weight', fontsize=12)
+    _save_or_show(fig_bar, folder_path, 'dynamic_gene_weight_top20.png')
+
+    fig_scatter, ax_scatter = plt.subplots(
+        figsize=(6.5, 5.0),
+        constrained_layout=True,
+    )
+    sizes = np.clip(
+        24.0 + 240.0 * gene_summary['weight_norm'].to_numpy(dtype=np.float32),
+        24.0,
+        220.0,
+    )
+    ax_scatter.scatter(
+        gene_summary['recoverability'],
+        gene_summary['truth_variance'],
+        s=sizes,
+        alpha=0.6,
+        c='#c44e52',
+        edgecolors='none',
+    )
+    ax_scatter.set_xlabel('Within-gene recoverability (Pearson r)', fontsize=9)
+    ax_scatter.set_ylabel('Within-gene truth variance', fontsize=9)
+    ax_scatter.set_title('Dynamic gene weighting landscape', fontsize=12)
+    _save_or_show(fig_scatter, folder_path, 'dynamic_gene_weight_scatter.png')
+
+
+def _write_marker_gene_relative_report(
+    gene_name: str,
+    gene_rows: pd.DataFrame,
+    result: Dict[str, Any],
+    folder_path: Optional[str],
+    *,
+    method: str,
+) -> None:
+    """Write same-gene relative attribution outputs for a requested marker gene."""
+    marker_folder = None
+    if folder_path is not None:
+        marker_folder = os.path.join(folder_path, 'same_gene_markers', gene_name)
+        os.makedirs(marker_folder, exist_ok=True)
+
+    all_rows = gene_rows.sort_values('truth_z').copy()
+    if marker_folder is not None:
+        all_rows.to_csv(
+            os.path.join(marker_folder, 'gene_rows.tsv'),
+            sep='\t',
+            index=False,
+        )
+
+    bg_rows = result['background_rows'].copy()
+    bg_rows['selection'] = 'baseline'
+    test_rows = result['test_rows'].copy()
+    test_rows['selection'] = test_rows['direction']
+    selected_rows = pd.concat([bg_rows, test_rows], axis=0, ignore_index=True)
+    if marker_folder is not None:
+        selected_rows.to_csv(
+            os.path.join(marker_folder, 'selected_rows.tsv'),
+            sep='\t',
+            index=False,
+        )
+
+    attributions = result['attributions']
+    direction_values: Dict[str, List[np.ndarray]] = {}
+    for direction in ('up', 'down'):
+        mask = test_rows['direction'] == direction
+        if not mask.any():
+            continue
+        idx = np.flatnonzero(mask.to_numpy(dtype=bool))
+        direction_values[direction] = [attr[idx] for attr in attributions]
+
+    if not direction_values:
+        return
+
+    group_names = ['Signals', 'Sequence', 'TSS Scalars', 'GB Scalars', 'Ref Scalars']
+    group_map: Dict[str, np.ndarray] = {}
+    channel_labels = BIOLOGICAL_SIGNAL_NAMES + ['Reference Sequence']
+    channel_map: Dict[str, np.ndarray] = {}
+    scalar_names = (
+        [f'TSS: {name}' for name in TSS_FEATURE_NAMES]
+        + [f'GB: {name}' for name in GB_FEATURE_NAMES]
+        + [f'Ref: {name}' for name in REF_SCALAR_NAMES]
+    )
+    scalar_map: Dict[str, np.ndarray] = {}
+    signal_profiles: Dict[str, np.ndarray] = {}
+
+    for direction, direction_attrs in direction_values.items():
+        signed_groups = _signed_group_contributions(direction_attrs)
+        group_map[direction] = np.array(
+            [float(np.mean(signed_groups[name])) for name in group_names],
+            dtype=np.float32,
+        )
+        _, signed_channels = _signed_channel_contributions(direction_attrs)
+        channel_map[direction] = signed_channels.mean(axis=0)
+        _, signed_scalars = _signed_scalar_contributions(direction_attrs)
+        scalar_map[direction] = signed_scalars.mean(axis=0)
+        signal_profiles[direction] = direction_attrs[0][:, :, :8].mean(axis=0).T
+
+    _plot_relative_direction_bars(
+        group_map,
+        group_names,
+        marker_folder,
+        f'{gene_name} relative contributions by input group',
+        'relative_group_contributions.png',
+    )
+    _plot_relative_direction_bars(
+        channel_map,
+        channel_labels,
+        marker_folder,
+        f'{gene_name} relative contributions by signal / sequence channel',
+        'relative_signal_channel_contributions.png',
+    )
+
+    scalar_max = np.zeros(len(scalar_names), dtype=np.float32)
+    for direction in scalar_map:
+        scalar_max = np.maximum(scalar_max, np.abs(scalar_map[direction]))
+    top_scalar_idx = np.argsort(scalar_max)[-15:]
+    top_scalar_idx = top_scalar_idx[np.argsort(scalar_max[top_scalar_idx])]
+    scalar_plot_map = {
+        direction: values[top_scalar_idx]
+        for direction, values in scalar_map.items()
+    }
+    _plot_relative_direction_bars(
+        scalar_plot_map,
+        [scalar_names[i] for i in top_scalar_idx],
+        marker_folder,
+        f'{gene_name} relative scalar contributions',
+        'relative_scalar_contributions.png',
+    )
+
+    profile_vmax = max(float(np.nanpercentile(np.abs(signal_profiles[direction]), 99)) for direction in signal_profiles)
+    if not np.isfinite(profile_vmax) or profile_vmax <= 0:
+        profile_vmax = 1e-6
+    fig_profiles, axes_profiles = plt.subplots(
+        len(signal_profiles),
+        1,
+        figsize=(12, 2.2 * len(signal_profiles)),
+        constrained_layout=True,
+        squeeze=False,
+    )
+    for ax, direction in zip(axes_profiles[:, 0], [d for d in ('up', 'down') if d in signal_profiles]):
+        im = ax.imshow(
+            signal_profiles[direction],
+            cmap='RdBu_r',
+            aspect='auto',
+            interpolation='nearest',
+            norm=TwoSlopeNorm(vmin=-profile_vmax, vcenter=0.0, vmax=profile_vmax),
+        )
+        ax.set_yticks(range(len(BIOLOGICAL_SIGNAL_NAMES)))
+        ax.set_yticklabels(BIOLOGICAL_SIGNAL_NAMES, fontsize=8)
+        ticks = np.linspace(0, signal_profiles[direction].shape[1] - 1, 9)
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f'{int(x)}' for x in np.linspace(-1000, 1000, 9)])
+        ax.set_title(f'{gene_name} {direction} relative to same-gene baseline', fontsize=11)
+    fig_profiles.suptitle(
+        f'{gene_name} same-gene relative signal profiles (method={method})',
+        fontsize=12,
+    )
+    fig_profiles.colorbar(im, ax=axes_profiles.ravel().tolist(), pad=0.02, aspect=35)
+    _save_or_show(fig_profiles, marker_folder, 'relative_signal_profiles.png')
+
+    fig_scatter, ax_scatter = plt.subplots(figsize=(5.5, 5.0), constrained_layout=True)
+    ax_scatter.scatter(
+        all_rows['truth_z'],
+        all_rows['pred_z'],
+        s=16,
+        alpha=0.7,
+        c='#4c72b0',
+        edgecolors='none',
+    )
+    ax_scatter.axvline(0, color='grey', linewidth=0.7, linestyle='--')
+    ax_scatter.axhline(0, color='grey', linewidth=0.7, linestyle='--')
+    ax_scatter.set_xlabel('Truth z-score (truth mean/std)')
+    ax_scatter.set_ylabel('Prediction z-score (truth mean/std)')
+    ax_scatter.set_title(f'{gene_name} same-gene dynamic scatter', fontsize=12)
+    _save_or_show(fig_scatter, marker_folder, 'truth_vs_prediction_zscore.png')
+
+
+def _plot_centered_relative_attribution_suite(
+    attributions: List[np.ndarray],
+    data: Dict[str, np.ndarray],
+    selected_meta: pd.DataFrame,
+    folder_path: Optional[str],
+    *,
+    method: str,
+    reference_output: float,
+) -> None:
+    """Emit the main attribution plot suite for centered same-gene relative rows."""
+    suite_folder = None
+    if folder_path is not None:
+        suite_folder = os.path.join(folder_path, 'relative_attribution')
+        os.makedirs(suite_folder, exist_ok=True)
+
+    plot_signal_attributions(attributions, suite_folder)
+    plot_signal_polarity(attributions, data, suite_folder)
+    plot_scalar_summary(attributions, data, suite_folder)
+    plot_scalar_bars(attributions, suite_folder)
+
+    local_prediction_decision_analysis(
+        attributions,
+        data,
+        selected_meta['prediction'].to_numpy(dtype=np.float32),
+        reference_output,
+        suite_folder,
+        method=method,
+    )
+    tfx_input_focus_analysis(attributions, data, suite_folder)
+    depth_input_focus_analysis(attributions, data, suite_folder)
+
+    focus_df = selected_meta.copy()
+    group_scores = _mean_group_attribution_per_gene(attributions)
+    total_mean_abs_attr = np.zeros(len(focus_df), dtype=np.float32)
+    for group_name, group_values in group_scores.items():
+        values = np.asarray(group_values, dtype=np.float32)
+        focus_df[f'{group_name}_mean_abs_attr'] = values
+        total_mean_abs_attr += values
+    focus_df['total_mean_abs_attr'] = total_mean_abs_attr
+
+    if suite_folder is not None:
+        focus_df.to_csv(
+            os.path.join(suite_folder, 'centered_relative_rows.tsv'),
+            sep='\t',
+            index=False,
+        )
+
+    _continuum_input_focus_analysis(
+        sample_df=focus_df,
+        continuum_col='truth_z',
+        continuum_label='Truth z-score (gene-centered)',
+        folder_path=suite_folder,
+        output_stem='truth_z_input_focus',
+        n_bins=8,
+        title_prefix='Centered Truth-Z',
+    )
+    _continuum_input_focus_analysis(
+        sample_df=focus_df,
+        continuum_col='pred_z',
+        continuum_label='Prediction z-score (gene-centered)',
+        folder_path=suite_folder,
+        output_stem='prediction_z_input_focus',
+        n_bins=8,
+        title_prefix='Centered Prediction-Z',
+    )
+    _continuum_input_focus_analysis(
+        sample_df=focus_df,
+        continuum_col='z_residual',
+        continuum_label='Prediction minus truth z-score',
+        folder_path=suite_folder,
+        output_stem='z_residual_input_focus',
+        n_bins=8,
+        title_prefix='Centered Residual',
+    )
+
+    fig_scatter, ax_scatter = plt.subplots(
+        figsize=(6.0, 5.0),
+        constrained_layout=True,
+    )
+    point_sizes = np.clip(
+        18.0 + 420.0 * focus_df['row_weight'].to_numpy(dtype=np.float32),
+        18.0,
+        90.0,
+    )
+    point_colors = np.where(
+        focus_df['direction'].to_numpy(dtype=object) == 'up',
+        '#c44e52',
+        '#4c72b0',
+    )
+    ax_scatter.scatter(
+        focus_df['truth_z'],
+        focus_df['pred_z'],
+        s=point_sizes,
+        c=point_colors,
+        alpha=0.65,
+        edgecolors='none',
+    )
+    ax_scatter.axvline(0.0, color='grey', linewidth=0.7, linestyle='--')
+    ax_scatter.axhline(0.0, color='grey', linewidth=0.7, linestyle='--')
+    ax_scatter.set_xlabel('Truth z-score (gene-centered)', fontsize=9)
+    ax_scatter.set_ylabel('Prediction z-score (gene-centered)', fontsize=9)
+    ax_scatter.set_title('Centered relative rows: truth vs prediction', fontsize=12)
+    _save_or_show(fig_scatter, suite_folder, 'truth_vs_prediction_zscore.png')
+
+
+def dynamic_gene_baseline_analysis(
+    model: BioDVN,
+    data: Dict[str, np.ndarray],
+    tumor_pred: np.ndarray,
+    folder_path: Optional[str] = None,
+    *,
+    method: str,
+    n_steps: int,
+    batch_size: int,
+    min_depth: float = 10.0,
+) -> None:
+    """Analyze within-gene dynamics relative to truth-based same-gene baselines."""
+    method = _canonicalize_attribution_method(method)
+
+    dynamic_folder = None
+    if folder_path is not None:
+        dynamic_folder = os.path.join(folder_path, 'dynamic_gene_centered')
+        os.makedirs(dynamic_folder, exist_ok=True)
+
+    row_df, gene_summary = _build_dynamic_gene_frame(
+        data,
+        tumor_pred,
+        min_depth=min_depth,
+    )
+    if row_df.empty or gene_summary.empty:
+        return
+
+    min_samples_per_gene = 6
+    max_dynamic_genes = 64
+    background_per_gene = 8
+    test_per_direction = 2
+    eligible_summary = gene_summary[
+        (gene_summary['n_stats'] >= min_samples_per_gene)
+        & (gene_summary['truth_std'] > 1e-6)
+        & (gene_summary['weight_raw'] > 0)
+    ].copy()
+    if eligible_summary.empty:
+        print('  [skip] No dynamic genes passed the non-PHT truth-centered eligibility filters')
+        return
+    eligible_summary = eligible_summary.sort_values('weight_raw', ascending=False).reset_index(drop=True)
+    weight_sum = float(eligible_summary['weight_raw'].sum())
+    if weight_sum > 0:
+        eligible_summary['weight_norm'] = eligible_summary['weight_raw'] / weight_sum
+    else:
+        eligible_summary['weight_norm'] = 0.0
+
+    if dynamic_folder is not None:
+        eligible_summary.to_csv(
+            os.path.join(dynamic_folder, 'dynamic_gene_summary.tsv'),
+            sep='\t',
+            index=False,
+        )
+        row_df.to_csv(
+            os.path.join(dynamic_folder, 'dynamic_gene_rows.tsv'),
+            sep='\t',
+            index=False,
+        )
+    print(
+        '  Dynamic centered candidate genes: '
+        f'{len(eligible_summary):,} '
+        f'(top {min(max_dynamic_genes, len(eligible_summary)):,} used for relative attribution)'
+    )
+    _plot_dynamic_gene_weight_overview(eligible_summary, dynamic_folder)
+
+    aggregate_gene_names = eligible_summary['gene_name'].head(max_dynamic_genes).tolist()
+    weight_map = {
+        str(row['gene_name']): float(row['weight_norm'])
+        for _, row in eligible_summary.iterrows()
+    }
+    variance_map = {
+        str(row['gene_name']): float(row['truth_variance'])
+        for _, row in eligible_summary.iterrows()
+    }
+    recoverability_map = {
+        str(row['gene_name']): float(row['recoverability'])
+        for _, row in eligible_summary.iterrows()
+    }
+
+    direction_attr_parts: Dict[str, List[List[np.ndarray]]] = {
+        'up': [[] for _ in range(5)],
+        'down': [[] for _ in range(5)],
+    }
+    direction_weights: Dict[str, List[float]] = {'up': [], 'down': []}
+    selected_rows: List[Dict[str, Any]] = []
+    combined_attr_parts: List[List[np.ndarray]] = [[] for _ in range(5)]
+    selected_row_indices: List[int] = []
+    baseline_predictions: List[float] = []
+    selection_status_rows: List[Dict[str, Any]] = []
+
+    for gene_name in aggregate_gene_names:
+        gene_rows = row_df[row_df['gene_name'] == gene_name].copy()
+        result = _run_same_gene_relative_attribution(
+            model,
+            data,
+            gene_rows,
+            method=method,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            background_per_gene=background_per_gene,
+            test_per_direction=test_per_direction,
+        )
+        if result is None:
+            selection_status_rows.append({
+                'gene_name': str(gene_name),
+                'status': 'insufficient_relative_rows',
+                'n_gene_rows': int(len(gene_rows)),
+                'truth_variance': variance_map[gene_name],
+                'recoverability': recoverability_map[gene_name],
+                'weight_norm': weight_map[gene_name],
+            })
+            continue
+
+        bg_rows = result['background_rows']
+        test_rows = result['test_rows']
+        if test_rows.empty:
+            selection_status_rows.append({
+                'gene_name': str(gene_name),
+                'status': 'empty_test_rows',
+                'n_gene_rows': int(len(gene_rows)),
+                'n_background_rows': int(len(bg_rows)),
+                'truth_variance': variance_map[gene_name],
+                'recoverability': recoverability_map[gene_name],
+                'weight_norm': weight_map[gene_name],
+            })
+            continue
+
+        baseline_predictions.extend(bg_rows['pred'].astype(float).tolist())
+        selection_status_rows.append({
+            'gene_name': str(gene_name),
+            'status': 'ok',
+            'n_gene_rows': int(len(gene_rows)),
+            'n_background_rows': int(len(bg_rows)),
+            'n_test_rows': int(len(test_rows)),
+            'n_up_rows': int((test_rows['direction'] == 'up').sum()),
+            'n_down_rows': int((test_rows['direction'] == 'down').sum()),
+            'truth_variance': variance_map[gene_name],
+            'recoverability': recoverability_map[gene_name],
+            'weight_norm': weight_map[gene_name],
+        })
+
+        row_weight = weight_map[gene_name] / float(len(test_rows))
+        attributions = result['attributions']
+        for local_idx, test_row in enumerate(test_rows.itertuples(index=False)):
+            direction = str(test_row.direction)
+            for attr_idx in range(5):
+                attr_slice = attributions[attr_idx][local_idx:local_idx + 1].copy()
+                direction_attr_parts[direction][attr_idx].append(
+                    attr_slice
+                )
+                combined_attr_parts[attr_idx].append(attr_slice)
+            direction_weights[direction].append(row_weight)
+            selected_row_indices.append(int(test_row.row_index))
+            selected_rows.append({
+                'gene_name': str(gene_name),
+                'row_index': int(test_row.row_index),
+                'sample_name': str(test_row.sample_name),
+                'cohort_name': str(test_row.cohort_name),
+                'truth': float(test_row.truth),
+                'prediction': float(test_row.pred),
+                'truth_mean': float(test_row.truth_mean),
+                'truth_std': float(test_row.truth_std),
+                'truth_variance': variance_map[gene_name],
+                'recoverability': recoverability_map[gene_name],
+                'truth_z': float(test_row.truth_z),
+                'pred_z': float(test_row.pred_z),
+                'z_residual': float(test_row.z_residual),
+                'direction': direction,
+                'row_weight': row_weight,
+            })
+
+        del attributions, result
+        torch.cuda.empty_cache()
+
+    if dynamic_folder is not None and selection_status_rows:
+        pd.DataFrame(selection_status_rows).to_csv(
+            os.path.join(dynamic_folder, 'dynamic_gene_selection_status.tsv'),
+            sep='\t',
+            index=False,
+        )
+
+    if selected_rows:
+        ok_gene_count = sum(1 for row in selection_status_rows if row.get('status') == 'ok')
+        print(
+            '  Dynamic centered relative rows: '
+            f'{len(selected_rows):,} across {ok_gene_count:,} genes'
+        )
+        selected_df = pd.DataFrame(selected_rows)
+        if dynamic_folder is not None:
+            selected_df.to_csv(
+                os.path.join(dynamic_folder, 'dynamic_gene_selected_rows.tsv'),
+                sep='\t',
+                index=False,
+            )
+
+        selected_data = _slice_data_dict(
+            data,
+            np.asarray(selected_row_indices, dtype=np.int64),
+        )
+        combined_attributions = [
+            np.concatenate(parts, axis=0) for parts in combined_attr_parts
+        ]
+        reference_output = float(np.mean(baseline_predictions)) if baseline_predictions else float(selected_df['prediction'].mean())
+        _plot_centered_relative_attribution_suite(
+            combined_attributions,
+            selected_data,
+            selected_df,
+            dynamic_folder,
+            method=method,
+            reference_output=reference_output,
+        )
+
+        direction_stacks: Dict[str, Tuple[List[np.ndarray], np.ndarray]] = {}
+        for direction in ('up', 'down'):
+            if not direction_weights[direction]:
+                continue
+            stacked_attrs = [np.concatenate(parts, axis=0) for parts in direction_attr_parts[direction]]
+            weights = np.asarray(direction_weights[direction], dtype=np.float64)
+            direction_stacks[direction] = (stacked_attrs, weights)
+
+        group_names = ['Signals', 'Sequence', 'TSS Scalars', 'GB Scalars', 'Ref Scalars']
+        channel_labels = BIOLOGICAL_SIGNAL_NAMES + ['Reference Sequence']
+        scalar_names = (
+            [f'TSS: {name}' for name in TSS_FEATURE_NAMES]
+            + [f'GB: {name}' for name in GB_FEATURE_NAMES]
+            + [f'Ref: {name}' for name in REF_SCALAR_NAMES]
+        )
+
+        group_values: Dict[str, np.ndarray] = {}
+        channel_values: Dict[str, np.ndarray] = {}
+        scalar_values: Dict[str, np.ndarray] = {}
+        signal_profiles: Dict[str, np.ndarray] = {}
+
+        for direction, (stacked_attrs, weights) in direction_stacks.items():
+            signed_groups = _signed_group_contributions(stacked_attrs)
+            group_values[direction] = np.array(
+                [np.average(signed_groups[name], weights=weights) for name in group_names],
+                dtype=np.float32,
+            )
+            _, signed_channels = _signed_channel_contributions(stacked_attrs)
+            channel_values[direction] = _weighted_mean(signed_channels, weights)
+            _, signed_scalars = _signed_scalar_contributions(stacked_attrs)
+            scalar_values[direction] = _weighted_mean(signed_scalars, weights)
+            signal_profiles[direction] = _weighted_mean(stacked_attrs[0][:, :, :8], weights).T
+
+        _plot_relative_direction_bars(
+            group_values,
+            group_names,
+            dynamic_folder,
+            'Variance x recoverability weighted centered contributions by input group',
+            'dynamic_group_contributions.png',
+        )
+        _plot_relative_direction_bars(
+            channel_values,
+            channel_labels,
+            dynamic_folder,
+            'Variance x recoverability weighted centered contributions by signal / sequence channel',
+            'dynamic_signal_channel_contributions.png',
+        )
+
+        scalar_max = np.zeros(len(scalar_names), dtype=np.float32)
+        for direction in scalar_values:
+            scalar_max = np.maximum(scalar_max, np.abs(scalar_values[direction]))
+        top_scalar_idx = np.argsort(scalar_max)[-15:]
+        top_scalar_idx = top_scalar_idx[np.argsort(scalar_max[top_scalar_idx])]
+        scalar_plot_values = {
+            direction: values[top_scalar_idx]
+            for direction, values in scalar_values.items()
+        }
+        _plot_relative_direction_bars(
+            scalar_plot_values,
+            [scalar_names[i] for i in top_scalar_idx],
+            dynamic_folder,
+            'Variance x recoverability weighted centered scalar contributions',
+            'dynamic_scalar_contributions.png',
+        )
+
+        available_profiles = [direction for direction in ('up', 'down') if direction in signal_profiles]
+        profile_vmax = max(float(np.nanpercentile(np.abs(signal_profiles[direction]), 99)) for direction in available_profiles)
+        if not np.isfinite(profile_vmax) or profile_vmax <= 0:
+            profile_vmax = 1e-6
+        fig_profiles, axes_profiles = plt.subplots(
+            len(available_profiles),
+            1,
+            figsize=(12, 2.2 * len(available_profiles)),
+            constrained_layout=True,
+            squeeze=False,
+        )
+        for ax, direction in zip(axes_profiles[:, 0], available_profiles):
+            im = ax.imshow(
+                signal_profiles[direction],
+                cmap='RdBu_r',
+                aspect='auto',
+                interpolation='nearest',
+                norm=TwoSlopeNorm(vmin=-profile_vmax, vcenter=0.0, vmax=profile_vmax),
+            )
+            ax.set_yticks(range(len(BIOLOGICAL_SIGNAL_NAMES)))
+            ax.set_yticklabels(BIOLOGICAL_SIGNAL_NAMES, fontsize=8)
+            ticks = np.linspace(0, signal_profiles[direction].shape[1] - 1, 9)
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([f'{int(x)}' for x in np.linspace(-1000, 1000, 9)])
+            ax.set_title(f'{direction.title()} relative to same-gene truth baseline', fontsize=11)
+        fig_profiles.suptitle(
+            f'Dynamic gene centered signal profiles (variance x recoverability weighted, method={method})',
+            fontsize=12,
+        )
+        fig_profiles.colorbar(im, ax=axes_profiles.ravel().tolist(), pad=0.02, aspect=35)
+        _save_or_show(fig_profiles, dynamic_folder, 'dynamic_signal_profiles.png')
+    else:
+        print(
+            '  [skip] No same-gene centered relative rows were selected; '
+            'see dynamic_gene_selection_status.tsv for per-gene diagnostics'
+        )
+
+    marker_summary_rows: List[Dict[str, Any]] = []
+    for gene_name in TARGET_DYNAMIC_GENE_NAMES:
+        gene_rows = row_df[row_df['gene_name'] == gene_name].copy()
+        if gene_rows.empty:
+            marker_summary_rows.append({'gene_name': gene_name, 'status': 'missing'})
+            continue
+        result = _run_same_gene_relative_attribution(
+            model,
+            data,
+            gene_rows,
+            method=method,
+            n_steps=n_steps,
+            batch_size=batch_size,
+            background_per_gene=max(10, background_per_gene),
+            test_per_direction=max(3, test_per_direction),
+        )
+        if result is None:
+            marker_summary_rows.append({'gene_name': gene_name, 'status': 'insufficient_relative_rows'})
+            continue
+        _write_marker_gene_relative_report(
+            gene_name,
+            gene_rows,
+            result,
+            dynamic_folder,
+            method=method,
+        )
+        gene_info = gene_rows.iloc[0]
+        marker_summary_rows.append({
+            'gene_name': gene_name,
+            'status': 'ok',
+            'n_stats': int(gene_info['n_stats']),
+            'truth_mean': float(gene_info['truth_mean']),
+            'truth_std': float(gene_info['truth_std']),
+            'truth_variance': float(gene_info['truth_variance']),
+            'recoverability': float(gene_info['recoverability']),
+            'weight_raw': float(gene_info['weight_raw']),
+        })
+        del result
+        torch.cuda.empty_cache()
+
+    if dynamic_folder is not None and marker_summary_rows:
+        pd.DataFrame(marker_summary_rows).to_csv(
+            os.path.join(dynamic_folder, 'same_gene_marker_summary.tsv'),
+            sep='\t',
+            index=False,
+        )
+    marker_ok_count = sum(1 for row in marker_summary_rows if row.get('status') == 'ok')
+    print(
+        '  Same-gene marker analyses completed: '
+        f'{marker_ok_count:,}/{len(marker_summary_rows):,}'
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2421,12 +3790,12 @@ def latent_space_umap(
     n_samples: int = 10_000,
     seed: int = 200,
 ) -> None:
-    """Generate UMAP plots of the tumor and background latent spaces.
+    """Generate UMAP plots of the tumor latent space.
 
-    Extracts ``z_tumor_mean`` and ``z_background_mean`` via forward hooks
-    on the respective VAE encoders, then projects each to 2D with UMAP.
+    Extracts ``z_tumor_mean`` via a forward hook on the tumor encoder, then
+    projects it to 2D with UMAP.
 
-    For each branch (tumor / background) produces:
+    Produces:
 
     1. Predicted expression (continuous).
     2. Ground-truth expression (from labels).
@@ -2448,9 +3817,7 @@ def latent_space_umap(
     features = _tensors_to_feature_dict(tensors)
 
     z_tumor_mean_parts: List[np.ndarray] = []
-    z_bg_mean_parts: List[np.ndarray] = []
     tumor_exp_parts: List[np.ndarray] = []
-    bg_exp_parts: List[np.ndarray] = []
 
     fwd_batch = 32
     n_total = tensors[0].shape[0]
@@ -2459,39 +3826,26 @@ def latent_space_umap(
         batch_feat = {k: v[start:end] for k, v in features.items()}
 
         z_tumor_chunk: Optional[np.ndarray] = None
-        z_bg_chunk: Optional[np.ndarray] = None
 
         def _tumor_hook(module: nn.Module, inp: Any,
                         out: Tuple[torch.Tensor, torch.Tensor]) -> None:
             nonlocal z_tumor_chunk
             z_tumor_chunk = out[0].detach().cpu().numpy()
 
-        def _bg_hook(module: nn.Module, inp: Any,
-                     out: Tuple[torch.Tensor, torch.Tensor]) -> None:
-            nonlocal z_bg_chunk
-            z_bg_chunk = out[0].detach().cpu().numpy()
-
         h_t = model.tumor_encoder.register_forward_hook(_tumor_hook)
-        h_b = model.background_encoder.register_forward_hook(_bg_hook)
         with torch.no_grad():
             preds, _ = model(batch_feat, return_internal_loss=False)
         h_t.remove()
-        h_b.remove()
 
         z_tumor_mean_parts.append(z_tumor_chunk)
-        z_bg_mean_parts.append(z_bg_chunk)
         tumor_exp_parts.append(preds['tumor_exp'].cpu().numpy().squeeze(-1))
-        bg_exp_parts.append(preds['background_exp'].cpu().numpy().squeeze(-1))
 
     del tensors, features
     torch.cuda.empty_cache()
 
     z_tumor_mean = np.concatenate(z_tumor_mean_parts, axis=0)
-    z_bg_mean = np.concatenate(z_bg_mean_parts, axis=0)
     tumor_pred = np.concatenate(tumor_exp_parts, axis=0)
-    bg_pred = np.concatenate(bg_exp_parts, axis=0)
     tumor_truth = sub['tumor_exp']
-    bg_truth = sub['background_exp']
     sample_names = np.array(sub['sample_names'])
     cohort_names = np.array(sub.get('cohort_names', ['Unknown'] * len(sample_names)))
 
@@ -2510,18 +3864,28 @@ def latent_space_umap(
         for cohort, sample in zip(cohort_names, sample_names)
     ], dtype=np.float32)
 
-    # ── Run UMAP + plots for each branch ──
+    # ── Run UMAP + plots for the tumor branch ──
     for branch, z_latent, pred_arr, truth_arr in [
         ('tumor', z_tumor_mean, tumor_pred, tumor_truth),
-        ('background', z_bg_mean, bg_pred, bg_truth),
     ]:
         branch_label = branch.capitalize()
 
         reducer = umap.UMAP(
-            n_components=2, random_state=seed,
+            n_components=2, random_state=seed, n_jobs=1,
             n_neighbors=30, min_dist=0.3, metric='cosine',
         )
-        embedding = reducer.fit_transform(z_latent)
+        with warnings.catch_warnings():
+            # Seeded UMAP is intentionally deterministic and single-threaded.
+            warnings.filterwarnings(
+                'ignore',
+                message=(
+                    'n_jobs value 1 overridden to 1 by setting random_state. '
+                    'Use no seed for parallelism.'
+                ),
+                category=UserWarning,
+                module='umap\\.umap_',
+            )
+            embedding = reducer.fit_transform(z_latent)
 
         residuals = pred_arr - truth_arr
         abs_error = np.abs(residuals)
@@ -2648,64 +4012,6 @@ def latent_space_umap(
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#           MIXTURE-COMPONENT (ZERO-CLASS) ATTRIBUTION
-# ═══════════════════════════════════════════════════════════════════════════
-
-def zero_component_attribution(
-    model: nn.Module,
-    data: Dict[str, np.ndarray],
-    background_size: int = 4_096,
-    test_size: int = 1_536,
-    method: str = 'integrated_gradients',
-    n_steps: int = 32,
-    batch_size: int = 16,
-    folder_path: Optional[str] = None,
-    seed: int = 200,
-) -> None:
-    """Attribution targeting the zero-component probability.
-
-    Uses :class:`_ZeroComponentWrapper` so that Captum attributes the
-    probability of the hurdle (zero expression) component instead of
-    the point estimate.  Analysis focuses on inactive genes where the
-    zero component dominates.
-    """
-    device = next(model.parameters()).device
-
-    bg_data = subsample(data, sample_size=background_size,
-                        seed=seed, restriction='all_genes')
-    test_data = subsample(data, sample_size=test_size,
-                          seed=seed + 1, restriction='inactive_genes')
-
-    bg_tensors = _data_to_tensors(bg_data, torch.device('cpu'))
-    test_tensors = _data_to_tensors(test_data, torch.device('cpu'))
-
-    print(f'  Zero-component attribution: {test_tensors[0].shape[0]} test genes')
-
-    attributions = _run_attribution(
-        model, test_tensors, bg_tensors,
-        method=method, n_steps=n_steps, batch_size=batch_size,
-        wrapper_cls=_ZeroComponentWrapper,
-    )
-
-    del bg_tensors, test_tensors
-    torch.cuda.empty_cache()
-
-    zero_folder: Optional[str] = None
-    if folder_path is not None:
-        zero_folder = os.path.join(folder_path, 'zero_component')
-        os.makedirs(zero_folder, exist_ok=True)
-
-    print('  Plotting zero-component signal attributions...')
-    plot_signal_attributions(attributions, zero_folder)
-    print('  Plotting zero-component polarity-impact...')
-    plot_signal_polarity(attributions, test_data, zero_folder)
-    print('  Plotting zero-component scalar summaries...')
-    plot_scalar_summary(attributions, test_data, zero_folder)
-    plot_scalar_bars(attributions, zero_folder)
-    print('  Done: zero-component attribution')
-
-
-# ═══════════════════════════════════════════════════════════════════════════
 #                     ATTRIBUTION WRAPPER
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -2714,7 +4020,7 @@ def attribution_analysis(
     data: Dict[str, np.ndarray],
     background_size: int = 4_096,
     test_size: int = 1_536,
-    method: str = 'integrated_gradients',
+    method: str = 'shap',
     n_steps: int = 32,
     batch_size: int = 16,
     save_filepath: Optional[str] = None,
@@ -2723,15 +4029,12 @@ def attribution_analysis(
     run_reduction: bool = True,
     run_umap: bool = True,
 ) -> None:
-    """Run interpretation analyses tied to the finalized BioDVN outputs.
+    """Run the default all-gene interpretation workflow.
 
-    Runs:
-
-    1. Tumor mean attributions on an ``all_genes`` sample.
-    2. Zero-component probability attributions on ``inactive_genes``.
-    3. Optional interaction analyses for joint signal/sequence models.
-
-    After the attribution passes, optionally runs:
+    Runs one tumor-mean attribution analysis with disjoint background and test
+    draws from the full loaded gene pool. After the attribution pass,
+    optionally runs:
+    - Dynamic-gene centered baseline analysis.
     - ReductionBlock activation analysis.
     - Latent-space UMAP visualization.
 
@@ -2740,8 +4043,10 @@ def attribution_analysis(
         data: Full dataset dict from :func:`load_interpretation_data`.
         background_size: Number of genes for the attribution baseline.
         test_size: Number of genes for the test set.
-        method: ``'integrated_gradients'`` or ``'gradient_shap'``.
-        n_steps: Interpolation steps (IG) or samples (GradientShap).
+        method: ``'shap'``/``'deep_shap'``, ``'integrated_gradients'``, or
+            ``'gradient_shap'``.
+        n_steps: Interpolation steps (IG), samples (SHAP expected gradients /
+            GradientShap).
         batch_size: Internal batch size for attribution computation.
         save_filepath: Root directory for output figures.
         seed: Random seed for subsampling.
@@ -2749,31 +4054,62 @@ def attribution_analysis(
         run_reduction: If True, run ReductionBlock activation analysis.
         run_umap: If True, run latent-space UMAP visualization.
     """
-    print('\n=== Attribution analysis: all_genes ===')
+    tumor_pred = _predict_tumor_expression(
+        model,
+        data,
+        batch_size=max(64, batch_size),
+    )
+    print('\n=== Attribution analysis: attribution ===')
 
     folder_path = None
     if save_filepath is not None:
-        folder_path = os.path.join(save_filepath, 'attribution_analysis')
+        folder_path = os.path.join(save_filepath, 'attribution')
         os.makedirs(folder_path, exist_ok=True)
 
-    bg_data = subsample(data, sample_size=background_size,
-                        seed=seed, restriction='all_genes')
-    test_data = subsample(data, sample_size=test_size,
-                          seed=seed + 1, restriction='all_genes')
+    bg_data, test_data = subsample_disjoint_pair(
+        data,
+        background_size=background_size,
+        test_size=test_size,
+        seed=seed,
+        restriction='all_genes',
+    )
 
     bg_tensors = _data_to_tensors(bg_data, torch.device('cpu'))
     test_tensors = _data_to_tensors(test_data, torch.device('cpu'))
 
     print(f'  Background: {bg_tensors[0].shape[0]} genes')
     print(f'  Test: {test_tensors[0].shape[0]} genes')
-    print(f'  Method: {method} (n_steps={n_steps})')
+    print('  Background/test gene sets are disjoint')
+    canonical_method = _canonicalize_attribution_method(method)
+    if canonical_method == 'shap':
+        print('  Method: shap (expected gradients)')
+    else:
+        print(f'  Method: {canonical_method} (n_steps={n_steps})')
+
+    bg_predictions = _predict_tumor_expression(
+        model,
+        bg_data,
+        batch_size=max(64, batch_size),
+    )
+    test_predictions = _predict_tumor_expression(
+        model,
+        test_data,
+        batch_size=max(64, batch_size),
+    )
+    finite_bg = np.isfinite(bg_predictions)
+    reference_output = float(bg_predictions[finite_bg].mean()) if finite_bg.any() else float('nan')
+    print(f'  Background mean prediction: {reference_output:.3f}')
 
     attributions = _run_attribution(
-        model, test_tensors, bg_tensors,
-        method=method, n_steps=n_steps, batch_size=batch_size,
+        model,
+        test_tensors,
+        bg_tensors,
+        method=method,
+        n_steps=n_steps,
+        batch_size=batch_size,
+        seed=seed,
     )
 
-    # Free baseline tensors from GPU
     del bg_tensors, test_tensors
     torch.cuda.empty_cache()
 
@@ -2786,6 +4122,16 @@ def attribution_analysis(
     print('  Plotting scalar summaries...')
     plot_scalar_summary(attributions, test_data, folder_path)
     plot_scalar_bars(attributions, folder_path)
+
+    print('  Explaining representative local decisions...')
+    local_prediction_decision_analysis(
+        attributions,
+        test_data,
+        test_predictions,
+        reference_output,
+        folder_path,
+        method=canonical_method,
+    )
 
     print('  Testing TFX-conditioned input focus...')
     tfx_input_focus_analysis(attributions, test_data, folder_path)
@@ -2814,24 +4160,22 @@ def attribution_analysis(
         print('  [skip] Signal–sequence interaction analysis requires both signal and sequence branches')
 
     del attributions
-    print('  Done: all_genes')
-
-    print('\n=== Attribution analysis: zero_component ===')
-    zero_component_attribution(
-        model,
-        data,
-        background_size=background_size,
-        test_size=test_size,
-        method=method,
-        n_steps=n_steps,
-        batch_size=batch_size,
-        folder_path=folder_path,
-        seed=seed,
-    )
+    print('  Done: attribution')
 
     # ── Analyses that run once ──
 
     analysis_root = save_filepath
+
+    print('\n=== Dynamic gene centered analysis ===')
+    dynamic_gene_baseline_analysis(
+        model,
+        data,
+        tumor_pred,
+        analysis_root,
+        method=method,
+        n_steps=n_steps,
+        batch_size=max(8, batch_size),
+    )
 
     if run_reduction:
         print('\n=== ReductionBlock activation analysis ===')

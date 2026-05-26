@@ -28,7 +28,6 @@ from proteus_utils.metrics import (
     scatter_stats,
 )
 from proteus_utils.data_helpers import (
-    compute_plcav4_2_objective,
     compute_soft_objective,
     weighted_group_mean,
 )
@@ -442,14 +441,6 @@ def _compute_group_summary_metrics(
         if math.isfinite(float(weighted_r_mean)) and math.isfinite(r_std)
         else float('nan')
     )
-
-    robust_objective, crps_log_ratio, crps_smooth_excess = compute_plcav4_2_objective(
-        summary['cohort_tumor_gvw_r_balanced'],
-        summary['cohort_tumor_gvw_crps_balanced'],
-    )
-    summary['cohort_tumor_gvw_v4_2_objective'] = robust_objective
-    summary['cohort_tumor_gvw_v4_2_crps_log_ratio'] = crps_log_ratio
-    summary['cohort_tumor_gvw_v4_2_crps_smooth_excess'] = crps_smooth_excess
 
     source_crps = {
         name: float(group_data['tumor']['gvw_crps'])

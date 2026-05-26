@@ -27,6 +27,7 @@ from .proteus_utils import (
     ProteusMultiSourceBatchDataset,
     ProteusHoldoutValDataset,
     collate_inference,
+    create_single_item_loader,
     create_data_loader,
     create_inference_loader,
     build_loaders_from_splits,
@@ -43,6 +44,8 @@ from .data_helpers import (
     resolve_pht_source, invert_source_groups, collect_pdx_names,
     collect_zarr_paths, assign_source,
     build_source_map_from_tsv, compute_source_variance,
+    get_source_weighted_selection_group_weights,
+    validate_source_weighted_selection_groups,
 )
 
 from .metrics import (
@@ -74,6 +77,7 @@ __all__ = [
     'ProteusMultiSourceBatchDataset',
     'ProteusHoldoutValDataset',
     'collate_inference',
+    'create_single_item_loader',
     'create_data_loader', 'create_inference_loader',
     'build_loaders_from_splits', 'build_multisource_loaders_from_splits',
     'extract_gene_depths',
@@ -90,4 +94,6 @@ __all__ = [
     'resolve_pht_source', 'invert_source_groups', 'collect_pdx_names',
     'collect_zarr_paths', 'assign_source',
     'build_source_map_from_tsv', 'compute_source_variance',
+    'get_source_weighted_selection_group_weights',
+    'validate_source_weighted_selection_groups',
 ]

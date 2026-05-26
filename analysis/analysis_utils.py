@@ -35,6 +35,23 @@ _GENEFU_BRIDGE_CACHE: Optional[Tuple[Any, Any, Any]] = None
 MIN_CORRELATION_N: int = 5
 
 
+def benjamini_hochberg(p_values: pd.Series) -> pd.Series:
+    """Return Benjamini-Hochberg adjusted q-values for a p-value series."""
+    numeric = pd.to_numeric(p_values, errors="coerce")
+    result = pd.Series(np.nan, index=numeric.index, dtype=float)
+    valid = numeric.notna()
+    if not bool(valid.any()):
+        return result
+
+    ordered = numeric.loc[valid].sort_values()
+    n_tests = int(len(ordered))
+    raw = ordered.values * n_tests / np.arange(1, n_tests + 1, dtype=float)
+    adjusted = np.minimum.accumulate(raw[::-1])[::-1]
+    adjusted = np.clip(adjusted, 0.0, 1.0)
+    result.loc[ordered.index] = adjusted
+    return result
+
+
 def _augment_missing_gene_aliases(expr_df: pd.DataFrame) -> pd.DataFrame:
     """Add targeted alias rows only when the requested symbol is absent."""
     if expr_df.empty:
@@ -1767,6 +1784,87 @@ def build_study_var_map() -> Dict[str, float]:
     return compute_gene_variance(build_study_truth_pool())
 
 
+def _build_plca_training_truth_by_source() -> Dict[str, pd.DataFrame]:
+    """Return the direct truth matrices for the four PLCA training sources."""
+    truth_by_source: Dict[str, pd.DataFrame] = {}
+    for cohort in ("CRPC-RA", "SCLC", "PC-PDX", "SCLC-PDX"):
+        truth_wide = load_truth(cohort)
+        if cohort == "PC-PDX":
+            keep = [sample for sample in PC_PDX_STUDY if sample in truth_wide.columns]
+            truth_wide = truth_wide.loc[:, keep]
+        elif cohort == "SCLC-PDX":
+            keep = [sample for sample in SCLC_PDX_STUDY if sample in truth_wide.columns]
+            truth_wide = truth_wide.loc[:, keep]
+        truth_by_source[cohort] = truth_wide
+    return truth_by_source
+
+
+def _compute_truth_dispersion_table(truth_wide: pd.DataFrame) -> pd.DataFrame:
+    """Compute direct per-gene dispersion statistics from a truth matrix."""
+    numeric_truth = truth_wide.apply(pd.to_numeric, errors="coerce")
+    q1 = numeric_truth.quantile(0.25, axis=1)
+    q3 = numeric_truth.quantile(0.75, axis=1)
+    return pd.DataFrame(
+        {
+            "stdev": numeric_truth.std(axis=1, ddof=1),
+            "variance": numeric_truth.var(axis=1, ddof=1),
+            "range": numeric_truth.max(axis=1) - numeric_truth.min(axis=1),
+            "mid_quartile_range": q3 - q1,
+        }
+    )
+
+
+def export_plca_training_truth_dispersion_table(
+    out_path: Optional[Union[str, Path]] = None,
+) -> pd.DataFrame:
+    """Export direct truth-data dispersion stats for the PLCA training pool.
+
+    The aggregate `training` columns combine all truth samples from CRPC-RA,
+    SCLC, PC-PDX, and SCLC-PDX. The PDX cohorts are restricted to the
+    canonical study sample lists so the export stays aligned with the training
+    sources used throughout the analysis pipeline.
+
+    Args:
+        out_path: Optional output TSV path. Defaults to
+            ``analysis/results/plca_training_truth_dispersion.tsv``.
+
+    Returns:
+        DataFrame with one row per gene and per-group columns for
+        standard deviation, variance, range, and mid-quartile range.
+    """
+    truth_by_source = _build_plca_training_truth_by_source()
+    training_truth = pd.concat(
+        [truth_by_source[cohort] for cohort in ("CRPC-RA", "SCLC", "PC-PDX", "SCLC-PDX")],
+        axis=1,
+    )
+    training_truth = training_truth.loc[:, ~training_truth.columns.duplicated()]
+
+    groups: Dict[str, pd.DataFrame] = {
+        "training": training_truth,
+        "CRPC-RA": truth_by_source["CRPC-RA"],
+        "SCLC": truth_by_source["SCLC"],
+        "PC-PDX": truth_by_source["PC-PDX"],
+        "SCLC-PDX": truth_by_source["SCLC-PDX"],
+    }
+
+    table = pd.DataFrame(index=training_truth.index.sort_values())
+    for group_name, truth_wide in groups.items():
+        prefix = group_name.lower().replace("-", "_")
+        group_table = _compute_truth_dispersion_table(truth_wide).add_prefix(f"{prefix}_")
+        table = table.join(group_table, how="left")
+
+    table.index.name = "gene"
+    table = table.reset_index()
+
+    if out_path is None:
+        out_path = PROJECT_ROOT / "analysis" / "results" / "plca_training_truth_dispersion.tsv"
+    out_path = Path(out_path)
+    ensure_dir(str(out_path.parent))
+    table.to_csv(out_path, sep="\t", index=False)
+
+    return table
+
+
 def export_plca_training_variance_table(
     out_path: Optional[Union[str, Path]] = None,
 ) -> pd.DataFrame:
@@ -2390,6 +2488,8 @@ def compute_onoff_confusion(
         return {"n_total": 0}
 
     truth_on = t >= threshold
+    n_truth_on = int(truth_on.sum())
+    n_truth_off = int((~truth_on).sum())
 
     if (
         activity_odds_ratio_flat is not None
@@ -2412,10 +2512,13 @@ def compute_onoff_confusion(
         if n_conf == 0:
             return {
                 "n_total": n_total,
+                "n_truth_on": n_truth_on,
+                "n_truth_off": n_truth_off,
                 "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
                 "tp": 0, "fp": 0, "tn": 0, "fn": 0,
                 "accuracy": float("nan"), "ppv": float("nan"),
                 "npv": float("nan"), "fpr": float("nan"), "fnr": float("nan"),
+                "sensitivity": float("nan"),
                 "coverage": 0.0,
             }
 
@@ -2427,6 +2530,8 @@ def compute_onoff_confusion(
         tn = int(((~pred_on_conf) & (~truth_on_conf)).sum())
         return {
             "n_total": n_total,
+            "n_truth_on": n_truth_on,
+            "n_truth_off": n_truth_off,
             "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
             "tp": tp, "fp": fp, "tn": tn, "fn": fn,
             "accuracy": (tp + tn) / max(n_conf, 1),
@@ -2434,6 +2539,7 @@ def compute_onoff_confusion(
             "npv": tn / max(tn + fn, 1),
             "fpr": fp / max(fp + tn, 1),
             "fnr": fn / max(fn + tp, 1),
+            "sensitivity": tp / max(tp + fn, 1),
             "coverage": n_conf / max(n_total, 1),
         }
 
@@ -2453,10 +2559,13 @@ def compute_onoff_confusion(
         if n_conf == 0:
             return {
                 "n_total": n_total,
+                "n_truth_on": n_truth_on,
+                "n_truth_off": n_truth_off,
                 "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
                 "tp": 0, "fp": 0, "tn": 0, "fn": 0,
                 "accuracy": float("nan"), "ppv": float("nan"),
                 "npv": float("nan"), "fpr": float("nan"), "fnr": float("nan"),
+                "sensitivity": float("nan"),
                 "coverage": 0.0,
             }
 
@@ -2468,6 +2577,8 @@ def compute_onoff_confusion(
         tn = int(((~pred_on_conf) & (~truth_on_conf)).sum())
         return {
             "n_total": n_total,
+            "n_truth_on": n_truth_on,
+            "n_truth_off": n_truth_off,
             "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
             "tp": tp, "fp": fp, "tn": tn, "fn": fn,
             "accuracy": (tp + tn) / max(n_conf, 1),
@@ -2475,6 +2586,7 @@ def compute_onoff_confusion(
             "npv": tn / max(tn + fn, 1),
             "fpr": fp / max(fp + tn, 1),
             "fnr": fn / max(fn + tp, 1),
+            "sensitivity": tp / max(tp + fn, 1),
             "coverage": n_conf / max(n_total, 1),
         }
 
@@ -2487,6 +2599,8 @@ def compute_onoff_confusion(
         tn = int(((~pred_on) & (~truth_on)).sum())
         return {
             "n_total": n_total,
+            "n_truth_on": n_truth_on,
+            "n_truth_off": n_truth_off,
             "n_on": int(pred_on.sum()),
             "n_off": int((~pred_on).sum()),
             "n_indet": 0,
@@ -2496,6 +2610,7 @@ def compute_onoff_confusion(
             "npv": tn / max(tn + fn, 1),
             "fpr": fp / max(fp + tn, 1),
             "fnr": fn / max(fn + tp, 1),
+            "sensitivity": tp / max(tp + fn, 1),
             "coverage": 1.0,
         }
 
@@ -2517,10 +2632,13 @@ def compute_onoff_confusion(
     if n_conf == 0:
         return {
             "n_total": n_total,
+            "n_truth_on": n_truth_on,
+            "n_truth_off": n_truth_off,
             "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
             "tp": 0, "fp": 0, "tn": 0, "fn": 0,
             "accuracy": float("nan"), "ppv": float("nan"),
             "npv": float("nan"), "fpr": float("nan"), "fnr": float("nan"),
+            "sensitivity": float("nan"),
             "coverage": 0.0,
         }
 
@@ -2534,6 +2652,8 @@ def compute_onoff_confusion(
 
     return {
         "n_total": n_total,
+        "n_truth_on": n_truth_on,
+        "n_truth_off": n_truth_off,
         "n_on": n_on, "n_off": n_off, "n_indet": n_indet,
         "tp": tp, "fp": fp, "tn": tn, "fn": fn,
         "accuracy": (tp + tn) / max(n_conf, 1),
@@ -2541,6 +2661,7 @@ def compute_onoff_confusion(
         "npv": tn / max(tn + fn, 1),
         "fpr": fp / max(fp + tn, 1),
         "fnr": fn / max(fn + tp, 1),
+        "sensitivity": tp / max(tp + fn, 1),
         "coverage": n_conf / max(n_total, 1),
     }
 
@@ -2748,72 +2869,6 @@ def pam50_classify_genefu(
     return results
 
 
-def pam50_classify_mc_genefu(
-    draws: List[pd.DataFrame],
-    point_pred: pd.DataFrame,
-    *,
-    model_names: Sequence[str] = _PAM50_GENEFU_MODEL_NAMES,
-) -> Dict[str, pd.DataFrame]:
-    """Run genefu PAM50 classification across MC draws and aggregate by variant."""
-    from collections import Counter
-
-    bridge = _load_genefu_bridge()
-    results: Dict[str, pd.DataFrame] = {}
-    for model_name in model_names:
-        sample_votes: Dict[str, List[str]] = {sample: [] for sample in point_pred.columns}
-        sample_metrics: Dict[str, List[Dict[str, float]]] = {sample: [] for sample in point_pred.columns}
-
-        for draw in draws:
-            draw_sub = draw.reindex(columns=point_pred.columns)
-            draw_sub = draw_sub.loc[:, draw_sub.notna().any(axis=0)]
-            if draw_sub.shape[1] == 0:
-                continue
-            draw_result = _pam50_classify_single_genefu(
-                draw_sub,
-                model_name=model_name,
-                bridge=bridge,
-            )
-            if draw_result.empty:
-                continue
-            for _, row in draw_result.iterrows():
-                sample_name = row["sample"]
-                if sample_name not in sample_votes:
-                    continue
-                sample_votes[sample_name].append(row["predicted_subtype"])
-                metrics = {
-                    key: float(row[key])
-                    for key in draw_result.columns
-                    if key.startswith("corr_") or key.startswith("proba_")
-                }
-                sample_metrics[sample_name].append(metrics)
-
-        rows: List[Dict[str, Any]] = []
-        for sample_name in point_pred.columns:
-            votes = sample_votes[sample_name]
-            if not votes:
-                continue
-            counts = Counter(votes)
-            modal_subtype = counts.most_common(1)[0][0]
-            stability = counts[modal_subtype] / len(votes)
-            row: Dict[str, Any] = {
-                "sample": sample_name,
-                "predicted_subtype": modal_subtype,
-                "stability": float(stability),
-            }
-            metric_draws = sample_metrics[sample_name]
-            if metric_draws:
-                all_metric_keys = sorted({key for metric_dict in metric_draws for key in metric_dict})
-                for metric_key in all_metric_keys:
-                    metric_values = [metric_dict[metric_key] for metric_dict in metric_draws if metric_key in metric_dict]
-                    if metric_values:
-                        row[metric_key] = float(np.mean(metric_values))
-            rows.append(row)
-
-        results[model_name] = pd.DataFrame(rows)
-
-    return results
-
-
 # ---------------------------------------------------------------------------
 # Pluvicto clinical data loaders
 # ---------------------------------------------------------------------------
@@ -2959,7 +3014,10 @@ def compute_cox_univariate(
             "n_events": int(cph_df["E"].sum()),
             "ph_p": ph_p,
         })
-    return pd.DataFrame(results)
+    result_df = pd.DataFrame(results)
+    if not result_df.empty:
+        result_df["q_value"] = benjamini_hochberg(result_df["p"])
+    return result_df
 
 
 def compute_cox_multivariate(
@@ -3046,7 +3104,10 @@ def compute_cox_multivariate(
             "ph_adjust_p": ph_adjust_p,
             "ph_min_p": ph_min_p,
         })
-    return pd.DataFrame(results)
+    result_df = pd.DataFrame(results)
+    if not result_df.empty:
+        result_df["q_value"] = benjamini_hochberg(result_df["p"])
+    return result_df
 
 
 # ---------------------------------------------------------------------------

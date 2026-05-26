@@ -6,9 +6,9 @@ Updates: Robert Patton, rpatton@fredhutch.org
 Ha Lab, Fred Hutchinson Cancer Research Center
 
 Command-line wrapper for model interpretation analysis on trained BioDVN
-models.  Supports kernel visualisation, Captum-based attribution analysis,
+models.  Supports kernel visualisation, SHAP/gradient-based attribution analysis,
 signal–sequence interaction, ReductionBlock activations, latent-space
-UMAP, and zero-component (hurdle) attribution.
+UMAP, and related downstream summaries.
 """
 
 import argparse
@@ -42,6 +42,8 @@ from proteus_utils.compile_sample_data import (
 
 
 _INTERPRETATION_PRESETS = {
+    # Note: this preset interprets the finalized full-train PLCA model on a
+    # capped slice of the full PLCA sample pool, not on CV-held-out folds.
     'plca-full': {
         'model_dir': str(_PROJECT_ROOT / 'trained_models' / 'proteus_plca-model' / 'full_train'),
         'use_set': 'PLCA',
@@ -201,7 +203,7 @@ def interpretation_analysis(
     test_size: int = 5_000,
     kernel_viz: bool = True,
     attribution: bool = True,
-    method: str = 'integrated_gradients',
+    method: str = 'shap',
     n_steps: int = 50,
     batch_size: int = 32,
     run_interaction: bool = True,
@@ -218,9 +220,11 @@ def interpretation_analysis(
         background_size: Genes for the attribution baseline set.
         test_size: Genes for the attribution test set.
         kernel_viz: Whether to run kernel/motif visualisation.
-        attribution: Whether to run Captum attribution analysis.
-        method: ``'integrated_gradients'`` or ``'gradient_shap'``.
-        n_steps: Interpolation steps (IG) or samples (GradientShap).
+        attribution: Whether to run attribution analysis.
+        method: ``'shap'``/``'deep_shap'``, ``'integrated_gradients'``, or
+            ``'gradient_shap'``.
+        n_steps: Interpolation steps (IG), samples (SHAP expected gradients /
+            GradientShap).
         batch_size: Internal batch size for attribution computation.
         run_interaction: Whether to run signal–sequence interaction analysis.
         run_reduction: Whether to run ReductionBlock activation analysis.
@@ -297,9 +301,9 @@ def main() -> None:
         help='Skip attribution analysis',
     )
     parser.add_argument(
-        '--method', type=str, default='integrated_gradients',
-        choices=['integrated_gradients', 'gradient_shap'],
-        help='Attribution method (default: integrated_gradients)',
+        '--method', type=str, default='shap',
+        choices=['shap', 'deep_shap', 'integrated_gradients', 'gradient_shap'],
+        help='Attribution method (default: shap)',
     )
     parser.add_argument(
         '--background_size', type=int, default=4_096,
@@ -311,7 +315,7 @@ def main() -> None:
     )
     parser.add_argument(
         '--n_steps', type=int, default=32,
-        help='Interpolation steps (IG) or samples (GradientShap) (default: 32)',
+        help='Interpolation steps (IG), samples (SHAP expected gradients / GradientShap) (default: 32)',
     )
     parser.add_argument(
         '--batch_size', type=int, default=16,
@@ -388,6 +392,8 @@ def main() -> None:
         if zarr_paths is None:
             zarr_paths = _resolve_zarr_paths(args.use_set, zarr_base)
         print(f'Resolved --use_set {args.use_set!r} → {len(zarr_paths)} zarr stores')
+        if args.preset == 'plca-full':
+            print('Note: plca-full interpretation uses the finalized full-train PLCA model and a capped full-PLCA sample slice, not CV-held-out folds.')
     else:
         zarr_paths = args.zarr_paths
 

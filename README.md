@@ -2,11 +2,11 @@
 
 **Predicting gene expression from cell-free DNA fragmentomics with deep mixture density networks.**
 
-Proteus is a PyTorch-based deep learning pipeline that predicts per-gene mRNA abundance
+Proteus is a PyTorch-based train/run framework for predicting per-gene mRNA abundance
 (log₂(CPM + 1)) directly from whole-genome sequencing of cell-free DNA (cfDNA).
-It takes Triton V2 signal profiles — promoter-region coverage, nucleosome positioning,
-and fragmentation features — and produces full predictive distributions for every gene,
-providing a liquid-biopsy analog to traditional RNA-seq.
+It compiles Triton V2 signal profiles into per-sample Zarr stores, trains BioDVN-family
+models, tunes them with Optuna, and runs inference with either bundled checkpoints or
+your own full-train outputs.
 
 *Proteus, the prophetic "old man of the sea," would change form before ultimately
 revealing the truth. Like Proteus, this tool transforms cfDNA data to reveal the
@@ -23,6 +23,15 @@ consumes these profiles to predict tumor gene expression, while
 subtypes and their proportions.
 
 <img src="misc/Pantheon.png">
+
+## What Proteus Supports
+
+- Run the bundled `BioDVN`, `BioDVN_NoSeq`, and `BioDVN_OnlySeq` checkpoints on compiled datasets immediately.
+- Reproduce the included training runs using the provided split TSVs and experiment YAMLs.
+- Fine-tune from an existing checkpoint with `--base_weights`.
+- Add a new dataset or experiment spec without changing framework code.
+
+Some bundled experiment files and trained checkpoints retain dataset-specific names such as `plca_*` because they point to included paper-reproduction assets. The framework code and CLI are dataset-agnostic: new datasets are introduced through YAML configs and split TSVs rather than hardcoded logic.
 
 ## Architecture
 
@@ -54,7 +63,7 @@ Inputs
 
 Each MDN head outputs a **3-component mixture distribution**:
 1. **Delta-zero** — point mass at 0 for unexpressed genes
-2. **Gamma(k=0.80, β)** — right-skewed component for low expression
+2. **Gamma(k=0.75, β)** — right-skewed component for low expression
 3. **Normal(μ, σ²)** — symmetric component for moderate/high expression
 
 The model is trained to minimize **CRPS** (Continuous Ranked Probability Score) rather
@@ -125,17 +134,45 @@ directories and run `--process_data` to compile them into Zarr stores.
 
 ### Environment Setup
 
-Proteus uses a micromamba environment with PyTorch + CUDA 12.1 bundled:
+Proteus uses a micromamba environment with PyTorch + CUDA 12.1 bundled. The
+canonical reproducible environment spec is [proteus.env](proteus.env):
 
 ```bash
-micromamba create -n proteus -c pytorch -c nvidia \
-    python=3.10 pytorch torchvision torchaudio pytorch-cuda=12.1
+micromamba create -f proteus.env
 micromamba activate proteus
-pip install zarr numcodecs numpy pandas h5py optuna matplotlib seaborn scipy scikit-learn pyyaml rich
 ```
 
-No separate CUDA/cuDNN module loads are required — the conda environment bundles
-the full CUDA 12.1 runtime. Only the host NVIDIA driver (≥ 530) is needed.
+For a lighter pip-based install of the core train/run framework, first install a
+compatible PyTorch 2.5+ build for your platform and CUDA stack, then install the
+remaining Proteus dependencies:
+
+```bash
+pip install <your-compatible-pytorch-build>
+pip install -r requirements.txt
+```
+
+Optional analysis and interpretation extras are split into [requirements-extra.txt](requirements-extra.txt):
+
+```bash
+pip install -r requirements.txt -r requirements-extra.txt
+```
+
+No separate CUDA/cuDNN module loads are required when using `proteus.env` — the
+environment bundles the CUDA 12.1 runtime. Only the host NVIDIA driver (≥ 530)
+is needed.
+
+For the paper-reproduction analysis workflow, see [analysis/README_ANALYSIS.md](analysis/README_ANALYSIS.md).
+
+Proteus now defaults to repository-local runtime paths so a fresh checkout has a
+coherent baseline layout:
+
+- `data/zarr` for compiled Zarr stores
+- `data/raw_triton` for Triton outputs
+- `labels/` for label TSVs
+- `reference/MANE.GRCh38.v1.3.UniversalReference.tsv` for the reference scalars TSV
+
+Override them with `PROTEUS_ZARR_BASE`, `PROTEUS_RAW_DATA_DIR`, CLI flags, or
+the tracked defaults in [config/paths.yaml](config/paths.yaml).
 
 ### Data Preparation
 
@@ -151,30 +188,37 @@ python Proteus.py --verify_data --use_set PC-PDX
 
 ```bash
 # Cross-validation (all folds)
-python Proteus.py --run_mode train --experiment config/experiments/biodvn_train.yaml
+python Proteus.py --run_mode train --experiment config/experiments/plca_cv.yaml
 
 # Single fold (for HPC parallelization)
-python Proteus.py --run_mode train --experiment config/experiments/biodvn_train.yaml --test_fold 1
+python Proteus.py --run_mode train --experiment config/experiments/plca_cv.yaml --test_fold 1
 
 # Full-train (production model, all data)
-python Proteus.py --run_mode full-train --experiment config/experiments/biodvn_train.yaml
+python Proteus.py --run_mode full-train --experiment config/experiments/plca_final-training.yaml
+
+# Fine-tune from an existing checkpoint
+python Proteus.py --run_mode full-train --experiment config/experiments/plca_final-training.yaml --model_name BioDVN --base_weights trained_models/proteus_plca-model/full_train/final_model.pt
 ```
 
 ### Hyperparameter Tuning
 
 ```bash
-# Optuna tuning (fold-parallel with shared SQLite DB)
-python Proteus.py --run_mode tune --experiment config/experiments/biodvn_tune_phase2-2.yaml --test_fold 1
-
 # Sequential CV tuning (single process)
-python Proteus.py --run_mode tune --experiment config/experiments/biodvn_tune_phase2-2.yaml --n_trials 50
+python Proteus.py --run_mode tune --experiment config/experiments/TDS_tuning/biodvn_tune-tds-v2_finalize.yaml --n_trials 50
+
+# Fold-parallel tuning worker
+python Proteus.py --run_mode tune --experiment config/experiments/TDS_tuning/biodvn_tune-tds-v2_finalize.yaml --test_fold 1
 ```
 
 ### Inference
 
 ```bash
-python Proteus.py --run_mode run --model_name BioDVN --use_set <dataset>
+python Proteus.py --run_mode run --model_name BioDVN --use_set PHS
+python Proteus.py --run_mode run --model_name BioDVN_NoSeq --use_set Crompton
+python Proteus.py --run_mode run --model_name BioDVN_OnlySeq --use_set SCLC-PDX
 ```
+
+Outputs are written under `results_holdout/<MODEL>/<DATASET>/`.
 
 ## CLI Reference
 
@@ -186,14 +230,14 @@ python Proteus.py --run_mode run --model_name BioDVN --use_set <dataset>
 | `--run_mode` | `train` · `full-train` · `tune` · `run` |
 | `--experiment` | Path to experiment YAML (required for train/tune) |
 | `--test_fold` | Run a single fold (for HPC parallelism) |
-| `--epochs` | Override max training epochs |
 | `--n_trials` | Number of Optuna trials (sequential mode) |
 | `--optuna_storage` | Optuna DB URL (default: SQLite in output dir) |
 | `--study_name` | Override Optuna study name |
 | `--sampler_seed` | Random seed for Optuna sampler |
 | `--base_weights` | Path to pretrained weights (transfer learning) |
+| `--zarr_output_dir` | Override the Zarr base directory |
+| `--raw_data_dir` | Override the raw Triton base directory |
 | `--subsample` | Gene subsample fraction for fast sanity checks |
-| `--debug_inputs` | Print tensor diagnostics for the first batch |
 | `--overwrite` | Overwrite existing Zarr stores |
 
 ## Project Structure
@@ -201,6 +245,7 @@ python Proteus.py --run_mode run --model_name BioDVN --use_set <dataset>
 ```
 Proteus/
 ├── Proteus.py                    # CLI entry point: data prep, train, tune, inference
+├── proteus_workflows/            # Extracted workflow layer for data, train, and inference flows
 ├── models/
 │   ├── models.py                 # BioDVN architecture + BioDVNConfig (channel-mode parameterized)
 │   └── model_utils.py            # MDN heads, CRPS loss, β-TCVAE losses, custom layers
@@ -215,7 +260,8 @@ Proteus/
 ├── config/
 │   ├── dataset_config.py         # Dataset YAML loading + DatasetConfig dataclass
 │   ├── experiment_spec.py        # Experiment schema (ExperimentSpec, TuningSpec, ParamSpec)
-│   ├── paths.yaml                # Base paths (gitignored, machine-specific)
+│   ├── paths.yaml                # Optional tracked runtime path defaults
+│   ├── runtime_paths.py          # Repository-local path resolution helpers
 │   ├── datasets/                 # Per-dataset YAML configs (Triton paths, label files)
 │   └── experiments/              # Experiment YAML configs (HP search spaces, training specs)
 ├── tuning/
@@ -225,8 +271,12 @@ Proteus/
 │   ├── promotion.py              # Cross-fold top-config promotion
 │   └── reporting.py              # Study reports, fold stability, search space narrowing
 ├── analysis/                     # Downstream analysis (gene-set scoring, patient-level metrics)
+│   ├── enrichment_utils.py       # Shared GSEA/ssGSEA primitives extracted from the main runner
+│   ├── analysis_utils.py         # Shared analysis loaders, metrics, survival, PAM50 helpers
+│   ├── plot_utils.py             # Analysis plotting helpers
+│   └── run_full_analysis.py      # Main analysis orchestrator
 ├── interpretation/               # Interpretability (Captum attribution, kernel visualization)
-├── runs/                         # SLURM job scripts for HPC execution
+├── runs/                         # Generic launcher templates + study-specific HPC scripts
 ├── labels/                       # Expression matrices + TFX/subtype labels
 ├── data/                         # Training split TSVs + fold index files
 └── trained_models/               # Saved model weights
@@ -300,22 +350,26 @@ sample-level R², MAE, RMSE.
 
 ## HPC Execution
 
-The `runs/biodvn_tune_base.sh` script orchestrates fold-parallel Optuna tuning on
-SLURM:
+The `runs/` directory now includes generic supported templates for the main workflows:
 
-1. Submit a single RTX 2080 Ti job (Fold 1) to initialize the shared Optuna SQLite DB
-2. Wait for the DB to be created, then submit remaining workers (14 RTX + 5 L40S)
-3. Monitor RTX workers — automatically resubmit failed jobs and blacklist bad nodes
+- `runs/launch_train_cv.sh`
+- `runs/launch_full_train.sh`
+- `runs/launch_inference.sh`
+- `runs/launch_tune_worker.sh`
 
-See `runs/` for example SLURM scripts.
+They are driven by environment variables such as `EXPERIMENT`, `MODEL_NAME`, `PARTITION`, `GPU`, and `ACCOUNT` so the same scripts can be reused across datasets and clusters. Older dataset-specific launchers remain in `runs/` as project examples for existing study configurations.
 
 ## Requirements
 
-**Python 3.10** with PyTorch 2.5+ (CUDA 12.1). Key dependencies:
+**Python 3.10** with PyTorch 2.5+ (CUDA 12.1).
+
+Core train/run dependencies live in [requirements.txt](requirements.txt). Optional analysis and interpretation extras live in [requirements-extra.txt](requirements-extra.txt).
+
+Core packages:
 
 | Package | Version | Purpose |
 |---|---|---|
-| pytorch | 2.5.1 | Core framework (CUDA 12.1 bundled) |
+| torch | ≥ 2.5 | Core framework (install a compatible build first) |
 | numpy | ≥ 2.0 | Array operations |
 | zarr | ≥ 2.18 | Per-sample data stores |
 | pandas | ≥ 2.0 | DataFrames for labels + metrics |
@@ -323,11 +377,15 @@ See `runs/` for example SLURM scripts.
 | scipy | ≥ 1.11 | Scientific computing (CRPS, statistics) |
 | scikit-learn | ≥ 1.3 | Metrics utilities |
 | matplotlib | ≥ 3.8 | Visualization |
-| seaborn | ≥ 0.13 | Statistical plots |
 | rich | ≥ 13.0 | Progress bars |
 | pyyaml | ≥ 6.0 | Config parsing |
 
-Full environment: see `proteus.env` (micromamba package list).
+Optional extras:
+
+- Analysis: `seaborn`, `lifelines`, `gseapy`, `rpy2`
+- Interpretation: `captum`, `logomaker`, `shap`, `umap-learn`
+
+Canonical micromamba environment spec: see [proteus.env](proteus.env).
 
 **GPU**: NVIDIA GPU with ≥ 11 GB VRAM. Tested on RTX 2080 Ti (11 GB) and L40S (48 GB).
 Host NVIDIA driver ≥ 530 required.

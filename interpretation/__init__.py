@@ -1,4 +1,4 @@
-# interpretation/ — PyTorch + Captum interpretation module for BioDVN models.
+# interpretation/ — PyTorch interpretation module for BioDVN models.
 
 from .interpretation_utils import (
     attribution_analysis,

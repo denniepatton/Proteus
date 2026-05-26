@@ -23,7 +23,6 @@ from .plot_utils import metric_distribution, sample_scatter
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-_NAIVE_DIRNAME = "NaiveExample"
 _MIXTURE_PDF_NAME = "MDN_Mixture_Fit.pdf"
 _EPS = 1e-6
 _LIGHT_GRAY = "#CFCFCF"
@@ -268,7 +267,7 @@ def fit_expression_mixture(
     output_dir: str,
     overwrite: bool,
 ) -> None:
-    naive_dir = ensure_dir(str(Path(output_dir) / _NAIVE_DIRNAME))
+    naive_dir = ensure_dir(str(Path(output_dir)))
     pdf_path = Path(naive_dir) / _MIXTURE_PDF_NAME
     if pdf_path.exists() and not overwrite:
         return
@@ -549,7 +548,7 @@ def _plot_pca_nearest_neighbors(
 
 
 def generate_naive_example(out_dir: str, overwrite: bool) -> None:
-    naive_dir = ensure_dir(str(Path(out_dir) / _NAIVE_DIRNAME))
+    naive_dir = ensure_dir(str(Path(out_dir)))
 
     pc_truth = pd.read_csv(
         PROJECT_ROOT / "labels" / "PC-PDX_Log2CPMplus1.tsv",
@@ -558,7 +557,7 @@ def generate_naive_example(out_dir: str, overwrite: bool) -> None:
     )
     keep = [s for s in PC_PDX_STUDY if s in pc_truth.columns]
     if len(keep) < 5:
-        raise ValueError("NaiveExample requires at least five PC-PDX study samples")
+        raise ValueError("Naive example requires at least five PC-PDX study samples")
 
     truth_wide = pc_truth[keep]
     truth_arr = truth_wide.values.astype(np.float64)

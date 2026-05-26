@@ -1,0 +1,13 @@
+# Optional Proteus extras.
+#
+# Analysis workflows additionally require an R installation with limma
+# available for the rpy2 bridge used by analysis/limma_de.R.
+
+seaborn>=0.13
+lifelines>=0.28
+gseapy>=1.1
+rpy2>=3.5
+captum>=0.7
+logomaker>=0.8
+shap>=0.46
+umap-learn>=0.5

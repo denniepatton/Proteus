@@ -23,33 +23,24 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 _PHT_RE = re.compile(r'^PHT-Fold-\d+_(.+)-BP\d+')
 
 
-# Fixed PLCAv2 selection weights.  These are intentionally hard-coded so
-# the weighted objective stays stable across trainer, evaluation, and tuning.
-PLCA_WEIGHTED_SOURCE_WEIGHTS: Dict[str, float] = {
+# Default source-group weights for the shipped mixed-source selection
+# objective. They remain fixed so trainer, evaluation, and tuning all score
+# runs with the same contract.
+DEFAULT_SOURCE_WEIGHTED_SELECTION_GROUP_WEIGHTS: Dict[str, float] = {
     'CRPC-RA': 0.30,
     'SCLC': 0.30,
     'Prostate-Synthetic': 0.20,
     'SCLC-Synthetic': 0.20,
 }
 
-# Fixed PLCAv4 cohort-objective constants requested for the fast sweep.
-# These are intentionally not exposed as new experiment knobs.
-COHORT_OBJECTIVE_ALPHA: float = 2.0
-COHORT_OBJECTIVE_ETA: float = 1.05
-
-# PLCAv4-2 continuous objective constants.  The CRPS reference reflects the
-# observed regime where good fold/source GVW-CRPS is approximately <= 1.0.
-PLCA_V4_2_CRPS_REFERENCE: float = 1.0
-PLCA_V4_2_CRPS_LOG_WEIGHT: float = 0.30
-PLCA_V4_2_CRPS_EXCESS_WEIGHT: float = 1.00
-PLCA_V4_2_CRPS_SOFTNESS: float = 0.03
-
-# PLCA soft-objective constants. This objective operates directly on the
-# four source-bucket GVW-CRPS and GVW-r values using an unnormalized
-# soft maximum (tau * log-sum-exp).
-PLCA_SOFT_OBJECTIVE_TAU: float = 0.10
-PLCA_SOFT_OBJECTIVE_ONE_MINUS_R_WEIGHT: float = 2.0
-PLCA_SOFT_OBJECTIVE_OFFSET: float = 2.0
+# Source-weighted soft-objective constants. This objective operates directly
+# on the source-bucket GVW-CRPS and GVW-r values using an unnormalized soft
+# maximum (tau * log-sum-exp).
+SOURCE_WEIGHTED_SOFT_OBJECTIVE_TAU: float = 0.10
+# Default now emphasizes GVW-r recovery more strongly: 2x on soft(1-r)
+# with a matching offset so the objective definition stays explicit.
+SOURCE_WEIGHTED_SOFT_OBJECTIVE_ONE_MINUS_R_WEIGHT: float = 2.0
+SOURCE_WEIGHTED_SOFT_OBJECTIVE_OFFSET: float = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -175,29 +166,31 @@ def collect_zarr_paths(
     return paths
 
 
-def get_plca_selection_group_weights(
+def get_source_weighted_selection_group_weights(
     source_groups: Optional[Dict[str, List[str]]],
 ) -> Optional[Dict[str, float]]:
-    """Return the fixed PLCAv2 source weights when the source groups match.
+    """Return the default source weights when the source groups match.
 
-    The PLCAv2 weighted objective is only defined for the four-bucket
-    patient/synthetic grouping.  Other source-group layouts keep the usual
+    The shipped weighted objective is defined for the four-bucket
+    patient/synthetic grouping. Other source-group layouts keep the usual
     balanced metrics but do not get a weighted selection metric.
     """
     if source_groups is None:
         return None
-    if set(source_groups) != set(PLCA_WEIGHTED_SOURCE_WEIGHTS):
+    if set(source_groups) != set(DEFAULT_SOURCE_WEIGHTED_SELECTION_GROUP_WEIGHTS):
         return None
-    return dict(PLCA_WEIGHTED_SOURCE_WEIGHTS)
+    return dict(DEFAULT_SOURCE_WEIGHTED_SELECTION_GROUP_WEIGHTS)
 
 
-def validate_plca_selection_groups(source_groups: Dict[str, List[str]]) -> None:
-    """Fail loudly if a weighted PLCAv2 run does not use the fixed 4 buckets."""
-    expected = set(PLCA_WEIGHTED_SOURCE_WEIGHTS)
+def validate_source_weighted_selection_groups(
+    source_groups: Dict[str, List[str]],
+) -> None:
+    """Fail loudly if weighted selection does not use the fixed 4 buckets."""
+    expected = set(DEFAULT_SOURCE_WEIGHTED_SELECTION_GROUP_WEIGHTS)
     actual = set(source_groups)
     if actual != expected:
         raise ValueError(
-            "Weighted PLCA selection requires source_groups with exactly "
+            "Weighted source-group selection requires source_groups with exactly "
             f"these keys: {sorted(expected)}. Got: {sorted(actual)}"
         )
 
@@ -229,46 +222,6 @@ def weighted_group_mean(
     return float(weighted_sum / total_weight)
 
 
-def compute_cohort_objective(
-    cohort_r_balanced: float,
-    cohort_crps_balanced: float,
-    best_observed_cohort_crps_balanced: float,
-) -> Tuple[float, float, float]:
-    """Return the gated PLCAv4 cohort objective, gate, and CRPS penalty.
-
-    Objective:
-        cohort_r_balanced - alpha * max(0, cohort_crps_balanced / crps_gate - 1)
-
-    where:
-        crps_gate = min(1.0, eta * best_observed_cohort_crps_balanced)
-    """
-    r_balanced = float(cohort_r_balanced)
-    crps_balanced = float(cohort_crps_balanced)
-    best_crps = float(best_observed_cohort_crps_balanced)
-    if not (
-        math.isfinite(r_balanced)
-        and math.isfinite(crps_balanced)
-        and math.isfinite(best_crps)
-    ):
-        return float('nan'), float('nan'), float('nan')
-
-    crps_gate = min(1.0, COHORT_OBJECTIVE_ETA * best_crps)
-    if crps_gate <= 0.0:
-        return float('nan'), float('nan'), float('nan')
-
-    crps_penalty = max(0.0, crps_balanced / crps_gate - 1.0)
-    objective = r_balanced - COHORT_OBJECTIVE_ALPHA * crps_penalty
-    return float(objective), float(crps_gate), float(crps_penalty)
-
-
-def _stable_softplus(value: float) -> float:
-    if value > 40.0:
-        return float(value)
-    if value < -40.0:
-        return float(math.exp(value))
-    return float(math.log1p(math.exp(value)))
-
-
 def _stable_logsumexp(values: List[float]) -> float:
     if not values:
         return float('nan')
@@ -283,7 +236,7 @@ def _stable_logsumexp(values: List[float]) -> float:
 def _soft_logsumexp_max(
     group_values: Dict[str, float],
     required_names: Optional[List[str]] = None,
-    tau: float = PLCA_SOFT_OBJECTIVE_TAU,
+    tau: float = SOURCE_WEIGHTED_SOFT_OBJECTIVE_TAU,
 ) -> float:
     if tau <= 0.0 or not math.isfinite(tau):
         return float('nan')
@@ -300,41 +253,6 @@ def _soft_logsumexp_max(
         scaled_values.append(float(raw_value) / tau)
 
     return float(tau * _stable_logsumexp(scaled_values))
-
-
-def compute_plcav4_2_objective(
-    cohort_r_balanced: float,
-    cohort_crps_balanced: float,
-) -> Tuple[float, float, float]:
-    """Return the continuous PLCAv4-2 robust cohort objective.
-
-    ``cohort_r_balanced`` is the fixed-source weighted GVW-r minus half the
-    source standard deviation.  ``cohort_crps_balanced`` is the fixed-source
-    weighted GVW-CRPS plus half the source standard deviation.  The objective
-    rewards robust r, rewards lower robust CRPS continuously via log-ratio,
-    and applies a smooth centered excess penalty around CRPS=1.0.
-    """
-    robust_r = float(cohort_r_balanced)
-    robust_crps = float(cohort_crps_balanced)
-    if not (math.isfinite(robust_r) and math.isfinite(robust_crps)):
-        return float('nan'), float('nan'), float('nan')
-    if robust_crps <= 0.0:
-        return float('nan'), float('nan'), float('nan')
-
-    crps_ratio = robust_crps / PLCA_V4_2_CRPS_REFERENCE
-    crps_log_ratio = math.log(crps_ratio)
-    excess_scaled = (
-        robust_crps - PLCA_V4_2_CRPS_REFERENCE
-    ) / PLCA_V4_2_CRPS_SOFTNESS
-    centered_smooth_excess = PLCA_V4_2_CRPS_SOFTNESS * (
-        _stable_softplus(excess_scaled) - math.log(2.0)
-    )
-    objective = (
-        robust_r
-        - PLCA_V4_2_CRPS_LOG_WEIGHT * crps_log_ratio
-        - PLCA_V4_2_CRPS_EXCESS_WEIGHT * centered_smooth_excess
-    )
-    return float(objective), float(crps_log_ratio), float(centered_smooth_excess)
 
 
 def compute_soft_objective(
@@ -365,8 +283,8 @@ def compute_soft_objective(
 
     objective = (
         soft_crps
-        + PLCA_SOFT_OBJECTIVE_ONE_MINUS_R_WEIGHT * soft_one_minus_r
-        - PLCA_SOFT_OBJECTIVE_OFFSET
+        + SOURCE_WEIGHTED_SOFT_OBJECTIVE_ONE_MINUS_R_WEIGHT * soft_one_minus_r
+        - SOURCE_WEIGHTED_SOFT_OBJECTIVE_OFFSET
     )
     return float(objective), float(soft_crps), float(soft_one_minus_r)
 

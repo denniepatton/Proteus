@@ -4,6 +4,7 @@ Training loop with AMP support, learning-rate scheduling, and checkpointing.
 """
 
 import os
+import json
 import math
 import time
 from typing import Dict, Optional, Tuple, List
@@ -40,8 +41,6 @@ from models.model_utils import (
     BioDVNMDNLoss
 )
 from proteus_utils.data_helpers import (
-    compute_cohort_objective,
-    compute_plcav4_2_objective,
     compute_soft_objective,
     weighted_group_mean,
 )
@@ -51,10 +50,10 @@ from proteus_utils.data_helpers import (
 class TrainingConfig:
     """Configuration for training."""
     # Optimizer settings
-    weight_decay: float = 2e-8
+    weight_decay: float = 0.0
     
     # LR schedule settings (step-based cosine annealing with warmup)
-    max_lr: float = 4e-4         # Peak learning rate
+    max_lr: float = 1.5e-4       # Peak learning rate
     min_lr_ratio: float = 1e-2   # Minimum LR as fraction of max_lr (eta_min = min_lr_ratio * max_lr)
     warmup_start_lr: float = 1e-5 # LR at the start of warmup (0 = start from 0)
     warmup_frac: float = 0.05    # Warmup as fraction of total training steps
@@ -66,15 +65,15 @@ class TrainingConfig:
 
     # Gradient accumulation: effective batch = genes_per_batch × accum_steps.
     # Set >1 to trade per-step noise for fewer optimizer steps per epoch.
-    grad_accum_steps: int = 4
+    grad_accum_steps: int = 1
     
     # Mixed precision
-    use_amp: bool = True
+    use_amp: bool = False
 
     # Exponential moving average of model parameters.
     # 0.0 = disabled; >0 (e.g. 0.999) = active.  When enabled, validation
     # and checkpoints use the EMA shadow weights.
-    ema_decay: float = 0.0
+    ema_decay: float = 0.995
     
     # torch.compile (PyTorch 2.0+)
     # Disabled: with 92K tiny 32-gene batches, CUDA graph recording/replay
@@ -89,14 +88,9 @@ class TrainingConfig:
     min_delta: float = 0.0
 
     # Model selection metric.
-    # 'min_balanced_crps': select epoch with lowest balanced GVW-CRPS.
-    # 'min_weighted_source_crps': select epoch with lowest fixed-weight
-    #   PLCAv2 source GVW-CRPS (0.3/0.3/0.2/0.2 across the 4 source buckets).
-    # 'max_gvw_r_lower_bound': select epoch with highest
-    #   balanced_tumor_gvw_r_lower_bound (mean − std across sources).
-    # 'max_cohort_v4_2_objective': select epoch with the highest continuous
-    #   PLCAv4-2 robust cohort objective.
-    selection_metric: str = 'min_weighted_source_crps'
+    # 'min_cohort_soft_objective': select the epoch with the finalized
+    # source-weighted soft objective, where lower is better.
+    selection_metric: str = 'min_cohort_soft_objective'
     
     # Checkpointing
     checkpoint_dir: str = 'checkpoints'
@@ -308,45 +302,44 @@ class Trainer:
         # Mixed precision
         self.use_amp = config.use_amp and self.device.type == 'cuda'
         if self.use_amp:
-            self.scaler = GradScaler('cuda')
+            self.scaler = GradScaler('cuda', init_scale=4096.0)
         else:
             self.scaler = None
 
         use_sequence_only_objective = self.model_config.channel_mode == 'only_seq'
-        beta_ccc = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_ccc', 0.25)
-        beta_srl_max = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_srl_max', 0.0)
-        beta_pht_consistency = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_pht_consistency', 0.10)
-        beta_pht_uncertainty = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_pht_uncertainty', 0.05)
-        
+        beta_srl_max = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_srl_max', 2.0)
+        beta_dynamic_pair_max = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_dynamic_pair_max', 0.0)
+        beta_pht_consistency = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_pht_consistency', 1.0)
+        beta_pht_uncertainty = 0.0 if use_sequence_only_objective else getattr(self.model_config, 'beta_pht_uncertainty', 1.0)
+
         # Loss functions
         self.external_loss_fn = BioDVNMDNLoss(
             beta_background=self.model_config.beta_background,
-            beta_ccc=beta_ccc,
             beta_srl_max=beta_srl_max,
-            srl_delta=getattr(self.model_config, 'srl_delta', 1.0),
-            srl_start=getattr(self.model_config, 'srl_start', 5),
-            srl_ramp=getattr(self.model_config, 'srl_ramp', 10),
+            beta_dynamic_pair_max=beta_dynamic_pair_max,
+            srl_delta=getattr(self.model_config, 'srl_delta', 5.0),
+            srl_start=getattr(self.model_config, 'srl_start', 0),
+            srl_ramp=getattr(self.model_config, 'srl_ramp', 50),
             beta_pht_consistency=beta_pht_consistency,
             beta_pht_uncertainty=beta_pht_uncertainty,
         )
-        
+
         # Metrics
         self.tumor_r2 = MaskedR2Metric()
-        
+
         # Early stopping
         self.early_stopping = EarlyStopping(
             patience=config.patience,
             min_delta=config.min_delta,
             mode='min'
         )
-        
+
         # Create checkpoint directory
         os.makedirs(config.checkpoint_dir, exist_ok=True)
-        
+
         # Scheduler will be initialized when training starts
         self.scheduler = None
 
-        # EMA state (created lazily in _prepare_for_fit if ema_decay > 0).
         self._ema: Optional[_EMAState] = None
 
         # One-time runtime banner to confirm GPU execution during actual training.
@@ -357,22 +350,6 @@ class Trainer:
         # Rich Live display and prevent cascade "Only one live display" errors.
         self._active_rich_progress = None
         self._active_pbar = None
-
-    def set_srl_stats(
-        self,
-        gene_mean_map: Dict[str, float],
-        gene_std_map: Dict[str, float],
-    ) -> None:
-        self.external_loss_fn.set_srl_stats(gene_mean_map, gene_std_map)
-
-    def _create_optimizer(self) -> torch.optim.Optimizer:
-        # Fused AdamW — always available on PyTorch 2.0+.
-        return torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, self.model.parameters()),
-            lr=self.config.max_lr,
-            weight_decay=self.config.weight_decay,
-            fused=True,
-        )
 
     def _prepare_for_fit(self) -> None:
         if self._prepared_for_fit:
@@ -399,6 +376,87 @@ class Trainer:
             print(f'  EMA enabled (decay={ema_decay})')
 
         self._prepared_for_fit = True
+
+    @staticmethod
+    def _append_validation_history(
+        history: Dict[str, List[float]],
+        *,
+        epoch: int,
+        val_metrics: Dict[str, float],
+    ) -> None:
+        history['val_epochs'].append(epoch)
+        history['val_loss'].append(val_metrics['val_loss'])
+        history['val_tumor_gvw_crps'].append(
+            val_metrics.get('val_tumor_gvw_crps', float('nan'))
+        )
+        history['val_weighted_tumor_gvw_crps'].append(
+            val_metrics.get('val_weighted_tumor_gvw_crps', float('nan'))
+        )
+        history['val_cohort_tumor_gvw_crps_balanced'].append(
+            val_metrics.get('val_cohort_tumor_gvw_crps_balanced', float('nan'))
+        )
+        history['val_tumor_aggregate_r2'].append(
+            val_metrics.get('val_tumor_aggregate_r2', 0)
+        )
+        history['val_balanced_tumor_gvw_r'].append(
+            val_metrics.get('val_balanced_tumor_gvw_r', float('nan'))
+        )
+        history['val_cohort_tumor_gvw_r_balanced'].append(
+            val_metrics.get('val_cohort_tumor_gvw_r_balanced', float('nan'))
+        )
+        history['val_cohort_tumor_soft_objective'].append(
+            val_metrics.get('val_cohort_tumor_soft_objective', float('nan'))
+        )
+        if 'val_balanced_tumor_gvw_crps' in val_metrics:
+            history.setdefault('val_balanced_tumor_gvw_crps', []).append(
+                val_metrics['val_balanced_tumor_gvw_crps']
+            )
+
+    def _validation_log_line(self, val_metrics: Dict[str, float]) -> str:
+        crps_label = 'Bal-CRPS'
+        crps_value = val_metrics.get('val_balanced_tumor_gvw_crps', float('nan'))
+
+        bal_r = val_metrics.get('val_balanced_tumor_gvw_r')
+        pooled_r = val_metrics.get('val_tumor_gvw_r')
+        if bal_r is not None:
+            r_str = f' | Bal-r: {bal_r:.4f}'
+        elif pooled_r is not None:
+            r_str = f' | GVW-r: {pooled_r:.4f}'
+        else:
+            r_str = ''
+
+        obj_str = ''
+        if 'val_cohort_tumor_soft_objective' in val_metrics:
+            obj_str = (
+                f' | Soft-obj: '
+                f'{val_metrics["val_cohort_tumor_soft_objective"]:.4f}'
+            )
+
+        src_crps_keys = [key for key in val_metrics if key.startswith('val_tumor_gvw_crps_')]
+        crps_std_str = ''
+        if len(src_crps_keys) > 1:
+            src_vals = [val_metrics[key] for key in src_crps_keys]
+            mu = sum(src_vals) / len(src_vals)
+            std = math.sqrt(sum((value - mu) ** 2 for value in src_vals) / len(src_vals))
+            crps_std_str = f' (std={std:.4f})'
+
+        return (
+            f'  Val Loss: {val_metrics["val_loss"]:.4f} '
+            f'| {crps_label}: {crps_value:.4f}{crps_std_str}'
+            f'{r_str}{obj_str} '
+            f'| Agg R²: {val_metrics.get("val_tumor_aggregate_r2", 0):.4f}'
+        )
+
+    def _select_validation_score(self, val_metrics: Dict[str, float]) -> float:
+        cohort_objective = val_metrics.get('val_cohort_tumor_soft_objective')
+        if cohort_objective is not None:
+            return float(cohort_objective)
+
+        balanced_crps = val_metrics.get('val_balanced_tumor_gvw_crps')
+        if balanced_crps is not None:
+            return float(balanced_crps)
+
+        return float(val_metrics['val_loss'])
 
     def _print_runtime_device_banner(self, features: Optional[Dict[str, torch.Tensor]] = None) -> None:
         if not bool(getattr(self.config, 'runtime_device_banner', False)):
@@ -479,6 +537,181 @@ class Trainer:
         labels_device = {k: v.to(self.device, non_blocking=True) for k, v in labels.items()}
         
         return features_device, labels_device
+
+    @staticmethod
+    def _json_scalar(value: object) -> object:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return Trainer._tensor_summary(value)
+            value = value.detach().float().cpu().item()
+        if value is None or isinstance(value, (str, int, bool)):
+            return value
+        if isinstance(value, float):
+            return value if math.isfinite(value) else str(value)
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        return numeric_value if math.isfinite(numeric_value) else str(numeric_value)
+
+    @staticmethod
+    def _tensor_summary(tensor: torch.Tensor) -> Dict[str, object]:
+        detached = tensor.detach()
+        summary: Dict[str, object] = {
+            'shape': list(detached.shape),
+            'dtype': str(detached.dtype),
+            'device': str(detached.device),
+            'numel': int(detached.numel()),
+        }
+        if detached.numel() == 0:
+            return summary
+
+        if torch.is_floating_point(detached) or torch.is_complex(detached):
+            finite_mask = torch.isfinite(detached)
+            n_nonfinite = int((~finite_mask).sum().detach().cpu().item())
+        else:
+            finite_mask = torch.ones(
+                detached.shape,
+                dtype=torch.bool,
+                device=detached.device,
+            )
+            n_nonfinite = 0
+
+        summary['nonfinite'] = n_nonfinite
+        if bool(finite_mask.any().detach().cpu().item()):
+            finite_values = detached[finite_mask]
+            if torch.is_complex(finite_values):
+                stat_values = finite_values.abs().float()
+            else:
+                stat_values = finite_values.float()
+            summary.update({
+                'min': float(stat_values.min().detach().cpu().item()),
+                'max': float(stat_values.max().detach().cpu().item()),
+                'mean': float(stat_values.mean().detach().cpu().item()),
+                'max_abs': float(stat_values.abs().max().detach().cpu().item()),
+            })
+        return summary
+
+    @staticmethod
+    def _sequence_summary(values: object, max_items: int = 128) -> Dict[str, object]:
+        if isinstance(values, torch.Tensor):
+            flat_values = [
+                Trainer._json_scalar(item)
+                for item in values.detach().view(-1)[:max_items]
+            ]
+            total_count = int(values.numel())
+        elif isinstance(values, (list, tuple)):
+            flat_values = [str(item) for item in values[:max_items]]
+            total_count = len(values)
+        else:
+            return {'value': str(values)}
+
+        unique_values = sorted({str(item) for item in flat_values})
+        return {
+            'count': total_count,
+            'values': flat_values,
+            'unique_values': unique_values[:max_items],
+            'unique_count_included': len(unique_values),
+        }
+
+    def _tensor_tree_summary(self, value: object) -> object:
+        if isinstance(value, torch.Tensor):
+            return self._tensor_summary(value)
+        if isinstance(value, dict):
+            return {
+                str(key): self._tensor_tree_summary(child)
+                for key, child in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return self._sequence_summary(value)
+        return self._json_scalar(value)
+
+    def _batch_metadata_rows(
+        self,
+        features: Dict[str, object],
+        max_rows: int = 128,
+    ) -> List[Dict[str, object]]:
+        metadata_keys = (
+            'sample_name',
+            'gene_name',
+            'source_name',
+            'pht_parent_id',
+            'pht_donor_id',
+        )
+        metadata_lists = {
+            key: features[key]
+            for key in metadata_keys
+            if isinstance(features.get(key), list)
+        }
+        if not metadata_lists:
+            return []
+        n_rows = min(max_rows, *(len(values) for values in metadata_lists.values()))
+        is_pht = features.get('is_pht')
+        is_pht_flat = None
+        if isinstance(is_pht, torch.Tensor):
+            is_pht_flat = is_pht.detach().view(-1)
+
+        rows: List[Dict[str, object]] = []
+        for row_idx in range(n_rows):
+            row = {
+                key: str(values[row_idx])
+                for key, values in metadata_lists.items()
+            }
+            if is_pht_flat is not None and row_idx < int(is_pht_flat.numel()):
+                row['is_pht'] = float(is_pht_flat[row_idx].detach().cpu().item())
+            rows.append(row)
+        return rows
+
+    def _gradient_diagnostic_summary(self) -> Dict[str, object]:
+        bad_gradients = []
+        largest_finite = []
+        for parameter_name, parameter in self.model.named_parameters():
+            if parameter.grad is None:
+                continue
+            grad_summary = self._tensor_summary(parameter.grad)
+            n_nonfinite = int(grad_summary.get('nonfinite', 0))
+            if n_nonfinite > 0 and len(bad_gradients) < 64:
+                bad_gradients.append({
+                    'parameter': parameter_name,
+                    'summary': grad_summary,
+                })
+            max_abs = grad_summary.get('max_abs')
+            if isinstance(max_abs, float) and math.isfinite(max_abs):
+                largest_finite.append({
+                    'parameter': parameter_name,
+                    'max_abs': max_abs,
+                    'nonfinite': n_nonfinite,
+                })
+        largest_finite.sort(key=lambda item: float(item['max_abs']), reverse=True)
+        return {
+            'bad_gradients': bad_gradients,
+            'largest_finite_gradients': largest_finite[:32],
+        }
+
+    def _write_r4_diagnostic(
+        self,
+        reason: str,
+        epoch: int,
+        batch_idx: int,
+        current_lr: float,
+        features: Dict[str, object],
+        labels: Dict[str, object],
+        predictions: Dict[str, object],
+        external_loss: torch.Tensor,
+        internal_loss_result: Optional[Tuple[torch.Tensor, dict]],
+        total_loss: torch.Tensor,
+        external_metrics: dict,
+        internal_metrics: dict,
+        scale_before: Optional[float] = None,
+        scale_after: Optional[float] = None,
+        grad_norm: Optional[torch.Tensor] = None,
+        bad_gradient_origin: Optional[str] = None,
+    ) -> Optional[str]:
+        # The structured JSON dumps were useful while bringing AMP recovery
+        # online, but they have become high-volume, low-signal artifacts during
+        # finalize sweeps. Keep recovery behavior and log-line context, but stop
+        # emitting per-batch diagnostic files.
+        return None
     
     def train_epoch(
         self,
@@ -563,6 +796,92 @@ class Trainer:
         # Store references so fit() can clean up if train_epoch() raises.
         self._active_rich_progress = rich_progress
         self._active_pbar = pbar
+        amp_overflow_steps = 0
+
+        def _log_runtime_message(message: str) -> None:
+            if pbar is not None:
+                pbar.write(message)
+            elif rich_progress is not None:
+                rich_progress.console.print(message)
+            else:
+                print(message)
+
+        def _scalar_value(value: object) -> float:
+            if isinstance(value, torch.Tensor):
+                return float(value.detach().cpu().item())
+            return float(value)
+
+        def _loss_component_summary(
+            current_external_loss: torch.Tensor,
+            current_internal_loss_result: Optional[Tuple[torch.Tensor, dict]],
+            current_external_metrics: dict,
+            current_internal_metrics: dict,
+        ) -> Tuple[float, object, str]:
+            ext_val = float(current_external_loss.detach().cpu().item())
+            int_val: object
+            if current_internal_loss_result is not None:
+                int_val = float(current_internal_loss_result[0].detach().cpu().item())
+            else:
+                int_val = 'N/A'
+
+            parts = []
+            for key, value in current_external_metrics.items():
+                parts.append(f'{key}={_scalar_value(value)}')
+            for key, value in current_internal_metrics.items():
+                parts.append(f'{key}={_scalar_value(value)}')
+            return ext_val, int_val, ', '.join(parts)
+
+        def _nonfinite_origin_summary(
+            current_features: Dict[str, object],
+            current_predictions: dict,
+        ) -> str:
+            origin_parts = []
+            for feature_name, feature_tensor in current_features.items():
+                if isinstance(feature_tensor, torch.Tensor) and not torch.isfinite(feature_tensor).all():
+                    n_bad = int((~torch.isfinite(feature_tensor)).sum().item())
+                    origin_parts.append(f'input:{feature_name}({n_bad} non-finite)')
+            for prediction_name in ('tumor_mdn', 'background_mdn'):
+                if prediction_name in current_predictions:
+                    for param_name, param_value in current_predictions[prediction_name].items():
+                        if isinstance(param_value, torch.Tensor) and not torch.isfinite(param_value).all():
+                            n_bad = int((~torch.isfinite(param_value)).sum().item())
+                            origin_parts.append(f'{prediction_name}.{param_name}({n_bad} non-finite)')
+            return '; '.join(origin_parts) if origin_parts else 'undetermined'
+
+        def _diagnostic_suffix(diagnostic_path: Optional[str]) -> str:
+            if diagnostic_path is None:
+                return ''
+            return f' Diagnostics: {diagnostic_path}.'
+
+        def _backoff_amp_scale(current_scale: Optional[float]) -> Optional[float]:
+            if self.scaler is None or current_scale is None:
+                return current_scale
+            next_scale = max(float(current_scale) * 0.5, 1.0)
+            try:
+                self.scaler.update(next_scale)
+            except (AssertionError, RuntimeError):
+                return float(self.scaler.get_scale())
+            return float(self.scaler.get_scale())
+
+        def _write_amp_recovery_diagnostic(
+            reason: str,
+            current_lr: float,
+            current_scale_before: Optional[float],
+            current_scale_after: Optional[float],
+            current_grad_norm: Optional[torch.Tensor] = None,
+            current_bad_gradient_origin: Optional[str] = None,
+        ) -> Optional[str]:
+            return None
+
+        def _record_batch_timing() -> None:
+            nonlocal ema_data_time, ema_step_time, ema_iter_time
+            if self.config.track_batch_timing:
+                step_time = time.time() - step_start
+                alpha = 0.05
+                ema_data_time = data_time if ema_data_time is None else (1 - alpha) * ema_data_time + alpha * data_time
+                ema_step_time = step_time if ema_step_time is None else (1 - alpha) * ema_step_time + alpha * step_time
+                iter_time = data_time + step_time
+                ema_iter_time = iter_time if ema_iter_time is None else (1 - alpha) * ema_iter_time + alpha * iter_time
 
         def _iter_batches():
             yield 0, first_batch
@@ -571,6 +890,15 @@ class Trainer:
 
         # Reset timing origin now that we've accounted for first-batch wait.
         last_iter_end = time.time()
+
+        def _finish_recovered_batch() -> None:
+            nonlocal last_iter_end
+            _record_batch_timing()
+            last_iter_end = time.time()
+            if pbar is not None:
+                pbar.update(1)
+            if rich_progress is not None and rich_task_id is not None:
+                rich_progress.advance(rich_task_id, 1)
 
         accum_steps = self.config.grad_accum_steps
         self.optimizer.zero_grad(set_to_none=True)
@@ -594,10 +922,8 @@ class Trainer:
                 )
 
             # Compute losses in float32 (outside autocast).
-            # The model forward benefits from float16 (conv/linear), but the
-            # CRPS loss involves gammainc / erf chains that need float32.
-            # The internal loss (KL, MSE reconstruction) also casts to float32
-            # internally, so this placement is belt-and-suspenders.
+            # The model forward benefits from float16 (conv/linear), while
+            # the distribution losses and internal losses need full precision.
             external_loss, external_metrics = self.external_loss_fn(
                 predictions,
                 labels,
@@ -623,43 +949,59 @@ class Trainer:
                     if self.scheduler is not None
                     else self.config.max_lr
                 )
+                current_scale = float(self.scaler.get_scale()) if self.use_amp else None
 
-                # Build diagnostic breakdown (used for both warning and fatal).
-                ext_val = float(external_loss.detach().cpu().item())
-                int_val = (
-                    float(internal_loss.detach().cpu().item())
-                    if internal_loss_result is not None
-                    else 'N/A'
+                ext_val, int_val, breakdown = _loss_component_summary(
+                    external_loss,
+                    internal_loss_result,
+                    external_metrics,
+                    internal_metrics,
                 )
-                parts = []
-                for k, v in external_metrics.items():
-                    val = float(v) if not isinstance(v, torch.Tensor) else float(v.detach().cpu().item())
-                    parts.append(f'{k}={val}')
-                for k, v in internal_metrics.items():
-                    val = float(v) if not isinstance(v, torch.Tensor) else float(v.detach().cpu().item())
-                    parts.append(f'{k}={val}')
-                breakdown = ', '.join(parts)
+                origin_info = _nonfinite_origin_summary(features, predictions)
+                scale_info = '' if current_scale is None else f' scale={current_scale:.3e}'
 
-                # Identify where the NaN originates.
-                origin_parts = []
-                for fname, ftensor in features.items():
-                    if isinstance(ftensor, torch.Tensor) and not torch.isfinite(ftensor).all():
-                        n_bad = int((~torch.isfinite(ftensor)).sum().item())
-                        origin_parts.append(f'input:{fname}({n_bad} non-finite)')
-                for pname in ('tumor_mdn', 'background_mdn'):
-                    if pname in predictions:
-                        for pk, pv in predictions[pname].items():
-                            if isinstance(pv, torch.Tensor) and not torch.isfinite(pv).all():
-                                n_bad = int((~torch.isfinite(pv)).sum().item())
-                                origin_parts.append(f'{pname}.{pk}({n_bad} non-finite)')
-                origin_info = '; '.join(origin_parts) if origin_parts else 'undetermined'
+                if self.use_amp and self.scaler is not None:
+                    scale_after = _backoff_amp_scale(current_scale)
+                    self.optimizer.zero_grad(set_to_none=True)
+                    amp_overflow_steps += 1
+                    diagnostic_path = _write_amp_recovery_diagnostic(
+                        'amp_nonfinite_loss',
+                        current_lr,
+                        current_scale,
+                        scale_after,
+                    )
+                    _log_runtime_message(
+                        f'  AMP non-finite loss recovery at batch {batch_idx} '
+                        f'(lr={current_lr:.3e}, scale={current_scale:.3e}->{scale_after:.3e}). '
+                        f'Origin: {origin_info}. Components: {breakdown}'
+                        f'{_diagnostic_suffix(diagnostic_path)}'
+                    )
+                    _finish_recovered_batch()
+                    continue
+
+                diagnostic_path = self._write_r4_diagnostic(
+                    reason='nonfinite_loss',
+                    epoch=epoch,
+                    batch_idx=batch_idx,
+                    current_lr=current_lr,
+                    features=features,
+                    labels=labels,
+                    predictions=predictions,
+                    external_loss=external_loss,
+                    internal_loss_result=internal_loss_result,
+                    total_loss=total_loss,
+                    external_metrics=external_metrics,
+                    internal_metrics=internal_metrics,
+                    scale_before=current_scale,
+                )
 
                 raise RuntimeError(
                     f'Non-finite total_loss={float(total_loss.detach().cpu().item())} '
                     f'(external={ext_val}, internal={int_val}) '
-                    f'at batch {batch_idx} (lr={current_lr:.3e}). '
+                    f'at batch {batch_idx} (lr={current_lr:.3e}{scale_info}). '
                     f'Origin: {origin_info}. '
                     f'Components: {breakdown}'
+                    f'{_diagnostic_suffix(diagnostic_path)}'
                 )
             
             # Backward pass — scale loss for gradient accumulation
@@ -672,7 +1014,9 @@ class Trainer:
             # Optimizer step at accumulation boundary
             is_accum_boundary = ((batch_idx + 1) % accum_steps == 0) or (batch_idx == n_batches - 1)
             if is_accum_boundary:
+                scale_before = None
                 if self.use_amp:
+                    scale_before = float(self.scaler.get_scale())
                     self.scaler.unscale_(self.optimizer)
 
                 bad_grad_parts = []
@@ -691,9 +1035,56 @@ class Trainer:
                         else self.config.max_lr
                     )
                     bad_grad_origin = '; '.join(bad_grad_parts)
+                    ext_val, int_val, breakdown = _loss_component_summary(
+                        external_loss,
+                        internal_loss_result,
+                        external_metrics,
+                        internal_metrics,
+                    )
+                    component_info = f'external={ext_val}, internal={int_val}'
+                    if breakdown:
+                        component_info = f'{component_info}, {breakdown}'
+                    if self.use_amp:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        scale_after = float(self.scaler.get_scale())
+                        amp_overflow_steps += 1
+                        diagnostic_path = _write_amp_recovery_diagnostic(
+                            'amp_nonfinite_gradients',
+                            current_lr,
+                            scale_before,
+                            scale_after,
+                            current_bad_gradient_origin=bad_grad_origin,
+                        )
+                        self.optimizer.zero_grad(set_to_none=True)
+                        _log_runtime_message(
+                            f'  AMP overflow recovery at batch {batch_idx} '
+                            f'(lr={current_lr:.3e}, scale={scale_before:.3e}->{scale_after:.3e}). '
+                            f'Origin: {bad_grad_origin}. Components: {component_info}'
+                            f'{_diagnostic_suffix(diagnostic_path)}'
+                        )
+                        _finish_recovered_batch()
+                        continue
+                    diagnostic_path = self._write_r4_diagnostic(
+                        reason='nonfinite_gradients',
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        current_lr=current_lr,
+                        features=features,
+                        labels=labels,
+                        predictions=predictions,
+                        external_loss=external_loss,
+                        internal_loss_result=internal_loss_result,
+                        total_loss=total_loss,
+                        external_metrics=external_metrics,
+                        internal_metrics=internal_metrics,
+                        bad_gradient_origin=bad_grad_origin,
+                    )
                     raise RuntimeError(
                         f'Non-finite gradients before optimizer step at batch {batch_idx} '
-                        f'(lr={current_lr:.3e}). Origin: {bad_grad_origin}'
+                        f'(lr={current_lr:.3e}). Origin: {bad_grad_origin}. '
+                        f'Components: {component_info}'
+                        f'{_diagnostic_suffix(diagnostic_path)}'
                     )
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -706,9 +1097,58 @@ class Trainer:
                         if self.scheduler is not None
                         else self.config.max_lr
                     )
+                    scale_info = '' if scale_before is None else f', scale={scale_before:.3e}'
+                    ext_val, int_val, breakdown = _loss_component_summary(
+                        external_loss,
+                        internal_loss_result,
+                        external_metrics,
+                        internal_metrics,
+                    )
+                    component_info = f'external={ext_val}, internal={int_val}'
+                    if breakdown:
+                        component_info = f'{component_info}, {breakdown}'
+                    if self.use_amp and self.scaler is not None:
+                        scale_after = _backoff_amp_scale(scale_before)
+                        self.optimizer.zero_grad(set_to_none=True)
+                        amp_overflow_steps += 1
+                        diagnostic_path = _write_amp_recovery_diagnostic(
+                            'amp_nonfinite_gradient_norm',
+                            current_lr,
+                            scale_before,
+                            scale_after,
+                            current_grad_norm=grad_norm,
+                        )
+                        _log_runtime_message(
+                            f'  AMP gradient-norm recovery at batch {batch_idx} '
+                            f'(lr={current_lr:.3e}, scale={scale_before:.3e}->{scale_after:.3e}, '
+                            f'grad_norm={float(grad_norm.detach().cpu().item())}). '
+                            f'Components: {component_info}'
+                            f'{_diagnostic_suffix(diagnostic_path)}'
+                        )
+                        _finish_recovered_batch()
+                        continue
+                    diagnostic_path = self._write_r4_diagnostic(
+                        reason='nonfinite_gradient_norm',
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        current_lr=current_lr,
+                        features=features,
+                        labels=labels,
+                        predictions=predictions,
+                        external_loss=external_loss,
+                        internal_loss_result=internal_loss_result,
+                        total_loss=total_loss,
+                        external_metrics=external_metrics,
+                        internal_metrics=internal_metrics,
+                        scale_before=scale_before,
+                        grad_norm=grad_norm,
+                    )
                     raise RuntimeError(
                         f'Non-finite gradient norm before optimizer step at batch {batch_idx} '
-                        f'(lr={current_lr:.3e}, grad_norm={float(grad_norm.detach().cpu().item())})'
+                        f'(lr={current_lr:.3e}{scale_info}, '
+                        f'grad_norm={float(grad_norm.detach().cpu().item())}). '
+                        f'Components: {component_info}'
+                        f'{_diagnostic_suffix(diagnostic_path)}'
                     )
 
                 if self.use_amp:
@@ -724,13 +1164,7 @@ class Trainer:
                 if self._ema is not None:
                     self._ema.update(self.model)
 
-            if self.config.track_batch_timing:
-                step_time = time.time() - step_start
-                alpha = 0.05
-                ema_data_time = data_time if ema_data_time is None else (1 - alpha) * ema_data_time + alpha * data_time
-                ema_step_time = step_time if ema_step_time is None else (1 - alpha) * ema_step_time + alpha * step_time
-                iter_time = data_time + step_time
-                ema_iter_time = iter_time if ema_iter_time is None else (1 - alpha) * ema_iter_time + alpha * iter_time
+            _record_batch_timing()
             
             # Track metrics - use TSS_signals for batch size.
             # Skip on non-finite loss to avoid polluting running averages.
@@ -796,6 +1230,9 @@ class Trainer:
         epoch_time = time.time() - start_time
         metrics = metrics_tracker.compute()
         metrics['epoch_time'] = epoch_time
+        metrics['amp_overflow_steps'] = float(amp_overflow_steps)
+        if self.use_amp:
+            metrics['amp_final_scale'] = float(self.scaler.get_scale())
         
         return metrics
     
@@ -1086,7 +1523,7 @@ class Trainer:
             metrics['val_background_gvw_crps'] = float('nan')
 
         # Group-level tumor GVW-CRPS: always expose the equal-weight mean,
-        # and optionally the fixed PLCAv2 weighted source objective.
+        # and optionally the fixed source-weighted selection objective.
         if group_crps:
             per_group_vals: Dict[str, float] = {}
             for cname, (cs, cd) in sorted(group_crps.items()):
@@ -1198,20 +1635,6 @@ class Trainer:
 
                 cohort_crps_balanced = metrics.get('val_cohort_tumor_gvw_crps_balanced')
                 cohort_r_balanced = metrics.get('val_cohort_tumor_gvw_r_balanced')
-                if (
-                    isinstance(cohort_r_balanced, (int, float))
-                    and isinstance(cohort_crps_balanced, (int, float))
-                    and math.isfinite(float(cohort_r_balanced))
-                    and math.isfinite(float(cohort_crps_balanced))
-                ):
-                    robust_objective, crps_log_ratio, crps_smooth_excess = compute_plcav4_2_objective(
-                        float(cohort_r_balanced),
-                        float(cohort_crps_balanced),
-                    )
-                    metrics['val_cohort_tumor_gvw_v4_2_objective'] = robust_objective
-                    metrics['val_cohort_tumor_gvw_v4_2_crps_log_ratio'] = crps_log_ratio
-                    metrics['val_cohort_tumor_gvw_v4_2_crps_smooth_excess'] = crps_smooth_excess
-
                 per_src_crps_map = {
                     key: float(value)
                     for key, value in per_group_vals.items()
@@ -1282,6 +1705,9 @@ class Trainer:
             eta_min=eta_min,
             warmup_start_lr=self.config.warmup_start_lr,
         )
+        if warmup_steps > 0:
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.config.warmup_start_lr
         
         # History tracking
         history = {
@@ -1294,26 +1720,18 @@ class Trainer:
             'val_tumor_aggregate_r2': [],
             'val_balanced_tumor_gvw_r': [],
             'val_cohort_tumor_gvw_r_balanced': [],
-            'val_cohort_tumor_gvw_objective': [],
-            'val_cohort_tumor_gvw_v4_2_objective': [],
             'val_cohort_tumor_soft_objective': [],
             'learning_rate': [],
         }
 
         best_val_score = float('inf')
-        best_epoch_cohort_crps = float('inf')
         selection_metric = str(self.config.selection_metric)
-        # For maximize metrics, we track negative-of-score so that
-        # "lower is better" logic works uniformly.
-        _use_cohort_objective = selection_metric == 'max_cohort_objective'
-        _use_cohort_v4_2_objective = selection_metric == 'max_cohort_v4_2_objective'
         _use_cohort_soft_objective = selection_metric == 'min_cohort_soft_objective'
-        _maximize = selection_metric in (
-            'max_gvw_r_lower_bound',
-            'max_cohort_objective',
-            'max_cohort_v4_2_objective',
-        )
-        _use_weighted_crps = selection_metric == 'min_weighted_source_crps'
+        if not _use_cohort_soft_objective:
+            raise ValueError(
+                "TrainingConfig.selection_metric must be 'min_cohort_soft_objective'. "
+                f"Got '{selection_metric}'."
+            )
         
         print(f'Starting training for {epochs} epochs')
         print(f'Device: {self.device}')
@@ -1348,6 +1766,16 @@ class Trainer:
             history['learning_rate'].append(self.scheduler.get_last_lr()[0])
             
             print(f'  Train Loss: {train_metrics["loss"]:.4f} | Time: {train_metrics["epoch_time"]:.1f}s')
+            overflow_steps = int(train_metrics.get('amp_overflow_steps', 0.0))
+            if overflow_steps > 0:
+                final_scale = train_metrics.get('amp_final_scale')
+                if isinstance(final_scale, (int, float)):
+                    print(
+                        f'  AMP overflow recoveries: {overflow_steps} '
+                        f'| Final scale: {float(final_scale):.3e}'
+                    )
+                else:
+                    print(f'  AMP overflow recoveries: {overflow_steps}')
             
             # Validation runs on the fixed cadence and always on the final
             # epoch so checkpoint selection and fold metrics remain defined.
@@ -1363,116 +1791,8 @@ class Trainer:
                     _ema_backup = self._ema.apply(self.model)
 
                 val_metrics = self.validate(val_loader)
-                cohort_balanced_crps = val_metrics.get('val_cohort_tumor_gvw_crps_balanced')
-                cohort_balanced_r = val_metrics.get('val_cohort_tumor_gvw_r_balanced')
-                if (
-                    isinstance(cohort_balanced_crps, (int, float))
-                    and math.isfinite(float(cohort_balanced_crps))
-                ):
-                    best_epoch_cohort_crps = min(
-                        best_epoch_cohort_crps,
-                        float(cohort_balanced_crps),
-                    )
-                if (
-                    isinstance(cohort_balanced_r, (int, float))
-                    and math.isfinite(float(cohort_balanced_r))
-                    and math.isfinite(best_epoch_cohort_crps)
-                    and isinstance(cohort_balanced_crps, (int, float))
-                    and math.isfinite(float(cohort_balanced_crps))
-                ):
-                    cohort_objective, crps_gate, crps_penalty = compute_cohort_objective(
-                        float(cohort_balanced_r),
-                        float(cohort_balanced_crps),
-                        best_epoch_cohort_crps,
-                    )
-                    val_metrics['val_cohort_tumor_gvw_objective'] = cohort_objective
-                    val_metrics['val_cohort_tumor_gvw_crps_gate'] = crps_gate
-                    val_metrics['val_cohort_tumor_gvw_crps_penalty'] = crps_penalty
-                
-                history['val_epochs'].append(epoch)
-                history['val_loss'].append(val_metrics['val_loss'])
-                history['val_tumor_gvw_crps'].append(val_metrics.get('val_tumor_gvw_crps', float('nan')))
-                history['val_weighted_tumor_gvw_crps'].append(
-                    val_metrics.get('val_weighted_tumor_gvw_crps', float('nan')))
-                history['val_cohort_tumor_gvw_crps_balanced'].append(
-                    val_metrics.get('val_cohort_tumor_gvw_crps_balanced', float('nan')))
-                history['val_tumor_aggregate_r2'].append(val_metrics.get('val_tumor_aggregate_r2', 0))
-                history['val_balanced_tumor_gvw_r'].append(val_metrics.get('val_balanced_tumor_gvw_r', float('nan')))
-                history['val_cohort_tumor_gvw_r_balanced'].append(
-                    val_metrics.get('val_cohort_tumor_gvw_r_balanced', float('nan')))
-                history['val_cohort_tumor_gvw_objective'].append(
-                    val_metrics.get('val_cohort_tumor_gvw_objective', float('nan')))
-                history['val_cohort_tumor_gvw_v4_2_objective'].append(
-                    val_metrics.get('val_cohort_tumor_gvw_v4_2_objective', float('nan')))
-                history['val_cohort_tumor_soft_objective'].append(
-                    val_metrics.get('val_cohort_tumor_soft_objective', float('nan')))
-                if 'val_balanced_tumor_gvw_crps' in val_metrics:
-                    history.setdefault('val_balanced_tumor_gvw_crps', []).append(
-                        val_metrics['val_balanced_tumor_gvw_crps'])
-
-                # Log line: prefer the weighted PLCAv2 objective, then the
-                # balanced group metric, then the pooled metric.
-                weighted_crps = val_metrics.get('val_weighted_tumor_gvw_crps')
-                bal_crps = val_metrics.get('val_balanced_tumor_gvw_crps')
-                if _use_cohort_objective and cohort_balanced_crps is not None:
-                    crps_label = 'Cohort-CRPS'
-                    crps_value = cohort_balanced_crps
-                elif _use_cohort_v4_2_objective and cohort_balanced_crps is not None:
-                    crps_label = 'Cohort-CRPS'
-                    crps_value = cohort_balanced_crps
-                elif _use_cohort_soft_objective:
-                    crps_label = 'Bal-CRPS'
-                    crps_value = val_metrics.get('val_balanced_tumor_gvw_crps', float('nan'))
-                elif weighted_crps is not None:
-                    crps_label = 'Weighted-CRPS'
-                    crps_value = weighted_crps
-                elif bal_crps is not None:
-                    crps_label = 'Bal-CRPS'
-                    crps_value = bal_crps
-                else:
-                    crps_label = 'GVW-CRPS'
-                    crps_value = val_metrics.get('val_tumor_gvw_crps', float('nan'))
-                bal_r = val_metrics.get('val_balanced_tumor_gvw_r')
-                pooled_r = val_metrics.get('val_tumor_gvw_r')
-                r_str = ''
-                if (_use_cohort_objective or _use_cohort_v4_2_objective) and cohort_balanced_r is not None:
-                    r_str = f' | Cohort-r: {cohort_balanced_r:.4f}'
-                elif bal_r is not None:
-                    r_str = f' | Bal-r: {bal_r:.4f}'
-                elif pooled_r is not None:
-                    r_str = f' | GVW-r: {pooled_r:.4f}'
-                obj_str = ''
-                if _use_cohort_objective and 'val_cohort_tumor_gvw_objective' in val_metrics:
-                    obj_str = (
-                        f' | Cohort-obj: '
-                        f'{val_metrics["val_cohort_tumor_gvw_objective"]:.4f}'
-                    )
-                elif _use_cohort_v4_2_objective and 'val_cohort_tumor_gvw_v4_2_objective' in val_metrics:
-                    obj_str = (
-                        f' | Cohort-v4.2: '
-                        f'{val_metrics["val_cohort_tumor_gvw_v4_2_objective"]:.4f}'
-                    )
-                elif _use_cohort_soft_objective and 'val_cohort_tumor_soft_objective' in val_metrics:
-                    obj_str = (
-                        f' | Soft-obj: '
-                        f'{val_metrics["val_cohort_tumor_soft_objective"]:.4f}'
-                    )
-                # Per-source CRPS std for multi-cohort diagnostics.
-                src_crps_keys = [k for k in val_metrics if k.startswith('val_tumor_gvw_crps_')]
-                crps_std_str = ''
-                if (_use_cohort_objective or _use_cohort_v4_2_objective) and 'val_cohort_tumor_gvw_crps_std' in val_metrics:
-                    crps_std_str = f' (std={val_metrics["val_cohort_tumor_gvw_crps_std"]:.4f})'
-                elif len(src_crps_keys) > 1:
-                    src_vals = [val_metrics[k] for k in src_crps_keys]
-                    mu = sum(src_vals) / len(src_vals)
-                    std = math.sqrt(sum((v - mu) ** 2 for v in src_vals) / len(src_vals))
-                    crps_std_str = f' (std={std:.4f})'
-                print(
-                    f'  Val Loss: {val_metrics["val_loss"]:.4f} '
-                    f'| {crps_label}: {crps_value:.4f}{crps_std_str}'
-                    f'{r_str}{obj_str} '
-                    f'| Agg R²: {val_metrics.get("val_tumor_aggregate_r2", 0):.4f}'
-                )
+                self._append_validation_history(history, epoch=epoch, val_metrics=val_metrics)
+                print(self._validation_log_line(val_metrics))
 
                 # Fixed-schedule monitoring mode records validation curves but
                 # must not alter checkpointing or the epoch budget.
@@ -1482,57 +1802,7 @@ class Trainer:
                     continue
 
                 # Model selection / early stopping metric.
-                if _use_cohort_soft_objective:
-                    _cohort_obj = val_metrics.get('val_cohort_tumor_soft_objective')
-                    if _cohort_obj is not None:
-                        val_score = _cohort_obj
-                    else:
-                        val_score = val_metrics.get(
-                            'val_balanced_tumor_gvw_crps',
-                            val_metrics['val_loss'],
-                        )
-                elif _use_cohort_v4_2_objective:
-                    _cohort_obj = val_metrics.get('val_cohort_tumor_gvw_v4_2_objective')
-                    _cohort_r = val_metrics.get('val_cohort_tumor_gvw_r_balanced')
-                    if _cohort_obj is not None:
-                        val_score = -_cohort_obj
-                    elif _cohort_r is not None:
-                        val_score = -_cohort_r
-                    else:
-                        val_score = val_metrics['val_loss']
-                elif _use_cohort_objective:
-                    _cohort_obj = val_metrics.get('val_cohort_tumor_gvw_objective')
-                    _cohort_r = val_metrics.get('val_cohort_tumor_gvw_r_balanced')
-                    if _cohort_obj is not None:
-                        val_score = -_cohort_obj
-                    elif _cohort_r is not None:
-                        val_score = -_cohort_r
-                    else:
-                        val_score = val_metrics['val_loss']
-                elif _maximize:
-                    # max_gvw_r_lower_bound: higher is better → negate for
-                    # uniform "lower is better" comparison.
-                    _lb = val_metrics.get('val_balanced_tumor_gvw_r_lower_bound')
-                    _br = val_metrics.get('val_balanced_tumor_gvw_r')
-                    if _lb is not None:
-                        val_score = -_lb
-                    elif _br is not None:
-                        val_score = -_br
-                    else:
-                        val_score = val_metrics['val_loss']
-                elif _use_weighted_crps:
-                    _weighted = val_metrics.get('val_weighted_tumor_gvw_crps')
-                    val_score = _weighted if _weighted is not None else float('nan')
-                else:
-                    # min_balanced_crps (default): lower is better.
-                    _bal = val_metrics.get('val_balanced_tumor_gvw_crps')
-                    _gvw = val_metrics.get('val_tumor_gvw_crps')
-                    if _bal is not None:
-                        val_score = _bal
-                    elif _gvw is not None:
-                        val_score = _gvw
-                    else:
-                        val_score = val_metrics['val_loss']
+                val_score = self._select_validation_score(val_metrics)
 
                 # If validation collapses to NaN/Inf, stop immediately.
                 if not isinstance(val_score, (int, float)) or not math.isfinite(float(val_score)):
@@ -1577,15 +1847,8 @@ class Trainer:
             print('\nTraining complete (fixed schedule; validation recorded for diagnostics only).')
             return history
 
-        if _maximize:
-            metric_label = 'GVW-r-LB'
-            display_score = -best_val_score
-        elif _use_weighted_crps:
-            metric_label = 'Weighted-CRPS'
-            display_score = best_val_score
-        else:
-            metric_label = 'Balanced-CRPS' if 'val_balanced_tumor_gvw_crps' in (history or {}) else 'GVW-CRPS'
-            display_score = best_val_score
+        metric_label = 'Soft-obj'
+        display_score = best_val_score
         print(f'\nTraining complete. Best validation score ({metric_label}): {display_score:.4f}')
         
         return history

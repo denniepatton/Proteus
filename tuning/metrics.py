@@ -15,15 +15,11 @@ from typing import Any, Dict, List
 
 from config.experiment_spec import ExperimentSpecError
 from proteus_utils.data_helpers import (
-    compute_cohort_objective,
-    compute_plcav4_2_objective,
     compute_soft_objective,
 )
 
 __all__ = [
     "collect_fold_metrics",
-    "compute_cohort_objective",
-    "compute_plcav4_2_objective",
     "compute_soft_objective",
     "nanmean",
     "nanstd",
@@ -212,36 +208,6 @@ def compute_cv_objective(run_dir: str) -> Dict[str, Any]:
     if cohort_gvw_crps_balanced:
         obj["cohort_tumor_gvw_crps_balanced"] = nanmean(cohort_gvw_crps_balanced)
         obj["cohort_tumor_gvw_crps_balanced_fold_std"] = nanstd(cohort_gvw_crps_balanced)
-
-    robust_fold_objectives: List[float] = []
-    for row in rows:
-        row_value = row.get("cohort_tumor_gvw_v4_2_objective")
-        if isinstance(row_value, (int, float)) and math.isfinite(float(row_value)):
-            robust_fold_objectives.append(float(row_value))
-            continue
-        row_r = row.get("cohort_tumor_gvw_r_balanced")
-        row_crps = row.get("cohort_tumor_gvw_crps_balanced")
-        if not (
-            isinstance(row_r, (int, float))
-            and isinstance(row_crps, (int, float))
-            and math.isfinite(float(row_r))
-            and math.isfinite(float(row_crps))
-        ):
-            continue
-        row_objective, _, _ = compute_plcav4_2_objective(
-            float(row_r),
-            float(row_crps),
-        )
-        if math.isfinite(row_objective):
-            robust_fold_objectives.append(row_objective)
-    if robust_fold_objectives:
-        fold_mean = nanmean(robust_fold_objectives)
-        fold_std = nanstd(robust_fold_objectives)
-        if not math.isfinite(fold_std):
-            fold_std = 0.0
-        obj["cohort_tumor_gvw_v4_2_objective_mean"] = fold_mean
-        obj["cohort_tumor_gvw_v4_2_objective_fold_std"] = fold_std
-        obj["cohort_tumor_gvw_v4_2_objective"] = fold_mean - 0.5 * fold_std
 
     soft_fold_objectives: List[float] = []
     for row in rows:

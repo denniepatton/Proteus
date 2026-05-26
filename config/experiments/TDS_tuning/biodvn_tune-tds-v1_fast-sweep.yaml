@@ -1,0 +1,91 @@
+# BioDVN TDS v1 — fast fold-5 scout
+
+
+name: biodvn_tune-tds-v1_fast-sweep
+output_dir: results_training/biodvn_tds_v1_fast_sweep
+
+transfer: ~
+
+objective:
+  # Single-fold proxy tuning reads the per-fold soft objective directly from
+  # validation-fold_<k>_metrics.json, so use the non-mean key here.
+  metric: cohort_tumor_soft_objective
+  direction: minimize
+
+tuning:
+  phase: "tds_v1_fast_sweep"
+  n_trials_per_fold: 100
+  prev_study: ~   # Temporary TDS scout: start from a fresh study.
+  top_fraction: 0.10
+  enqueue_top_k: 5
+  promote_top_frac: 0
+  max_promotions: 0
+  pruner_type: hyperband
+
+data:
+  training_set: data/TDS_sample-splits.tsv
+  zarr_base: ${PROTEUS_ZARR_BASE:-data/zarr}
+  subsample_frac: 1.00
+  seed: 23
+  batch_mode: multi_source
+  steps_per_epoch: 4000
+  selection_metric: min_cohort_soft_objective
+  source_groups:
+    CRPC-RA: [CRPC-RA]
+    SCLC: [SCLC]
+    Prostate-Synthetic: [PC-PDX]
+    SCLC-Synthetic: [SCLC-PDX]
+
+structural:
+  beta_background:
+    suggest: {type: categorical, choices: [0.25, 0.50, 1.0]} # 1.0
+  beta_kl: 1.0
+  beta_contrastive: 1.0
+  beta_tfx: 0.5
+  beta_pht_consistency:
+    suggest: {type: categorical, choices: [0.0, 0.5, 1.0]} # 1.0
+  beta_pht_uncertainty: 0.0
+  beta_reconstruction: 3.0
+  beta_srl_max:
+    suggest: {type: categorical, choices: [0.0, 1.0, 2.0, 3.0, 4.0]}
+  beta_dynamic_pair_max:
+    suggest: {type: categorical, choices: [0.0, 0.5, 1.0, 2.0, 3.0]}
+  srl_delta:
+    suggest: {type: categorical, choices: [0.5, 1.0, 2.0]} # 1.0
+  srl_start: 5  # Begin ramp at end of warmup
+  srl_ramp: 85
+  cl_margin: 1.0
+  internal_weight:
+    suggest: {type: categorical, choices: [0.25, 0.5, 1.0]} # 0.5
+
+training:
+  epochs: 100
+  patience: 100
+  use_amp: false
+  ema_decay:
+    suggest: {type: categorical, choices: [0.990, 0.995, 0.999]} # 0.0
+  grad_accum_steps: 1
+  min_lr_ratio: 0.01
+  warmup_start_lr: 1.0e-5
+  warmup_frac: 0.056 # * 0.90 (schedule_frac) * 100 epochs = 5.0 epochs of warmup
+  schedule_frac: 0.90 # 90 epochs, of which 5 are warmup, 85 are decay
+  max_grad_norm: 10.0
+  max_lr:
+    suggest: {type: categorical, choices: [1.0e-4, 1.5e-4, 2.0e-4]} # 1.5e-4
+  weight_decay: 0.0
+
+scale:
+  signal_ksize: 3
+  interaction_ksize: 5
+  n_reductions: 3
+  funnel_reduction_factor: 4
+  reduction_dilation: 3
+  encoder_start: 256
+  latent_size: 64
+  decoder_start: 32
+  mdn_hidden: 32
+  mdn_final: 16
+  signal_filters: 16
+  initial_reduction_channels: 64
+  dropout_rate:
+    suggest: {type: categorical, choices: [0.20, 0.25, 0.30]} # 0.20

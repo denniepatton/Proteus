@@ -27,7 +27,10 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Union
 
 import yaml
 
-from proteus_utils.data_helpers import PLCA_WEIGHTED_SOURCE_WEIGHTS
+from config.runtime_paths import DEFAULT_ZARR_BASE, normalize_path
+from proteus_utils.data_helpers import (
+    DEFAULT_SOURCE_WEIGHTED_SELECTION_GROUP_WEIGHTS,
+)
 
 
 JSONScalar = Union[str, int, float, bool, None]
@@ -149,8 +152,8 @@ class StructuralSpec:
     beta_contrastive: ParamSpec
     beta_reconstruction: ParamSpec
     beta_tfx: ParamSpec
-    beta_ccc: ParamSpec
     beta_srl_max: ParamSpec
+    beta_dynamic_pair_max: ParamSpec
     srl_delta: ParamSpec
     srl_start: ParamSpec
     srl_ramp: ParamSpec
@@ -164,8 +167,9 @@ class StructuralSpec:
         d = _expect_dict(x, "structural")
         allowed = [
             "beta_background", "beta_kl", "beta_contrastive",
-            "beta_reconstruction", "beta_tfx", "beta_ccc",
-            "beta_srl_max", "srl_delta", "srl_start", "srl_ramp",
+            "beta_reconstruction", "beta_tfx",
+            "beta_srl_max", "beta_dynamic_pair_max",
+            "srl_delta", "srl_start", "srl_ramp",
             "beta_pht_consistency", "beta_pht_uncertainty", "cl_margin",
             "internal_weight",
         ]
@@ -175,20 +179,20 @@ class StructuralSpec:
             return ParamSpec.from_yaml(d.get(name, default), f"structural.{name}")
 
         return StructuralSpec(
-            beta_background=p("beta_background", 2.0),
+            beta_background=p("beta_background", 1.0),
             beta_kl=p("beta_kl", 1.0),
             beta_contrastive=p("beta_contrastive", 1.0),
-            beta_reconstruction=p("beta_reconstruction", 0.50),
-            beta_tfx=p("beta_tfx", 0.20),
-            beta_ccc=p("beta_ccc", 0.25),
-            beta_srl_max=p("beta_srl_max", 0.0),
-            srl_delta=p("srl_delta", 1.0),
-            srl_start=p("srl_start", 5),
-            srl_ramp=p("srl_ramp", 10),
-            beta_pht_consistency=p("beta_pht_consistency", 0.10),
-            beta_pht_uncertainty=p("beta_pht_uncertainty", 0.05),
+            beta_reconstruction=p("beta_reconstruction", 3.0),
+            beta_tfx=p("beta_tfx", 0.5),
+            beta_srl_max=p("beta_srl_max", 2.0),
+            beta_dynamic_pair_max=p("beta_dynamic_pair_max", 0.0),
+            srl_delta=p("srl_delta", 5.0),
+            srl_start=p("srl_start", 0),
+            srl_ramp=p("srl_ramp", 50),
+            beta_pht_consistency=p("beta_pht_consistency", 1.0),
+            beta_pht_uncertainty=p("beta_pht_uncertainty", 1.0),
             cl_margin=p("cl_margin", 1.0),
-            internal_weight=p("internal_weight", 1.0),
+            internal_weight=p("internal_weight", 0.5),
         )
 
 
@@ -234,18 +238,18 @@ class TrainingSpec:
             return ParamSpec.from_yaml(d.get(name, default), f"training.{name}")
 
         return TrainingSpec(
-            max_lr=p("max_lr", 0.0015),
-            min_lr_ratio=p("min_lr_ratio", 5e-4),
-            warmup_start_lr=p("warmup_start_lr", 2.5e-4),
-            weight_decay=p("weight_decay", 1e-5),
-            max_grad_norm=p("max_grad_norm", 18.0),
-            warmup_frac=p("warmup_frac", 0.10),
+            max_lr=p("max_lr", 1.5e-4),
+            min_lr_ratio=p("min_lr_ratio", 1e-2),
+            warmup_start_lr=p("warmup_start_lr", 1e-5),
+            weight_decay=p("weight_decay", 0.0),
+            max_grad_norm=p("max_grad_norm", 10.0),
+            warmup_frac=p("warmup_frac", 0.05),
             schedule_frac=p("schedule_frac", 0.90),
-            epochs=p("epochs", 15),
-            patience=p("patience", 3),
-            use_amp=p("use_amp", True),
-            ema_decay=p("ema_decay", 0.0),
-            grad_accum_steps=p("grad_accum_steps", 4),
+            epochs=p("epochs", 100),
+            patience=p("patience", 100),
+            use_amp=p("use_amp", False),
+            ema_decay=p("ema_decay", 0.995),
+            grad_accum_steps=p("grad_accum_steps", 1),
         )
 
 
@@ -294,19 +298,19 @@ class ScaleSpec:
             return ParamSpec.from_yaml(d.get(name, default), f"scale.{name}")
 
         return ScaleSpec(
-            encoder_start=p("encoder_start", 128),
-            latent_size=p("latent_size", 64),
+            encoder_start=p("encoder_start", 256),
+            latent_size=p("latent_size", 128),
             decoder_start=p("decoder_start", 64),
             mdn_hidden=p("mdn_hidden", 64),
             mdn_final=p("mdn_final", 32),
             signal_filters=p("signal_filters", 16),
-            signal_ksize=p("signal_ksize", 6),
-            interaction_ksize=p("interaction_ksize", 3),
+            signal_ksize=p("signal_ksize", 3),
+            interaction_ksize=p("interaction_ksize", 5),
             initial_reduction_channels=p("initial_reduction_channels", 64),
             n_reductions=p("n_reductions", 3),
             funnel_reduction_factor=p("funnel_reduction_factor", 4),
             reduction_dilation=p("reduction_dilation", 3),
-            dropout_rate=p("dropout_rate", 0.20),
+            dropout_rate=p("dropout_rate", 0.25),
         )
 
 
@@ -329,7 +333,9 @@ class TransferSpec:
 
         base_weights = d.get("base_weights", None)
         if base_weights is not None:
-            base_weights = _as_str(base_weights, "transfer.base_weights")
+            base_weights = normalize_path(
+                _as_str(base_weights, "transfer.base_weights")
+            )
 
         return TransferSpec(base_weights=base_weights)
 
@@ -366,24 +372,9 @@ class DataSpec:
         gene-conditioned source/PHT-aware training batcher. ``'chunk'`` is
         retained for validation/inference-style contiguous reads.
 
-    selection_metric (optional, str: 'min_balanced_crps' |
-                                     'min_weighted_source_crps' |
-                                     'min_cohort_soft_objective' |
-                                     'max_gvw_r_lower_bound' |
-                                     'max_cohort_objective' |
-                                     'max_cohort_v4_2_objective'):
-        Model selection / early-stopping metric.  ``'min_balanced_crps'``
-        (default) selects the epoch with lowest balanced GVW-CRPS.
-        ``'min_weighted_source_crps'`` selects the epoch with lowest
-        fixed-weight PLCAv2 source GVW-CRPS using the 4 source buckets.
-        ``'min_cohort_soft_objective'`` selects the epoch with the lowest
-        source-level soft objective.
-        ``'max_gvw_r_lower_bound'`` selects the epoch with highest
-        balanced GVW-r lower bound (mean − std across sources).
-        ``'max_cohort_objective'`` selects the epoch with the highest
-        gated PLCAv4 cohort objective.
-        ``'max_cohort_v4_2_objective'`` selects the epoch with the highest
-        continuous PLCAv4-2 robust cohort objective.
+    selection_metric (optional, str: 'min_cohort_soft_objective'):
+        Model selection / early-stopping metric. The live training path uses
+        the finalized source-level soft objective and minimizes it.
     """
     training_set: str
     zarr_base: str
@@ -467,45 +458,38 @@ class DataSpec:
                   "data.source_groups to be set")
 
         selection_metric_raw = _as_str(
-            d.get("selection_metric", "min_balanced_crps"),
+            d.get("selection_metric", "min_cohort_soft_objective"),
             "data.selection_metric",
         ).lower()
-        if selection_metric_raw not in (
-            "min_balanced_crps", "min_weighted_source_crps",
-            "min_cohort_soft_objective",
-            "max_gvw_r_lower_bound", "max_cohort_objective",
-            "max_cohort_v4_2_objective",
-        ):
-            _fail(f"data.selection_metric must be 'min_balanced_crps' "
-                  f"or 'min_weighted_source_crps' or 'min_cohort_soft_objective' or 'max_gvw_r_lower_bound' "
-                  f"or 'max_cohort_objective' or 'max_cohort_v4_2_objective', "
-                  f"got '{selection_metric_raw}'")
+        if selection_metric_raw != 'min_cohort_soft_objective':
+            _fail(
+                "data.selection_metric must be 'min_cohort_soft_objective', "
+                f"got '{selection_metric_raw}'"
+            )
 
-        if selection_metric_raw in (
-            'min_weighted_source_crps',
-            'min_cohort_soft_objective',
-            'max_cohort_objective',
-            'max_cohort_v4_2_objective',
-        ):
+        if selection_metric_raw == 'min_cohort_soft_objective':
             if source_groups is None:
                 _fail(
                     f"data.selection_metric='{selection_metric_raw}' requires "
                     "data.source_groups"
                 )
-            expected = set(PLCA_WEIGHTED_SOURCE_WEIGHTS)
+            expected = set(DEFAULT_SOURCE_WEIGHTED_SELECTION_GROUP_WEIGHTS)
             actual = set(source_groups)
             if actual != expected:
                 _fail(
-                    "PLCA cohort selection requires source_groups with keys "
+                    "Weighted source-group selection requires source_groups with keys "
                     f"{sorted(expected)}, got {sorted(actual)}"
                 )
 
         return DataSpec(
-            training_set=_as_str(d["training_set"], "data.training_set"),
-            zarr_base=_as_str(
-                d.get("zarr_base",
-                      "/hpc/temp/ha_g/user/rpatton/ProteusZarrs"),
-                "data.zarr_base"),
+            training_set=normalize_path(
+                _as_str(d["training_set"], "data.training_set")
+            ),
+            zarr_base=(
+                normalize_path(_as_str(d["zarr_base"], "data.zarr_base"))
+                if "zarr_base" in d
+                else DEFAULT_ZARR_BASE
+            ),
             seed=_as_int(d.get("seed", 42), "data.seed"),
             subsample_frac=subsample_frac,
             train_only_cohorts=train_only,
@@ -531,12 +515,18 @@ class ObjectiveSpec:
     @staticmethod
     def from_yaml(x: Any) -> "ObjectiveSpec":
         if x is None:
-            return ObjectiveSpec(metric="val_loss", direction="minimize")
+            return ObjectiveSpec(
+                metric="cohort_tumor_soft_objective_mean",
+                direction="minimize",
+            )
         d = _expect_dict(x, "objective")
         allowed = ["metric", "direction"]
         _check_no_unknown_keys(d, allowed=allowed, ctx="objective")
 
-        metric = _as_str(d.get("metric", "val_loss"), "objective.metric")
+        metric = _as_str(
+            d.get("metric", "cohort_tumor_soft_objective_mean"),
+            "objective.metric",
+        )
         direction = _as_str(d.get("direction", "minimize"), "objective.direction").lower()
         if direction not in ("minimize", "maximize"):
             _fail("objective.direction must be one of: minimize|maximize")
@@ -648,8 +638,9 @@ class ExperimentSpec:
         _check_no_unknown_keys(d, allowed=allowed, ctx="experiment")
 
         name = _as_str(d.get("name", "experiment"), "name")
-        output_dir = _as_str(d.get("output_dir", "results_training"),
-                             "output_dir")
+        output_dir = normalize_path(
+            _as_str(d.get("output_dir", "results_training"), "output_dir")
+        )
 
         return ExperimentSpec(
             name=name,
