@@ -52,6 +52,7 @@ from tuning.metrics import (
     objective_value,
 )
 from tuning.param_resolution import (
+    FixedParamTrial,
     config_hash,
     configs_from_trial_json,
     resolve_trial_configs,
@@ -134,6 +135,99 @@ def _make_storage(url: str) -> Any:
             raise last_error
 
     return url
+
+
+def _reconstruct_trial_config_from_study(
+    exp: ExperimentSpec,
+    *,
+    trial_number: int,
+    storage: str,
+    study_name: Optional[str],
+    sampler_seed: int,
+) -> Dict[str, Any]:
+    resolved_study_name = str(study_name) if study_name is not None else exp.name
+    storage_obj = _make_storage(storage)
+    try:
+        study = optuna.load_study(
+            study_name=resolved_study_name,
+            storage=storage_obj,
+        )
+    except KeyError:
+        study = _create_missing_study_trials(
+            exp,
+            trial_number=trial_number,
+            storage=storage,
+            study_name=resolved_study_name,
+            sampler_seed=sampler_seed,
+        )
+
+    frozen_trial = next(
+        (trial for trial in study.trials if int(trial.number) == int(trial_number)),
+        None,
+    )
+    if frozen_trial is None:
+        study = _create_missing_study_trials(
+            exp,
+            trial_number=trial_number,
+            storage=storage,
+            study_name=resolved_study_name,
+            sampler_seed=sampler_seed,
+        )
+        frozen_trial = next(
+            (trial for trial in study.trials if int(trial.number) == int(trial_number)),
+            None,
+        )
+        if frozen_trial is None:
+            raise FileNotFoundError(
+                f"Trial {trial_number:05d} not found in study '{resolved_study_name}'."
+            )
+    if not frozen_trial.params:
+        raise FileNotFoundError(
+            f"Trial {trial_number:05d} in study '{resolved_study_name}' has no recorded params yet."
+        )
+
+    _model_cfg, _train_cfg, trial_cfg = resolve_trial_configs(
+        exp,
+        FixedParamTrial(frozen_trial.params),
+    )
+    return trial_cfg
+
+
+def _create_missing_study_trials(
+    exp: ExperimentSpec,
+    *,
+    trial_number: int,
+    storage: str,
+    study_name: str,
+    sampler_seed: int,
+) -> optuna.Study:
+    sampler = optuna.samplers.TPESampler(
+        seed=int(sampler_seed),
+        multivariate=True,
+        constant_liar=True,
+        warn_independent_sampling=False,
+        n_startup_trials=4,
+    )
+    study = optuna.create_study(
+        study_name=study_name,
+        direction=exp.objective.direction,
+        storage=_make_storage(storage),
+        load_if_exists=True,
+        sampler=sampler,
+        pruner=optuna.pruners.NopPruner(),
+    )
+
+    while len(study.trials) <= int(trial_number):
+        trial = study.ask()
+        try:
+            _, _, trial_cfg = resolve_trial_configs(exp, trial)
+        except optuna.TrialPruned:
+            study.tell(trial, state=optuna.trial.TrialState.PRUNED)
+            continue
+
+        trial.set_user_attr('config_hash', config_hash(trial_cfg))
+
+    return study
 
 
 def _inject_cohort_objective(obj: Dict[str, Any], _study: optuna.Study) -> None:
@@ -1904,6 +1998,12 @@ def run_coordinated_fold(
     experiment_path: str,
     trial_number: int,
     fold_num: int,
+    *,
+    storage: str = "sqlite:///results_training/optuna.db",
+    study_name: Optional[str] = None,
+    sampler_seed: int = 42,
+    verbose: bool = False,
+    runtime_device_banner: bool = False,
 ) -> None:
     """Train a single fold for a coordinated trial.
 
@@ -1911,22 +2011,36 @@ def run_coordinated_fold(
     builds model/training configs, and runs ``train_model_cv`` for the
     specified fold.  No Optuna interaction — pure training.
     """
+    from proteus_workflows.train import apply_cli_training_overrides, train_model_cv
+
     exp = load_experiment_spec(experiment_path)
     run_dir = _trial_run_dir(exp.output_dir, trial_number)
     config_path = _trial_config_path(run_dir)
 
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(
-            f"Trial config not found: {config_path}\n"
-            f"Run 'tune-ask' first to generate configs."
+    if os.path.exists(config_path):
+        trial_cfg = _read_json(config_path)
+    else:
+        trial_cfg = _reconstruct_trial_config_from_study(
+            exp,
+            trial_number=int(trial_number),
+            storage=str(storage),
+            study_name=study_name,
+            sampler_seed=int(sampler_seed),
+        )
+        os.makedirs(run_dir, exist_ok=True)
+        _write_trial_config(run_dir, trial_cfg)
+        print(
+            f"[Coordinated] Reconstructed missing trial config from study for trial {trial_number:05d}",
+            flush=True,
         )
 
-    trial_cfg = _read_json(config_path)
-
     model_cfg, train_cfg = configs_from_trial_json(trial_cfg, exp)
+    train_cfg = apply_cli_training_overrides(
+        train_cfg,
+        verbose=verbose,
+        runtime_device_banner=runtime_device_banner,
+    )
     use_fixed_schedule_oof = str(exp.tuning.phase).strip().lower().endswith("finalize")
-
-    from proteus_workflows.train import train_model_cv
 
     print(f"[Coordinated] Training trial {trial_number:05d}, fold {fold_num}",
           flush=True)
@@ -1944,9 +2058,7 @@ def run_coordinated_fold(
         seed=exp.data.seed,
         subsample_frac=exp.data.subsample_frac,
         train_only_cohorts=exp.data.train_only_cohorts,
-        balance_cohorts=exp.data.balance_cohorts,
         source_groups=exp.data.source_groups,
-        target_n_per_source=exp.data.target_n_per_source,
         steps_per_epoch=exp.data.steps_per_epoch,
         batch_mode=exp.data.batch_mode,
         fixed_schedule_oof=use_fixed_schedule_oof,

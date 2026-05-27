@@ -439,18 +439,45 @@ class MetricsTracker:
         self.metrics = {}
         self.counts = {}
     
-    def update(self, name: str, value: float, count: int = 1):
-        if name not in self.metrics:
-            self.metrics[name] = 0.0
-            self.counts[name] = 0
-        self.metrics[name] += value * count
+    def update(self, name: str, value: float | torch.Tensor, count: int = 1):
+        if isinstance(value, torch.Tensor):
+            detached_value = value.detach()
+            if detached_value.numel() != 1:
+                raise ValueError(
+                    f"MetricsTracker.update expects scalar tensors, got shape {tuple(detached_value.shape)} for '{name}'."
+                )
+            detached_value = detached_value.reshape(())
+            if name not in self.metrics:
+                self.metrics[name] = detached_value.new_tensor(0.0)
+                self.counts[name] = 0
+            elif not isinstance(self.metrics[name], torch.Tensor):
+                self.metrics[name] = detached_value.new_tensor(float(self.metrics[name]))
+            self.metrics[name] = self.metrics[name] + detached_value * count
+        else:
+            scalar_value = float(value)
+            if name not in self.metrics:
+                self.metrics[name] = 0.0
+                self.counts[name] = 0
+            elif isinstance(self.metrics[name], torch.Tensor):
+                self.metrics[name] = self.metrics[name] + self.metrics[name].new_tensor(scalar_value * count)
+                self.counts[name] += count
+                return
+            else:
+                self.metrics[name] += scalar_value * count
         self.counts[name] += count
     
-    def compute(self) -> dict:
-        return {
-            name: self.metrics[name] / max(self.counts[name], 1)
-            for name in self.metrics
-        }
+    def compute(self, *, as_python: bool = True) -> dict:
+        result = {}
+        for name, total in self.metrics.items():
+            avg = total / max(self.counts[name], 1)
+            if as_python:
+                if isinstance(avg, torch.Tensor):
+                    result[name] = float(avg.detach().cpu().item())
+                else:
+                    result[name] = float(avg)
+            else:
+                result[name] = avg
+        return result
 
 
 # ==============================================================================
@@ -1048,9 +1075,9 @@ class MixtureDensityCRPSLoss(nn.Module):
         total_loss = tumor_crps + self.beta_background * background_crps
 
         loss_dict = {
-            'tumor_crps': tumor_crps.item(),
-            'background_crps': background_crps.item(),
-            'total_external_loss': total_loss.item(),
+            'tumor_crps': tumor_crps.detach(),
+            'background_crps': background_crps.detach(),
+            'total_external_loss': total_loss.detach(),
         }
 
         srl_weight = self._current_srl_weight()
@@ -1062,9 +1089,9 @@ class MixtureDensityCRPSLoss(nn.Module):
                 sample_weight,
             )
             total_loss = total_loss + srl_weight * srl_loss
-            loss_dict['standardized_residual_loss'] = srl_loss.item()
+            loss_dict['standardized_residual_loss'] = srl_loss.detach()
             loss_dict['standardized_residual_weight'] = srl_weight
-            loss_dict['total_external_loss'] = total_loss.item()
+            loss_dict['total_external_loss'] = total_loss.detach()
 
         # Experimental fold-local scout term: isolate the same-gene/source
         # dynamic recovery penalty behind one beta so the whole path is easy
@@ -1078,9 +1105,9 @@ class MixtureDensityCRPSLoss(nn.Module):
                 sample_weight,
             )
             total_loss = total_loss + dynamic_pair_weight * dynamic_pair_loss
-            loss_dict['dynamic_pair_loss'] = dynamic_pair_loss.item()
+            loss_dict['dynamic_pair_loss'] = dynamic_pair_loss.detach()
             loss_dict['dynamic_pair_weight'] = dynamic_pair_weight
-            loss_dict['total_external_loss'] = total_loss.item()
+            loss_dict['total_external_loss'] = total_loss.detach()
 
         if features is not None and (
             self._current_pht_consistency_weight() > 0.0 or self._current_pht_uncertainty_weight() > 0.0
@@ -1093,11 +1120,11 @@ class MixtureDensityCRPSLoss(nn.Module):
                 + self._current_pht_consistency_weight() * pht_consistency
                 + self._current_pht_uncertainty_weight() * pht_uncertainty
             )
-            loss_dict['pht_consistency_loss'] = pht_consistency.item()
-            loss_dict['pht_uncertainty_loss'] = pht_uncertainty.item()
+            loss_dict['pht_consistency_loss'] = pht_consistency.detach()
+            loss_dict['pht_uncertainty_loss'] = pht_uncertainty.detach()
             loss_dict['pht_consistency_weight'] = self._current_pht_consistency_weight()
             loss_dict['pht_uncertainty_weight'] = self._current_pht_uncertainty_weight()
-            loss_dict['total_external_loss'] = total_loss.item()
+            loss_dict['total_external_loss'] = total_loss.detach()
         return total_loss, loss_dict
 
     def _head_crps(
@@ -1110,9 +1137,11 @@ class MixtureDensityCRPSLoss(nn.Module):
         crps_sum, denom = mixture_crps(
             mdn_params, target, sample_weight=gene_weight,
         )
-        if float(denom.detach().cpu().item()) <= 0.0:
-            return crps_sum.new_tensor(0.0)
-        return crps_sum / denom
+        return torch.where(
+            denom > 0,
+            crps_sum / denom.clamp(min=1e-8),
+            crps_sum.new_tensor(0.0),
+        )
 
     def _current_ramped_weight(self, beta_max: float) -> float:
         if beta_max <= 0.0:
@@ -1285,8 +1314,6 @@ class MixtureDensityCRPSLoss(nn.Module):
                 * true_delta.abs().detach().clamp(max=2.0)
             )
             denom_weight = pair_weight.sum()
-            if float(denom_weight.detach().cpu().item()) <= 0.0:
-                continue
 
             pair_huber = F.huber_loss(
                 pair_resid,
@@ -1294,13 +1321,22 @@ class MixtureDensityCRPSLoss(nn.Module):
                 reduction='none',
                 delta=float(self.srl_delta),
             )
+            group_loss = (pair_weight * pair_huber).sum() / denom_weight.clamp(min=1e-8)
             group_losses.append(
-                (pair_weight * pair_huber).sum() / denom_weight.clamp(min=1e-8)
+                torch.where(
+                    denom_weight > 0,
+                    group_loss,
+                    group_loss.new_tensor(float('nan')),
+                )
             )
 
         if not group_losses:
             return pred.new_tensor(0.0)
-        return torch.stack(group_losses).mean()
+        group_loss_tensor = torch.stack(group_losses)
+        finite_group_losses = group_loss_tensor[torch.isfinite(group_loss_tensor)]
+        if finite_group_losses.numel() == 0:
+            return pred.new_tensor(0.0)
+        return finite_group_losses.mean()
 
     @staticmethod
     def _metadata_list(features: dict, key: str, n: int) -> Optional[list]:
@@ -1337,23 +1373,33 @@ class MixtureDensityCRPSLoss(nn.Module):
 
         valid_groups = group_ids[valid]
         valid_values = values[valid]
-        n_groups = int(group_ids.max().item()) + 1
-
-        counts = values.new_zeros(n_groups)
-        counts.index_add_(0, valid_groups, torch.ones_like(valid_values))
-
-        sums = values.new_zeros(n_groups)
-        sums.index_add_(0, valid_groups, valid_values)
+        counts = torch.bincount(valid_groups, minlength=0).to(dtype=values.dtype)
+        sums = torch.bincount(
+            valid_groups,
+            weights=valid_values,
+            minlength=counts.numel(),
+        )
         means = sums / counts.clamp(min=1.0)
 
         centered = valid_values - means[valid_groups]
-        sq_sums = values.new_zeros(n_groups)
-        sq_sums.index_add_(0, valid_groups, centered.pow(2))
+        sq_sums = torch.bincount(
+            valid_groups,
+            weights=centered.pow(2),
+            minlength=counts.numel(),
+        )
 
         eligible = counts >= 2.0
-        if not eligible.any():
-            return values.new_tensor(0.0)
-        return (sq_sums[eligible] / counts[eligible]).mean()
+        eligible_count = eligible.to(dtype=values.dtype).sum()
+        eligible_variance = torch.where(
+            eligible,
+            sq_sums / counts.clamp(min=1.0),
+            torch.zeros_like(sq_sums),
+        )
+        return torch.where(
+            eligible_count > 0,
+            eligible_variance.sum() / eligible_count.clamp(min=1.0),
+            values.new_tensor(0.0),
+        )
 
     @staticmethod
     def _pht_losses(

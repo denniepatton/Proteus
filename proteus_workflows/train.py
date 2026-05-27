@@ -110,6 +110,86 @@ def _write_temp_index_files(prefix: str, named_index_paths: Dict[str, List[str]]
     return index_paths
 
 
+def _filter_split_rows(
+    split_rows: List[Dict[str, str]],
+    *,
+    exclude_fold: Optional[int] = None,
+    exclude_cohorts: Optional[set[str]] = None,
+) -> List[Dict[str, str]]:
+    filtered: List[Dict[str, str]] = []
+    excluded = exclude_cohorts or set()
+    for row in split_rows:
+        if exclude_fold is not None and int(row['Fold']) == exclude_fold:
+            continue
+        if row['Cohort'].strip() in excluded:
+            continue
+        filtered.append(row)
+    return filtered
+
+
+def _expected_zarr_path_preview(
+    split_rows: List[Dict[str, str]],
+    zarr_base: str,
+    *,
+    limit: int = 8,
+) -> str:
+    from proteus_utils.data_helpers import zarr_path_for_sample
+
+    if not split_rows:
+        return '  (no eligible TSV rows)'
+
+    lines: List[str] = []
+    for row in split_rows[:limit]:
+        cohort = row['Cohort'].strip()
+        sample = row['Sample'].strip()
+        lines.append(f'  {zarr_path_for_sample(sample, cohort, zarr_base)}')
+
+    remaining = len(split_rows) - limit
+    if remaining > 0:
+        lines.append(f'  ... and {remaining} more expected path(s)')
+
+    return '\n'.join(lines)
+
+
+def _require_existing_variance_pool(
+    zarr_paths: List[str],
+    split_rows: List[Dict[str, str]],
+    zarr_base: str,
+    *,
+    context: str,
+) -> None:
+    if zarr_paths:
+        return
+
+    raise FileNotFoundError(
+        f'No Zarr stores found for {context} under {zarr_base}. '
+        f'Eligible TSV rows: {len(split_rows)}.\n'
+        f'First expected paths:\n{_expected_zarr_path_preview(split_rows, zarr_base)}'
+    )
+
+
+def _log_raw_variance_summary(
+    raw_variance: Dict[str, float],
+    *,
+    gene_count: int,
+    sample_count: int,
+    context: str,
+    label_key: str,
+) -> None:
+    raw_values = list(raw_variance.values())
+    if not raw_values:
+        raise ValueError(
+            f'Variance computation for {context} produced no finite genes from '
+            f'{sample_count} Zarr store(s) using label_key {label_key!r}.'
+        )
+
+    print(
+        f'  {gene_count} genes, n={sample_count} samples — '
+        f'raw variance [{min(raw_values):.4f}, {max(raw_values):.4f}], '
+        'clipped to [0.100, 10.000]'
+    )
+
+
 def _collect_full_train_paths(
     split_rows: List[Dict[str, str]],
     zarr_base: str,
@@ -165,6 +245,43 @@ def _loader_workers() -> int:
         return max(1, os.cpu_count() or 1)
 
 
+def _multisource_train_loader_kwargs() -> Dict[str, int | bool]:
+    # The multi-source training dataset is already fully preloaded into RAM.
+    # Running it through forked persistent workers adds process startup and
+    # prefetch overhead without providing I/O overlap, and can stall before the
+    # first batch on the current 100+ GB resident panel.
+    return {
+        'num_workers': 0,
+        'persistent_workers': False,
+        'prefetch_factor': 2,
+    }
+
+
+def apply_cli_training_overrides(
+    training_config: TrainingConfig,
+    *,
+    verbose: bool = False,
+    runtime_device_banner: bool = False,
+) -> TrainingConfig:
+    updates: Dict[str, object] = {}
+
+    if verbose:
+        updates.update({
+            'progress_bar': True,
+            'progress_backend': 'tqdm',
+            'track_batch_timing': True,
+            'log_interval': min(int(training_config.log_interval), 10),
+        })
+
+    if verbose or runtime_device_banner:
+        updates['runtime_device_banner'] = True
+
+    if not updates:
+        return training_config
+
+    return replace(training_config, **updates)
+
+
 def train_model_cv(
     model_name: str,
     training_set_tsv: str,
@@ -178,9 +295,7 @@ def train_model_cv(
     epoch_end_callback: Optional[Callable[..., None]] = None,
     external_stop_check: Optional[Callable[..., bool]] = None,
     train_only_cohorts: Optional[List[str]] = None,
-    balance_cohorts: Optional[List[str]] = None,
     source_groups: Optional[Dict[str, List[str]]] = None,
-    target_n_per_source: Optional[int] = None,
     steps_per_epoch: int = 4000,
     batch_mode: str = 'multi_source',
     fixed_schedule_oof: bool = False,
@@ -247,11 +362,22 @@ def train_model_cv(
         fold_training_config = replace(training_config, checkpoint_dir=fold_dir)
 
         print(f'Computing gene variance weights from training folds (excluding fold {fold_num}, excluding PHT)...')
+        variance_rows = _filter_split_rows(
+            split_rows,
+            exclude_fold=fold_num,
+            exclude_cohorts={'PHT'},
+        )
         train_zarr_paths = collect_zarr_paths(
             training_set_tsv,
             zarr_base,
             exclude_fold=fold_num,
             exclude_cohorts={'PHT'},
+        )
+        _require_existing_variance_pool(
+            train_zarr_paths,
+            variance_rows,
+            zarr_base,
+            context=f'fold {fold_num} tumor-variance computation',
         )
         train_fold_variance_raw = compute_gene_variances_unclipped(
             train_zarr_paths,
@@ -265,11 +391,12 @@ def train_model_cv(
             train_zarr_paths,
             label_key='flat/tumor_exp',
         )
-        raw_values = list(train_fold_variance_raw.values())
-        print(
-            f'  {len(gene_weights)} genes, n={len(train_zarr_paths)} samples — '
-            f'raw variance [{min(raw_values):.4f}, {max(raw_values):.4f}], '
-            'clipped to [0.100, 10.000]'
+        _log_raw_variance_summary(
+            train_fold_variance_raw,
+            gene_count=len(gene_weights),
+            sample_count=len(train_zarr_paths),
+            context=f'fold {fold_num} tumor-variance computation',
+            label_key='flat/tumor_exp',
         )
 
         train_background_variance: Optional[Dict[str, float]] = compute_gene_variances_unclipped(
@@ -295,15 +422,22 @@ def train_model_cv(
         if batch_mode == 'multi_source':
             if source_groups is None:
                 raise ValueError("batch_mode='multi_source' requires source_groups")
+            train_loader_kwargs = _multisource_train_loader_kwargs()
+            print(
+                '  [MultiSource] training loader uses single-process iteration '
+                'because samples are already preloaded in RAM'
+            )
             train_loader, val_loader, train_steps, val_steps = build_multisource_loaders_from_splits(
                 training_set_tsv=training_set_tsv,
                 zarr_base=zarr_base,
                 val_fold=fold_num,
                 source_groups=source_groups,
                 gene_variance=train_fold_variance_raw,
-                n_eff_per_source=target_n_per_source or 24,
                 steps_per_epoch=steps_per_epoch,
                 num_workers=_loader_workers(),
+                train_num_workers=int(train_loader_kwargs['num_workers']),
+                train_persistent_workers=bool(train_loader_kwargs['persistent_workers']),
+                train_prefetch_factor=int(train_loader_kwargs['prefetch_factor']),
                 seed=seed,
                 train_only_cohorts=train_only_cohorts,
                 gene_weights=gene_weights,
@@ -319,9 +453,6 @@ def train_model_cv(
                 subsample_frac=subsample_frac,
                 gene_weights=gene_weights,
                 train_only_cohorts=train_only_cohorts,
-                balance_cohorts=balance_cohorts,
-                source_groups=source_groups,
-                target_n_per_source=target_n_per_source,
             )
         print(f'Training batches: {train_steps}, Validation batches: {val_steps}')
 
@@ -582,9 +713,7 @@ def full_train_from_splits(
     seed: int = 42,
     subsample_frac: Optional[float] = None,
     train_only_cohorts: Optional[List[str]] = None,
-    balance_cohorts: Optional[List[str]] = None,
     source_groups: Optional[Dict[str, List[str]]] = None,
-    target_n_per_source: Optional[int] = None,
     steps_per_epoch: int = 4000,
     batch_mode: str = 'multi_source',
 ):
@@ -637,7 +766,14 @@ def full_train_from_splits(
         print(f'  [Subsample] Using ~{subsample_frac * 100:.0f}% of genes for fast sanity check')
 
     print('Computing gene variance weights from all non-PHT tumor samples...')
+    tumor_weight_rows = _filter_split_rows(split_rows, exclude_cohorts={'PHT'})
     tumor_weight_paths = [path for path in all_paths if zarr_cohort_map[path] != 'PHT']
+    _require_existing_variance_pool(
+        tumor_weight_paths,
+        tumor_weight_rows,
+        zarr_base,
+        context='full-train tumor-variance computation',
+    )
     train_fold_variance_raw = compute_gene_variances_unclipped(tumor_weight_paths, label_key='flat/tumor_exp')
     train_gene_mean_total, train_gene_std_total = compute_gene_mean_std_from_zarr(
         tumor_weight_paths,
@@ -647,10 +783,12 @@ def full_train_from_splits(
         tumor_weight_paths,
         label_key='flat/tumor_exp',
     )
-    raw_values = list(train_fold_variance_raw.values())
-    print(
-        f'  {len(gene_weights)} genes — raw variance [{min(raw_values):.4f}, {max(raw_values):.4f}], '
-        'clipped to [0.100, 10.000]'
+    _log_raw_variance_summary(
+        train_fold_variance_raw,
+        gene_count=len(gene_weights),
+        sample_count=len(tumor_weight_paths),
+        context='full-train tumor-variance computation',
+        label_key='flat/tumor_exp',
     )
 
     selection_group_weights = get_source_weighted_selection_group_weights(source_groups)
@@ -696,10 +834,15 @@ def full_train_from_splits(
         if sample_paths_by_source is None:
             raise ValueError("batch_mode='multi_source' requires source_groups")
 
+        train_loader_kwargs = _multisource_train_loader_kwargs()
+        print(
+            '  [MultiSource] training loader uses single-process iteration '
+            'because samples are already preloaded in RAM'
+        )
+
         train_dataset = ProteusMultiSourceBatchDataset(
             sample_paths_by_source=sample_paths_by_source,
             gene_variance=train_fold_variance_raw,
-            n_eff_per_source=target_n_per_source or 24,
             steps_per_epoch=steps_per_epoch,
             seed=seed,
             labeled=True,
@@ -708,17 +851,17 @@ def full_train_from_splits(
             subsample_frac=subsample_frac,
         )
 
-        loader_workers = _loader_workers()
         train_loader = create_single_item_loader(
             train_dataset,
-            num_workers=loader_workers,
+            num_workers=int(train_loader_kwargs['num_workers']),
             seed=seed,
-            persistent_workers=True,
-            prefetch_factor=4,
+            persistent_workers=bool(train_loader_kwargs['persistent_workers']),
+            prefetch_factor=int(train_loader_kwargs['prefetch_factor']),
         )
         train_steps = len(train_dataset)
 
         if use_checkpoint_holdout:
+            loader_workers = _loader_workers()
             n_samples = len(train_dataset._all_sample_paths)
             n_union = len(train_dataset._union_genes)
             rng_mask = np.random.RandomState(seed + 12345)
@@ -770,8 +913,6 @@ def full_train_from_splits(
             gene_weights=gene_weights,
             val_frac=val_frac if use_checkpoint_holdout else None,
             val_split=False,
-            cohort_map=zarr_cohort_map if balance_cohorts else None,
-            balance_cohorts=balance_cohorts,
         )
 
         if use_checkpoint_holdout:

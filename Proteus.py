@@ -31,10 +31,16 @@ Usage:
 """
 
 # Standard library imports
-import sys
 import argparse
+import json
+import os
+import re
+import sys
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Callable
+
+import numpy as np
+import pandas as pd
 
 # Local imports
 from models import BioDVNConfig
@@ -50,6 +56,11 @@ from config.dataset_config import load_dataset_config, list_datasets
 from config.experiment_spec import load_experiment_spec
 from proteus_workflows.data import verify_dataset_stores
 from proteus_workflows.inference import run_saved_model_on_dataset
+from proteus_utils import compute_regression_metrics
+
+
+DEFAULT_OPTUNA_STORAGE = 'sqlite:///results_training/optuna.db'
+DEFAULT_OPTUNA_SAMPLER_SEED = 42
 
 
 def ensure_datasets_exist(
@@ -113,9 +124,7 @@ def train_model_cv(
     epoch_end_callback: Optional[Callable[..., None]] = None,
     external_stop_check: Optional[Callable[..., bool]] = None,
     train_only_cohorts: Optional[List[str]] = None,
-    balance_cohorts: Optional[List[str]] = None,
     source_groups: Optional[Dict[str, List[str]]] = None,
-    target_n_per_source: Optional[int] = None,
     steps_per_epoch: int = 4000,
     batch_mode: str = 'multi_source',
     fixed_schedule_oof: bool = False,
@@ -135,9 +144,7 @@ def train_model_cv(
         epoch_end_callback=epoch_end_callback,
         external_stop_check=external_stop_check,
         train_only_cohorts=train_only_cohorts,
-        balance_cohorts=balance_cohorts,
         source_groups=source_groups,
-        target_n_per_source=target_n_per_source,
         steps_per_epoch=steps_per_epoch,
         batch_mode=batch_mode,
         fixed_schedule_oof=fixed_schedule_oof,
@@ -263,9 +270,7 @@ def full_train_from_splits(
     seed: int = 42,
     subsample_frac: Optional[float] = None,
     train_only_cohorts: Optional[List[str]] = None,
-    balance_cohorts: Optional[List[str]] = None,
     source_groups: Optional[Dict[str, List[str]]] = None,
-    target_n_per_source: Optional[int] = None,
     steps_per_epoch: int = 4000,
     batch_mode: str = 'multi_source',
 ):
@@ -281,9 +286,7 @@ def full_train_from_splits(
         seed=seed,
         subsample_frac=subsample_frac,
         train_only_cohorts=train_only_cohorts,
-        balance_cohorts=balance_cohorts,
         source_groups=source_groups,
-        target_n_per_source=target_n_per_source,
         steps_per_epoch=steps_per_epoch,
         batch_mode=batch_mode,
     )
@@ -309,16 +312,23 @@ def _build_configs_from_spec(
     experiment_spec,
     *,
     model_name: str = 'BioDVN',
+    verbose: bool = False,
     runtime_device_banner: bool = False,
     base_weights_override: Optional[str] = None,
 ) -> tuple:
     from proteus_workflows.train import build_training_configs_from_spec as _workflow_impl
+    from proteus_workflows.train import apply_cli_training_overrides
 
-    return _workflow_impl(
+    model_cfg, train_cfg = _workflow_impl(
         experiment_spec,
         model_name=model_name,
         runtime_device_banner=runtime_device_banner,
         base_weights_override=base_weights_override,
+    )
+    return model_cfg, apply_cli_training_overrides(
+        train_cfg,
+        verbose=verbose,
+        runtime_device_banner=runtime_device_banner,
     )
 
 
@@ -327,6 +337,72 @@ def _load_optional_dataset_config(dataset_name: str):
         return load_dataset_config(dataset_name)
     except FileNotFoundError:
         return None
+
+
+def _resolve_optuna_study_name(
+    experiment_spec,
+    study_name_override: Optional[str],
+) -> Optional[str]:
+    if study_name_override is not None:
+        return str(study_name_override)
+    if experiment_spec is None:
+        return None
+    return str(experiment_spec.name)
+
+
+def _resolve_optuna_storage(
+    experiment_spec,
+    storage_override: str,
+) -> str:
+    if experiment_spec is None:
+        return str(storage_override)
+    if str(storage_override) != DEFAULT_OPTUNA_STORAGE:
+        return str(storage_override)
+
+    tuning_phase = getattr(getattr(experiment_spec, 'tuning', None), 'phase', None)
+    if tuning_phase is None:
+        return str(storage_override)
+
+    phase_name = str(tuning_phase).strip()
+    if not phase_name:
+        return str(storage_override)
+
+    return f'sqlite:///results_training/optuna_{phase_name}.db'
+
+
+def _resolve_sampler_seed(
+    experiment_path: Optional[str],
+    sampler_seed: int,
+) -> int:
+    if int(sampler_seed) != DEFAULT_OPTUNA_SAMPLER_SEED or experiment_path is None:
+        return int(sampler_seed)
+
+    experiment_rel = Path(experiment_path).as_posix()
+    runs_dir = Path(PROJECT_ROOT) / 'runs'
+    if not runs_dir.is_dir():
+        return int(sampler_seed)
+
+    experiment_re = re.compile(r'EXPERIMENT="\$\{EXPERIMENT:-([^"]+)\}"')
+    seed_re = re.compile(r'BASE_SAMPLER_SEED="\$\{BASE_SAMPLER_SEED:-([0-9]+)\}"')
+
+    for script_path in sorted(runs_dir.glob('*.sh')):
+        try:
+            script_text = script_path.read_text(encoding='utf-8')
+        except OSError:
+            continue
+
+        experiment_match = experiment_re.search(script_text)
+        if experiment_match is None:
+            continue
+        if Path(experiment_match.group(1)).as_posix() != experiment_rel:
+            continue
+
+        seed_match = seed_re.search(script_text)
+        if seed_match is None:
+            return int(sampler_seed)
+        return int(seed_match.group(1))
+
+    return int(sampler_seed)
 
 
 def main():
@@ -377,13 +453,14 @@ def main():
     parser.add_argument('--n_configs', type=int, default=4, help='Number of parallel config groups for --run_mode tune-ask')
     parser.add_argument('--trial_number', type=int, default=None, help='Trial number for --run_mode tune-fold')
     parser.add_argument('--trial_numbers', type=str, default=None, help='Comma-separated trial numbers for --run_mode tune-tell (default: read from coordinated_active.json)')
-    parser.add_argument('--optuna_storage', type=str, default='sqlite:///results_training/optuna.db', help='Optuna storage URL')
+    parser.add_argument('--optuna_storage', type=str, default=DEFAULT_OPTUNA_STORAGE, help='Optuna storage URL')
     parser.add_argument('--study_name', type=str, default=None, help='Optuna study name override (default: experiment.name)')
     parser.add_argument('--sampler_seed', type=int, default=42, help='Optuna sampler seed')
 
     # Manual warm-start only (transfer learning is HP-controlled in experiment YAML)
     parser.add_argument('--base_weights', type=str, default=None, help='Optional warm-start checkpoint for train/full-train. Overrides transfer.base_weights from the experiment YAML.')
     parser.add_argument('--runtime_device_banner', action='store_true', help='Print device and memory info at runtime')
+    parser.add_argument('--verbose', action='store_true', help='Enable progress bars, batch timing, and more frequent training logs')
     
     # Sanity check / fast iteration
     parser.add_argument('--subsample', type=float, default=None, help='Subsample fraction (0.0-1.0) of genes for fast sanity checks, e.g. --subsample 0.1 for ~10% of genes per epoch.')
@@ -391,6 +468,9 @@ def main():
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing data files')
     args = parser.parse_args()
     experiment_spec = load_experiment_spec(args.experiment) if args.experiment is not None else None
+    resolved_optuna_storage = _resolve_optuna_storage(experiment_spec, args.optuna_storage)
+    resolved_study_name = _resolve_optuna_study_name(experiment_spec, args.study_name)
+    resolved_sampler_seed = _resolve_sampler_seed(args.experiment, int(args.sampler_seed))
     zarr_base = resolve_zarr_base(args.zarr_output_dir)
     labels_dir = resolve_labels_dir()
     reference_path = resolve_reference_path(args.scalars_reference_path)
@@ -479,6 +559,7 @@ def main():
         model_cfg, train_cfg = _build_configs_from_spec(
             experiment_spec,
             model_name=args.model_name,
+            verbose=bool(args.verbose),
             runtime_device_banner=bool(args.runtime_device_banner),
             base_weights_override=args.base_weights,
         )
@@ -502,9 +583,7 @@ def main():
             seed=experiment_spec.data.seed,
             subsample_frac=args.subsample,
             train_only_cohorts=experiment_spec.data.train_only_cohorts,
-            balance_cohorts=experiment_spec.data.balance_cohorts,
             source_groups=experiment_spec.data.source_groups,
-            target_n_per_source=experiment_spec.data.target_n_per_source,
             steps_per_epoch=experiment_spec.data.steps_per_epoch,
             batch_mode=experiment_spec.data.batch_mode,
             fixed_schedule_oof=True,
@@ -522,6 +601,7 @@ def main():
         model_cfg, train_cfg = _build_configs_from_spec(
             experiment_spec,
             model_name=args.model_name,
+            verbose=bool(args.verbose),
             runtime_device_banner=bool(args.runtime_device_banner),
             base_weights_override=args.base_weights,
         )
@@ -538,9 +618,7 @@ def main():
             seed=experiment_spec.data.seed,
             subsample_frac=args.subsample,
             train_only_cohorts=experiment_spec.data.train_only_cohorts,
-            balance_cohorts=experiment_spec.data.balance_cohorts,
             source_groups=experiment_spec.data.source_groups,
-            target_n_per_source=experiment_spec.data.target_n_per_source,
             steps_per_epoch=experiment_spec.data.steps_per_epoch,
             batch_mode=experiment_spec.data.batch_mode,
         )
@@ -558,18 +636,18 @@ def main():
             run_optuna_fold_tuning(
                 experiment_path=str(args.experiment),
                 fold_num=int(args.test_fold),
-                storage=str(args.optuna_storage),
+                storage=str(resolved_optuna_storage),
                 n_trials=(int(args.n_trials) if args.n_trials else None),
-                study_name=(None if args.study_name is None else str(args.study_name)),
-                sampler_seed=int(args.sampler_seed),
+                study_name=resolved_study_name,
+                sampler_seed=int(resolved_sampler_seed),
             )
         else:
             run_optuna_cv_tuning(
                 experiment_path=str(args.experiment),
                 n_trials=int(args.n_trials),
-                storage=str(args.optuna_storage),
-                study_name=(None if args.study_name is None else str(args.study_name)),
-                sampler_seed=int(args.sampler_seed),
+                storage=str(resolved_optuna_storage),
+                study_name=resolved_study_name,
+                sampler_seed=int(resolved_sampler_seed),
             )
 
     elif args.run_mode == 'tune-rescue':
@@ -584,10 +662,10 @@ def main():
 
         rescued_trials = rescue_failed_fold_trials(
             experiment_path=str(args.experiment),
-            storage=str(args.optuna_storage),
-            study_name=(None if args.study_name is None else str(args.study_name)),
+            storage=str(resolved_optuna_storage),
+            study_name=resolved_study_name,
             trial_numbers=trial_nums,
-            sampler_seed=int(args.sampler_seed),
+            sampler_seed=int(resolved_sampler_seed),
         )
         print(f"RESCUED_TRIAL_NUMBERS={','.join(str(t) for t in rescued_trials)}", flush=True)
 
@@ -600,9 +678,9 @@ def main():
         trial_numbers = coordinated_ask(
             experiment_path=str(args.experiment),
             n_configs=int(args.n_configs),
-            storage=str(args.optuna_storage),
-            study_name=(None if args.study_name is None else str(args.study_name)),
-            sampler_seed=int(args.sampler_seed),
+            storage=str(resolved_optuna_storage),
+            study_name=resolved_study_name,
+            sampler_seed=int(resolved_sampler_seed),
         )
         # Print trial numbers for SLURM script to parse
         print(f"TRIAL_NUMBERS={','.join(str(t) for t in trial_numbers)}", flush=True)
@@ -620,9 +698,9 @@ def main():
         coordinated_tell(
             experiment_path=str(args.experiment),
             trial_numbers=trial_nums,
-            storage=str(args.optuna_storage),
-            study_name=(None if args.study_name is None else str(args.study_name)),
-            sampler_seed=int(args.sampler_seed),
+            storage=str(resolved_optuna_storage),
+            study_name=resolved_study_name,
+            sampler_seed=int(resolved_sampler_seed),
         )
 
     elif args.run_mode == 'tune-proxy-ask':
@@ -634,9 +712,9 @@ def main():
         trial_numbers = coordinated_proxy_ask(
             experiment_path=str(args.experiment),
             n_configs=int(args.n_configs),
-            storage=str(args.optuna_storage),
-            study_name=(None if args.study_name is None else str(args.study_name)),
-            sampler_seed=int(args.sampler_seed),
+            storage=str(resolved_optuna_storage),
+            study_name=resolved_study_name,
+            sampler_seed=int(resolved_sampler_seed),
         )
         print(f"TRIAL_NUMBERS={','.join(str(t) for t in trial_numbers)}", flush=True)
 
@@ -653,9 +731,9 @@ def main():
         reported_trials = coordinated_proxy_tell(
             experiment_path=str(args.experiment),
             trial_numbers=trial_nums,
-            storage=str(args.optuna_storage),
-            study_name=(None if args.study_name is None else str(args.study_name)),
-            sampler_seed=int(args.sampler_seed),
+            storage=str(resolved_optuna_storage),
+            study_name=resolved_study_name,
+            sampler_seed=int(resolved_sampler_seed),
         )
         print(f"REPORTED_TRIAL_NUMBERS={','.join(str(t) for t in reported_trials)}", flush=True)
 
@@ -689,6 +767,11 @@ def main():
             experiment_path=str(args.experiment),
             trial_number=int(args.trial_number),
             fold_num=int(args.test_fold),
+            storage=str(resolved_optuna_storage),
+            study_name=resolved_study_name,
+            sampler_seed=int(resolved_sampler_seed),
+            verbose=bool(args.verbose),
+            runtime_device_banner=bool(args.runtime_device_banner),
         )
     
     elif args.run_mode == 'run':

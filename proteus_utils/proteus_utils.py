@@ -131,10 +131,6 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         gene_weights: Optional[Dict[str, float]] = None,
         val_frac: Optional[float] = None,
         val_split: bool = False,
-        cohort_map: Optional[Dict[str, str]] = None,
-        balance_cohorts: Optional[List[str]] = None,
-        source_map: Optional[Dict[str, str]] = None,
-        target_n_per_source: Optional[int] = None,
         sample_name_map: Optional[Dict[str, str]] = None,
     ):
         super().__init__()
@@ -149,12 +145,7 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         self.gene_weights = gene_weights
         self.val_frac = val_frac
         self.val_split = val_split
-        self.cohort_map = cohort_map       # zarr_path -> cohort name
-        self.balance_cohorts = balance_cohorts  # cohorts to balance
-        self.source_map = source_map       # zarr_path -> source group name
-        self.target_n_per_source = target_n_per_source
         self.sample_name_map = sample_name_map  # zarr_path -> display name (TSV sample)
-        self._balance_iter = 0
         self._shuffle_buffer_batches = max(
             16,
             2 * (self.chunk_size // self.genes_per_batch),
@@ -210,12 +201,6 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
                 self._chunks = [c for i, c in enumerate(self._chunks) if i not in val_indices]
 
         self._n_batches = self._count_batches(self._chunks)
-        self._balanced_n_batches = self._estimate_balanced_batches(
-            self._chunks, self.sample_paths, self.genes_per_batch,
-            self.source_map, self.target_n_per_source,
-            self.cohort_map, self.balance_cohorts,
-            self._n_batches,
-        )
 
         # Per-worker caches (populated lazily).
         self._store_cache: Dict[str, zarr.Group] = {}
@@ -254,84 +239,6 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
             json.dump(chunks, f)
         return chunks
 
-    @staticmethod
-    def _estimate_balanced_batches(
-        chunks: List[Tuple[str, int, int]],
-        sample_paths: List[str],
-        genes_per_batch: int,
-        source_map: Optional[Dict[str, str]],
-        target_n_per_source: Optional[int],
-        cohort_map: Optional[Dict[str, str]],
-        balance_cohorts: Optional[List[str]],
-        fallback: int,
-    ) -> int:
-        """Upper-bound batch count for balanced training modes.
-
-        With persistent_workers the main-process balance counter never
-        advances, so __len__ can't predict the exact epoch size.  This
-        computes a tight upper bound by assuming the worst-case sample
-        selection (samples with the most batches).
-        """
-        from collections import defaultdict
-
-        if source_map and target_n_per_source:
-            batches_per_sample: Dict[str, int] = {}
-            for path, start, end in chunks:
-                batches_per_sample[path] = (
-                    batches_per_sample.get(path, 0)
-                    + (end - start) // genes_per_batch
-                )
-            source_paths: Dict[str, List[str]] = defaultdict(list)
-            for path in sample_paths:
-                src = source_map.get(path)
-                if src is not None:
-                    source_paths[src].append(path)
-            total = 0
-            for paths in source_paths.values():
-                per_sample = sorted(
-                    [batches_per_sample.get(p, 0) for p in paths],
-                    reverse=True,
-                )
-                if len(per_sample) >= target_n_per_source:
-                    total += sum(per_sample[:target_n_per_source])
-                else:
-                    full = target_n_per_source // len(per_sample)
-                    rem = target_n_per_source % len(per_sample)
-                    total += sum(per_sample) * full + sum(per_sample[:rem])
-            return total
-
-        if cohort_map and balance_cohorts:
-            batches_per_sample = {}
-            for path, start, end in chunks:
-                batches_per_sample[path] = (
-                    batches_per_sample.get(path, 0)
-                    + (end - start) // genes_per_batch
-                )
-            cohort_paths: Dict[str, List[str]] = defaultdict(list)
-            for path in sample_paths:
-                coh = cohort_map.get(path)
-                if coh is not None:
-                    cohort_paths[coh].append(path)
-            balance_set = set(balance_cohorts)
-            per_cohort_counts = {
-                c: len(cohort_paths[c])
-                for c in balance_cohorts if c in cohort_paths
-            }
-            n_min = min(per_cohort_counts.values()) if per_cohort_counts else 0
-            total = 0
-            for coh, paths in cohort_paths.items():
-                per_sample = sorted(
-                    [batches_per_sample.get(p, 0) for p in paths],
-                    reverse=True,
-                )
-                if coh in balance_set:
-                    total += sum(per_sample[:n_min])
-                else:
-                    total += sum(per_sample)
-            return total
-
-        return fallback
-
     def _count_batches(self, chunks: List[Tuple[str, int, int]]) -> int:
         n_batches = 0
         for _path, start, end in chunks:
@@ -339,83 +246,7 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         return int(n_batches)
 
     def __len__(self) -> int:
-        if self.source_map and self.target_n_per_source:
-            return self._balanced_n_batches
-        if self.cohort_map and self.balance_cohorts:
-            return self._balanced_n_batches
         return int(self._n_batches)
-
-    def _balanced_chunks(self, epoch: int) -> List[Tuple[str, int, int]]:
-        """Return chunks filtered for balanced training.
-
-        Two modes:
-
-        1.  **Source-group balancing** (``source_map`` + ``target_n_per_source``):
-            Groups samples by source, then draws exactly
-            ``target_n_per_source`` samples per source per epoch
-            (oversampling small sources with replacement,
-            undersampling large sources without).
-
-        2.  **Legacy cohort balancing** (``balance_cohorts`` only):
-            Undersamples balanced cohorts to the minority count.
-            Non-balanced cohorts are always included at full count.
-        """
-        from collections import defaultdict
-
-        # ------- Source-group balanced sampling -------
-        if self.source_map and self.target_n_per_source:
-            source_paths: Dict[str, List[str]] = defaultdict(list)
-            for path in self.sample_paths:
-                src = self.source_map.get(path)
-                if src is not None:
-                    source_paths[src].append(path)
-
-            rng = random.Random(self.seed + epoch * 997)
-            selected_paths: set = set()
-            for src_name, paths in source_paths.items():
-                n_avail = len(paths)
-                n_target = self.target_n_per_source
-                if n_avail == 0:
-                    continue
-                if n_avail >= n_target:
-                    chosen = rng.sample(paths, n_target)
-                else:
-                    # Oversample: full copy + random remainder
-                    full_copies = n_target // n_avail
-                    remainder = n_target % n_avail
-                    chosen = paths * full_copies + rng.sample(paths, remainder)
-                selected_paths.update(chosen)
-            filtered = [c for c in self._chunks if c[0] in selected_paths]
-            rng.shuffle(filtered)
-            return filtered
-
-        # ------- Legacy cohort-balanced sampling -------
-        cohort_paths: Dict[str, List[str]] = defaultdict(list)
-        for path in self.sample_paths:
-            coh = self.cohort_map.get(path, None)
-            if coh is not None:
-                cohort_paths[coh].append(path)
-
-        counts = {c: len(cohort_paths[c]) for c in self.balance_cohorts
-                  if c in cohort_paths}
-        if not counts:
-            return self._chunks
-        n_min = min(counts.values())
-
-        rng = random.Random(self.seed + epoch * 997)
-        selected_paths = set()
-        for coh in self.balance_cohorts:
-            paths = cohort_paths.get(coh, [])
-            chosen = rng.sample(paths, min(n_min, len(paths)))
-            selected_paths.update(chosen)
-
-        for coh, paths in cohort_paths.items():
-            if coh not in self.balance_cohorts:
-                selected_paths.update(paths)
-
-        filtered = [c for c in self._chunks if c[0] in selected_paths]
-        rng.shuffle(filtered)
-        return filtered
 
     def _get_store(self, zarr_path: str) -> zarr.Group:
         if self.cache_stores:
@@ -562,15 +393,9 @@ class ProteusGeneChunkIterableDataset(IterableDataset):
         # Per-epoch deterministic chunk reshuffling.  This preserves exact
         # once-per-epoch example exposure while preventing the model from
         # seeing the same sample-local chunk order every epoch.
-        self._balance_iter += 1
-        epoch_seed = self.seed + self._balance_iter * 997
+        epoch_seed = self.seed + 997
         active_chunks = list(self._chunks)
-        if self.source_map and self.target_n_per_source:
-            active_chunks = self._balanced_chunks(self._balance_iter)
-        elif self.cohort_map and self.balance_cohorts:
-            active_chunks = self._balanced_chunks(self._balance_iter)
-        else:
-            random.Random(epoch_seed).shuffle(active_chunks)
+        random.Random(epoch_seed).shuffle(active_chunks)
 
         worker_rng = random.Random(epoch_seed + 104729 * (worker_id + 1))
         microbatch_buffer: List[Tuple[Dict[str, Any], Dict[str, torch.Tensor]]] = []
@@ -665,7 +490,6 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         self,
         sample_paths_by_source: Dict[str, List[str]],
         gene_variance: Dict[str, float],
-        n_eff_per_source: int = 24,
         genes_per_batch: int = 2,
         batch_size: int = 64,
         steps_per_epoch: int = 4000,
@@ -682,7 +506,6 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         self.sample_paths_by_source = dict(sample_paths_by_source)
         self.source_names = sorted(self.sample_paths_by_source.keys())
         self.n_sources = len(self.source_names)
-        self.n_eff_per_source = n_eff_per_source
         self.genes_per_batch = genes_per_batch
         self.batch_size = batch_size
         self.steps_per_epoch = int(steps_per_epoch)
@@ -1563,10 +1386,6 @@ def create_data_loader(
     gene_weights: Optional[Dict[str, float]] = None,
     val_frac: Optional[float] = None,
     val_split: bool = False,
-    cohort_map: Optional[Dict[str, str]] = None,
-    balance_cohorts: Optional[List[str]] = None,
-    source_map: Optional[Dict[str, str]] = None,
-    target_n_per_source: Optional[int] = None,
     sample_name_map: Optional[Dict[str, str]] = None,
 ) -> Tuple[DataLoader, int]:
     """Create a chunk-based DataLoader for Proteus training/validation.
@@ -1585,10 +1404,6 @@ def create_data_loader(
         gene_weights: Per-gene variance weights for loss scaling.
         val_frac: Fraction of chunks to reserve for validation.
         val_split: If True, yield only val chunks; if False, yield only train chunks.
-        cohort_map: zarr_path → cohort name (for cohort balancing).
-        balance_cohorts: Cohort names to balance by undersampling.
-        source_map: zarr_path → source group name (for source balancing).
-        target_n_per_source: Target samples per source per epoch.
         sample_name_map: zarr_path → display name (TSV sample name).
 
     Returns:
@@ -1604,10 +1419,6 @@ def create_data_loader(
         gene_weights=gene_weights,
         val_frac=val_frac,
         val_split=val_split,
-        cohort_map=cohort_map,
-        balance_cohorts=balance_cohorts,
-        source_map=source_map,
-        target_n_per_source=target_n_per_source,
         sample_name_map=sample_name_map,
     )
 
@@ -1662,9 +1473,6 @@ def build_loaders_from_splits(
     subsample_frac: Optional[float] = None,
     gene_weights: Optional[Dict[str, float]] = None,
     train_only_cohorts: Optional[List[str]] = None,
-    balance_cohorts: Optional[List[str]] = None,
-    source_groups: Optional[Dict[str, List[str]]] = None,
-    target_n_per_source: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader, int, int]:
     """Build train/val DataLoaders from a deterministic splits TSV file.
 
@@ -1698,34 +1506,13 @@ def build_loaders_from_splits(
         FileNotFoundError: If training_set_tsv or any Zarr store doesn't exist.
         ValueError: If TSV format is invalid.
     """
-    train_paths, val_paths, zarr_path_to_cohort, zarr_path_to_sample_name = (
+    train_paths, val_paths, _zarr_path_to_cohort, zarr_path_to_sample_name = (
         _parse_splits_tsv(training_set_tsv, zarr_base, val_fold, train_only_cohorts)
     )
 
     # Shuffle training paths deterministically
     rng = np.random.RandomState(seed)
     rng.shuffle(train_paths)
-
-    # Build source assignments for validation / reporting.
-    zarr_path_to_source: Optional[Dict[str, str]] = None
-    if source_groups:
-        _cohort_to_source = invert_source_groups(source_groups)
-        _pdx_names = collect_pdx_names(training_set_tsv, _cohort_to_source)
-
-        zarr_path_to_source = {}
-        for zpath, coh in zarr_path_to_cohort.items():
-            if zpath not in train_paths:
-                continue
-            basename = os.path.basename(zpath).replace('.zarr', '')
-            source = assign_source(coh, basename, _cohort_to_source,
-                                   _pdx_names)
-            if source is not None:
-                zarr_path_to_source[zpath] = source
-
-        from collections import Counter
-        src_counts = Counter(zarr_path_to_source.values())
-        print(f"  [Source groups] {dict(src_counts)}, "
-              f"target_n_per_source={target_n_per_source}")
 
     index_paths = _write_temp_index_files(
         'proteus_splits_',
@@ -1749,8 +1536,6 @@ def build_loaders_from_splits(
         seed=seed,
         subsample_frac=subsample_frac,
         gene_weights=gene_weights,
-        cohort_map=zarr_path_to_cohort if balance_cohorts else None,
-        balance_cohorts=balance_cohorts,
     )
 
     val_loader, val_steps = create_data_loader(
@@ -1774,15 +1559,17 @@ def build_multisource_loaders_from_splits(
     val_fold: int,
     source_groups: Dict[str, List[str]],
     gene_variance: Dict[str, float],
-    n_eff_per_source: int = 24,
     genes_per_batch: int = 2,
     batch_size: int = 64,
     steps_per_epoch: int = 4000,
     gene_weight_min: float = 0.5,
     gene_weight_max: float = 2.0,
     num_workers: int = 4,
+    train_num_workers: int = 0,
     persistent_workers: bool = True,
+    train_persistent_workers: bool = False,
     prefetch_factor: int = 4,
+    train_prefetch_factor: int = 2,
     seed: int = 42,
     train_only_cohorts: Optional[List[str]] = None,
     gene_weights: Optional[Dict[str, float]] = None,
@@ -1800,16 +1587,17 @@ def build_multisource_loaders_from_splits(
         val_fold: Fold number held out for validation.
         source_groups: Mapping of source name → list of cohort names.
         gene_variance: Per-gene raw variance (for loss weights).
-        n_eff_per_source: Retained for caller compatibility; fixed stochastic
-            epochs are controlled by ``steps_per_epoch``.
         genes_per_batch: Unique genes drawn per batch (default 2).
         batch_size: Total items per batch (default 64).
         steps_per_epoch: Fixed stochastic batches per epoch (default 4000).
         gene_weight_min: Minimum compressed loss weight (default 0.5).
         gene_weight_max: Maximum compressed loss weight (default 2.0).
-        num_workers: DataLoader workers.
+        num_workers: Validation DataLoader workers.
+        train_num_workers: Training DataLoader workers.
         persistent_workers: Keep workers alive between epochs.
+        train_persistent_workers: Keep training workers alive between epochs.
         prefetch_factor: Batches to prefetch per worker.
+        train_prefetch_factor: Training batches to prefetch per worker.
         seed: Random seed.
         train_only_cohorts: Cohorts always routed to training (e.g. ``['PHT']``).
         gene_weights: Clipped variance weights for the validation loader.
@@ -1852,7 +1640,6 @@ def build_multisource_loaders_from_splits(
     train_dataset = ProteusMultiSourceBatchDataset(
         sample_paths_by_source=sample_paths_by_source,
         gene_variance=gene_variance,
-        n_eff_per_source=n_eff_per_source,
         genes_per_batch=genes_per_batch,
         batch_size=batch_size,
         steps_per_epoch=steps_per_epoch,
@@ -1867,11 +1654,11 @@ def build_multisource_loaders_from_splits(
 
     train_loader = create_single_item_loader(
         train_dataset,
-        num_workers=num_workers,
+        num_workers=train_num_workers,
         seed=seed,
         collate_fn=_collate_identity,
-        persistent_workers=persistent_workers,
-        prefetch_factor=prefetch_factor,
+        persistent_workers=train_persistent_workers,
+        prefetch_factor=train_prefetch_factor,
     )
     train_steps = len(train_dataset)
 

@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Literal, Mapping, Optional, Sequence, Union
 
 import yaml
 
-from config.runtime_paths import DEFAULT_ZARR_BASE, normalize_path
+from config.runtime_paths import normalize_path, resolve_zarr_base
 from proteus_utils.data_helpers import (
     DEFAULT_SOURCE_WEIGHTED_SELECTION_GROUP_WEIGHTS,
 )
@@ -86,6 +86,12 @@ def _as_str(x: Any, ctx: str) -> str:
             _fail(f"{ctx} must be a non-empty string")
         return s
     _fail(f"{ctx} must be a string, got {type(x).__name__}")
+
+
+def _resolve_experiment_zarr_base(raw_value: Optional[str]) -> str:
+    if raw_value is None:
+        return resolve_zarr_base()
+    return normalize_path(str(raw_value).strip())
 
 
 @dataclass(frozen=True)
@@ -290,7 +296,6 @@ class ScaleSpec:
             "funnel_reduction_factor",
             "reduction_dilation",
             "dropout_rate",
-            "signal_encoder_width",  # Legacy key; ignored by the current compact spatial encoder
         ]
         _check_no_unknown_keys(d, allowed=allowed, ctx="scale")
 
@@ -358,11 +363,8 @@ class DataSpec:
         Maps a source name to the list of cohort names that belong to
         that source.  PHT samples are automatically assigned to the
         source whose PDX cohort they derive from (parsed from sample
-        name).  In the preferred chunk-based PLCAv2 path this does not
-        alter training exposure; it defines how validation metrics are
-        aggregated.  The legacy ``multi_source`` batch mode still uses
-        these groups for explicit source-balanced sampling.
-        Mutually exclusive with ``balance_cohorts``.
+        name). These groups define the source-balanced multi-source
+        training path and the aligned validation aggregation.
 
     steps_per_epoch (optional, int):
         Number of fixed stochastic gene-conditioned micro-batches per epoch.
@@ -381,9 +383,7 @@ class DataSpec:
     seed: int
     subsample_frac: Optional[float]
     train_only_cohorts: Optional[List[str]]
-    balance_cohorts: Optional[List[str]]
     source_groups: Optional[Dict[str, List[str]]]
-    target_n_per_source: Optional[int]
     steps_per_epoch: int
     batch_mode: str
     selection_metric: str
@@ -393,8 +393,7 @@ class DataSpec:
         d = _expect_dict(x, "data")
         allowed = ["training_set", "zarr_base", "seed",
                     "subsample_frac", "train_only_cohorts",
-                    "balance_cohorts", "source_groups",
-                    "target_n_per_source", "steps_per_epoch", "batch_mode",
+                    "source_groups", "steps_per_epoch", "batch_mode",
                     "selection_metric"]
         _check_no_unknown_keys(d, allowed=allowed, ctx="data")
         subsample_raw = d.get("subsample_frac", None)
@@ -412,13 +411,6 @@ class DataSpec:
                 _fail("data.train_only_cohorts must be a list of strings")
             train_only = [str(c).strip() for c in train_only_raw]
 
-        balance_raw = d.get("balance_cohorts", None)
-        balance: Optional[List[str]] = None
-        if balance_raw is not None:
-            if not isinstance(balance_raw, list):
-                _fail("data.balance_cohorts must be a list of strings")
-            balance = [str(c).strip() for c in balance_raw]
-
         source_groups_raw = d.get("source_groups", None)
         source_groups: Optional[Dict[str, List[str]]] = None
         if source_groups_raw is not None:
@@ -429,22 +421,11 @@ class DataSpec:
                 for k, v in source_groups_raw.items()
             }
 
-        target_n_raw = d.get("target_n_per_source", None)
-        target_n: Optional[int] = None
-        if target_n_raw is not None:
-            target_n = _as_int(target_n_raw, "data.target_n_per_source")
-            if target_n <= 0:
-                _fail(f"data.target_n_per_source must be > 0, got {target_n}")
-
         steps_per_epoch = _as_int(
             d.get("steps_per_epoch", 4000), "data.steps_per_epoch"
         )
         if steps_per_epoch <= 0:
             _fail(f"data.steps_per_epoch must be > 0, got {steps_per_epoch}")
-
-        if source_groups is not None and balance is not None:
-            _fail("data.source_groups and data.balance_cohorts are "
-                  "mutually exclusive — use one or the other")
 
         batch_mode_raw = _as_str(
             d.get("batch_mode", "multi_source"), "data.batch_mode"
@@ -485,17 +466,15 @@ class DataSpec:
             training_set=normalize_path(
                 _as_str(d["training_set"], "data.training_set")
             ),
-            zarr_base=(
-                normalize_path(_as_str(d["zarr_base"], "data.zarr_base"))
+            zarr_base=_resolve_experiment_zarr_base(
+                _as_str(d["zarr_base"], "data.zarr_base")
                 if "zarr_base" in d
-                else DEFAULT_ZARR_BASE
+                else None
             ),
             seed=_as_int(d.get("seed", 42), "data.seed"),
             subsample_frac=subsample_frac,
             train_only_cohorts=train_only,
-            balance_cohorts=balance,
             source_groups=source_groups,
-            target_n_per_source=target_n,
             steps_per_epoch=steps_per_epoch,
             batch_mode=batch_mode_raw,
             selection_metric=selection_metric_raw,

@@ -100,14 +100,14 @@ class TrainingConfig:
     log_interval: int = 100  # Log every N batches
 
     # Progress bar
-    progress_bar: bool = True
+    progress_bar: bool = False
 
     # Progress backend: 'auto'|'tqdm'|'rich'|'none'
     # - auto: prefer Rich if installed, else tqdm
     progress_backend: str = 'auto'
 
     # Diagnostics
-    track_batch_timing: bool = True
+    track_batch_timing: bool = False
 
     # Runtime banner (prints device / memory / one batch shape)
     runtime_device_banner: bool = False
@@ -351,6 +351,13 @@ class Trainer:
         self._active_rich_progress = None
         self._active_pbar = None
 
+    def set_srl_stats(
+        self,
+        gene_mean_map: Dict[str, float],
+        gene_std_map: Dict[str, float],
+    ) -> None:
+        self.external_loss_fn.set_srl_stats(gene_mean_map, gene_std_map)
+
     def _prepare_for_fit(self) -> None:
         if self._prepared_for_fit:
             return
@@ -504,6 +511,22 @@ class Trainer:
                 print(f'  cuda_mem_allocated_GB={torch.cuda.memory_allocated()/1e9:.3f} max_allocated_GB={torch.cuda.max_memory_allocated()/1e9:.3f}')
             except RuntimeError:
                 pass
+
+    def _create_optimizer(self) -> torch.optim.Optimizer:
+        trainable_params = [
+            parameter
+            for parameter in self.model.parameters()
+            if parameter.requires_grad
+        ]
+        if not trainable_params:
+            raise ValueError('Cannot create optimizer with no trainable parameters.')
+
+        return torch.optim.AdamW(
+            trainable_params,
+            lr=self.config.max_lr,
+            weight_decay=self.config.weight_decay,
+            fused=(self.device.type == 'cuda'),
+        )
     
     def _load_weights(self, weights_path: str):
         """Load pre-trained weights (raw state_dict or full checkpoint)."""
@@ -757,14 +780,16 @@ class Trainer:
         # (DataLoader worker spin-up, prefetch, etc.) instead of showing a stuck 0% bar.
         data_iter = iter(train_loader)
         t_fetch0 = time.time()
-        print(f'Epoch {epoch}: initializing DataLoader iterator...')
-        print(f'Epoch {epoch}: waiting for first batch...')
+        if use_pbar or self.config.track_batch_timing:
+            print(f'Epoch {epoch}: initializing DataLoader iterator...')
+            print(f'Epoch {epoch}: waiting for first batch...')
         try:
             first_batch = next(data_iter)
         except StopIteration:
             return {'loss': float('nan'), 'epoch_time': 0.0}
         t_fetch1 = time.time()
-        print(f'Epoch {epoch}: first batch ready (wait {(t_fetch1 - t_fetch0):.2f}s)')
+        if use_pbar or self.config.track_batch_timing:
+            print(f'Epoch {epoch}: first batch ready (wait {(t_fetch1 - t_fetch0):.2f}s)')
 
         pbar = None
         rich_progress = None
@@ -942,7 +967,7 @@ class Trainer:
             # ----------------------------------------------------------
             # Non-finite loss handling
             # ----------------------------------------------------------
-            _loss_is_finite = torch.isfinite(total_loss)
+            _loss_is_finite = bool(torch.isfinite(total_loss.detach()).all().item())
             if not _loss_is_finite:
                 current_lr = (
                     self.scheduler.get_last_lr()[0]
@@ -1019,85 +1044,27 @@ class Trainer:
                     scale_before = float(self.scaler.get_scale())
                     self.scaler.unscale_(self.optimizer)
 
-                bad_grad_parts = []
-                for parameter_name, parameter in self.model.named_parameters():
-                    if parameter.grad is None:
-                        continue
-                    if not torch.isfinite(parameter.grad).all():
-                        n_bad = int((~torch.isfinite(parameter.grad)).sum().item())
-                        bad_grad_parts.append(f'{parameter_name}({n_bad} non-finite)')
-                        if len(bad_grad_parts) >= 8:
-                            break
-                if bad_grad_parts:
-                    current_lr = (
-                        self.scheduler.get_last_lr()[0]
-                        if self.scheduler is not None
-                        else self.config.max_lr
-                    )
-                    bad_grad_origin = '; '.join(bad_grad_parts)
-                    ext_val, int_val, breakdown = _loss_component_summary(
-                        external_loss,
-                        internal_loss_result,
-                        external_metrics,
-                        internal_metrics,
-                    )
-                    component_info = f'external={ext_val}, internal={int_val}'
-                    if breakdown:
-                        component_info = f'{component_info}, {breakdown}'
-                    if self.use_amp:
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        scale_after = float(self.scaler.get_scale())
-                        amp_overflow_steps += 1
-                        diagnostic_path = _write_amp_recovery_diagnostic(
-                            'amp_nonfinite_gradients',
-                            current_lr,
-                            scale_before,
-                            scale_after,
-                            current_bad_gradient_origin=bad_grad_origin,
-                        )
-                        self.optimizer.zero_grad(set_to_none=True)
-                        _log_runtime_message(
-                            f'  AMP overflow recovery at batch {batch_idx} '
-                            f'(lr={current_lr:.3e}, scale={scale_before:.3e}->{scale_after:.3e}). '
-                            f'Origin: {bad_grad_origin}. Components: {component_info}'
-                            f'{_diagnostic_suffix(diagnostic_path)}'
-                        )
-                        _finish_recovered_batch()
-                        continue
-                    diagnostic_path = self._write_r4_diagnostic(
-                        reason='nonfinite_gradients',
-                        epoch=epoch,
-                        batch_idx=batch_idx,
-                        current_lr=current_lr,
-                        features=features,
-                        labels=labels,
-                        predictions=predictions,
-                        external_loss=external_loss,
-                        internal_loss_result=internal_loss_result,
-                        total_loss=total_loss,
-                        external_metrics=external_metrics,
-                        internal_metrics=internal_metrics,
-                        bad_gradient_origin=bad_grad_origin,
-                    )
-                    raise RuntimeError(
-                        f'Non-finite gradients before optimizer step at batch {batch_idx} '
-                        f'(lr={current_lr:.3e}). Origin: {bad_grad_origin}. '
-                        f'Components: {component_info}'
-                        f'{_diagnostic_suffix(diagnostic_path)}'
-                    )
-
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.config.max_grad_norm,
+                    error_if_nonfinite=False,
                 )
-                if not torch.isfinite(grad_norm):
+                if not bool(torch.isfinite(grad_norm.detach()).all().item()):
                     current_lr = (
                         self.scheduler.get_last_lr()[0]
                         if self.scheduler is not None
                         else self.config.max_lr
                     )
                     scale_info = '' if scale_before is None else f', scale={scale_before:.3e}'
+                    gradient_summary = self._gradient_diagnostic_summary()
+                    bad_grad_entries = gradient_summary.get('bad_gradients', [])
+                    if bad_grad_entries:
+                        bad_grad_origin = '; '.join(
+                            f"{entry['parameter']}({int(entry['summary'].get('nonfinite', 0))} non-finite)"
+                            for entry in bad_grad_entries[:8]
+                        )
+                    else:
+                        bad_grad_origin = 'undetermined'
                     ext_val, int_val, breakdown = _loss_component_summary(
                         external_loss,
                         internal_loss_result,
@@ -1117,12 +1084,13 @@ class Trainer:
                             scale_before,
                             scale_after,
                             current_grad_norm=grad_norm,
+                            current_bad_gradient_origin=bad_grad_origin,
                         )
                         _log_runtime_message(
                             f'  AMP gradient-norm recovery at batch {batch_idx} '
                             f'(lr={current_lr:.3e}, scale={scale_before:.3e}->{scale_after:.3e}, '
                             f'grad_norm={float(grad_norm.detach().cpu().item())}). '
-                            f'Components: {component_info}'
+                            f'Origin: {bad_grad_origin}. Components: {component_info}'
                             f'{_diagnostic_suffix(diagnostic_path)}'
                         )
                         _finish_recovered_batch()
@@ -1142,12 +1110,13 @@ class Trainer:
                         internal_metrics=internal_metrics,
                         scale_before=scale_before,
                         grad_norm=grad_norm,
+                        bad_gradient_origin=bad_grad_origin,
                     )
                     raise RuntimeError(
                         f'Non-finite gradient norm before optimizer step at batch {batch_idx} '
                         f'(lr={current_lr:.3e}{scale_info}, '
                         f'grad_norm={float(grad_norm.detach().cpu().item())}). '
-                        f'Components: {component_info}'
+                        f'Origin: {bad_grad_origin}. Components: {component_info}'
                         f'{_diagnostic_suffix(diagnostic_path)}'
                     )
 
@@ -1170,17 +1139,17 @@ class Trainer:
             # Skip on non-finite loss to avoid polluting running averages.
             if _loss_is_finite:
                 batch_size = features['TSS_signals'].shape[0]
-                metrics_tracker.update('loss', total_loss.item(), batch_size)
+                metrics_tracker.update('loss', total_loss.detach(), batch_size)
                 for k, v in external_metrics.items():
-                    metrics_tracker.update(k, float(v) if not isinstance(v, torch.Tensor) else float(v.detach().cpu().item()), batch_size)
+                    metrics_tracker.update(k, v if isinstance(v, torch.Tensor) else float(v), batch_size)
                 for k, v in internal_metrics.items():
-                    metrics_tracker.update(k, float(v) if not isinstance(v, torch.Tensor) else float(v.detach().cpu().item()), batch_size)
+                    metrics_tracker.update(k, v if isinstance(v, torch.Tensor) else float(v), batch_size)
             
             # Logging
             if batch_idx % self.config.log_interval == 0:
                 current_lr = self.scheduler.get_last_lr()[0] if self.scheduler else self.config.max_lr
-                avg_metrics = metrics_tracker.compute()
-                avg_loss = avg_metrics.get('loss', total_loss.item())
+                avg_metrics = metrics_tracker.compute(as_python=True)
+                avg_loss = avg_metrics.get('loss', float(total_loss.detach().cpu().item()))
                 if pbar is not None:
                     postfix = {
                         'loss': f'{avg_loss:.4f}',
@@ -1200,19 +1169,6 @@ class Trainer:
                     rich_progress.update(rich_task_id, description=desc)
                 else:
                     print(f'  Batch {batch_idx}/{n_batches} | Loss: {avg_loss:.4f} | LR: {current_lr:.2e}')
-
-            # Keep progress bar telemetry fresh (even when log_interval is large).
-            if pbar is not None and self.config.track_batch_timing:
-                batches_s = (1.0 / ema_iter_time) if (ema_iter_time is not None and ema_iter_time > 0) else 0.0
-                avg_metrics_fresh = metrics_tracker.compute()
-                avg_loss_fresh = avg_metrics_fresh.get('loss', total_loss.item())
-                pbar.set_postfix({
-                    'loss': f'{avg_loss_fresh:.4f}',
-                    'lr': f'{(self.scheduler.get_last_lr()[0] if self.scheduler else self.config.max_lr):.2e}',
-                    'batches_s': f'{batches_s:.2f}',
-                    'data_s': f'{(ema_data_time if ema_data_time is not None else 0.0):.3f}',
-                    'step_s': f'{(ema_step_time if ema_step_time is not None else 0.0):.3f}',
-                })
             last_iter_end = time.time()
 
             if pbar is not None:
@@ -1228,7 +1184,7 @@ class Trainer:
         self._active_pbar = None
         
         epoch_time = time.time() - start_time
-        metrics = metrics_tracker.compute()
+        metrics = metrics_tracker.compute(as_python=True)
         metrics['epoch_time'] = epoch_time
         metrics['amp_overflow_steps'] = float(amp_overflow_steps)
         if self.use_amp:
@@ -1323,7 +1279,7 @@ class Trainer:
         last_iter_end = time.time()
         ema_data_time: Optional[float] = None
 
-        for features, labels in iterable:
+        for batch_idx, (features, labels) in enumerate(iterable):
             if self.config.track_batch_timing:
                 data_time = time.time() - last_iter_end
             features, labels = self._move_batch_to_device(features, labels)
@@ -1478,21 +1434,27 @@ class Trainer:
 
             # Use TSS_signals for batch size
             batch_size = features['TSS_signals'].shape[0]
-            metrics_tracker.update('val_loss', external_loss.item(), batch_size)
+            metrics_tracker.update('val_loss', external_loss.detach(), batch_size)
             for k, v in external_metrics.items():
-                metrics_tracker.update(f'val_{k}', float(v) if not isinstance(v, torch.Tensor) else float(v.detach().cpu().item()), batch_size)
+                metrics_tracker.update(f'val_{k}', v if isinstance(v, torch.Tensor) else float(v), batch_size)
 
-            if use_pbar and backend == 'tqdm':
+            if use_pbar and backend == 'tqdm' and (batch_idx % self.config.log_interval == 0):
                 # Show running average val loss
-                current = metrics_tracker.compute().get('val_loss', external_loss.item())
+                current = metrics_tracker.compute(as_python=True).get(
+                    'val_loss',
+                    float(external_loss.detach().cpu().item()),
+                )
                 postfix = {'val_loss': f'{current:.4f}'}
                 if self.config.track_batch_timing:
                     alpha = 0.05
                     ema_data_time = data_time if ema_data_time is None else (1 - alpha) * ema_data_time + alpha * data_time
                     postfix['data_s'] = f'{ema_data_time:.3f}'
                 iterable.set_postfix(postfix)
-            elif rich_progress is not None and rich_task_id is not None:
-                current = metrics_tracker.compute().get('val_loss', external_loss.item())
+            elif rich_progress is not None and rich_task_id is not None and (batch_idx % self.config.log_interval == 0):
+                current = metrics_tracker.compute(as_python=True).get(
+                    'val_loss',
+                    float(external_loss.detach().cpu().item()),
+                )
                 desc = f'Val  val_loss={current:.4f}'
                 if self.config.track_batch_timing:
                     alpha = 0.05
@@ -1509,7 +1471,7 @@ class Trainer:
             # Aggregate R² (unweighted, pooled across all genes/samples)
             self.tumor_r2.update(predictions['tumor_exp'], labels['tumor_exp'])
         
-        metrics = metrics_tracker.compute()
+        metrics = metrics_tracker.compute(as_python=True)
         metrics['val_tumor_aggregate_r2'] = self.tumor_r2.compute()
 
         if float(tumor_crps_denom.item()) > 0:

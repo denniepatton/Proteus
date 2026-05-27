@@ -365,9 +365,12 @@ def load_interpretation_data(
 
         all_arrays['TSS_signals'].append(flat['TSS_signals'][gene_indices].astype(np.float32))
         all_arrays['TSS_nucleotides'].append(flat['TSS_nucleotides'][gene_indices].astype(np.float32))
-        # Backward-compatible: old Zarr stores have 17 TSS features; use first 11.
         tss_feat = flat['TSS_features'][gene_indices].astype(np.float32)
-        all_arrays['TSS_features'].append(tss_feat[:, :11])
+        if tss_feat.ndim != 2 or int(tss_feat.shape[1]) != 11:
+            raise ValueError(
+                f"Expected TSS_features shape (n_genes, 11) in {zpath}, got {tuple(tss_feat.shape)}"
+            )
+        all_arrays['TSS_features'].append(tss_feat)
         all_arrays['GB_features'].append(flat['GB_features'][gene_indices].astype(np.float32))
         all_arrays['ref_scalars'].append(flat['ref_scalars'][gene_indices].astype(np.float32))
         all_arrays['TFX_label'].append(flat['TFX_label'][gene_indices].astype(np.float32))
@@ -593,7 +596,7 @@ def _tensors_to_feature_dict(tensors: Tuple[torch.Tensor, ...]) -> Dict[str, tor
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _TumorMeanWrapper(nn.Module):
-    """Thin wrapper around :class:`BioDVN` for attribution compatibility.
+    """Thin wrapper around :class:`BioDVN` for attribution workflows.
 
     Attribution libraries used here expect models that accept positional
     tensor arguments and return a single scalar output per sample.

@@ -8,8 +8,8 @@ set -euo pipefail
 # multi-task GPU jobs are used.
 #
 # The launcher resumes pending coordinated trials from the output directory and
-# auto-retries CUDA init/node failures on the alternate GPU class while
-# excluding the failed node.
+# auto-retries CUDA init/node failures on the same GPU class while excluding
+# the failed node.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
@@ -24,6 +24,7 @@ CONFIGS_PER_ROUND="${CONFIGS_PER_ROUND:-4}"
 BASE_SAMPLER_SEED="${BASE_SAMPLER_SEED:-7200}"
 PYTHON_BIN="${HOME}/.local/share/mamba/envs/${ENV_NAME}/bin/python"
 JOB_PREFIX="${JOB_PREFIX:-tds_v2_finalize}"
+DEFAULT_PROTEUS_ZARR_BASE="/hpc/temp/ha_g/user/rpatton/ProteusZarrs"
 RTX_PARTITION="${RTX_PARTITION:-campus-new}"
 RTX_GPU="${RTX_GPU:-rtx2080ti:1}"
 RTX_TIME="${RTX_TIME:-24:00:00}"
@@ -57,6 +58,49 @@ resolve_python() {
 }
 
 WORKER_PYTHON="$(resolve_python)"
+export PROTEUS_ZARR_BASE="${PROTEUS_ZARR_BASE:-${DEFAULT_PROTEUS_ZARR_BASE}}"
+
+validate_data_paths() {
+    EXPERIMENT_ENV="${EXPERIMENT}" \
+    "${WORKER_PYTHON}" - <<'PY'
+import csv
+import os
+
+from config.experiment_spec import load_experiment_spec
+from proteus_utils.data_helpers import zarr_path_for_sample
+
+exp = load_experiment_spec(os.environ["EXPERIMENT_ENV"])
+training_set = exp.data.training_set
+zarr_base = exp.data.zarr_base
+
+missing = []
+checked = 0
+with open(training_set, "r", newline="") as handle:
+    reader = csv.DictReader(handle, delimiter="\t")
+    for row in reader:
+        cohort = row["Cohort"].strip()
+        if cohort == "PHT":
+            continue
+        sample = row["Sample"].strip()
+        checked += 1
+        zarr_path = zarr_path_for_sample(sample, cohort, zarr_base)
+        if not os.path.isdir(zarr_path):
+            missing.append(zarr_path)
+
+if missing:
+    preview = "\n".join(f"  {path}" for path in missing[:8])
+    remainder = "" if len(missing) <= 8 else f"\n  ... and {len(missing) - 8} more"
+    raise SystemExit(
+        f"[tds-v2-finalize] Missing {len(missing)} non-PHT Zarr store(s) under {zarr_base} "
+        f"for {training_set}.\nFirst missing paths:\n{preview}{remainder}"
+    )
+
+print(
+    f"[tds-v2-finalize] validated {checked} non-PHT Zarr store(s) under {zarr_base}",
+    flush=True,
+)
+PY
+}
 
 bootstrap_study() {
     OPTUNA_STORAGE_ENV="${OPTUNA_STORAGE}" \
@@ -214,6 +258,7 @@ WORKER_EOF
         --job-name="${job_name}" \
         --output="logs/${job_name}_%j.out" \
         --error="logs/${job_name}_%j.err" \
+        --export="ALL,PROTEUS_ZARR_BASE=${PROTEUS_ZARR_BASE}" \
         --partition="${partition}" \
         --ntasks=1 \
         --cpus-per-task=8 \
@@ -233,7 +278,7 @@ WORKER_EOF
         return 1
     fi
 
-    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+    printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
         "${job_id}" \
         "${job_name}" \
         "${worker_script}" \
@@ -243,19 +288,15 @@ WORKER_EOF
         "${time_limit}" \
         "${trial_num}" \
         "${fold_num}" \
-        "${config_idx}"
+        "${config_idx}" \
+        "${exclude_nodes}"
 }
 
-wait_for_job() {
+job_is_active() {
     local job_id="$1"
-    while true; do
-        sleep 30
-        local state
-        state=$(squeue -j "${job_id}" -h -o '%T' 2>/dev/null || true)
-        if [[ -z "${state}" ]]; then
-            break
-        fi
-    done
+    local state
+    state=$(squeue -j "${job_id}" -h -o '%T' 2>/dev/null || true)
+    [[ -n "${state}" ]]
 }
 
 check_job_exit() {
@@ -296,13 +337,30 @@ job_failed_for_cuda_init() {
     return 1
 }
 
-alternate_gpu_target() {
-    local current_gpu_class="$1"
-    if [[ "${current_gpu_class}" == "rtx" ]]; then
-        printf 'l40|%s|%s|%s\n' "${L40_PARTITION}" "${L40_GPU}" "${L40_TIME}"
-    else
-        printf 'rtx|%s|%s|%s\n' "${RTX_PARTITION}" "${RTX_GPU}" "${RTX_TIME}"
+merge_exclude_nodes() {
+    local existing_nodes="$1"
+    local new_node="$2"
+    local node
+
+    if [[ -z "${new_node}" ]]; then
+        echo "${existing_nodes}"
+        return 0
     fi
+
+    if [[ -z "${existing_nodes}" ]]; then
+        echo "${new_node}"
+        return 0
+    fi
+
+    IFS=',' read -r -a existing_node_list <<< "${existing_nodes}"
+    for node in "${existing_node_list[@]}"; do
+        if [[ "${node}" == "${new_node}" ]]; then
+            echo "${existing_nodes}"
+            return 0
+        fi
+    done
+
+    echo "${existing_nodes},${new_node}"
 }
 
 fold_metrics_path() {
@@ -390,8 +448,8 @@ run_trial_batch() {
             fi
 
             if record=$(submit_single_fold "${gpu_class}" "$((idx + 1))" "${trial_num}" "${fold_num}" "${partition}" "${gpu_spec}" "${time_limit}"); then
-                local _job_id _job_name _worker_script _record_gpu_class _record_partition _record_gpu_spec _record_time _record_trial _record_fold _record_config_idx
-                IFS='|' read -r _job_id _job_name _worker_script _record_gpu_class _record_partition _record_gpu_spec _record_time _record_trial _record_fold _record_config_idx <<< "${record}"
+                local _job_id _job_name _worker_script _record_gpu_class _record_partition _record_gpu_spec _record_time _record_trial _record_fold _record_config_idx _record_exclude_nodes
+                IFS='|' read -r _job_id _job_name _worker_script _record_gpu_class _record_partition _record_gpu_spec _record_time _record_trial _record_fold _record_config_idx _record_exclude_nodes <<< "${record}"
                 trial_job_records+=("${record}")
                 trial_worker_scripts+=("${_worker_script}")
             else
@@ -426,33 +484,46 @@ run_trial_batch() {
         fi
     done
 
-    local record
-    for record in "${job_records[@]}"; do
-        local job_id job_name worker_script gpu_class partition gpu_spec time_limit trial_num fold_num config_idx
-        IFS='|' read -r job_id job_name worker_script gpu_class partition gpu_spec time_limit trial_num fold_num config_idx <<< "${record}"
+    local pending_job_records=("${job_records[@]}")
+    while (( ${#pending_job_records[@]} > 0 )); do
+        local next_pending_job_records=()
+        local saw_completion=0
 
-        wait_for_job "${job_id}"
-        if ! check_job_exit "${job_id}"; then
-            if job_failed_for_cuda_init "${job_name}" "${job_id}"; then
-                local failed_node retry_gpu_class retry_partition retry_gpu_spec retry_time retry_record
-                failed_node=$(job_nodelist "${job_id}")
-                IFS='|' read -r retry_gpu_class retry_partition retry_gpu_spec retry_time <<< "$(alternate_gpu_target "${gpu_class}")"
-                echo "  Job ${job_id} hit a CUDA init failure; resubmitting trial ${trial_num} fold ${fold_num} on ${retry_gpu_class}${failed_node:+ while excluding ${failed_node}}"
-                if retry_record=$(submit_single_fold "${retry_gpu_class}" "${config_idx}" "${trial_num}" "${fold_num}" "${retry_partition}" "${retry_gpu_spec}" "${retry_time}" "${failed_node}"); then
-                    local retry_job_id retry_job_name retry_worker_script _retry_gpu_class _retry_partition _retry_gpu_spec _retry_time _retry_trial_num _retry_fold_num _retry_config_idx
-                    IFS='|' read -r retry_job_id retry_job_name retry_worker_script _retry_gpu_class _retry_partition _retry_gpu_spec _retry_time _retry_trial_num _retry_fold_num _retry_config_idx <<< "${retry_record}"
-                    worker_scripts+=("${retry_worker_script}")
-                    wait_for_job "${retry_job_id}"
-                    if ! check_job_exit "${retry_job_id}"; then
-                        failed_jobs+=("${retry_job_id}")
+        local record
+        for record in "${pending_job_records[@]}"; do
+            local job_id job_name worker_script gpu_class partition gpu_spec time_limit trial_num fold_num config_idx exclude_nodes
+            IFS='|' read -r job_id job_name worker_script gpu_class partition gpu_spec time_limit trial_num fold_num config_idx exclude_nodes <<< "${record}"
+
+            if job_is_active "${job_id}"; then
+                next_pending_job_records+=("${record}")
+                continue
+            fi
+
+            saw_completion=1
+            if ! check_job_exit "${job_id}"; then
+                if job_failed_for_cuda_init "${job_name}" "${job_id}"; then
+                    local failed_node retry_exclude_nodes retry_record
+                    failed_node=$(job_nodelist "${job_id}")
+                    retry_exclude_nodes=$(merge_exclude_nodes "${exclude_nodes}" "${failed_node}")
+                    echo "  Job ${job_id} hit a CUDA init failure; resubmitting trial ${trial_num} fold ${fold_num} on ${gpu_class}${retry_exclude_nodes:+ while excluding ${retry_exclude_nodes}}"
+                    if retry_record=$(submit_single_fold "${gpu_class}" "${config_idx}" "${trial_num}" "${fold_num}" "${partition}" "${gpu_spec}" "${time_limit}" "${retry_exclude_nodes}"); then
+                        local retry_job_id retry_job_name retry_worker_script _retry_gpu_class _retry_partition _retry_gpu_spec _retry_time _retry_trial_num _retry_fold_num _retry_config_idx _retry_exclude_nodes
+                        IFS='|' read -r retry_job_id retry_job_name retry_worker_script _retry_gpu_class _retry_partition _retry_gpu_spec _retry_time _retry_trial_num _retry_fold_num _retry_config_idx _retry_exclude_nodes <<< "${retry_record}"
+                        worker_scripts+=("${retry_worker_script}")
+                        next_pending_job_records+=("${retry_record}")
+                    else
+                        echo "  Retry submission failed for trial ${trial_num} fold ${fold_num}" >&2
+                        failed_jobs+=("${job_id}")
                     fi
                 else
-                    echo "  Retry submission failed for trial ${trial_num} fold ${fold_num}" >&2
                     failed_jobs+=("${job_id}")
                 fi
-            else
-                failed_jobs+=("${job_id}")
             fi
+        done
+
+        pending_job_records=("${next_pending_job_records[@]}")
+        if (( ${#pending_job_records[@]} > 0 && saw_completion == 0 )); then
+            sleep 30
         fi
     done
 
@@ -496,10 +567,12 @@ echo "Study: ${STUDY_NAME}"
 echo "Storage: ${OPTUNA_STORAGE}"
 echo "Total configs: ${TOTAL_CONFIGS} (${CONFIGS_PER_ROUND} per round)"
 echo "Output: ${OUTPUT_DIR}"
+echo "Zarr base: ${PROTEUS_ZARR_BASE}"
 echo "Objective: mean cohort_tumor_soft_objective across folds"
 echo "Resources: one GPU per fold job; GPU assignment cycles rtx,rtx,rtx,l40"
 echo "Walltime: RTX=${RTX_TIME}, L40=${L40_TIME}"
 
+validate_data_paths
 bootstrap_study
 
 configs_started=$(count_completed_trials)

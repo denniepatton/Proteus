@@ -205,7 +205,7 @@ def resolve_trial_configs(
         srl_ramp=int(srl_ramp),
         beta_pht_consistency=float(beta_pht_consistency),
         beta_pht_uncertainty=float(beta_pht_uncertainty),
-        # Training HPs stored in model config (legacy coupling)
+        # Training HPs stored in model config for downstream reconstruction.
         dropout_rate=float(dropout_rate),
         weight_decay=float(weight_decay),
         max_lr=float(max_lr),

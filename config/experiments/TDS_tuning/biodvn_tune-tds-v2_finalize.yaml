@@ -25,7 +25,6 @@ tuning:
 
 data:
   training_set: data/TDS_sample-splits.tsv
-  zarr_base: ${PROTEUS_ZARR_BASE:-data/zarr}
   subsample_frac: 1.00
   seed: 23
   batch_mode: multi_source

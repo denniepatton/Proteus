@@ -381,6 +381,11 @@ def compute_source_variance(
         if src_paths:
             result[src_name] = compute_fn(src_paths, label_key)
             vals = list(result[src_name].values())
+            if not vals:
+                raise ValueError(
+                    f'Source "{src_name}" variance computation produced no finite genes '
+                    f'from {len(src_paths)} Zarr store(s) using label_key {label_key!r}.'
+                )
             print(
                 f'  Source "{src_name}": {len(vals)} genes, '
                 f'variance range [{min(vals):.3f}, {max(vals):.3f}], '

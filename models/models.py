@@ -864,7 +864,7 @@ class BioDVN(nn.Module):
         tumor_mdn = self.tumor_mdn_head(z_tumor)
         background_mdn = self.background_mdn_head(z_background)
         
-        # Point estimates (mixture mean) for backward-compatible metrics / analysis
+        # Point estimates (mixture mean) for metrics / analysis
         tumor_exp = mixture_mean(tumor_mdn)
         background_exp = mixture_mean(background_mdn)
         
