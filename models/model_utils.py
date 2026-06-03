@@ -592,8 +592,6 @@ class MixtureDensityHead(nn.Module):
                 normal_mu: (batch, 1) bounded to the active-expression range
                 normal_sigma: (batch, 1) bounded away from zero and blow-up
         """
-        h = self.shared(x)
-
         # Force float32 before parameterization.  The smooth sigmoid maps
         # below keep every parameter inside a validated support while
         # preserving gradient flow across the full raw range.
@@ -810,23 +808,26 @@ def _gamma_abs_dev(
 ) -> torch.Tensor:
     """Aᵍ(y) = E|X − y|  for  X ~ Gamma(k, rate=β),  k = K_GAMMA.
 
-    Uses the same Gauss-Laguerre expectation rule as the gamma-normal CRPS
-    cross term:
+    Closed form using the regularized lower incomplete gamma P(a, x):
+        Aᵍ = y(2P(k, βy) − 1) + (k/β)(1 − 2P(k+1, βy))
 
-        E[g(Xᵍ)] = Γ(k)⁻¹ ∫₀∞ g(t/β) t^(k-1) e^(-t) dt
-                 ≈ Γ(k)⁻¹ Σᵢ wᵢ |tᵢ/β - y| tᵢ^(k-1)
+    Derivation:
+        E|X − y| = y·F(y) − ∫₀ʸ x·f(x)dx + E[X] − ∫₀ʸ x·f(x)dx − y(1−F(y))
+                 = y(2F(y) − 1) − 2(k/β)P(k+1, βy) + k/β
+    where F(y) = P(k, βy) and ∫₀ʸ x·f(x)dx = (k/β)P(k+1, βy).
 
-    The closed form goes through ``torch.special.gammainc``.  Its CUDA
-    backward is singular for k < 1 at zero-expression targets and produced
-    finite CRPS values with non-finite gradients in the finalize logs.  This
-    quadrature form keeps the same Gamma(k, β) expectation but removes the
-    incomplete-gamma backward path from training.
+    Numerical note:
+        The backward of ``gammainc(a, x)`` is singular at x = 0 when
+        0 < a < 1.  Clamping βy away from zero keeps the closed-form CRPS
+        path finite while leaving zero-expression forward values effectively
+        at the Gamma mean.
     """
-    nodes, weights, node_powers = _get_quad_tensors(beta.device)
-    x_g = nodes.unsqueeze(0) / beta
-    abs_dev = (x_g - y).abs()
-    integrand = abs_dev * node_powers.unsqueeze(0) * weights.unsqueeze(0)
-    return integrand.sum(dim=-1, keepdim=True) * _INV_GAMMA_K
+    by = (beta * y).clamp(min=1e-7)
+    k_t = y.new_tensor(K_GAMMA)
+    k1_t = y.new_tensor(K_GAMMA + 1.0)
+    P_k = torch.special.gammainc(k_t, by)
+    P_k1 = torch.special.gammainc(k1_t, by)
+    return y * (2.0 * P_k - 1.0) + (K_GAMMA / beta) * (1.0 - 2.0 * P_k1)
 
 
 def _gamma_self_interaction(beta: torch.Tensor) -> torch.Tensor:
@@ -951,7 +952,7 @@ def mixture_crps(
     # A-terms:  Aᵢ(y) = E|Xᵢ − y|
     # ------------------------------------------------------------------
     a0 = y.abs()                              # |y|;  y ≥ 0 in log₂(CPM+1)
-    ag = _gamma_abs_dev(y, beta)              # Gauss-Laguerre; no gammainc backward
+    ag = _gamma_abs_dev(y, beta)              # closed form via gammainc
     an = _normal_abs_dev(y, mu, sigma)        # closed form via erf
 
     a_sum = w0 * a0 + wg * ag + wn * an      # (batch, 1)
@@ -980,7 +981,7 @@ def mixture_crps(
     crps = a_sum - 0.5 * b_sum                 # (valid_batch, 1)
 
     # ------------------------------------------------------------------
-    # Sample-weight handling (identical to previous implementation)
+    # Sample-weight handling
     # ------------------------------------------------------------------
     if sample_weight is not None:
         w = sample_weight
@@ -1007,7 +1008,7 @@ class MixtureDensityCRPSLoss(nn.Module):
     """Masked, gene-weighted analytical CRPS loss for the 3-component mixture.
 
     The external objective keeps CRPS as the distributional likelihood-aligned
-    term, then adds SRL, an experimental same-gene/source dynamic term, and
+    term, then adds SRL, same-gene/source dynamic structure, and
     PHT structure losses when metadata are available from the gene-conditioned
     loader.
     """
@@ -1015,12 +1016,12 @@ class MixtureDensityCRPSLoss(nn.Module):
     def __init__(
         self,
         beta_background: float = 1.0,
-        beta_srl_max: float = 0.0,
+        beta_srl_max: float = 1.5,
         beta_dynamic_pair_max: float = 0.0,
         srl_delta: float = 1.0,
         srl_start: int = 5,
         srl_ramp: int = 10,
-        beta_pht_consistency: float = 0.0,
+        beta_pht_consistency: float = 0.5,
         beta_pht_uncertainty: float = 1.5,
     ):
         super().__init__()
@@ -1093,9 +1094,6 @@ class MixtureDensityCRPSLoss(nn.Module):
             loss_dict['standardized_residual_weight'] = srl_weight
             loss_dict['total_external_loss'] = total_loss.detach()
 
-        # Experimental fold-local scout term: isolate the same-gene/source
-        # dynamic recovery penalty behind one beta so the whole path is easy
-        # to remove later if it does not help GVW-r/Pearson.
         dynamic_pair_weight = self._current_dynamic_pair_weight()
         if dynamic_pair_weight > 0.0 and features is not None:
             dynamic_pair_loss = self._dynamic_pair_loss(
@@ -1373,20 +1371,17 @@ class MixtureDensityCRPSLoss(nn.Module):
 
         valid_groups = group_ids[valid]
         valid_values = values[valid]
-        counts = torch.bincount(valid_groups, minlength=0).to(dtype=values.dtype)
-        sums = torch.bincount(
+        group_count = int(valid_groups.max().detach().cpu().item()) + 1
+        counts = values.new_zeros(group_count).scatter_add(
+            0,
             valid_groups,
-            weights=valid_values,
-            minlength=counts.numel(),
+            values.new_ones((valid_groups.numel(),)),
         )
+        sums = values.new_zeros(group_count).scatter_add(0, valid_groups, valid_values)
         means = sums / counts.clamp(min=1.0)
 
         centered = valid_values - means[valid_groups]
-        sq_sums = torch.bincount(
-            valid_groups,
-            weights=centered.pow(2),
-            minlength=counts.numel(),
-        )
+        sq_sums = values.new_zeros(group_count).scatter_add(0, valid_groups, centered.pow(2))
 
         eligible = counts >= 2.0
         eligible_count = eligible.to(dtype=values.dtype).sum()
@@ -1492,12 +1487,12 @@ class BioDVNMDNLoss:
     def __init__(
         self,
         beta_background: float = 1.0,
-        beta_srl_max: float = 0.0,
+        beta_srl_max: float = 1.5,
         beta_dynamic_pair_max: float = 0.0,
         srl_delta: float = 1.0,
         srl_start: int = 5,
         srl_ramp: int = 10,
-        beta_pht_consistency: float = 0.0,
+        beta_pht_consistency: float = 0.5,
         beta_pht_uncertainty: float = 1.5,
     ):
         self.mdn_crps = MixtureDensityCRPSLoss(

@@ -51,20 +51,64 @@ import pandas as pd
 import zarr
 from numcodecs import Blosc, VLenUTF8
 
-from config.runtime_paths import resolve_raw_data_dir, resolve_zarr_base
-
 # =============================================================================
 # Configuration
 # =============================================================================
 
 def _get_default_zarr_base() -> str:
-    """Resolve the default Zarr base for data compilation."""
-    return resolve_zarr_base()
+    """
+    Get default Zarr base directory from config or fallback to hardcoded value.
+    
+    Order of precedence:
+    1. PROTEUS_ZARR_BASE environment variable
+    2. paths.yaml configuration file
+    3. Hardcoded fallback
+    """
+    # Check environment variable first
+    env_zarr_base = os.environ.get('PROTEUS_ZARR_BASE')
+    if env_zarr_base:
+        return env_zarr_base
+    
+    # Try to load from paths.yaml
+    try:
+        import yaml as _yaml
+        _paths_file = Path(__file__).resolve().parent.parent / 'config' / 'paths.yaml'
+        with open(_paths_file) as _f:
+            _paths = _yaml.safe_load(_f)
+        return _paths['base']['zarr_base_dir']
+    except (FileNotFoundError, KeyError, OSError) as e:
+        logging.debug('Config-based zarr_base_dir lookup failed: %s', e)
+    
+    # Fallback to hardcoded default
+    return "/hpc/temp/ha_g/user/rpatton/ProteusZarrs"
 
 
 def _get_default_raw_data_dir() -> str:
-    """Resolve the default raw Triton directory for data compilation."""
-    return resolve_raw_data_dir()
+    """
+    Get default raw data directory from config or fallback to hardcoded value.
+    
+    Order of precedence:
+    1. PROTEUS_RAW_DATA_DIR environment variable
+    2. paths.yaml configuration file
+    3. Hardcoded fallback
+    """
+    # Check environment variable first
+    env_raw_data = os.environ.get('PROTEUS_RAW_DATA_DIR')
+    if env_raw_data:
+        return env_raw_data
+    
+    # Try to load from paths.yaml
+    try:
+        import yaml as _yaml
+        _paths_file = Path(__file__).resolve().parent.parent / 'config' / 'paths.yaml'
+        with open(_paths_file) as _f:
+            _paths = _yaml.safe_load(_f)
+        return _paths['base']['raw_data_dir']
+    except (FileNotFoundError, KeyError, OSError) as e:
+        logging.debug('Config-based raw_data_dir lookup failed: %s', e)
+    
+    # Fallback to hardcoded default
+    return "/fh/fast/ha_g/user/rpatton"
 
 
 # Default Zarr output directory (loaded from config or environment)
@@ -128,9 +172,9 @@ LOG_TRANSFORM_FEATURES = ['fl-kurtosis', 'pn-mean-spacing', 'pn-mean-amplitude']
 # NaN thresholds for gene exclusion (signal NaN is encoded, not thresholded)
 MAX_FEATURE_NAN_FRACTION = 0.5
 
-# Signal clipping bounds for continuous channels after their natural Triton
-# transform.  Channels 0/1/3 are mean-normalized first; channels 4/5/6 are
-# already log-ratio or robust-z signals, so they are clipped but not rescaled.
+# Signal clipping bounds for mean-normalized channels.
+# After division by gene-level mean, values beyond these bounds are extreme
+# spikes (>10× the mean) — clipped to prevent float16 overflow under AMP.
 SIGNAL_CLIP_MIN = -10.0
 SIGNAL_CLIP_MAX = 10.0
 
@@ -204,12 +248,11 @@ def get_samples(triton_results_dir: str, dataset: str = None) -> List[str]:
 # =============================================================================
 
 def _scale_signal(input_array: np.ndarray) -> np.ndarray:
-    """Scale a ratio-like signal by dividing by its mean.
+    """Scale an input array by dividing by its mean (avoid division by zero/Inf).
 
-    Depth, fragment-end coverage, and PN signal have a natural positive
-    baseline, so mean-normalization makes the expected baseline ~1.0 before
-    clipping rare denominator spikes.  Triton-transformed log/z-score channels
-    must not use this path because their means may be near zero.
+    After division the expected baseline is ~1.0.  Values beyond the clipping
+    bounds (SIGNAL_CLIP_MIN/MAX) are extreme spikes (>10× the gene-level mean)
+    and are clipped to prevent float16 overflow under AMP and to suppress noise.
     """
     mean_val = np.nanmean(input_array)
     if mean_val > 1e-10 and not np.isnan(mean_val):  # Use small threshold, not just != 0
@@ -283,9 +326,7 @@ def _load_signal_profiles(
         # Build NaN mask BEFORE any imputation: 1 where any channel had NaN
         nan_mask = np.isnan(signals).any(axis=1).astype(np.float32)  # (2000,)
         
-        # Mean-normalize ratio-like channels 0, 1, 3 before imputation
-        # (nanmean ignores NaN).  These channels have a natural positive
-        # baseline; the clip bounds rare local denominator spikes.
+        # Mean-normalize channels 0, 1, 3 before imputation (nanmean ignores NaN)
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', RuntimeWarning)
             # Channel 0 (depth): normalize by mean
@@ -294,17 +335,6 @@ def _load_signal_profiles(
             signals[:, 1] = _scale_signal(signals[:, 1])
             # Channel 3 (PN signal): normalize by mean
             signals[:, 3] = _scale_signal(signals[:, 3])
-
-        # Channels 4-6 are already Triton-transformed: log2 short/long fragment
-        # ratio, entropy robust z-score, and Gini-Simpson robust z-score.  Bound
-        # their tails directly without mean-normalizing them.
-        signals[:, 4:7] = np.clip(signals[:, 4:7], SIGNAL_CLIP_MIN, SIGNAL_CLIP_MAX)
-
-        # Channels 2 and 7 are bounded by construction: orientation asymmetry is
-        # in [-1, 1], and PN peak calls are sparse {-1, 1, NaN}.  Clip only to
-        # enforce the Triton invariants before NaNs are converted to 0.
-        signals[:, 2] = np.clip(signals[:, 2], -1.0, 1.0)
-        signals[:, 7] = np.clip(signals[:, 7], -1.0, 1.0)
         
         # Impute all NaN/Inf to 0 (not channel-mean)
         signals = np.nan_to_num(signals, nan=0.0, posinf=0.0, neginf=0.0)

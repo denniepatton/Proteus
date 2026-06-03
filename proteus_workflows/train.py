@@ -246,13 +246,9 @@ def _loader_workers() -> int:
 
 
 def _multisource_train_loader_kwargs() -> Dict[str, int | bool]:
-    # The multi-source training dataset is already fully preloaded into RAM.
-    # Running it through forked persistent workers adds process startup and
-    # prefetch overhead without providing I/O overlap, and can stall before the
-    # first batch on the current 100+ GB resident panel.
     return {
-        'num_workers': 0,
-        'persistent_workers': False,
+        'num_workers': _loader_workers(),
+        'persistent_workers': True,
         'prefetch_factor': 2,
     }
 
@@ -424,8 +420,8 @@ def train_model_cv(
                 raise ValueError("batch_mode='multi_source' requires source_groups")
             train_loader_kwargs = _multisource_train_loader_kwargs()
             print(
-                '  [MultiSource] training loader uses single-process iteration '
-                'because samples are already preloaded in RAM'
+                f"  [MultiSource] training loader uses "
+                f"{train_loader_kwargs['num_workers']} persistent workers"
             )
             train_loader, val_loader, train_steps, val_steps = build_multisource_loaders_from_splits(
                 training_set_tsv=training_set_tsv,
@@ -836,8 +832,8 @@ def full_train_from_splits(
 
         train_loader_kwargs = _multisource_train_loader_kwargs()
         print(
-            '  [MultiSource] training loader uses single-process iteration '
-            'because samples are already preloaded in RAM'
+            f"  [MultiSource] training loader uses "
+            f"{train_loader_kwargs['num_workers']} persistent workers"
         )
 
         train_dataset = ProteusMultiSourceBatchDataset(

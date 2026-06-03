@@ -41,6 +41,9 @@ from typing import Optional, Dict, List, Any, Callable
 
 import numpy as np
 import pandas as pd
+import torch
+
+torch.backends.cudnn.benchmark = True
 
 # Local imports
 from models import BioDVNConfig
@@ -61,6 +64,13 @@ from proteus_utils import compute_regression_metrics
 
 DEFAULT_OPTUNA_STORAGE = 'sqlite:///results_training/optuna.db'
 DEFAULT_OPTUNA_SAMPLER_SEED = 42
+
+
+def _configure_streaming_stdout() -> None:
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(line_buffering=True)
 
 
 def ensure_datasets_exist(
@@ -407,6 +417,8 @@ def _resolve_sampler_seed(
 
 def main():
     """Main entry point for Proteus PyTorch pipeline."""
+    _configure_streaming_stdout()
+
     parser = argparse.ArgumentParser(
         description='Run Proteus - cfDNA to gene-expression data prep, training, tuning, and inference',
         formatter_class=argparse.RawDescriptionHelpFormatter,

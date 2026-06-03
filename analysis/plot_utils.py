@@ -2345,10 +2345,10 @@ def forest_plot(
                    lw=1.5, label="Univariate (sig.)"),
             Line2D([0], [0], color="#AAAAAA", marker="o", markersize=6,
                    lw=1.5, alpha=0.45, label="Univariate (n.s.)"),
-            Line2D([0], [0], color=_MAROON, marker="D", markersize=6,
-                   lw=1.5, label="Multivariate / TFx-adj. (sig.)"),
-            Line2D([0], [0], color=_MAROON_FADED, marker="o", markersize=6,
-                   lw=1.5, alpha=0.45, label="Multivariate / TFx-adj. (n.s.)"),
+             Line2D([0], [0], color=_MAROON, marker="D", markersize=6,
+                 lw=1.5, label="Multivariate / TFx-adj. (sig.)"),
+             Line2D([0], [0], color=_MAROON_FADED, marker="o", markersize=6,
+                 lw=1.5, alpha=0.45, label="Multivariate / TFx-adj. (n.s.)"),
         ]
         ax.legend(handles=legend_elements, fontsize=7, loc="lower right",
                   framealpha=0.9)

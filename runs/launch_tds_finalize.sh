@@ -237,6 +237,7 @@ submit_single_fold() {
     cat > "${worker_script}" <<'WORKER_EOF'
 #!/bin/bash
 set -euo pipefail
+export PYTHONUNBUFFERED=1
 
 trial_num="$1"
 fold_num="$2"
@@ -245,7 +246,7 @@ worker_python="$4"
 
 echo "[tds-v2-finalize] host=$(hostname) trial=${trial_num} fold=${fold_num} task=0"
 
-"${worker_python}" Proteus.py \
+"${worker_python}" -u Proteus.py \
     --run_mode tune-fold \
     --experiment "${experiment_path}" \
     --trial_number "${trial_num}" \

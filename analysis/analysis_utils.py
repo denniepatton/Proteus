@@ -1,14 +1,8 @@
-"""
-analysis_utils.py
-Proteus analysis framework — data loading, stats, and metrics.
 
-All public functions work on *wide* DataFrames (genes × samples) unless
-explicitly noted.  Long-format prediction TSVs are pivoted to wide on load.
-"""
+"""Core analysis utilities: data loading, metrics, statistics, and constants."""
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import warnings
@@ -17,74 +11,96 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
-from concurrent.futures import ProcessPoolExecutor
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+MIN_CORRELATION_N = 5
 
-_GENE_ALIAS_FALLBACKS: Dict[str, str] = {
-    "TARP": "CD3G",
-}
-
-_MDN_GAMMA_SHAPE: float = 0.75
-_AOR_EPSILON: float = 1e-6
-_PAM50_GENEFU_MODEL_NAMES: Tuple[str, ...] = ("pam50.scale",)
-_PAM50_LABEL_MAP: Dict[str, str] = {
-    "Her2": "HER2",
-}
+_GENE_LISTS: Dict[str, List[str]] = {}
 _GENEFU_BRIDGE_CACHE: Optional[Tuple[Any, Any, Any]] = None
-MIN_CORRELATION_N: int = 5
+
+# Targeted alias support only. These are not broad synonym expansions; they
+# exist to preserve the paper-path scoring behavior for a small number of known
+# mismatches between curated gene sets and some expression matrices.
+_TARGETED_GENE_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "TARP": ("CD3G",),
+}
 
 
-def benjamini_hochberg(p_values: pd.Series) -> pd.Series:
-    """Return Benjamini-Hochberg adjusted q-values for a p-value series."""
-    numeric = pd.to_numeric(p_values, errors="coerce")
-    result = pd.Series(np.nan, index=numeric.index, dtype=float)
-    valid = numeric.notna()
-    if not bool(valid.any()):
-        return result
+def benjamini_hochberg(p_values: Union[pd.Series, np.ndarray, Sequence[float]]) -> Union[pd.Series, np.ndarray]:
+    """Benjamini-Hochberg FDR correction preserving Series index when present."""
+    if isinstance(p_values, pd.Series):
+        values = pd.to_numeric(p_values, errors="coerce").to_numpy(dtype=np.float64)
+        index = p_values.index
+        is_series = True
+    else:
+        values = pd.to_numeric(pd.Series(p_values), errors="coerce").to_numpy(dtype=np.float64)
+        index = None
+        is_series = False
 
-    ordered = numeric.loc[valid].sort_values()
-    n_tests = int(len(ordered))
-    raw = ordered.values * n_tests / np.arange(1, n_tests + 1, dtype=float)
-    adjusted = np.minimum.accumulate(raw[::-1])[::-1]
-    adjusted = np.clip(adjusted, 0.0, 1.0)
-    result.loc[ordered.index] = adjusted
-    return result
+    adjusted = np.full(values.shape, np.nan, dtype=np.float64)
+    valid_mask = np.isfinite(values)
+    if valid_mask.any():
+        valid_values = values[valid_mask]
+        order = np.argsort(valid_values, kind="mergesort")
+        ranked = valid_values[order]
+        n_valid = ranked.size
+        scale = float(n_valid) / np.arange(1, n_valid + 1, dtype=np.float64)
+        adjusted_ranked = np.minimum.accumulate((ranked * scale)[::-1])[::-1]
+        adjusted_ranked = np.clip(adjusted_ranked, 0.0, 1.0)
+        restored = np.empty_like(adjusted_ranked)
+        restored[order] = adjusted_ranked
+        adjusted[valid_mask] = restored
+
+    if is_series:
+        return pd.Series(adjusted, index=index)
+    return adjusted
 
 
 def _augment_missing_gene_aliases(expr_df: pd.DataFrame) -> pd.DataFrame:
-    """Add targeted alias rows only when the requested symbol is absent."""
-    if expr_df.empty:
-        return expr_df
+    """Add a small set of deterministic fallback gene rows when absent.
 
-    augmented = expr_df
-    for target_symbol, source_symbol in _GENE_ALIAS_FALLBACKS.items():
-        if target_symbol in augmented.index or source_symbol not in augmented.index:
+    The current analysis contract only needs one targeted fallback: if `TARP`
+    is absent but `CD3G` is present, expose a synthetic `TARP` row by copying
+    `CD3G`. This preserves older scoring expectations without introducing a
+    broad alias system that could silently duplicate many genes.
+    """
+    if expr_df.empty:
+        return expr_df.copy()
+
+    augmented = expr_df.copy()
+    augmented.index = pd.Index([str(gene_name) for gene_name in augmented.index])
+    for target_gene, source_candidates in _TARGETED_GENE_ALIASES.items():
+        if target_gene in augmented.index:
             continue
-        alias_row = augmented.loc[[source_symbol]].rename(index={source_symbol: target_symbol})
-        augmented = pd.concat([augmented, alias_row], axis=0)
+        for source_gene in source_candidates:
+            if source_gene in augmented.index:
+                augmented.loc[target_gene] = augmented.loc[source_gene]
+                break
     return augmented
 
 
-def _resolve_expression_gene_rows(
-    expr_df: pd.DataFrame,
-    gene_list: Sequence[str],
-) -> List[str]:
-    """Resolve gene rows against the expression matrix with targeted alias fallback."""
+def _resolve_expression_gene_rows(expr_df: pd.DataFrame, gene_list: Sequence[str]) -> List[str]:
+    """Resolve requested gene names against an expression matrix.
+
+    Resolution is exact-name first, then targeted fallback aliases. Returned
+    row labels are unique and preserve the requested gene-list order so mean
+    gene-set scores remain deterministic.
+    """
     resolved_rows: List[str] = []
     seen_rows: set[str] = set()
-    for gene_symbol in gene_list:
-        row_name = gene_symbol
-        if row_name not in expr_df.index:
-            row_name = _GENE_ALIAS_FALLBACKS.get(gene_symbol, gene_symbol)
-        if row_name in expr_df.index and row_name not in seen_rows:
-            resolved_rows.append(row_name)
-            seen_rows.add(row_name)
+    available_rows = {str(row_name) for row_name in expr_df.index}
+
+    for requested_gene in gene_list:
+        requested_name = str(requested_gene)
+        candidate_rows = (requested_name,) + _TARGETED_GENE_ALIASES.get(requested_name, ())
+        for candidate_row in candidate_rows:
+            if candidate_row in available_rows and candidate_row not in seen_rows:
+                resolved_rows.append(candidate_row)
+                seen_rows.add(candidate_row)
+                break
     return resolved_rows
 
-# ---------------------------------------------------------------------------
-# Reference / label loaders
-# ---------------------------------------------------------------------------
 
 def load_truth(cohort: str) -> pd.DataFrame:
     """Load truth expression: labels/<cohort>_Log2CPMplus1.tsv → wide DataFrame.
@@ -138,10 +154,6 @@ def load_fold_splits() -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Gene-list registry (commonly used sets)
 # ---------------------------------------------------------------------------
-
-# Lazy-loaded cache
-_GENE_LISTS: Dict[str, List[str]] = {}
-
 
 def gene_list_available(name: str) -> bool:
     """Check whether a named gene list file exists on disk."""
@@ -1378,6 +1390,11 @@ def generate_null_predictions(
         rng.shuffle(finite_vals)
         row[finite] = finite_vals
     return shuffled
+
+
+# Keep these analysis-side MDN constants aligned with the stored model outputs.
+_MDN_GAMMA_SHAPE = 0.75
+_AOR_EPSILON = 1e-6
 
 
 def _mdn_on_probability(
@@ -2732,6 +2749,24 @@ _PAM50_CENTROIDS_RAW: Dict[str, List[float]] = {
     "ERBB2":   [-0.146,  0.317, -0.050, -0.017, -0.036],
 }
 
+_PAM50_LABEL_MAP: Dict[str, str] = {
+    "Basal": "Basal",
+    "Basal-like": "Basal",
+    "HER2": "HER2",
+    "HER2-enriched": "HER2",
+    "Her2": "HER2",
+    "LumA": "LumA",
+    "Luminal A": "LumA",
+    "LumB": "LumB",
+    "Luminal B": "LumB",
+    "Normal": "Normal",
+    "Normal-like": "Normal",
+}
+
+_PAM50_GENEFU_MODEL_NAMES: Tuple[str, ...] = (
+    "pam50.scale",
+)
+
 
 def _normalize_pam50_label(label: Any) -> str:
     """Normalize genefu PAM50 labels to the repo's display convention."""
@@ -3027,11 +3062,11 @@ def compute_cox_multivariate(
     adjust_for: pd.Series,
     adjust_name: str = "TFx",
 ) -> pd.DataFrame:
-    """Fit multivariate Cox PH for each column in *covariates_df*,
-    adjusting for a single confounding covariate (*adjust_for*).
+    """Fit multivariate Cox PH for each column in *covariates_df*.
 
-    Each model fits two covariates: the target variable and the
-    adjustment variable.  Only the target variable's HR is reported.
+    Each model includes the target covariate plus a shared adjustment term.
+    For the Pluvicto survival workflow that adjustment term is TFx, which the
+    user explicitly requested to preserve outside the limma path.
 
     Parameters
     ----------
@@ -3042,7 +3077,7 @@ def compute_cox_multivariate(
     covariates_df : pd.DataFrame
         One column per covariate, rows aligned with *time* / *event*.
     adjust_for : pd.Series
-        Confounding covariate to include in every model (e.g. TFx).
+        Confounding covariate included in every fit.
     adjust_name : str
         Column name for the adjustment variable.
 
@@ -3050,7 +3085,8 @@ def compute_cox_multivariate(
     -------
     pd.DataFrame
         Rows = covariates, columns include ``HR``, ``HR_lo``, ``HR_hi``, ``p``,
-        ``n``, ``n_events``, and proportional-hazards diagnostics.
+        ``n``, ``n_events``, and proportional-hazards diagnostics for both the
+        target term and the adjustment term.
     """
     from lifelines import CoxPHFitter
     from lifelines.statistics import proportional_hazard_test
@@ -3067,19 +3103,28 @@ def compute_cox_multivariate(
         }).dropna()
         if cph_df.shape[0] < 10 or cph_df["E"].sum() < 3:
             results.append({
-                "variable": col, "HR": np.nan, "HR_lo": np.nan,
-                "HR_hi": np.nan, "p": np.nan,
-                "n": int(cph_df.shape[0]), "n_events": int(cph_df["E"].sum()),
-                "ph_p": np.nan, "ph_adjust_p": np.nan, "ph_min_p": np.nan,
+                "variable": col,
+                "HR": np.nan,
+                "HR_lo": np.nan,
+                "HR_hi": np.nan,
+                "p": np.nan,
+                "n": int(cph_df.shape[0]),
+                "n_events": int(cph_df["E"].sum()),
+                "ph_p": np.nan,
+                "ph_adjust_p": np.nan,
+                "ph_min_p": np.nan,
             })
             continue
-        # Standardise both covariates to unit variance
-        for c in (col, adjust_name):
-            std = cph_df[c].std()
+
+        # Standardize both terms so hazard ratios remain comparable across
+        # biomarkers while keeping the TFx-adjusted survival path numerically
+        # stable when one term has a narrow range.
+        for covariate_name in (col, adjust_name):
+            std = cph_df[covariate_name].std()
             if std < 1e-12:
-                cph_df[c] = 0.0
+                cph_df[covariate_name] = 0.0
             else:
-                cph_df[c] = cph_df[c] / std
+                cph_df[covariate_name] = cph_df[covariate_name] / std
 
         cph = CoxPHFitter()
         cph.fit(cph_df, duration_col="T", event_col="E")
@@ -3108,6 +3153,25 @@ def compute_cox_multivariate(
     if not result_df.empty:
         result_df["q_value"] = benjamini_hochberg(result_df["p"])
     return result_df
+
+
+def compute_logrank_p(
+    time_lo: pd.Series,
+    event_lo: pd.Series,
+    time_hi: pd.Series,
+    event_hi: pd.Series,
+) -> float:
+    """Return the two-group log-rank p-value for exploratory KM plots."""
+    from lifelines.statistics import logrank_test
+
+    return float(
+        logrank_test(
+            time_lo.values.astype(float),
+            time_hi.values.astype(float),
+            event_observed_A=event_lo.values.astype(int),
+            event_observed_B=event_hi.values.astype(int),
+        ).p_value
+    )
 
 
 # ---------------------------------------------------------------------------

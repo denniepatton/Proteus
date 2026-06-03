@@ -4,7 +4,6 @@ Training loop with AMP support, learning-rate scheduling, and checkpointing.
 """
 
 import os
-import json
 import math
 import time
 from typing import Dict, Optional, Tuple, List
@@ -561,185 +560,10 @@ class Trainer:
         
         return features_device, labels_device
 
-    @staticmethod
-    def _json_scalar(value: object) -> object:
-        if isinstance(value, torch.Tensor):
-            if value.numel() != 1:
-                return Trainer._tensor_summary(value)
-            value = value.detach().float().cpu().item()
-        if value is None or isinstance(value, (str, int, bool)):
-            return value
-        if isinstance(value, float):
-            return value if math.isfinite(value) else str(value)
-        try:
-            numeric_value = float(value)
-        except (TypeError, ValueError):
-            return str(value)
-        return numeric_value if math.isfinite(numeric_value) else str(numeric_value)
-
-    @staticmethod
-    def _tensor_summary(tensor: torch.Tensor) -> Dict[str, object]:
-        detached = tensor.detach()
-        summary: Dict[str, object] = {
-            'shape': list(detached.shape),
-            'dtype': str(detached.dtype),
-            'device': str(detached.device),
-            'numel': int(detached.numel()),
-        }
-        if detached.numel() == 0:
-            return summary
-
-        if torch.is_floating_point(detached) or torch.is_complex(detached):
-            finite_mask = torch.isfinite(detached)
-            n_nonfinite = int((~finite_mask).sum().detach().cpu().item())
-        else:
-            finite_mask = torch.ones(
-                detached.shape,
-                dtype=torch.bool,
-                device=detached.device,
-            )
-            n_nonfinite = 0
-
-        summary['nonfinite'] = n_nonfinite
-        if bool(finite_mask.any().detach().cpu().item()):
-            finite_values = detached[finite_mask]
-            if torch.is_complex(finite_values):
-                stat_values = finite_values.abs().float()
-            else:
-                stat_values = finite_values.float()
-            summary.update({
-                'min': float(stat_values.min().detach().cpu().item()),
-                'max': float(stat_values.max().detach().cpu().item()),
-                'mean': float(stat_values.mean().detach().cpu().item()),
-                'max_abs': float(stat_values.abs().max().detach().cpu().item()),
-            })
-        return summary
-
-    @staticmethod
-    def _sequence_summary(values: object, max_items: int = 128) -> Dict[str, object]:
-        if isinstance(values, torch.Tensor):
-            flat_values = [
-                Trainer._json_scalar(item)
-                for item in values.detach().view(-1)[:max_items]
-            ]
-            total_count = int(values.numel())
-        elif isinstance(values, (list, tuple)):
-            flat_values = [str(item) for item in values[:max_items]]
-            total_count = len(values)
-        else:
-            return {'value': str(values)}
-
-        unique_values = sorted({str(item) for item in flat_values})
-        return {
-            'count': total_count,
-            'values': flat_values,
-            'unique_values': unique_values[:max_items],
-            'unique_count_included': len(unique_values),
-        }
-
-    def _tensor_tree_summary(self, value: object) -> object:
-        if isinstance(value, torch.Tensor):
-            return self._tensor_summary(value)
-        if isinstance(value, dict):
-            return {
-                str(key): self._tensor_tree_summary(child)
-                for key, child in value.items()
-            }
-        if isinstance(value, (list, tuple)):
-            return self._sequence_summary(value)
-        return self._json_scalar(value)
-
-    def _batch_metadata_rows(
-        self,
-        features: Dict[str, object],
-        max_rows: int = 128,
-    ) -> List[Dict[str, object]]:
-        metadata_keys = (
-            'sample_name',
-            'gene_name',
-            'source_name',
-            'pht_parent_id',
-            'pht_donor_id',
-        )
-        metadata_lists = {
-            key: features[key]
-            for key in metadata_keys
-            if isinstance(features.get(key), list)
-        }
-        if not metadata_lists:
-            return []
-        n_rows = min(max_rows, *(len(values) for values in metadata_lists.values()))
-        is_pht = features.get('is_pht')
-        is_pht_flat = None
-        if isinstance(is_pht, torch.Tensor):
-            is_pht_flat = is_pht.detach().view(-1)
-
-        rows: List[Dict[str, object]] = []
-        for row_idx in range(n_rows):
-            row = {
-                key: str(values[row_idx])
-                for key, values in metadata_lists.items()
-            }
-            if is_pht_flat is not None and row_idx < int(is_pht_flat.numel()):
-                row['is_pht'] = float(is_pht_flat[row_idx].detach().cpu().item())
-            rows.append(row)
-        return rows
-
-    def _gradient_diagnostic_summary(self) -> Dict[str, object]:
-        bad_gradients = []
-        largest_finite = []
-        for parameter_name, parameter in self.model.named_parameters():
-            if parameter.grad is None:
-                continue
-            grad_summary = self._tensor_summary(parameter.grad)
-            n_nonfinite = int(grad_summary.get('nonfinite', 0))
-            if n_nonfinite > 0 and len(bad_gradients) < 64:
-                bad_gradients.append({
-                    'parameter': parameter_name,
-                    'summary': grad_summary,
-                })
-            max_abs = grad_summary.get('max_abs')
-            if isinstance(max_abs, float) and math.isfinite(max_abs):
-                largest_finite.append({
-                    'parameter': parameter_name,
-                    'max_abs': max_abs,
-                    'nonfinite': n_nonfinite,
-                })
-        largest_finite.sort(key=lambda item: float(item['max_abs']), reverse=True)
-        return {
-            'bad_gradients': bad_gradients,
-            'largest_finite_gradients': largest_finite[:32],
-        }
-
-    def _write_r4_diagnostic(
-        self,
-        reason: str,
-        epoch: int,
-        batch_idx: int,
-        current_lr: float,
-        features: Dict[str, object],
-        labels: Dict[str, object],
-        predictions: Dict[str, object],
-        external_loss: torch.Tensor,
-        internal_loss_result: Optional[Tuple[torch.Tensor, dict]],
-        total_loss: torch.Tensor,
-        external_metrics: dict,
-        internal_metrics: dict,
-        scale_before: Optional[float] = None,
-        scale_after: Optional[float] = None,
-        grad_norm: Optional[torch.Tensor] = None,
-        bad_gradient_origin: Optional[str] = None,
-    ) -> Optional[str]:
-        # The structured JSON dumps were useful while bringing AMP recovery
-        # online, but they have become high-volume, low-signal artifacts during
-        # finalize sweeps. Keep recovery behavior and log-line context, but stop
-        # emitting per-batch diagnostic files.
-        return None
-    
     def train_epoch(
         self,
         train_loader: DataLoader,
-        epoch: int
+        epoch: int,
     ) -> Dict[str, float]:
         """
         Train for one epoch.
@@ -821,82 +645,6 @@ class Trainer:
         # Store references so fit() can clean up if train_epoch() raises.
         self._active_rich_progress = rich_progress
         self._active_pbar = pbar
-        amp_overflow_steps = 0
-
-        def _log_runtime_message(message: str) -> None:
-            if pbar is not None:
-                pbar.write(message)
-            elif rich_progress is not None:
-                rich_progress.console.print(message)
-            else:
-                print(message)
-
-        def _scalar_value(value: object) -> float:
-            if isinstance(value, torch.Tensor):
-                return float(value.detach().cpu().item())
-            return float(value)
-
-        def _loss_component_summary(
-            current_external_loss: torch.Tensor,
-            current_internal_loss_result: Optional[Tuple[torch.Tensor, dict]],
-            current_external_metrics: dict,
-            current_internal_metrics: dict,
-        ) -> Tuple[float, object, str]:
-            ext_val = float(current_external_loss.detach().cpu().item())
-            int_val: object
-            if current_internal_loss_result is not None:
-                int_val = float(current_internal_loss_result[0].detach().cpu().item())
-            else:
-                int_val = 'N/A'
-
-            parts = []
-            for key, value in current_external_metrics.items():
-                parts.append(f'{key}={_scalar_value(value)}')
-            for key, value in current_internal_metrics.items():
-                parts.append(f'{key}={_scalar_value(value)}')
-            return ext_val, int_val, ', '.join(parts)
-
-        def _nonfinite_origin_summary(
-            current_features: Dict[str, object],
-            current_predictions: dict,
-        ) -> str:
-            origin_parts = []
-            for feature_name, feature_tensor in current_features.items():
-                if isinstance(feature_tensor, torch.Tensor) and not torch.isfinite(feature_tensor).all():
-                    n_bad = int((~torch.isfinite(feature_tensor)).sum().item())
-                    origin_parts.append(f'input:{feature_name}({n_bad} non-finite)')
-            for prediction_name in ('tumor_mdn', 'background_mdn'):
-                if prediction_name in current_predictions:
-                    for param_name, param_value in current_predictions[prediction_name].items():
-                        if isinstance(param_value, torch.Tensor) and not torch.isfinite(param_value).all():
-                            n_bad = int((~torch.isfinite(param_value)).sum().item())
-                            origin_parts.append(f'{prediction_name}.{param_name}({n_bad} non-finite)')
-            return '; '.join(origin_parts) if origin_parts else 'undetermined'
-
-        def _diagnostic_suffix(diagnostic_path: Optional[str]) -> str:
-            if diagnostic_path is None:
-                return ''
-            return f' Diagnostics: {diagnostic_path}.'
-
-        def _backoff_amp_scale(current_scale: Optional[float]) -> Optional[float]:
-            if self.scaler is None or current_scale is None:
-                return current_scale
-            next_scale = max(float(current_scale) * 0.5, 1.0)
-            try:
-                self.scaler.update(next_scale)
-            except (AssertionError, RuntimeError):
-                return float(self.scaler.get_scale())
-            return float(self.scaler.get_scale())
-
-        def _write_amp_recovery_diagnostic(
-            reason: str,
-            current_lr: float,
-            current_scale_before: Optional[float],
-            current_scale_after: Optional[float],
-            current_grad_norm: Optional[torch.Tensor] = None,
-            current_bad_gradient_origin: Optional[str] = None,
-        ) -> Optional[str]:
-            return None
 
         def _record_batch_timing() -> None:
             nonlocal ema_data_time, ema_step_time, ema_iter_time
@@ -915,15 +663,6 @@ class Trainer:
 
         # Reset timing origin now that we've accounted for first-batch wait.
         last_iter_end = time.time()
-
-        def _finish_recovered_batch() -> None:
-            nonlocal last_iter_end
-            _record_batch_timing()
-            last_iter_end = time.time()
-            if pbar is not None:
-                pbar.update(1)
-            if rich_progress is not None and rich_task_id is not None:
-                rich_progress.advance(rich_task_id, 1)
 
         accum_steps = self.config.grad_accum_steps
         self.optimizer.zero_grad(set_to_none=True)
@@ -963,71 +702,6 @@ class Trainer:
             else:
                 internal_metrics = {}
                 total_loss = external_loss
-
-            # ----------------------------------------------------------
-            # Non-finite loss handling
-            # ----------------------------------------------------------
-            _loss_is_finite = bool(torch.isfinite(total_loss.detach()).all().item())
-            if not _loss_is_finite:
-                current_lr = (
-                    self.scheduler.get_last_lr()[0]
-                    if self.scheduler is not None
-                    else self.config.max_lr
-                )
-                current_scale = float(self.scaler.get_scale()) if self.use_amp else None
-
-                ext_val, int_val, breakdown = _loss_component_summary(
-                    external_loss,
-                    internal_loss_result,
-                    external_metrics,
-                    internal_metrics,
-                )
-                origin_info = _nonfinite_origin_summary(features, predictions)
-                scale_info = '' if current_scale is None else f' scale={current_scale:.3e}'
-
-                if self.use_amp and self.scaler is not None:
-                    scale_after = _backoff_amp_scale(current_scale)
-                    self.optimizer.zero_grad(set_to_none=True)
-                    amp_overflow_steps += 1
-                    diagnostic_path = _write_amp_recovery_diagnostic(
-                        'amp_nonfinite_loss',
-                        current_lr,
-                        current_scale,
-                        scale_after,
-                    )
-                    _log_runtime_message(
-                        f'  AMP non-finite loss recovery at batch {batch_idx} '
-                        f'(lr={current_lr:.3e}, scale={current_scale:.3e}->{scale_after:.3e}). '
-                        f'Origin: {origin_info}. Components: {breakdown}'
-                        f'{_diagnostic_suffix(diagnostic_path)}'
-                    )
-                    _finish_recovered_batch()
-                    continue
-
-                diagnostic_path = self._write_r4_diagnostic(
-                    reason='nonfinite_loss',
-                    epoch=epoch,
-                    batch_idx=batch_idx,
-                    current_lr=current_lr,
-                    features=features,
-                    labels=labels,
-                    predictions=predictions,
-                    external_loss=external_loss,
-                    internal_loss_result=internal_loss_result,
-                    total_loss=total_loss,
-                    external_metrics=external_metrics,
-                    internal_metrics=internal_metrics,
-                    scale_before=current_scale,
-                )
-
-                raise RuntimeError(
-                    f'Non-finite total_loss={float(total_loss.detach().cpu().item())} '
-                    f'(external={ext_val}, internal={int_val}) '
-                    f'at batch {batch_idx} (lr={current_lr:.3e}{scale_info}). '
-                    f'Origin: {origin_info}. '
-                    f'Components: {breakdown}'
-                    f'{_diagnostic_suffix(diagnostic_path)}'
-                )
             
             # Backward pass — scale loss for gradient accumulation
             scaled_loss = total_loss / accum_steps
@@ -1039,111 +713,50 @@ class Trainer:
             # Optimizer step at accumulation boundary
             is_accum_boundary = ((batch_idx + 1) % accum_steps == 0) or (batch_idx == n_batches - 1)
             if is_accum_boundary:
-                scale_before = None
+                optimizer_step_applied = False
                 if self.use_amp:
                     scale_before = float(self.scaler.get_scale())
                     self.scaler.unscale_(self.optimizer)
 
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.max_grad_norm,
-                    error_if_nonfinite=False,
-                )
-                if not bool(torch.isfinite(grad_norm.detach()).all().item()):
-                    current_lr = (
-                        self.scheduler.get_last_lr()[0]
-                        if self.scheduler is not None
-                        else self.config.max_lr
+                    # Under AMP, a non-finite unscaled gradient norm can be a
+                    # transient loss-scale overflow rather than a faulty model
+                    # state. GradScaler records that during unscale_ and will
+                    # skip the optimizer step while backing the scale off.
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.max_grad_norm,
+                        error_if_nonfinite=False,
                     )
-                    scale_info = '' if scale_before is None else f', scale={scale_before:.3e}'
-                    gradient_summary = self._gradient_diagnostic_summary()
-                    bad_grad_entries = gradient_summary.get('bad_gradients', [])
-                    if bad_grad_entries:
-                        bad_grad_origin = '; '.join(
-                            f"{entry['parameter']}({int(entry['summary'].get('nonfinite', 0))} non-finite)"
-                            for entry in bad_grad_entries[:8]
-                        )
-                    else:
-                        bad_grad_origin = 'undetermined'
-                    ext_val, int_val, breakdown = _loss_component_summary(
-                        external_loss,
-                        internal_loss_result,
-                        external_metrics,
-                        internal_metrics,
-                    )
-                    component_info = f'external={ext_val}, internal={int_val}'
-                    if breakdown:
-                        component_info = f'{component_info}, {breakdown}'
-                    if self.use_amp and self.scaler is not None:
-                        scale_after = _backoff_amp_scale(scale_before)
-                        self.optimizer.zero_grad(set_to_none=True)
-                        amp_overflow_steps += 1
-                        diagnostic_path = _write_amp_recovery_diagnostic(
-                            'amp_nonfinite_gradient_norm',
-                            current_lr,
-                            scale_before,
-                            scale_after,
-                            current_grad_norm=grad_norm,
-                            current_bad_gradient_origin=bad_grad_origin,
-                        )
-                        _log_runtime_message(
-                            f'  AMP gradient-norm recovery at batch {batch_idx} '
-                            f'(lr={current_lr:.3e}, scale={scale_before:.3e}->{scale_after:.3e}, '
-                            f'grad_norm={float(grad_norm.detach().cpu().item())}). '
-                            f'Origin: {bad_grad_origin}. Components: {component_info}'
-                            f'{_diagnostic_suffix(diagnostic_path)}'
-                        )
-                        _finish_recovered_batch()
-                        continue
-                    diagnostic_path = self._write_r4_diagnostic(
-                        reason='nonfinite_gradient_norm',
-                        epoch=epoch,
-                        batch_idx=batch_idx,
-                        current_lr=current_lr,
-                        features=features,
-                        labels=labels,
-                        predictions=predictions,
-                        external_loss=external_loss,
-                        internal_loss_result=internal_loss_result,
-                        total_loss=total_loss,
-                        external_metrics=external_metrics,
-                        internal_metrics=internal_metrics,
-                        scale_before=scale_before,
-                        grad_norm=grad_norm,
-                        bad_gradient_origin=bad_grad_origin,
-                    )
-                    raise RuntimeError(
-                        f'Non-finite gradient norm before optimizer step at batch {batch_idx} '
-                        f'(lr={current_lr:.3e}{scale_info}, '
-                        f'grad_norm={float(grad_norm.detach().cpu().item())}). '
-                        f'Origin: {bad_grad_origin}. Components: {component_info}'
-                        f'{_diagnostic_suffix(diagnostic_path)}'
-                    )
-
-                if self.use_amp:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    scale_after = float(self.scaler.get_scale())
+                    optimizer_step_applied = scale_after >= scale_before
                 else:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config.max_grad_norm,
+                        error_if_nonfinite=True,
+                    )
                     self.optimizer.step()
-                if self.scheduler is not None:
+                    optimizer_step_applied = True
+
+                if optimizer_step_applied and self.scheduler is not None:
                     self.scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
 
                 # EMA shadow update (after optimizer step).
-                if self._ema is not None:
+                if optimizer_step_applied and self._ema is not None:
                     self._ema.update(self.model)
 
             _record_batch_timing()
             
             # Track metrics - use TSS_signals for batch size.
-            # Skip on non-finite loss to avoid polluting running averages.
-            if _loss_is_finite:
-                batch_size = features['TSS_signals'].shape[0]
-                metrics_tracker.update('loss', total_loss.detach(), batch_size)
-                for k, v in external_metrics.items():
-                    metrics_tracker.update(k, v if isinstance(v, torch.Tensor) else float(v), batch_size)
-                for k, v in internal_metrics.items():
-                    metrics_tracker.update(k, v if isinstance(v, torch.Tensor) else float(v), batch_size)
+            batch_size = features['TSS_signals'].shape[0]
+            metrics_tracker.update('loss', total_loss.detach(), batch_size)
+            for k, v in external_metrics.items():
+                metrics_tracker.update(k, v if isinstance(v, torch.Tensor) else float(v), batch_size)
+            for k, v in internal_metrics.items():
+                metrics_tracker.update(k, v if isinstance(v, torch.Tensor) else float(v), batch_size)
             
             # Logging
             if batch_idx % self.config.log_interval == 0:
@@ -1167,8 +780,6 @@ class Trainer:
                         batches_s = (1.0 / ema_iter_time) if (ema_iter_time is not None and ema_iter_time > 0) else 0.0
                         desc += f' batches_s={batches_s:.2f} data_s={(ema_data_time if ema_data_time is not None else 0.0):.3f} step_s={(ema_step_time if ema_step_time is not None else 0.0):.3f}'
                     rich_progress.update(rich_task_id, description=desc)
-                else:
-                    print(f'  Batch {batch_idx}/{n_batches} | Loss: {avg_loss:.4f} | LR: {current_lr:.2e}')
             last_iter_end = time.time()
 
             if pbar is not None:
@@ -1186,9 +797,6 @@ class Trainer:
         epoch_time = time.time() - start_time
         metrics = metrics_tracker.compute(as_python=True)
         metrics['epoch_time'] = epoch_time
-        metrics['amp_overflow_steps'] = float(amp_overflow_steps)
-        if self.use_amp:
-            metrics['amp_final_scale'] = float(self.scaler.get_scale())
         
         return metrics
     
@@ -1702,8 +1310,6 @@ class Trainer:
         print(f'Train batches: {steps_per_epoch} (accum={accum}, optimizer_steps/epoch={optimizer_steps_per_epoch}), Val batches: {len(val_loader) if val_loader else 0}')
         
         for epoch in range(1, epochs + 1):
-            print(f'\nEpoch {epoch}/{epochs}')
-            
             # Training
             try:
                 train_metrics = self.train_epoch(train_loader, epoch)
@@ -1726,18 +1332,23 @@ class Trainer:
                 raise
             history['train_loss'].append(train_metrics['loss'])
             history['learning_rate'].append(self.scheduler.get_last_lr()[0])
-            
-            print(f'  Train Loss: {train_metrics["loss"]:.4f} | Time: {train_metrics["epoch_time"]:.1f}s')
-            overflow_steps = int(train_metrics.get('amp_overflow_steps', 0.0))
-            if overflow_steps > 0:
-                final_scale = train_metrics.get('amp_final_scale')
-                if isinstance(final_scale, (int, float)):
-                    print(
-                        f'  AMP overflow recoveries: {overflow_steps} '
-                        f'| Final scale: {float(final_scale):.3e}'
-                    )
-                else:
-                    print(f'  AMP overflow recoveries: {overflow_steps}')
+
+            train_summary = [
+                f'Epoch {epoch}/{epochs}',
+                f'Train Loss: {train_metrics["loss"]:.4f}',
+            ]
+            for metric_name, label in (
+                ('tumor_crps', 'Tumor CRPS'),
+                ('background_crps', 'Background CRPS'),
+                ('internal_loss', 'Internal'),
+            ):
+                metric_value = train_metrics.get(metric_name)
+                if isinstance(metric_value, (int, float)) and math.isfinite(float(metric_value)):
+                    train_summary.append(f'{label}: {float(metric_value):.4f}')
+            current_lr = self.scheduler.get_last_lr()[0] if self.scheduler is not None else self.config.max_lr
+            train_summary.append(f'LR: {current_lr:.2e}')
+            train_summary.append(f'Time: {train_metrics["epoch_time"]:.1f}s')
+            print('  ' + ' | '.join(train_summary))
             
             # Validation runs on the fixed cadence and always on the final
             # epoch so checkpoint selection and fold metrics remain defined.
@@ -1798,9 +1409,7 @@ class Trainer:
                 # Restore raw model weights for next training epoch.
                 if _ema_backup is not None:
                     self._ema.restore(self.model, _ema_backup)
-            elif val_loader is not None:
-                print('  Validation skipped (scheduled every 5 epochs)')
-        
+
         if val_loader is None:
             print('\nTraining complete (fixed schedule; no validation checkpoint selection).')
             return history

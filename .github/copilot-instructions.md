@@ -27,6 +27,9 @@
 - **Comments explain *why*, not *what*.** Scientific rationale, mathematical formulas, biological motivation, and design decisions belong in comments. Do not narrate obvious code.
 - **Descriptive variable names.** Prefer `train_fold_variance_raw` over `_raw_var`, `_residual_crop_offsets` over `_skip_offsets`. Single-letter names only in tight numeric loops where context is unambiguous.
 - **Functions should be focused.** Orchestrating functions coordinate helpers; they should not contain 300+ lines of inline logic. Extract coherent sub-operations into named private functions.
+- **Human-facing orchestrators stay thin.** Files such as `Proteus.py` and `analysis/run_full_analysis.py` should read as step-by-step workflow coordinators, not as the home for large computational subsystems, plotting suites, or calibration math.
+- **Extract heavy logic into reusable modules.** If a change introduces substantial math, statistics, plotting, caching, file-format handling, or multi-function workflow machinery, move it into an existing helper module or a new focused module under the appropriate package instead of embedding it in an entrypoint/orchestrator.
+- **Prefer reuse over local helper sprawl.** Before adding new helper blocks to an orchestrator, first look for an existing module to extend. Avoid growing long private-function chains in human-facing runners when the logic can be shared cleanly elsewhere.
 - **Module-level `__all__` exports.** Every package `__init__.py` must declare `__all__`. No wildcard imports (exception: `analysis/__init__.py` which re-exports from submodules for notebook convenience).
 
 ## Big picture (what runs where)

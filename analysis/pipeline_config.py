@@ -95,14 +95,14 @@ VALIDATION_PATIENT_HOLDOUT_PATHS: Dict[str, str] = {
 }
 
 
-# Canonical pooled PLCA OOF predictions used by patient validation,
+# Canonical pooled TDS OOF predictions used by patient validation,
 # PDX validation, and calibration. These are the exact fold files.
 PLCA_CV_FOLD_TUMOR_PREDICTION_PATHS: Dict[int, str] = {
-    1: "results_training/proteus_plca-model_cv/CV-fold_1/validation-fold_1_predictions_tumor.tsv",
-    2: "results_training/proteus_plca-model_cv/CV-fold_2/validation-fold_2_predictions_tumor.tsv",
-    3: "results_training/proteus_plca-model_cv/CV-fold_3/validation-fold_3_predictions_tumor.tsv",
-    4: "results_training/proteus_plca-model_cv/CV-fold_4/validation-fold_4_predictions_tumor.tsv",
-    5: "results_training/proteus_plca-model_cv/CV-fold_5/validation-fold_5_predictions_tumor.tsv",
+    1: "results_training/proteus_tds-model_cv/CV-fold_1/validation-fold_1_predictions_tumor.tsv",
+    2: "results_training/proteus_tds-model_cv/CV-fold_2/validation-fold_2_predictions_tumor.tsv",
+    3: "results_training/proteus_tds-model_cv/CV-fold_3/validation-fold_3_predictions_tumor.tsv",
+    4: "results_training/proteus_tds-model_cv/CV-fold_4/validation-fold_4_predictions_tumor.tsv",
+    5: "results_training/proteus_tds-model_cv/CV-fold_5/validation-fold_5_predictions_tumor.tsv",
 }
 
 

@@ -35,6 +35,13 @@ from proteus_utils.data_helpers import (
 )
 
 
+def _available_loader_workers() -> int:
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except AttributeError:
+        return max(1, os.cpu_count() or 1)
+
+
 def _collate_identity(batch: List[Any]) -> Any:
     """Return the single element produced by DataLoader(batch_size=1)."""
     return batch[0]
@@ -851,15 +858,6 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
             rng.shuffle(drawn)
             return drawn
 
-        # Original implementation kept for reference:
-        # return rng.choices(
-        #     gene_population,
-        #     weights=gene_sampling_probs,
-        #     k=self.genes_per_batch,
-        # )
-        # Sample genes without replacement so a batch never contains the same
-        # gene twice, which would otherwise reopen same-sample/origin repeats
-        # inside a single CCC group.
         np_rng = np.random.default_rng(rng.randrange(2**32))
         drawn = np_rng.choice(
             np.asarray(gene_population, dtype=np.int64),
@@ -871,34 +869,9 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
 
     def _draw_real_paths(self, src: str, gene_idx: int, n_draws: int, rng: random.Random) -> List[str]:
         candidates = self._valid_paths_for_gene(self._source_real_paths[src], gene_idx)
-        # Original implementation kept for reference:
-        # if not candidates or n_draws <= 0:
-        #     return []
-        # return [rng.choice(candidates) for _ in range(n_draws)]
-        # Draw real samples without replacement so a gene group never repeats
-        # the same biological sample within one batch.
         return self._sample_unique_paths(candidates, n_draws, rng)
 
     def _draw_pht_paths(self, src: str, gene_idx: int, n_draws: int, rng: random.Random) -> List[str]:
-        # Original implementation kept for reference:
-        # if n_draws <= 0:
-        #     return []
-        # grouped = self._source_pht_by_parent[src] if rng.random() < 0.5 else self._source_pht_by_donor[src]
-        # valid_groups = []
-        # for group_paths in grouped.values():
-        #     valid = self._valid_paths_for_gene(group_paths, gene_idx)
-        #     if len(valid) >= 2:
-        #         valid_groups.append(valid)
-        # if valid_groups:
-        #     chosen_group = rng.choice(valid_groups)
-        #     if len(chosen_group) >= n_draws:
-        #         return rng.sample(chosen_group, n_draws)
-        #     return chosen_group + [rng.choice(chosen_group) for _ in range(n_draws - len(chosen_group))]
-        # candidates = self._valid_paths_for_gene(self._source_pht_paths[src], gene_idx)
-        # if not candidates:
-        #     return []
-        # return [rng.choice(candidates) for _ in range(n_draws)]
-        # PHT-only draws now also respect without-replacement semantics.
         candidates = self._valid_paths_for_gene(self._source_pht_paths[src], gene_idx)
         return self._sample_unique_paths(candidates, n_draws, rng)
 
@@ -906,29 +879,6 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         if n_draws <= 0:
             return []
         pht_available = bool(self._valid_paths_for_gene(self._source_pht_paths[src], gene_idx))
-        # Original implementation kept for reference:
-        # real_available = bool(self._valid_paths_for_gene(self._source_real_paths[src], gene_idx))
-        # if pht_available and real_available:
-        #     n_pht = max(1, n_draws // 4)
-        #     n_real = n_draws - n_pht
-        # elif pht_available:
-        #     n_pht = n_draws
-        #     n_real = 0
-        # else:
-        #     n_pht = 0
-        #     n_real = n_draws
-        # drawn = self._draw_real_paths(src, gene_idx, n_real, rng)
-        # drawn.extend(self._draw_pht_paths(src, gene_idx, n_pht, rng))
-        # while len(drawn) < n_draws:
-        #     filler = self._draw_real_paths(src, gene_idx, 1, rng) or self._draw_pht_paths(src, gene_idx, 1, rng)
-        #     if not filler:
-        #         break
-        #     drawn.extend(filler)
-        # rng.shuffle(drawn)
-        # return drawn[:n_draws]
-        # Mixed synthetic sources now draw from the combined PDX/PHT pool with
-        # no explicit non-PHT preference.  We sample distinct model origins
-        # without replacement, then choose one concrete path per origin.
         if pht_available:
             return self._draw_synthetic_paths(src, gene_idx, n_draws, rng)
         return self._draw_real_paths(src, gene_idx, n_draws, rng)
@@ -1366,12 +1316,6 @@ def _print_multisource_split_audit(
         f"train={len(train_paths)} val={len(val_paths)}"
     )
     print(f"  [SplitAudit] TSV fold counts: {_fmt_counts(fold_counts)}")
-    if 2 in fold_counts:
-        print(
-            "  [SplitAudit] Fold 2 membership in this run: "
-            f"train={train_fold_counts.get(2, 0)} "
-            f"val={val_fold_counts.get(2, 0)}"
-        )
 
 
 def create_data_loader(
@@ -1564,10 +1508,10 @@ def build_multisource_loaders_from_splits(
     steps_per_epoch: int = 4000,
     gene_weight_min: float = 0.5,
     gene_weight_max: float = 2.0,
-    num_workers: int = 4,
-    train_num_workers: int = 0,
+    num_workers: Optional[int] = None,
+    train_num_workers: Optional[int] = None,
     persistent_workers: bool = True,
-    train_persistent_workers: bool = False,
+    train_persistent_workers: Optional[bool] = None,
     prefetch_factor: int = 4,
     train_prefetch_factor: int = 2,
     seed: int = 42,
@@ -1606,6 +1550,13 @@ def build_multisource_loaders_from_splits(
     Returns:
         (train_loader, val_loader, train_steps, val_steps)
     """
+    if num_workers is None:
+        num_workers = _available_loader_workers()
+    if train_num_workers is None:
+        train_num_workers = num_workers
+    if train_persistent_workers is None:
+        train_persistent_workers = persistent_workers
+
     train_paths, val_paths, zarr_path_to_cohort, zarr_path_to_sample_name = (
         _parse_splits_tsv(training_set_tsv, zarr_base, val_fold, train_only_cohorts)
     )
@@ -1841,10 +1792,11 @@ def _compute_gene_variances(
             raw_weights[g] = 0.0
             clipped_weights[g] = clip_min
             continue
+
         mean = gene_sum[g] / n
-        var = max(0.0, gene_sum_sq[g] / n - mean * mean)
-        raw_weights[g] = float(var)
-        clipped_weights[g] = float(np.clip(var, clip_min, clip_max))
+        variance = max(0.0, gene_sum_sq[g] / n - mean * mean)
+        raw_weights[g] = float(variance)
+        clipped_weights[g] = float(np.clip(variance, clip_min, clip_max))
 
     return raw_weights, clipped_weights
 

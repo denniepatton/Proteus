@@ -134,12 +134,12 @@ class BioDVNConfig:
     internal_weight: float = 0.5
     cl_margin: float = 1.0
     beta_tfx: float = 0.5
-    beta_srl_max: float = 2.0
+    beta_srl_max: float = 1.5
     beta_dynamic_pair_max: float = 0.0
     srl_delta: float = 5.0
     srl_start: int = 0
     srl_ramp: int = 50
-    beta_pht_consistency: float = 1.0
+    beta_pht_consistency: float = 0.5
     beta_pht_uncertainty: float = 1.0
     
     # Training hyperparameters
