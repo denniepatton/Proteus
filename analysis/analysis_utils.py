@@ -486,6 +486,41 @@ def load_cv_predictions_proteus_full_from_paths(
     return result
 
 
+# CRPC-WCDT canonical evaluation set. Only these 13 samples have complete,
+# cross-model matched results; every analysis that loads CRPC-WCDT predictions
+# is restricted to this set at load time so the n=13 cap propagates naturally.
+CRPC_WCDT_COMPLETE_SAMPLES: Tuple[str, ...] = (
+    "DTB-097-PRO",
+    "DTB-102-PRO",
+    "DTB-119-PRO",
+    "DTB-149-BL",
+    "DTB-156-BL",
+    "DTB-183-BL",
+    "DTB-205-BL",
+    "DTB-210-BL",
+    "DTB-214-BL",
+    "DTB-216-PRO",
+    "DTB-258-BL",
+    "DTB-261-BL",
+    "DTB-266-BL",
+)
+_CRPC_WCDT_PATH_TOKEN: str = "CRPC-WCDT"
+
+
+def _restrict_wcdt_wide_by_path(
+    wide: Optional[pd.DataFrame], path: str,
+) -> Optional[pd.DataFrame]:
+    """Restrict a genes × samples table to the CRPC-WCDT canonical 13 samples.
+
+    Applied only when *path* refers to a CRPC-WCDT prediction file; otherwise
+    the table is returned unchanged. Column order follows the canonical list.
+    """
+    if wide is None or _CRPC_WCDT_PATH_TOKEN not in str(path):
+        return wide
+    keep = [s for s in CRPC_WCDT_COMPLETE_SAMPLES if s in wide.columns]
+    return wide[keep]
+
+
 def load_holdout_predictions_proteus_full(
     path: str,
 ) -> Dict[str, Any]:
@@ -549,6 +584,9 @@ def load_holdout_predictions_proteus_full(
         )
     else:
         result["active_confidence_wide"] = None
+    for _key, _table in list(result.items()):
+        if isinstance(_table, pd.DataFrame):
+            result[_key] = _restrict_wcdt_wide_by_path(_table, path)
     return result
 
 
@@ -566,6 +604,9 @@ def load_holdout_predictions_proteus(
     ci_lo = _long_to_wide(df, "ci_q5") if "ci_q5" in df.columns else None
     ci_hi = _long_to_wide(df, "ci_q95") if "ci_q95" in df.columns else None
 
+    pred_wide = _restrict_wcdt_wide_by_path(pred_wide, path)
+    ci_lo = _restrict_wcdt_wide_by_path(ci_lo, path)
+    ci_hi = _restrict_wcdt_wide_by_path(ci_hi, path)
     return pred_wide, ci_lo, ci_hi
 
 
@@ -577,7 +618,7 @@ def load_holdout_predictions_xgboost(path: str) -> pd.DataFrame:
         # Some HPC-backed filesystems intermittently fail the C parser on
         # otherwise valid TSVs; the Python engine is slower but more robust.
         df = pd.read_csv(path, sep="\t", index_col=0, engine="python")
-    return _long_to_wide(df, "prediction")
+    return _restrict_wcdt_wide_by_path(_long_to_wide(df, "prediction"), path)
 
 
 def load_cv_predictions_xgboost(

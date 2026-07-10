@@ -1,4 +1,4 @@
-"""Train a final XGBoost model on ALL BTS data with best HPs.
+"""Train a final XGBoost model on all samples from the selected splits TSV.
 
 All samples contribute to both training and validation.  A deterministic
 10% gene-level row split (shuffled by seed) provides the early-stopping
@@ -64,8 +64,10 @@ def train_final_model(
     zarr_base: Optional[str] = None,
     val_frac: float = 0.10,
     seed: int = 42,
+    params_source: str = "cemented_params",
+    params_json_path: Optional[str] = None,
 ) -> None:
-    """Train a single XGBoost regressor on all BTS data and save.
+    """Train a single XGBoost regressor on all rows from the selected splits TSV.
 
     A deterministic gene-level row split (val_frac of rows) is used for
     early stopping.  Gene-variance weights are computed from **all** data
@@ -125,6 +127,9 @@ def train_final_model(
     # ---- Save training metadata ----
     meta = {
         "xgb_params": {k: v for k, v in xgb_params.items() if k != "nthread"},
+        "params_source": params_source,
+        "params_json": params_json_path,
+        "splits_tsv": os.path.abspath(tsv_path),
         "n_estimators_max": n_estimators,
         "best_iteration": best_iter,
         "val_frac": val_frac,
@@ -147,7 +152,7 @@ def train_final_model(
 
 def main(argv: Optional[List[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Train final XGBoost on all BTS data with best HPs",
+        description="Train the final XGBoost model using the selected sample splits",
     )
     parser.add_argument(
         "--params_json", type=str, default=None,
@@ -176,9 +181,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         with open(args.params_json, "r") as f:
             summary = json.load(f)
         best_params = summary["best_params"]
+        params_source = "params_json"
         print(f"Loaded HPs from {args.params_json}")
     else:
         best_params = CEMENTED_PARAMS
+        params_source = "cemented_params"
         print("Using cemented HPs (Optuna trial 186)")
 
     cpu_count = os.cpu_count() or 1
@@ -204,6 +211,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         zarr_base=args.zarr_base,
         val_frac=args.val_frac,
         seed=args.seed,
+        params_source=params_source,
+        params_json_path=os.path.abspath(args.params_json) if args.params_json else None,
     )
 
 

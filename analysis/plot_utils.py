@@ -19,6 +19,10 @@ import matplotlib as mpl
 import matplotlib.gridspec as gridspec
 import matplotlib.patheffects as PathEffects
 import matplotlib.pyplot as plt
+from matplotlib.axes import Axes
+from matplotlib.figure import Figure
+from matplotlib.legend import Legend
+from matplotlib.lines import Line2D
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -46,6 +50,50 @@ _ONOFF_OFF_COLOR = "#3B76AF"
 _WITHHELD_COLOR = "#D9D9D9"
 _SENSITIVITY_COLOR = "#2E8B57"
 _SPECIFICITY_COLOR = "#3F3F3F"
+_RESPONDER_COLOR = "#007191"
+_NON_RESPONDER_COLOR = "#F97C00"
+_PT_COLOR = "#D31F11"
+_MIXED_TARGET_SCATTER_COLOR = "#999999"
+_CROSSCOHORT_DRAW_ORDER: Tuple[str, ...] = (
+    "CRPC-RA",
+    "SCLC",
+    "CRPC-WCDT",
+    "BLCA-RA",
+)
+_CROSSCOHORT_DRAW_PRIORITY: Dict[str, int] = {
+    cohort_name: idx for idx, cohort_name in enumerate(_CROSSCOHORT_DRAW_ORDER)
+}
+
+
+def _install_off_axis_legend_policy() -> None:
+    """Default all Matplotlib legends to outside the plotting axes."""
+    if getattr(Axes.legend, "_proteus_off_axis", False):
+        return
+
+    original_axes_legend = Axes.legend
+    original_figure_legend = Figure.legend
+
+    def axes_legend(self: Axes, *args: Any, **kwargs: Any) -> Legend:
+        if "bbox_to_anchor" not in kwargs:
+            kwargs["bbox_to_anchor"] = (1.04, 1.0)
+            kwargs["loc"] = "upper left"
+        kwargs.setdefault("borderaxespad", 0.0)
+        return original_axes_legend(self, *args, **kwargs)
+
+    def figure_legend(self: Figure, *args: Any, **kwargs: Any) -> Legend:
+        if "bbox_to_anchor" not in kwargs:
+            kwargs["bbox_to_anchor"] = (1.02, 0.5)
+            kwargs["loc"] = "center left"
+        kwargs.setdefault("borderaxespad", 0.0)
+        return original_figure_legend(self, *args, **kwargs)
+
+    axes_legend._proteus_off_axis = True  # type: ignore[attr-defined]
+    figure_legend._proteus_off_axis = True  # type: ignore[attr-defined]
+    Axes.legend = axes_legend  # type: ignore[method-assign]
+    Figure.legend = figure_legend  # type: ignore[method-assign]
+
+
+_install_off_axis_legend_policy()
 
 
 def _palette() -> Dict[str, str]:
@@ -56,7 +104,55 @@ def _palette() -> Dict[str, str]:
 
 
 def _color(subtype: str) -> str:
-    return _palette().get(subtype, "#999999")
+    palette = _palette()
+    subtype_text = str(subtype).strip()
+    # Prefer an exact palette key so context-specific subtypes (e.g. the BLCA
+    # "NE" entry) resolve to their own color rather than a short-name alias.
+    if subtype_text in palette:
+        return palette[subtype_text]
+    alias_map = {
+        "AR": "ARPC",
+        "NE": "NEPC",
+        "BLCA": "BLCA-RA",
+    }
+    alias = alias_map.get(subtype_text.upper())
+    if alias is not None and alias in palette:
+        return palette[alias]
+    return palette.get(subtype_text, "#999999")
+
+
+def _contrast_group_display_name(group_name: str) -> str:
+    mapping = {
+        "NonResponder": "Non-Responder",
+        "Non-Responder": "Non-Responder",
+        "Death": "PT",
+    }
+    return mapping.get(group_name, group_name)
+
+
+def _contrast_group_color(group_name: str, fallback: str) -> str:
+    mapping = {
+        "Responder": _RESPONDER_COLOR,
+        "NonResponder": _NON_RESPONDER_COLOR,
+        "Non-Responder": _NON_RESPONDER_COLOR,
+        "C1": _RESPONDER_COLOR,
+        "Death": _PT_COLOR,
+        "PT": _PT_COLOR,
+    }
+    return mapping.get(group_name, _palette().get(group_name, fallback))
+
+
+def _collapse_crpc_target_scatter_subtype(subtype: str) -> Tuple[str, str]:
+    subtype_text = str(subtype).strip().upper()
+    if subtype_text == "ARPC":
+        return "ARPC", _palette().get("ARPC", "#0077BB")
+    if subtype_text == "NEPC":
+        return "NEPC", _palette().get("NEPC", "#EE7733")
+    return "Mixed", _MIXED_TARGET_SCATTER_COLOR
+
+
+def _crosscohort_priority(group_name: Any) -> int:
+    return _CROSSCOHORT_DRAW_PRIORITY.get(str(group_name), len(_CROSSCOHORT_DRAW_PRIORITY))
 
 
 def _darken(hex_color: str, factor: float = 0.6) -> str:
@@ -138,6 +234,67 @@ def _compute_correlation_stats(
     }
 
 
+def _tfx_marker_size(
+    tfx_value: float,
+    *,
+    min_size: float = 40.0,
+    scale: float = 260.0,
+    default_size: float = 60.0,
+) -> float:
+    if np.isfinite(tfx_value):
+        return max(min_size, scale * float(tfx_value))
+    return default_size
+
+
+def add_tfx_size_legend(
+    ax: plt.Axes,
+    tfx_values: Sequence[float] | np.ndarray | pd.Series,
+    *,
+    title: str = "TFx",
+    bbox_to_anchor: Tuple[float, float] = (1.18, 0.28),
+    loc: str = "center left",
+    fontsize: float = 8,
+    min_size: float = 40.0,
+    scale: float = 260.0,
+    default_size: float = 60.0,
+) -> Optional[Legend]:
+    numeric = pd.to_numeric(pd.Series(tfx_values), errors="coerce")
+    if not np.isfinite(numeric.to_numpy(dtype=float)).any():
+        return None
+
+    legend_values = [0.1, 0.5, 1.0]
+
+    handles = [
+        ax.scatter(
+            [],
+            [],
+            s=_tfx_marker_size(
+                value,
+                min_size=min_size,
+                scale=scale,
+                default_size=default_size,
+            ),
+            facecolors="#BDBDBD",
+            edgecolors="black",
+            linewidths=0.5,
+            alpha=0.78,
+        )
+        for value in legend_values
+    ]
+    labels = [f"{value:.1f}" for value in legend_values]
+    return ax.legend(
+        handles,
+        labels,
+        title=title,
+        bbox_to_anchor=bbox_to_anchor,
+        loc=loc,
+        fontsize=fontsize,
+        labelspacing=1.2,
+        borderpad=0.7,
+        handletextpad=1.0,
+    )
+
+
 def sample_scatter(
     truth_col: pd.Series,
     pred_col: pd.Series,
@@ -178,10 +335,45 @@ def sample_scatter(
         axis_max = max(15.0, np.ceil(max_value))
 
     fig, ax = plt.subplots(figsize=(6, 6))
-    if point_style == "hexbin" and len(truth) >= 200:
-        ax.hexbin(truth.values, pred.values, gridsize=65, extent=(0, axis_max, 0, axis_max), cmap="Greys", mincnt=1)
+    base_scatter = None
+    if len(truth) >= 200:
+        x_vals = truth.values.astype(np.float64, copy=False)
+        y_vals = pred.values.astype(np.float64, copy=False)
+        bins = min(150, max(60, int(np.sqrt(len(x_vals)))))
+        hist, x_edges, y_edges = np.histogram2d(
+            x_vals,
+            y_vals,
+            bins=bins,
+            range=[[0.0, float(axis_max)], [0.0, float(axis_max)]],
+        )
+        x_idx = np.clip(np.searchsorted(x_edges, x_vals, side="right") - 1, 0, bins - 1)
+        y_idx = np.clip(np.searchsorted(y_edges, y_vals, side="right") - 1, 0, bins - 1)
+        counts = hist[x_idx, y_idx]
+        density = np.log10(counts + 1.0)
+        draw_order = np.argsort(density)
+        base_scatter = ax.scatter(
+            x_vals[draw_order],
+            y_vals[draw_order],
+            c=density[draw_order],
+            cmap="viridis_r",
+            s=point_size,
+            alpha=0.9,
+            edgecolors="none",
+            rasterized=True,
+            zorder=2,
+        )
+    elif point_style == "hexbin":
+        hb = ax.hexbin(
+            truth.values,
+            pred.values,
+            gridsize=65,
+            extent=(0, axis_max, 0, axis_max),
+            cmap="Greys",
+            mincnt=1,
+        )
+        base_scatter = hb
     else:
-        ax.scatter(
+        base_scatter = ax.scatter(
             truth.values,
             pred.values,
             s=point_size,
@@ -189,7 +381,12 @@ def sample_scatter(
             alpha=0.35,
             edgecolors="none",
             rasterized=True,
+            zorder=2,
         )
+
+    if len(truth) >= 200 and base_scatter is not None:
+        cbar = fig.colorbar(base_scatter, ax=ax, pad=0.02)
+        cbar.set_label(r"$\log_{10}(N + 1)$")
 
     if goi:
         for subtype, genes in goi.items():
@@ -208,7 +405,7 @@ def sample_scatter(
                 linewidths=0.5,
                 color=color,
                 marker=marker,
-                zorder=3,
+                zorder=4,
             )
             for gene in present:
                 ax.annotate(
@@ -431,19 +628,45 @@ def gene_target_scatter(
     # Plot points
     pal = _palette()
     seen = set()
+    seen_colors: Dict[str, str] = {}
     default_color = mpl.rcParams["axes.prop_cycle"].by_key().get("color", ["#4477AA"])[0]
-    for sample in t.index:
+    sample_order = list(t.index)
+    if subtypes_df is not None and "subtype" in subtypes_df.columns:
+        sample_order = sorted(
+            sample_order,
+            key=lambda sample_name: (
+                _crosscohort_priority(subtypes_df.loc[sample_name, "subtype"]) if sample_name in subtypes_df.index else len(_CROSSCOHORT_DRAW_PRIORITY),
+                str(sample_name),
+            ),
+        )
+
+    for sample in sample_order:
         sz = 200
         if tfx_dict is not None:
-            sz = max(30, tfx_dict.get(sample, 1.0) * 300)
+            sz = _tfx_marker_size(
+                tfx_dict.get(sample, np.nan),
+                min_size=30.0,
+                scale=300.0,
+                default_size=200.0,
+            )
         color = default_color
         marker = "o"
+        subtype = "Unknown"
         if subtypes_df is not None and sample in subtypes_df.index:
             subtype = subtypes_df.loc[sample, "subtype"] if "subtype" in subtypes_df.columns else "Unknown"
-            color = pal.get(subtype, "#999999")
+            if "gene_tumor_scatters_Targets_CRPC" in name:
+                subtype, color = _collapse_crpc_target_scatter_subtype(str(subtype))
+            else:
+                color = pal.get(subtype, "#999999")
             seen.add(subtype)
+            seen_colors[subtype] = color
             if "status" in subtypes_df.columns and subtypes_df.loc[sample, "status"] == "holdout":
                 marker = "D"
+        elif "gene_tumor_scatters_Targets_CRPC" in name:
+            subtype = "Mixed"
+            color = _MIXED_TARGET_SCATTER_COLOR
+            seen.add(subtype)
+            seen_colors[subtype] = color
 
         if bool(is_low_confidence.loc[sample]):
             ax.scatter(
@@ -469,14 +692,31 @@ def gene_target_scatter(
                 alpha=0.75,
                 zorder=3,
             )
+    subtype_legend = None
     if subtypes_df is not None:
+        ordered_seen = sorted(
+            seen,
+            key=lambda subtype_name: (_crosscohort_priority(subtype_name), str(subtype_name)),
+        )
         handles = [
             plt.Line2D([0], [0], marker="o", color="w",
-                       markerfacecolor=pal.get(s, "#999999"), markersize=8, label=s)
-            for s in sorted(seen)
+                       markerfacecolor=seen_colors.get(s, pal.get(s, "#999999")), markersize=8, label=s)
+            for s in ordered_seen
         ]
         if handles:
-            ax.legend(handles=handles, title="Subtype", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
+            subtype_legend = ax.legend(handles=handles, title="Subtype", bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
+    tfx_legend = None
+    if tfx_dict is not None:
+        tfx_legend = add_tfx_size_legend(
+            ax,
+            [tfx_dict.get(sample, np.nan) for sample in t.index],
+            bbox_to_anchor=(1.18, 0.28),
+            min_size=30.0,
+            scale=300.0,
+            default_size=200.0,
+        )
+    if subtype_legend is not None and tfx_legend is not None:
+        ax.add_artist(subtype_legend)
 
     # HD-L background overlay (gray diamonds, behind tumor legend)
     if bg_t is not None and bg_p is not None:
@@ -512,12 +752,10 @@ def gene_target_scatter(
         0.05, 0.95, metric_note,
         transform=ax.transAxes, va="top", fontsize=9,
     )
-    if n_low_conf > 0 or tfx_dict is not None:
+    if n_low_conf > 0:
         note = []
         if n_low_conf > 0:
             note.append("Hollow = low-confidence")
-        if tfx_dict is not None:
-            note.append("Marker area ∝ TFx")
         ax.text(
             0.95,
             0.05,
@@ -1264,11 +1502,11 @@ def plot_reliability_weights(
 def _render_sample_scatter(args: Tuple) -> str:
     """Worker function for parallel sample scatter generation."""
     (truth_col, pred_col, sample_name, out_path,
-     goi, tfx, depth, is_holdout) = args
+     goi, tfx, depth, is_holdout, axis_max) = args
     sample_scatter(
         truth_col, pred_col, sample_name, out_path,
         goi=goi, tfx=tfx, depth=depth,
-        is_holdout=is_holdout,
+        is_holdout=is_holdout, axis_max=axis_max,
     )
     return sample_name
 
@@ -1281,12 +1519,14 @@ def batch_sample_scatters(
     goi: Optional[Dict[str, List[str]]] = None,
     subtypes_df: Optional[pd.DataFrame] = None,
     n_workers: Optional[int] = None,
+    axis_max: Optional[float] = None,
 ) -> None:
     """Generate per-sample scatter plots in parallel.
 
     ``goi`` maps subtype name → list of gene names (passed through to sample_scatter).
     If ``subtypes_df`` has a ``status`` column, samples with status == "holdout"
-    will be drawn with hollow markers.
+    will be drawn with hollow markers. ``axis_max`` forces a fixed square axis
+    limit when provided.
     """
     common_samples = truth_wide.columns.intersection(pred_wide.columns)
     os.makedirs(out_dir, exist_ok=True)
@@ -1308,7 +1548,7 @@ def batch_sample_scatters(
         args_list.append((
             truth_wide[sample], pred_wide[sample], sample,
             os.path.join(out_dir, sample),
-            goi, tfx, depth, is_holdout,
+            goi, tfx, depth, is_holdout, axis_max,
         ))
 
     if n_workers > 1 and len(args_list) > 4:
@@ -1405,16 +1645,17 @@ _BENCH_FALLBACK_COLORS = [
 
 _BENCH_EXPLICIT_COLORS = {
     "Naive": "#8F8F8F",
+    "Proteus": "#1F78B4",
 }
 
 
 def _bench_parent_model_name(model_name: str) -> str:
     for suffix in (
-        " (binary)",
         " (adjusted)",
         " (uncertainty-aware)",
         " (uncertainty-aware, 90% CI)",
         " (uncertainty-aware, 50% CI)",
+        " (uncertainty-informed)",
     ):
         if model_name.endswith(suffix):
             return model_name[: -len(suffix)]
@@ -1424,7 +1665,6 @@ def _bench_parent_model_name(model_name: str) -> str:
 def _bench_display_label(model_name: str) -> str:
     return (
         model_name
-        .replace(" (binary)", "\nBinary")
         .replace(" (adjusted)", "\nAdjusted")
         .replace(" (uncertainty-aware, 90% CI)", "\nUncertainty-aware\n90% CI")
         .replace(" (uncertainty-aware, 50% CI)", "\nUncertainty-aware\n50% CI")
@@ -1723,6 +1963,24 @@ def benchmark_cohort_boxplots(
             for flier in bp.get("fliers", []):
                 flier.set_markersize(4)
 
+            rng = np.random.default_rng(42)
+            for pos, vals, color in zip(all_positions, all_data, all_colors):
+                numeric_vals = np.asarray(vals, dtype=float)
+                numeric_vals = numeric_vals[np.isfinite(numeric_vals)]
+                if numeric_vals.size == 0:
+                    continue
+                jitter = rng.uniform(-0.08, 0.08, size=numeric_vals.size)
+                ax.scatter(
+                    float(pos) + jitter,
+                    numeric_vals,
+                    color=color,
+                    edgecolor="black",
+                    linewidth=0.4,
+                    s=28,
+                    alpha=0.85,
+                    zorder=3,
+                )
+
             ax.set_xticks(tick_positions)
             ax.set_xticklabels(tick_labels, rotation=55, ha="right", fontsize=7)
 
@@ -1794,6 +2052,114 @@ def benchmark_cohort_histograms(
 
     fig.suptitle(title or "Per-Gene Spearman ρ Distribution",
                  fontsize=13, fontweight="bold", y=1.01)
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def benchmark_cohort_retention_curve(
+    gene_rho_table: pd.DataFrame,
+    name: str,
+    *,
+    cohort_order: Sequence[str],
+    model_order: Sequence[str],
+    title: Optional[str] = None,
+) -> None:
+    """Retention curve of mean per-gene Spearman rho vs retained genes.
+
+    Each curve is ranked by per-gene Spearman rho within a cohort/model pair,
+    then plotted as the cumulative mean of the retained top-k genes.
+    Model identity is encoded by color; cohort identity is encoded by marker
+    shape and line style.
+    """
+    _ensure_dir(name)
+    cmap = _bench_color_map(model_order)
+    cohort_style_map = {
+        "BLCA-RA": {"marker": "o", "linestyle": "-"},
+        "CRPC-WCDT": {"marker": "s", "linestyle": ":"},
+    }
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.5))
+    plotted_any = False
+    max_retained = 0
+
+    for model in model_order:
+        model_color = cmap.get(model, "#BBBBBB")
+        for cohort in cohort_order:
+            sub = gene_rho_table[
+                (gene_rho_table["cohort"] == cohort)
+                & (gene_rho_table["model"] == model)
+            ]
+            rho_vals = pd.to_numeric(sub["spearman_rho"], errors="coerce").dropna().to_numpy(dtype=np.float64)
+            if rho_vals.size == 0:
+                continue
+            rho_vals = np.sort(rho_vals)[::-1]
+            retained = np.arange(1, rho_vals.size + 1, dtype=np.int32)
+            mean_rho = np.cumsum(rho_vals) / retained
+            max_retained = max(max_retained, int(retained[-1]))
+
+            style = cohort_style_map.get(cohort, {"marker": "o", "linestyle": "-"})
+            markevery = max(1, int(rho_vals.size // 40))
+            ax.plot(
+                retained,
+                mean_rho,
+                color=model_color,
+                linewidth=1.6,
+                linestyle=style["linestyle"],
+                marker=style["marker"],
+                markersize=3.5,
+                markevery=markevery,
+                alpha=0.95,
+                zorder=2,
+            )
+            plotted_any = True
+
+    if not plotted_any:
+        plt.close(fig)
+        return
+
+    model_handles = [
+        Line2D([0], [0], color=cmap.get(model, "#BBBBBB"), linewidth=2.0, label=model)
+        for model in model_order
+    ]
+    cohort_handles = [
+        Line2D(
+            [0], [0],
+            color="#444444",
+            linestyle=cohort_style_map.get(cohort, {"linestyle": "-"})["linestyle"],
+            marker=cohort_style_map.get(cohort, {"marker": "o"})["marker"],
+            markersize=6,
+            linewidth=1.6,
+            label=cohort,
+        )
+        for cohort in cohort_order
+    ]
+
+    model_legend = ax.legend(
+        handles=model_handles,
+        title="Model",
+        fontsize=8,
+        title_fontsize=9,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+    )
+    ax.add_artist(model_legend)
+    ax.legend(
+        handles=cohort_handles,
+        title="Cohort",
+        fontsize=8,
+        title_fontsize=9,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 0.46),
+    )
+
+    ax.set_xlabel("Retained Genes")
+    ax.set_ylabel("Mean Spearman ρ")
+    ax.set_xlim(1, max_retained)
+    ax.set_ylim(-1.0, 1.0)
+    ax.set_title(title or "Gene Retention Curve")
+    ax.grid(True, alpha=0.2)
+
     fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
@@ -1885,7 +2251,7 @@ def volcano_plot(
         padj_thresh: Adjusted p-value significance threshold.
         lfc_thresh: Absolute log2 fold-change threshold.
         contrast_name: Contrast string (group2-group1) for axis label.
-        n_label: Number of top genes to label.
+        n_label: Ignored; volcano plots no longer label genes directly.
     """
     _ensure_dir(os.path.dirname(name))
     pal = _palette()
@@ -1894,52 +2260,38 @@ def volcano_plot(
     parts = contrast_name.split("-", 1)
     up_group = parts[0]          # positive logFC direction
     down_group = parts[1] if len(parts) > 1 else "Down"
-    up_color = pal.get(up_group, "#EE7733")
-    down_color = pal.get(down_group, "#0077BB")
+    up_label = _contrast_group_display_name(up_group)
+    down_label = _contrast_group_display_name(down_group)
+    display_contrast = f"{up_label}-{down_label}"
+    up_color = _contrast_group_color(up_group, "#EE7733")
+    down_color = _contrast_group_color(down_group, "#0077BB")
     ns_color = "#BBBBBB"
 
     logfc = de_results["logFC"].values
     neg_log_p = -np.log10(de_results["adj.P.Val"].clip(lower=1e-300).values)
-    genes = de_results.index.astype(str).values
-
     sig_up = (logfc > lfc_thresh) & (de_results["adj.P.Val"].values < padj_thresh)
     sig_down = (logfc < -lfc_thresh) & (de_results["adj.P.Val"].values < padj_thresh)
     ns = ~(sig_up | sig_down)
 
     fig, ax = plt.subplots(figsize=(7, 6))
 
-    ax.scatter(logfc[ns], neg_log_p[ns], c=ns_color, s=6, alpha=0.4,
+    ax.scatter(logfc[ns], neg_log_p[ns], c=ns_color, s=24, alpha=0.4,
                linewidths=0, rasterized=True, label="NS")
-    ax.scatter(logfc[sig_down], neg_log_p[sig_down], c=down_color, s=14,
-               alpha=0.7, linewidths=0, label=f"{down_group}-up ({sig_down.sum()})")
-    ax.scatter(logfc[sig_up], neg_log_p[sig_up], c=up_color, s=14,
-               alpha=0.7, linewidths=0, label=f"{up_group}-up ({sig_up.sum()})")
+    ax.scatter(logfc[sig_down], neg_log_p[sig_down], c=down_color, s=84,
+               alpha=0.7, linewidths=0, label=f"{down_label}-up ({sig_down.sum()})")
+    ax.scatter(logfc[sig_up], neg_log_p[sig_up], c=up_color, s=84,
+               alpha=0.7, linewidths=0, label=f"{up_label}-up ({sig_up.sum()})")
 
     # Threshold lines
     ax.axhline(-np.log10(padj_thresh), ls="--", lw=0.7, color="grey", alpha=0.6)
     ax.axvline(lfc_thresh, ls="--", lw=0.7, color="grey", alpha=0.6)
     ax.axvline(-lfc_thresh, ls="--", lw=0.7, color="grey", alpha=0.6)
 
-    # Label top genes by adjusted p-value among significant
-    sig_mask = sig_up | sig_down
-    if sig_mask.any():
-        sig_idx = np.where(sig_mask)[0]
-        top_idx = sig_idx[np.argsort(de_results["adj.P.Val"].values[sig_idx])[:n_label]]
-        for i in top_idx:
-            ax.annotate(
-                genes[i], (logfc[i], neg_log_p[i]),
-                fontsize=6, alpha=0.85,
-                textcoords="offset points", xytext=(4, 4),
-                path_effects=[
-                    PathEffects.withStroke(linewidth=2, foreground="white"),
-                ],
-            )
-
-    ax.set_xlabel(f"log$_2$ FC ({contrast_name})", fontsize=12)
+    ax.set_xlabel(f"log$_2$ FC ({display_contrast})", fontsize=12)
     ax.set_ylabel(r"$-\log_{10}$(adj. p-value)", fontsize=12)
-    ax.set_title(f"Differential Expression: {contrast_name}", fontsize=13,
+    ax.set_title(f"Differential Expression: {display_contrast}", fontsize=13,
                  fontweight="bold")
-    ax.legend(loc="upper right", fontsize=8, framealpha=0.8)
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=8, framealpha=0.8)
     ax.grid(True, alpha=0.2)
 
     fig.tight_layout()
@@ -2022,8 +2374,11 @@ def enrichment_dot_plot(
     parts = contrast_name.split("-", 1)
     up_group = parts[0]
     down_group = parts[1] if len(parts) > 1 else "Down"
-    up_color = pal.get(up_group, "#EE7733")
-    down_color = pal.get(down_group, "#0077BB")
+    up_label = _contrast_group_display_name(up_group)
+    down_label = _contrast_group_display_name(down_group)
+    display_contrast = f"{up_label}-{down_label}"
+    up_color = _contrast_group_color(up_group, "#EE7733")
+    down_color = _contrast_group_color(down_group, "#0077BB")
 
     colors = [up_color if nes > 0 else down_color for nes in df["nes"].values]
 
@@ -2038,28 +2393,74 @@ def enrichment_dot_plot(
     else:
         sizes = np.full_like(neg_log_fdr, (size_min + size_max) / 2)
 
-    fig_height = max(4, 0.35 * len(df))
-    fig, ax = plt.subplots(figsize=(7, fig_height))
+    max_label_chars = int(df["label"].astype(str).map(len).max()) if not df.empty else 0
+    left_margin_in = min(4.0, max(1.6, 0.06 * max_label_chars + 0.35))
+    right_margin_in = 1.45
+    axis_width_in = 1.0
+    top_margin_in = 0.55
+    bottom_margin_in = 0.35
+    axis_height_in = max(1.0, 0.22 * len(df))
+
+    fig_width = left_margin_in + axis_width_in + right_margin_in
+    fig_height = top_margin_in + axis_height_in + bottom_margin_in
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.set_position([
+        left_margin_in / fig_width,
+        bottom_margin_in / fig_height,
+        axis_width_in / fig_width,
+        axis_height_in / fig_height,
+    ])
+
+    # Fill encodes significance so the dot SIZE (a within-plot relative
+    # -log10(FDR) rescaling, not an absolute scale) is not misread as
+    # significance: significant pathways (FDR < threshold) are filled, others are
+    # drawn hollow (open outline in the direction color).
+    significant = df["fdr"].values < fdr_thresh
+    sig_count = int(significant.sum())
+    face_colors = [color if is_sig else "none" for color, is_sig in zip(colors, significant)]
+    edge_colors = ["white" if is_sig else color for color, is_sig in zip(colors, significant)]
+    line_widths = [0.5 if is_sig else 1.1 for is_sig in significant]
 
     y_pos = np.arange(len(df))
-    ax.scatter(df["nes"].values, y_pos, c=colors, s=sizes,
-               alpha=0.8, edgecolors="white", linewidths=0.5)
+    ax.scatter(df["nes"].values, y_pos, facecolors=face_colors, s=sizes,
+               alpha=0.85, edgecolors=edge_colors, linewidths=line_widths)
     ax.set_yticks(y_pos)
     ax.set_yticklabels(df["label"].values, fontsize=8)
     ax.axvline(0, color="grey", ls="-", lw=0.6, alpha=0.5)
 
     # FDR threshold annotation
-    sig_count = int((df["fdr"] < fdr_thresh).sum())
+    x_values = pd.to_numeric(df["nes"], errors="coerce").to_numpy(dtype=np.float64)
+    finite_x = x_values[np.isfinite(x_values)]
+    if finite_x.size > 0:
+        x_min = float(np.min(finite_x))
+        x_max = float(np.max(finite_x))
+        x_span = x_max - x_min
+        if x_span <= 0.0:
+            x_span = max(1.0, abs(x_min) * 0.1)
+            x_min -= 0.5 * x_span
+            x_max += 0.5 * x_span
+        max_marker_radius_points = float(np.sqrt(float(np.max(sizes)) / np.pi))
+        marker_pad_data = (max_marker_radius_points / 72.0) * (x_span / axis_width_in)
+        base_pad_data = 0.03 * x_span
+        x_pad = marker_pad_data + base_pad_data
+        ax.set_xlim(x_min - x_pad, x_max + x_pad)
+        ax.margins(x=0.0)
+
     ax.set_xlabel("Normalized Enrichment Score (NES)", fontsize=11)
-    ax.set_title(title or f"GSEA: {contrast_name}", fontsize=13, fontweight="bold")
+    ax.set_title(title or f"GSEA: {display_contrast}", fontsize=13, fontweight="bold")
 
     # Legend for direction
     from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], marker="o", color="w", markerfacecolor=up_color,
-               markersize=8, label=f"{up_group}-enriched"),
+             markersize=8, label=f"{up_label}-enriched"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor=down_color,
-               markersize=8, label=f"{down_group}-enriched"),
+             markersize=8, label=f"{down_label}-enriched"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="#888888",
+               markeredgecolor="white", markersize=8,
+               label=f"FDR < {fdr_thresh:g} (n={sig_count})"),
+        Line2D([0], [0], marker="o", color="w", markerfacecolor="none",
+               markeredgecolor="#888888", markersize=8, label="n.s."),
     ]
     # Size legend (small / large)
     for fdr_val, lbl in [(0.05, "FDR=0.05"), (0.001, "FDR=0.001")]:
@@ -2072,11 +2473,10 @@ def enrichment_dot_plot(
             Line2D([0], [0], marker="o", color="w", markerfacecolor="#888888",
                    markersize=np.sqrt(sz) * 0.6, label=lbl),
         )
-    ax.legend(handles=legend_elements, loc="lower right", fontsize=7,
+    ax.legend(handles=legend_elements, loc="upper left", bbox_to_anchor=(1.02, 1.0), fontsize=7,
               framealpha=0.8, handletextpad=0.5)
 
     ax.grid(True, axis="x", alpha=0.2)
-    fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
 
@@ -2229,6 +2629,7 @@ def forest_plot(
     pval_col: str = "p",
     label_col: str = "variable",
     sig_threshold: float = 0.05,
+    mv_only: bool = False,
 ) -> None:
     """Horizontal forest plot of hazard ratios with 95% CI.
 
@@ -2242,16 +2643,34 @@ def forest_plot(
     - **Multivariate**: maroon (significant) / faded maroon (non-sig)
     - **Significant** markers are diamonds at full saturation
     - **Non-significant** markers are circles at reduced saturation
+
+    When *mv_only* is True, only the multivariate/TFx-adjusted HRs are
+    drawn (the univariate series is omitted). ``hr_table`` still supplies
+    the variable ordering and labels; a multivariate table is required.
     """
     _ensure_dir(name)
 
     df = hr_table.copy()
-    df = df.sort_values(hr_col, ascending=True).reset_index(drop=True)
+    has_mv = hr_table_mv is not None and not hr_table_mv.empty
+    if mv_only and not has_mv:
+        return
+    if mv_only:
+        # TFx-adjusted-only plots order rows by the adjusted (multivariate) HR
+        # rather than inheriting the univariate ordering used by the combined
+        # plot. Variables absent from the multivariate table cannot be drawn.
+        mv_hr_lookup = hr_table_mv.set_index(label_col)[hr_col]
+        df = df[df[label_col].astype(str).isin(mv_hr_lookup.index.astype(str))].copy()
+        df["_mv_hr_sort"] = df[label_col].map(mv_hr_lookup)
+        df = (
+            df.sort_values("_mv_hr_sort", ascending=True)
+            .drop(columns="_mv_hr_sort")
+            .reset_index(drop=True)
+        )
+    else:
+        df = df.sort_values(hr_col, ascending=True).reset_index(drop=True)
     n = len(df)
     if n == 0:
         return
-
-    has_mv = hr_table_mv is not None and not hr_table_mv.empty
 
     fig_height = max(4, 0.4 * n + 1.5)
     fig, ax = plt.subplots(figsize=(8, fig_height))
@@ -2271,24 +2690,26 @@ def forest_plot(
                 "hi": float(row[hi_col]), "p": float(row[pval_col]),
             }
 
-    # Vertical offset for uni vs mv when both present
-    offset = 0.15 if has_mv else 0.0
+    # Vertical offset for uni vs mv when both present. In mv-only mode the
+    # multivariate markers are centred on each row.
+    offset = 0.0 if mv_only else (0.15 if has_mv else 0.0)
 
     # --- Univariate ---
-    for i in range(n):
-        sig = pvals[i] < sig_threshold
-        if has_mv:
-            color = "#000000" if sig else "#AAAAAA"
-            alpha = 1.0 if sig else 0.45
-        else:
-            color = "#CC3311" if sig else "#555555"
-            alpha = 1.0
-        y = y_pos[i] + offset
-        ax.plot([lo[i], hi[i]], [y, y],
-                color=color, lw=1.5, solid_capstyle="round", alpha=alpha)
-        marker = "D" if sig else "o"
-        ax.plot(hrs[i], y, marker, color=color, markersize=7,
-                zorder=4, alpha=alpha)
+    if not mv_only:
+        for i in range(n):
+            sig = pvals[i] < sig_threshold
+            if has_mv:
+                color = "#000000" if sig else "#AAAAAA"
+                alpha = 1.0 if sig else 0.45
+            else:
+                color = "#CC3311" if sig else "#555555"
+                alpha = 1.0
+            y = y_pos[i] + offset
+            ax.plot([lo[i], hi[i]], [y, y],
+                    color=color, lw=1.5, solid_capstyle="round", alpha=alpha)
+            marker = "D" if sig else "o"
+            ax.plot(hrs[i], y, marker, color=color, markersize=7,
+                    zorder=4, alpha=alpha)
 
     # --- Multivariate ---
     if has_mv:
@@ -2318,17 +2739,25 @@ def forest_plot(
     cleaned = [str(l).replace("HALLMARK_", "").replace("_", " ") for l in labels]
     ax.set_yticklabels(cleaned, fontsize=8)
 
-    # P-value text on right side (univariate)
-    all_hi = list(hi)
-    if has_mv:
-        all_hi.extend(v["hi"] for v in mv_map.values() if np.isfinite(v["hi"]))
+    # P-value text on right side
+    if mv_only:
+        all_hi = [v["hi"] for v in mv_map.values() if np.isfinite(v["hi"])]
+    else:
+        all_hi = list(hi)
+        if has_mv:
+            all_hi.extend(v["hi"] for v in mv_map.values() if np.isfinite(v["hi"]))
     x_max = float(np.nanmax(all_hi)) * 1.3 if all_hi else 2.0
     for i in range(n):
-        pv_str = format_pval(pvals[i])
         var_name = str(df[label_col].iloc[i])
         mv = mv_map.get(var_name)
-        if has_mv and mv is not None and np.isfinite(mv["p"]):
-            pv_str += f"  |  {format_pval(mv['p'])}"
+        if mv_only:
+            if mv is None or not np.isfinite(mv["p"]):
+                continue
+            pv_str = format_pval(mv["p"])
+        else:
+            pv_str = format_pval(pvals[i])
+            if has_mv and mv is not None and np.isfinite(mv["p"]):
+                pv_str += f"  |  {format_pval(mv['p'])}"
         ax.text(x_max, y_pos[i], pv_str,
                 va="center", fontsize=7, color="#555555")
 
@@ -2340,16 +2769,24 @@ def forest_plot(
     # Legend when multivariate is present
     if has_mv:
         from matplotlib.lines import Line2D
-        legend_elements = [
-            Line2D([0], [0], color="#000000", marker="D", markersize=6,
-                   lw=1.5, label="Univariate (sig.)"),
-            Line2D([0], [0], color="#AAAAAA", marker="o", markersize=6,
-                   lw=1.5, alpha=0.45, label="Univariate (n.s.)"),
-             Line2D([0], [0], color=_MAROON, marker="D", markersize=6,
-                 lw=1.5, label="Multivariate / TFx-adj. (sig.)"),
-             Line2D([0], [0], color=_MAROON_FADED, marker="o", markersize=6,
-                 lw=1.5, alpha=0.45, label="Multivariate / TFx-adj. (n.s.)"),
-        ]
+        if mv_only:
+            legend_elements = [
+                Line2D([0], [0], color=_MAROON, marker="D", markersize=6,
+                       lw=1.5, label="Multivariate / TFx-adj. (sig.)"),
+                Line2D([0], [0], color=_MAROON_FADED, marker="o", markersize=6,
+                       lw=1.5, alpha=0.45, label="Multivariate / TFx-adj. (n.s.)"),
+            ]
+        else:
+            legend_elements = [
+                Line2D([0], [0], color="#000000", marker="D", markersize=6,
+                       lw=1.5, label="Univariate (sig.)"),
+                Line2D([0], [0], color="#AAAAAA", marker="o", markersize=6,
+                       lw=1.5, alpha=0.45, label="Univariate (n.s.)"),
+                Line2D([0], [0], color=_MAROON, marker="D", markersize=6,
+                       lw=1.5, label="Multivariate / TFx-adj. (sig.)"),
+                Line2D([0], [0], color=_MAROON_FADED, marker="o", markersize=6,
+                       lw=1.5, alpha=0.45, label="Multivariate / TFx-adj. (n.s.)"),
+            ]
         ax.legend(handles=legend_elements, fontsize=7, loc="lower right",
                   framealpha=0.9)
 
@@ -2405,6 +2842,9 @@ def kaplan_meier_plot(
                                        facecolor="white", alpha=0.8))
 
     ax.legend(fontsize=10, loc="best", framealpha=0.8)
+    # Force a 1:1 visual aspect for the plotting box (not the figure) so the two
+    # data axes get equal on-screen length regardless of their differing units.
+    ax.set_box_aspect(1)
     fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
@@ -2495,7 +2935,7 @@ def clinical_correlation_scatter(
                 else "o"
             )
             color = palette.get(group_name, "#999999")
-            size = max(40.0, 260.0 * float(tfx_val)) if np.isfinite(tfx_val) else 60.0
+            size = _tfx_marker_size(tfx_val)
             ax.scatter(
                 float(x_series.loc[sample_name]),
                 float(y_series.loc[sample_name]),
@@ -2535,6 +2975,7 @@ def clinical_correlation_scatter(
             va="top", ha="left", fontsize=8,
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
 
+    group_legend = None
     if seen_groups:
         handles = [
             plt.Line2D(
@@ -2543,21 +2984,23 @@ def clinical_correlation_scatter(
             )
             for group_name, color in sorted(seen_groups.items())
         ]
-        ax.legend(
+        group_legend = ax.legend(
             handles=handles,
             title=legend_title,
             bbox_to_anchor=(1.02, 1.0),
             loc="upper left",
             fontsize=8,
         )
+    tfx_legend = None
+    if meta is not None and "tfx" in meta.columns:
+        tfx_legend = add_tfx_size_legend(ax, meta["tfx"], bbox_to_anchor=(1.18, 0.28))
+    if group_legend is not None and tfx_legend is not None:
+        ax.add_artist(group_legend)
 
     ax.set_xlabel(xlabel, fontsize=11)
     ax.set_ylabel(ylabel, fontsize=11)
     if title:
         ax.set_title(title, fontsize=13, fontweight="bold")
-    if meta is not None and "tfx" in meta.columns and pd.to_numeric(meta["tfx"], errors="coerce").notna().any():
-        ax.text(0.98, 0.03, "size ∝ TFx", transform=ax.transAxes,
-                ha="right", va="bottom", fontsize=8)
     ax.set_box_aspect(1)
 
     fig.tight_layout()
@@ -2911,6 +3354,7 @@ def onoff_confusion_summary_plot(
             {
                 "model": model_name,
                 "display_label": _bench_display_label(model_name),
+                "n_total": n_total,
                 "frac_on": summary.get("n_on", 0) / n_total,
                 "frac_off": summary.get("n_off", 0) / n_total,
                 "frac_withheld": summary.get("n_indet", 0) / n_total,
@@ -2938,76 +3382,77 @@ def onoff_confusion_summary_plot(
     )
 
     n_models = len(rows)
-    fig, (ax_comp, ax_metrics) = plt.subplots(
-        ncols=2,
-        sharey=True,
-        figsize=(12.4, max(5.2, 0.95 * n_models + 2.8)),
-        gridspec_kw={"width_ratios": [1.0, 1.0]},
+    fig, ax_comp = plt.subplots(
+        ncols=1,
+        figsize=(9.0, max(3.8, 0.58 * n_models + 1.9)),
     )
 
-    y = np.arange(n_models)
-    call_y = y - 0.16
-    truth_y = y + 0.16
-    call_bar_height = 0.26
-    truth_bar_height = 0.22
+    y_truth = np.array([0.0], dtype=np.float64)
+    y_calls = np.arange(1, n_models + 1, dtype=np.float64)
+    bar_height = 0.52
     withheld_edge = "#8E8E8E"
 
     frac_on = np.array([row["frac_on"] for row in rows], dtype=np.float64)
     frac_off = np.array([row["frac_off"] for row in rows], dtype=np.float64)
     frac_withheld = np.array([row["frac_withheld"] for row in rows], dtype=np.float64)
-    frac_truth_on = np.array([row["frac_truth_on"] for row in rows], dtype=np.float64)
-    frac_truth_off = np.array([row["frac_truth_off"] for row in rows], dtype=np.float64)
 
+    total_truth_on = float(sum(row["frac_truth_on"] * row["n_total"] for row in rows))
+    total_truth_off = float(sum(row["frac_truth_off"] * row["n_total"] for row in rows))
+    truth_den = max(total_truth_on + total_truth_off, 1e-12)
+    frac_truth_on = total_truth_on / truth_den
+    frac_truth_off = total_truth_off / truth_den
+
+    # One shared Truth row (top, fully saturated) followed by per-model calls.
     ax_comp.barh(
-        call_y,
-        frac_on,
-        height=call_bar_height,
+        y_truth,
+        [frac_truth_on],
+        height=bar_height,
         color=_ONOFF_COLOR,
         edgecolor="white",
         linewidth=0.8,
-        label="ON (confident)",
+        label="Truth ON",
     )
     ax_comp.barh(
-        call_y,
-        frac_off,
-        left=frac_on,
-        height=call_bar_height,
+        y_truth,
+        [frac_truth_off],
+        left=[frac_truth_on],
+        height=bar_height,
         color=_ONOFF_OFF_COLOR,
         edgecolor="white",
         linewidth=0.8,
-        label="OFF (confident)",
+        label="Truth OFF",
+    )
+
+    ax_comp.barh(
+        y_calls,
+        frac_on,
+        height=bar_height,
+        color=_ONOFF_COLOR,
+        edgecolor="white",
+        linewidth=0.8,
+        label="Calls ON (confident)",
     )
     ax_comp.barh(
-        call_y,
+        y_calls,
+        frac_off,
+        left=frac_on,
+        height=bar_height,
+        color=_ONOFF_OFF_COLOR,
+        edgecolor="white",
+        linewidth=0.8,
+        label="Calls OFF (confident)",
+    )
+    ax_comp.barh(
+        y_calls,
         frac_withheld,
         left=frac_on + frac_off,
-        height=call_bar_height,
+        height=bar_height,
         color=_WITHHELD_COLOR,
         edgecolor=withheld_edge,
         linewidth=0.8,
         hatch="//",
-        alpha=0.8,
+        alpha=0.95,
         label="Withheld",
-    )
-
-    ax_comp.barh(
-        truth_y,
-        frac_truth_on,
-        height=truth_bar_height,
-        color=_ONOFF_COLOR,
-        edgecolor="white",
-        linewidth=0.8,
-        alpha=0.45,
-    )
-    ax_comp.barh(
-        truth_y,
-        frac_truth_off,
-        left=frac_truth_on,
-        height=truth_bar_height,
-        color=_ONOFF_OFF_COLOR,
-        edgecolor="white",
-        linewidth=0.8,
-        alpha=0.45,
     )
 
     def _segment_label(
@@ -3040,128 +3485,489 @@ def onoff_confusion_summary_plot(
         )
         text.set_path_effects([PathEffects.withStroke(linewidth=1.4, foreground=stroke_color, alpha=0.35)])
 
+    _segment_label(ax_comp, 0.0, frac_truth_on, float(y_truth[0]), f"ON\n{frac_truth_on:.0%}", "on", always_show=True)
+    _segment_label(ax_comp, frac_truth_on, frac_truth_off, float(y_truth[0]), f"OFF\n{frac_truth_off:.0%}", "off", always_show=True)
+
     for idx, row in enumerate(rows):
-        _segment_label(ax_comp, 0.0, row["frac_on"], call_y[idx], f"ON\n{row['frac_on']:.0%}", "on")
-        _segment_label(ax_comp, row["frac_on"], row["frac_off"], call_y[idx], f"OFF\n{row['frac_off']:.0%}", "off")
+        _segment_label(ax_comp, 0.0, row["frac_on"], y_calls[idx], f"ON\n{row['frac_on']:.0%}", "on")
+        _segment_label(ax_comp, row["frac_on"], row["frac_off"], y_calls[idx], f"OFF\n{row['frac_off']:.0%}", "off")
         if row["frac_withheld"] > 0.0:
             _segment_label(
                 ax_comp,
                 row["frac_on"] + row["frac_off"],
                 row["frac_withheld"],
-                call_y[idx],
+                y_calls[idx],
                 f"Withheld\n{row['frac_withheld']:.0%}",
                 "withheld",
             )
-        _segment_label(ax_comp, 0.0, row["frac_truth_on"], truth_y[idx], f"ON\n{row['frac_truth_on']:.0%}", "on")
-        _segment_label(ax_comp, row["frac_truth_on"], row["frac_truth_off"], truth_y[idx], f"OFF\n{row['frac_truth_off']:.0%}", "off")
-        ax_comp.text(
-            -0.03,
-            call_y[idx],
-            "Calls",
-            ha="right",
-            va="center",
-            fontsize=8.5,
-            color="#5A5A5A",
-            clip_on=False,
-        )
-        ax_comp.text(
-            -0.03,
-            truth_y[idx],
-            "Truth",
-            ha="right",
-            va="center",
-            fontsize=8.5,
-            color="#5A5A5A",
-            clip_on=False,
-        )
 
-    ax_comp.set_yticks(y)
-    ax_comp.set_yticklabels([row["display_label"] for row in rows], fontsize=10)
+    ax_comp.set_yticks(np.concatenate([y_truth, y_calls]))
+    ax_comp.set_yticklabels(["Truth", *[row["display_label"] for row in rows]], fontsize=10)
     ax_comp.invert_yaxis()
     ax_comp.set_xlim(0.0, 1.0)
     _set_explicit_ticks(ax_comp, x_ticks=np.linspace(0.0, 1.0, 5))
     ax_comp.set_xlabel("Fraction of gene-sample pairs", fontsize=11)
-    ax_comp.set_title("Calls vs truth composition", fontsize=11, fontweight="bold")
+    ax_comp.set_title("Truth and call composition", fontsize=11, fontweight="bold")
     ax_comp.grid(True, axis="x", alpha=0.2)
 
-    metric_specs = [
-        ("PPV", "ppv", _ONOFF_COLOR, "o"),
-        ("NPV", "npv", _ONOFF_OFF_COLOR, "s"),
-        ("Sensitivity", "sensitivity", _SENSITIVITY_COLOR, "^"),
-        ("Specificity", "specificity", _SPECIFICITY_COLOR, "D"),
-        ("Coverage", "coverage", "#7A7A7A", "P"),
+    legend_handles = [
+        mpl.patches.Patch(facecolor=_ONOFF_COLOR, edgecolor="white", label="ON"),
+        mpl.patches.Patch(facecolor=_ONOFF_OFF_COLOR, edgecolor="white", label="OFF"),
+        mpl.patches.Patch(facecolor=_WITHHELD_COLOR, edgecolor=withheld_edge, hatch="//", label="Withheld"),
     ]
-    offsets = np.linspace(-0.24, 0.24, len(metric_specs), dtype=np.float64)
-    legend_handles: List[Any] = []
-    for offset, (metric_label, metric_key, color, marker) in zip(offsets, metric_specs):
-        metric_vals = np.array([row[metric_key] for row in rows], dtype=np.float64)
-        valid = np.isfinite(metric_vals)
-        ax_metrics.scatter(
-            metric_vals[valid],
-            y[valid] + offset,
-            s=58,
-            color=color,
-            marker=marker,
-            edgecolors="black",
-            linewidths=0.45,
-            zorder=3,
-        )
-        legend_handles.append(
-            mpl.lines.Line2D(
-                [0],
-                [0],
-                marker=marker,
-                color="none",
-                markerfacecolor=color,
-                markeredgecolor="black",
-                markeredgewidth=0.45,
-                markersize=7,
-                label=metric_label,
-            )
-        )
-
-    for ref_line in (0.5, 0.75):
-        ax_metrics.axvline(ref_line, linestyle="--", alpha=0.2, color="#4A4A4A", linewidth=1.0)
-    ax_metrics.set_xlim(0.0, 1.0)
-    _set_explicit_ticks(ax_metrics, x_ticks=np.linspace(0.0, 1.0, 5))
-    ax_metrics.set_xlabel("Metric value", fontsize=11)
-    ax_metrics.set_title("Performance on confident calls", fontsize=11, fontweight="bold")
-    ax_metrics.grid(True, axis="x", alpha=0.2)
-    ax_metrics.tick_params(axis="y", left=False, labelleft=False)
-    ax_metrics.legend(
+    ax_comp.legend(
         handles=legend_handles,
-        loc="center left",
-        bbox_to_anchor=(1.02, 0.5),
+        loc="upper left",
+        bbox_to_anchor=(1.01, 1.0),
         fontsize=8.5,
         frameon=False,
     )
 
-    binary_row = next((row for row in rows if row["model"] == "Proteus (binary)"), None)
-    ua_row = next(
-        (
-            row for row in rows
-            if row["model"] == "Proteus (uncertainty-informed)"
-        ),
-        None,
-    )
-    if binary_row is not None and ua_row is not None:
-        delta_ppv = ua_row["ppv"] - binary_row["ppv"]
-        delta_npv = ua_row["npv"] - binary_row["npv"]
-        if np.isfinite(delta_ppv) and np.isfinite(delta_npv):
-            ua_idx = next(i for i, row in enumerate(rows) if row["model"] == ua_row["model"])
-            ax_metrics.text(
-                1.04,
-                ua_idx,
-                f"↑ PPV {delta_ppv:+.02f}\n↑ NPV {delta_npv:+.02f}",
-                ha="left",
-                va="center",
-                fontsize=8.5,
-                color="#2F2F2F",
-                clip_on=False,
+    def _fmt_metric(value: Any) -> str:
+        return f"{float(value):.3f}" if np.isfinite(value) else "NA"
+
+    metrics_caption_lines = ["Calls metrics (confident calls):"]
+    for row in rows:
+        metrics_caption_lines.append(
+            (
+                f"{row['display_label']}: "
+                f"PPV={_fmt_metric(row['ppv'])}, "
+                f"NPV={_fmt_metric(row['npv'])}, "
+                f"Sensitivity={_fmt_metric(row['sensitivity'])}, "
+                f"Specificity={_fmt_metric(row['specificity'])}, "
+                f"Coverage={_fmt_metric(row['coverage'])}"
             )
+        )
 
     fig.suptitle(title, fontsize=13, fontweight="bold", y=0.99)
-    fig.tight_layout(rect=[0.0, 0.0, 0.9, 0.96])
+    bottom_pad = min(0.62, 0.20 + 0.04 * len(rows))
+    fig.subplots_adjust(bottom=bottom_pad, right=0.83, top=0.92)
+    fig.text(
+        0.01,
+        0.02,
+        "\n".join(metrics_caption_lines),
+        ha="left",
+        va="bottom",
+        fontsize=8,
+    )
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def benchmark_patient_onoff_confusion_plot(
+    confusion_table: pd.DataFrame,
+    name: str,
+    *,
+    title: str,
+    model_order: Sequence[str],
+    cohort_order: Sequence[str] = ("CRPC-WCDT", "BLCA-RA"),
+) -> None:
+    """Benchmarking_Patient ON/OFF confusion plot with pooled cohorts.
+
+    Layout:
+      - Left: one Truth row + model rows, each with two cohort bars
+        (CRPC-WCDT solid, BLCA-RA hatched).
+      - Right: per model/cohort thin horizontal metric bars for
+        PPV/NPV/Sensitivity/Specificity/Coverage.
+
+    The input table must contain columns:
+      model, cohort, n_total, n_on, n_off, n_indet,
+      n_truth_on, n_truth_off, ppv, npv, sensitivity, specificity, coverage.
+    """
+    _ensure_dir(name)
+    required = {
+        "model",
+        "cohort",
+        "n_total",
+        "n_on",
+        "n_off",
+        "n_indet",
+        "n_truth_on",
+        "n_truth_off",
+        "ppv",
+        "npv",
+        "sensitivity",
+        "specificity",
+        "coverage",
+    }
+    if confusion_table.empty or not required.issubset(confusion_table.columns):
+        return
+
+    table = confusion_table.copy()
+    table["cohort"] = table["cohort"].astype(str)
+    table["model"] = table["model"].astype(str)
+    table["n_total"] = pd.to_numeric(table["n_total"], errors="coerce")
+    table = table[table["n_total"] > 0]
+    if table.empty:
+        return
+
+    def _display_model_label(model_name: str) -> str:
+        if model_name == "XGBoost":
+            return "XGBoost (Triton)"
+        if model_name.startswith("EPIC_"):
+            return "EPIC-Seq"
+        return model_name.replace("_", " ")
+
+    present_models = set(table["model"].tolist())
+    ordered_models = [model_name for model_name in model_order if model_name in present_models]
+
+    row_keys = ["RNA-Seq (Ground Truth)", *ordered_models]
+    row_labels = ["RNA-Seq (Ground Truth)", *[_display_model_label(model_name) for model_name in ordered_models]]
+    row_y = np.arange(len(row_keys), dtype=np.float64)
+
+    cohort_offsets = {
+        str(cohort_order[0]): -0.16,
+        str(cohort_order[1]): 0.16,
+    }
+    call_bar_height = 0.28
+
+    metric_specs = [
+        ("PPV", "ppv", "#008080"),
+        ("NPV", "npv", "#800000"),
+        ("Specificity", "specificity", "#000000"),
+        ("Sensitivity", "sensitivity", "#6E6E6E"),
+    ]
+
+    cmap = _bench_color_map(ordered_models)
+    for model_name in ordered_models:
+        if model_name.endswith(" (uncertainty-informed)"):
+            cmap[model_name] = "#069494"
+
+    fig_height = 2.0 * max(3.4, 0.42 * len(row_keys) + 1.1)
+    fig, (ax_left, ax_right) = plt.subplots(
+        1,
+        2,
+        figsize=(17.0, fig_height),
+        gridspec_kw={"width_ratios": [1.0, 2.0]},
+    )
+
+    def _lighten(hex_color: str, factor: float = 0.45) -> str:
+        rgb = np.array(mpl.colors.to_rgb(hex_color), dtype=np.float64)
+        mixed = rgb + (1.0 - rgb) * float(np.clip(factor, 0.0, 1.0))
+        return mpl.colors.to_hex(np.clip(mixed, 0.0, 1.0))
+
+    def _segment_label(ax: plt.Axes, left: float, width: float, y_pos: float, label: str) -> None:
+        if width < 0.08:
+            return
+        text_color = "white" if width >= 0.18 else "black"
+        stroke_color = "black" if text_color == "white" else "white"
+        text = ax.text(
+            left + width / 2.0,
+            y_pos,
+            label,
+            ha="center",
+            va="center",
+            fontsize=7.5,
+            color=text_color,
+            fontweight="bold",
+        )
+        text.set_path_effects([
+            PathEffects.withStroke(linewidth=1.3, foreground=stroke_color, alpha=0.35)
+        ])
+
+    for row_idx, row_key in enumerate(row_keys):
+        for cohort_name in cohort_order:
+            cohort_name = str(cohort_name)
+            y_center = row_y[row_idx] + cohort_offsets.get(cohort_name, 0.0)
+
+            if row_key == "RNA-Seq (Ground Truth)":
+                cohort_truth = table[table["cohort"] == cohort_name]
+                if cohort_truth.empty:
+                    continue
+                n_truth_on = float(pd.to_numeric(cohort_truth["n_truth_on"], errors="coerce").sum())
+                n_truth_off = float(pd.to_numeric(cohort_truth["n_truth_off"], errors="coerce").sum())
+                truth_total = n_truth_on + n_truth_off
+                if truth_total <= 0.0:
+                    continue
+                frac_on = n_truth_on / truth_total
+                frac_off = n_truth_off / truth_total
+                frac_withheld = 0.0
+                base_color = "#444444"
+            else:
+                row_df = table[(table["model"] == row_key) & (table["cohort"] == cohort_name)]
+                if row_df.empty:
+                    continue
+                row = row_df.iloc[0]
+                n_total = float(row["n_total"])
+                if n_total <= 0.0:
+                    continue
+                frac_on = float(row["n_on"]) / n_total
+                frac_off = float(row["n_off"]) / n_total
+                frac_withheld = float(row["n_indet"]) / n_total
+                base_color = cmap.get(row_key, "#777777")
+
+            off_color = _lighten(base_color, factor=0.45)
+            cohort_hatch = "" if cohort_name == "CRPC-WCDT" else "///"
+
+            ax_left.barh(
+                y_center,
+                frac_on,
+                height=call_bar_height,
+                color=base_color,
+                edgecolor="white",
+                linewidth=0.8,
+                hatch=cohort_hatch,
+                zorder=2,
+            )
+            ax_left.barh(
+                y_center,
+                frac_off,
+                left=frac_on,
+                height=call_bar_height,
+                color=off_color,
+                edgecolor="white",
+                linewidth=0.8,
+                hatch=cohort_hatch,
+                zorder=2,
+            )
+            if frac_withheld > 0.0:
+                withh_hatch = "xx" if cohort_name == "CRPC-WCDT" else "///xx"
+                ax_left.barh(
+                    y_center,
+                    frac_withheld,
+                    left=frac_on + frac_off,
+                    height=call_bar_height,
+                    color=_WITHHELD_COLOR,
+                    edgecolor="#8E8E8E",
+                    linewidth=0.8,
+                    hatch=withh_hatch,
+                    zorder=2,
+                )
+
+            _segment_label(ax_left, 0.0, frac_on, y_center, f"{frac_on:.0%}")
+            _segment_label(ax_left, frac_on, frac_off, y_center, f"{frac_off:.0%}")
+            if frac_withheld > 0.0:
+                _segment_label(ax_left, frac_on + frac_off, frac_withheld, y_center, f"{frac_withheld:.0%}")
+
+    plot_models = [model_name for model_name in ordered_models if model_name != "RNA-Seq (Ground Truth)"]
+    n_models = len(plot_models)
+    n_cohorts = len(cohort_order)
+    bars_per_metric = max(1, n_models * n_cohorts)
+    group_width = 0.86
+    bar_width = group_width / bars_per_metric
+
+    for metric_index, (metric_label, metric_key, _) in enumerate(metric_specs):
+        x_center = float(metric_index)
+        left_edge = x_center - group_width / 2.0
+        slot_index = 0
+        for model_name in plot_models:
+            for cohort_name in cohort_order:
+                metric_row = table[(table["model"] == model_name) & (table["cohort"] == str(cohort_name))]
+                if metric_row.empty:
+                    slot_index += 1
+                    continue
+                metric_value = pd.to_numeric(pd.Series([metric_row.iloc[0][metric_key]]), errors="coerce").iloc[0]
+                x_position = left_edge + slot_index * bar_width + bar_width * 0.5
+                slot_index += 1
+                if not np.isfinite(metric_value):
+                    continue
+                model_color = cmap.get(model_name, "#777777")
+                cohort_hatch = "" if str(cohort_name) == str(cohort_order[0]) else "///"
+                ax_right.bar(
+                    x_position,
+                    float(metric_value),
+                    width=bar_width * 0.92,
+                    color=model_color,
+                    edgecolor="white",
+                    linewidth=0.7,
+                    hatch=cohort_hatch,
+                    alpha=0.95,
+                    zorder=3,
+                )
+
+    ax_left.set_xlim(0.0, 1.0)
+    _set_explicit_ticks(ax_left, x_ticks=np.linspace(0.0, 1.0, 5))
+    ax_left.set_xlabel("Fraction of gene-sample pairs", fontsize=10)
+    ax_left.set_title("Truth/Calls composition", fontsize=11, fontweight="bold")
+    ax_left.grid(True, axis="x", alpha=0.18)
+
+    ax_left.set_yticks(row_y)
+    ax_left.set_yticklabels(row_labels, fontsize=9)
+    ax_left.invert_yaxis()
+    ax_left.set_box_aspect(1.0)
+
+    ax_right.set_xlim(-0.6, len(metric_specs) - 0.4)
+    ax_right.set_ylim(0.0, 1.0)
+    ax_right.set_xticks(np.arange(len(metric_specs), dtype=float))
+    ax_right.set_xticklabels([label for label, _, _ in metric_specs], fontsize=9)
+    _set_explicit_ticks(ax_right, y_ticks=np.linspace(0.0, 1.0, 5))
+    ax_right.set_xlabel("Metric", fontsize=10)
+    ax_right.set_ylabel("Metric value", fontsize=10)
+    ax_right.set_title("Per-metric model/cohort bars", fontsize=11, fontweight="bold")
+    ax_right.grid(True, axis="y", alpha=0.18)
+    ax_right.set_box_aspect(0.5)
+
+    cohort_handles = [
+        mpl.patches.Patch(facecolor="#666666", edgecolor="white", label="CRPC-WCDT (solid)"),
+        mpl.patches.Patch(facecolor="#666666", edgecolor="white", hatch="///", label="BLCA-RA (hatched)"),
+    ]
+    model_handles = [
+        mpl.patches.Patch(facecolor=cmap.get(model_name, "#777777"), edgecolor="white", label=_display_model_label(model_name))
+        for model_name in plot_models
+    ]
+    call_handles = [
+        mpl.patches.Patch(facecolor="#666666", edgecolor="white", label="ON (base model color)"),
+        mpl.patches.Patch(facecolor="#BBBBBB", edgecolor="white", label="OFF (lightened model color)"),
+        mpl.patches.Patch(facecolor=_WITHHELD_COLOR, edgecolor="#8E8E8E", hatch="xx", label="Withheld"),
+    ]
+
+    fig.legend(
+        handles=model_handles + cohort_handles + call_handles,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.01),
+        fontsize=7.6,
+        frameon=False,
+        ncol=3,
+        handlelength=1.8,
+        handletextpad=0.6,
+        columnspacing=1.0,
+    )
+
+    fig.suptitle(title, fontsize=12.5, fontweight="bold", y=0.98)
+    fig.tight_layout(rect=[0.0, 0.14, 1.0, 0.95])
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def ci_width_vs_absolute_residual_scatter(
+    ci_width_flat: np.ndarray,
+    abs_residual_flat: np.ndarray,
+    name: str,
+    *,
+    title: str = "CI Width vs |Residual|",
+    x_label: str = "90% CI width",
+    fit_label: str = "Linear fit",
+    density_gamma: float = 2.2,
+    x_max: float = 8.0,
+    y_max: float = 8.0,
+) -> None:
+    """Density-colored scatter of 90% CI width (x) vs absolute residual (y).
+
+    Includes a linear fit with 95% confidence band and Pearson/Spearman
+    annotations. Axes are hard-clipped to [0, x_max] × [0, y_max]; points
+    outside that range are excluded from the density estimate and regression.
+
+    Parameters
+    ----------
+    ci_width_flat:
+        CI width per gene-sample pair (hi − lo), 1-D.
+    abs_residual_flat:
+        Absolute residual |truth − pred| per gene-sample pair, 1-D.
+    name:
+        Output path prefix (`.pdf` appended automatically).
+    title:
+        Figure suptitle.
+    x_max, y_max:
+        Upper limits for both display and fitting (values beyond are excluded).
+    """
+    _ensure_dir(name)
+
+    x = np.asarray(ci_width_flat, dtype=np.float64)
+    y = np.asarray(abs_residual_flat, dtype=np.float64)
+    valid = np.isfinite(x) & np.isfinite(y) & (x >= 0.0) & (y >= 0.0) & (x <= float(x_max)) & (y <= float(y_max))
+    x = x[valid]
+    y = y[valid]
+    n = len(x)
+    if n < MIN_CORRELATION_N:
+        return
+
+    corr_stats = _compute_correlation_stats(x, y)
+
+    # Linear fit via least squares with 95% CI band
+    x_fit = np.linspace(0.0, float(x_max), 300)
+    slope: float = float("nan")
+    intercept: float = float("nan")
+    y_fit_lo: Optional[np.ndarray] = None
+    y_fit_hi: Optional[np.ndarray] = None
+    y_fit: Optional[np.ndarray] = None
+    try:
+        from scipy.stats import t as t_dist
+        x_mean = float(np.mean(x))
+        x_sum_sq = float(np.sum((x - x_mean) ** 2))
+        if x_sum_sq > 0.0:
+            slope = float(np.sum((x - x_mean) * y) / x_sum_sq)
+            intercept = float(np.mean(y) - slope * x_mean)
+            y_fit = slope * x_fit + intercept
+            residuals = y - (slope * x + intercept)
+            sigma2 = float(np.sum(residuals ** 2) / max(n - 2, 1))
+            se_fit = np.sqrt(sigma2 * (1.0 / n + (x_fit - x_mean) ** 2 / x_sum_sq))
+            t_crit = float(t_dist.ppf(0.975, df=max(n - 2, 1)))
+            y_fit_lo = y_fit - t_crit * se_fit
+            y_fit_hi = y_fit + t_crit * se_fit
+    except Exception:
+        pass
+
+    # Density coloring: 2-D histogram → per-point log density
+    bins = min(150, max(50, int(np.sqrt(n))))
+    hist, x_edges, y_edges = np.histogram2d(
+        x,
+        y,
+        bins=bins,
+        range=[[0.0, float(x_max)], [0.0, float(y_max)]],
+    )
+    x_idx = np.clip(np.searchsorted(x_edges, x, side="right") - 1, 0, bins - 1)
+    y_idx = np.clip(np.searchsorted(y_edges, y, side="right") - 1, 0, bins - 1)
+    counts = hist[x_idx, y_idx]
+    density = np.log10(counts + 1.0)
+    draw_order = np.argsort(density)
+
+    fig, ax = plt.subplots(figsize=(7.2, 6.0))
+    vmax = float(np.nanmax(density)) if len(density) else 1.0
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        vmax = 1.0
+    density_norm = mpl.colors.PowerNorm(gamma=max(float(density_gamma), 1.0), vmin=0.0, vmax=vmax)
+    sc = ax.scatter(
+        x[draw_order],
+        y[draw_order],
+        c=density[draw_order],
+        cmap="Greys",
+        norm=density_norm,
+        s=4,
+        alpha=0.85,
+        edgecolors="none",
+        rasterized=True,
+        zorder=2,
+    )
+    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+    cbar.set_label(r"$\log_{10}(N + 1)$", fontsize=9)
+
+    if y_fit is not None:
+        ax.plot(x_fit, y_fit, color="#CC3311", lw=1.6, zorder=4, label=fit_label)
+    if y_fit_lo is not None and y_fit_hi is not None:
+        ax.fill_between(x_fit, y_fit_lo, y_fit_hi, color="#CC3311", alpha=0.15, zorder=3)
+
+    ax.set_xlim(0.0, float(x_max))
+    ax.set_ylim(0.0, float(y_max))
+    x_tick_step = 2.0 if x_max >= 6.0 else 1.0
+    y_tick_step = 2.0 if y_max >= 6.0 else 1.0
+    _set_explicit_ticks(
+        ax,
+        x_ticks=np.arange(0.0, float(x_max) + x_tick_step * 0.5, x_tick_step),
+        y_ticks=np.arange(0.0, float(y_max) + y_tick_step * 0.5, y_tick_step),
+    )
+    ax.set_box_aspect(1)
+    ax.set_xlabel(x_label, fontsize=11)
+    ax.set_ylabel("|Residual|  (|truth − pred|)", fontsize=11)
+
+    stat_lines = [
+        _format_correlation_line("Pearson r", corr_stats["pearson_r"], corr_stats["pearson_p"]),
+        _format_correlation_line("Spearman ρ", corr_stats["spearman_rho"], corr_stats["spearman_p"]),
+        f"n={n:,}",
+    ]
+    if np.isfinite(slope):
+        stat_lines.append(f"slope={slope:.3f}, intercept={intercept:.3f}")
+    fig.text(
+        0.80,
+        0.23,
+        "\n".join(stat_lines),
+        ha="left",
+        va="bottom",
+        fontsize=8.5,
+        family="monospace",
+    )
+
+    fig.suptitle(title, fontsize=11, fontweight="bold")
+    fig.tight_layout(rect=[0.0, 0.0, 0.77, 1.0])
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
 

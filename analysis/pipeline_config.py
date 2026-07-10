@@ -114,8 +114,7 @@ VALIDATION_PDX_HOLDOUT_PATHS: Dict[str, str] = {
 
 DISCOVERY_COHORTS: List[Tuple[str, str | None]] = [
     ("CRPC-Pfizer", None),
-    ("CRPC-Pluvicto_MC", "CRPC-Pluvicto"),
-    ("CRPC-Pluvicto_Full", "CRPC-Pluvicto"),
+    ("CRPC-Pluvicto", "CRPC-Pluvicto"),
     ("CRPC-UW", "CRPC-UW"),
     ("BC-Ghana", None),
 ]
@@ -123,8 +122,7 @@ DISCOVERY_COHORTS: List[Tuple[str, str | None]] = [
 
 DISCOVERY_PROTEUS_PATHS: Dict[str, str] = {
     "CRPC-Pfizer": "results_holdout/BioDVN/CRPC-Pfizer/predictions_tumor.tsv",
-    "CRPC-Pluvicto_MC": "results_holdout/BioDVN/CRPC-Pluvicto/predictions_tumor.tsv",
-    "CRPC-Pluvicto_Full": "results_holdout/BioDVN/CRPC-Pluvicto/predictions_tumor.tsv",
+    "CRPC-Pluvicto": "results_holdout/BioDVN/CRPC-Pluvicto/predictions_tumor.tsv",
     "CRPC-UW": "results_holdout/BioDVN/CRPC-UW/predictions_tumor.tsv",
     "BC-Ghana": "results_holdout/BioDVN/BC-Ghana/predictions_tumor.tsv",
 }

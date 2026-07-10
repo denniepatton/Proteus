@@ -149,8 +149,13 @@ def aggregate_ssgsea_score_matrices(
     *,
     min_size: int,
     max_size: int = 500,
-) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """Aggregate ssGSEA score matrices across Monte Carlo draws."""
+) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """Aggregate ssGSEA score matrices across Monte Carlo draws.
+
+    Returns ``(mean, median, ci_lo, ci_hi)`` where ``median`` is the per
+    (gene-set, sample) q50 across draws — the quantile-consistent
+    full-distribution-aware point estimate paired with the q5/q95 interval.
+    """
     all_scores: List[pd.DataFrame] = []
     for draw in draws:
         draw_scores = compute_ssgsea_score_matrix(
@@ -163,7 +168,7 @@ def aggregate_ssgsea_score_matrices(
             all_scores.append(draw_scores)
 
     if not all_scores:
-        return None, None, None
+        return None, None, None, None
 
     template = all_scores[0]
     stacked = np.stack(
@@ -178,6 +183,11 @@ def aggregate_ssgsea_score_matrices(
         index=template.index,
         columns=template.columns,
     )
+    median_scores = pd.DataFrame(
+        np.percentile(stacked, 50.0, axis=0),
+        index=template.index,
+        columns=template.columns,
+    )
     ci_lo = pd.DataFrame(
         np.percentile(stacked, 5.0, axis=0),
         index=template.index,
@@ -188,7 +198,7 @@ def aggregate_ssgsea_score_matrices(
         index=template.index,
         columns=template.columns,
     )
-    return mean_scores, ci_lo, ci_hi
+    return mean_scores, median_scores, ci_lo, ci_hi
 
 
 __all__ = [

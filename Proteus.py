@@ -475,7 +475,7 @@ def main():
     parser.add_argument('--verbose', action='store_true', help='Enable progress bars, batch timing, and more frequent training logs')
     
     # Sanity check / fast iteration
-    parser.add_argument('--subsample', type=float, default=None, help='Subsample fraction (0.0-1.0) of genes for fast sanity checks, e.g. --subsample 0.1 for ~10% of genes per epoch.')
+    parser.add_argument('--subsample', type=float, default=None, help='Subsample fraction (0.0-1.0) of genes for fast sanity checks, e.g. --subsample 0.1 for ~10%% of genes per epoch.')
     # General options
     parser.add_argument('--overwrite', action='store_true', help='Overwrite existing data files')
     args = parser.parse_args()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,11 +12,13 @@ from scipy.stats import norm
 
 from .analysis_utils import (
     PC_PDX_STUDY,
+    _MDN_GAMMA_SHAPE,
     _gvw_r_from_wide,
     _gvw_rho_from_wide,
     compute_gene_variance,
     ensure_dir,
     generate_null_predictions,
+    mdn_quantile_interval_wide,
 )
 from .plot_utils import metric_distribution, sample_scatter
 
@@ -29,6 +31,17 @@ _LIGHT_GRAY = "#CFCFCF"
 _GRAY = "#7A7A7A"
 _TEAL = "#0F8B8D"
 _BLACK = "#000000"
+
+# Single-gene MDN output-distribution example (gene "AR" in CRPC-RA patients).
+_DIST_EXAMPLE_PDF_NAME = "MDN_Output_Distributions_AR.pdf"
+_DIST_EXAMPLE_GENE = "AR"
+# Ordered ON / OFF / UNCLEAR exemplars (full TSV sample names).
+_DIST_EXAMPLE_SAMPLES = (
+    ("ON", "CRPC-RA_17-113", "#1F77B4"),   # blue
+    ("OFF", "CRPC-RA_18-039", "#FF7F0E"),  # orange
+    ("UNCLEAR", "CRPC-RA_05-144", "#7A7A7A"),  # gray
+)
+_DIST_EXAMPLE_CI = (0.05, 0.95)  # reported 90% credible interval
 _SCATTER_TICKS = [0.0, 3.0, 6.0, 9.0, 12.0, 15.0]
 _SPEARMAN_TICKS = [-1.0, -0.5, 0.0, 0.5, 1.0]
 _SPEARMAN_DENSITY_Y_TICKS = [0.0, 0.5, 1.0, 1.5, 2.0]
@@ -789,7 +802,152 @@ def generate_naive_example(out_dir: str, overwrite: bool) -> None:
     )
 
 
-def run_examples(output_dir: str, plca_truth_wide: pd.DataFrame, overwrite: bool) -> None:
+def _mdn_example_scalar(wide: Optional[pd.DataFrame], gene: str, sample: str, *, name: str) -> float:
+    """Extract a single gene x sample MDN scalar, failing loudly when absent."""
+    if wide is None:
+        raise ValueError(f"MDN example requires '{name}' surface, but it was not loaded")
+    if gene not in wide.index:
+        raise ValueError(f"Gene '{gene}' missing from '{name}' surface")
+    if sample not in wide.columns:
+        raise ValueError(f"Sample '{sample}' missing from '{name}' surface")
+    value = float(wide.at[gene, sample])
+    if not np.isfinite(value):
+        raise ValueError(f"Non-finite '{name}' value for {gene} / {sample}")
+    return value
+
+
+def generate_distribution_example(out_dir: str, cv_full: Dict[str, Any], overwrite: bool) -> None:
+    """Plot normalized MDN output distributions for ON/OFF/UNCLEAR exemplars.
+
+    Renders the smooth continuous portion of the hurdle-gamma-normal mixture for
+    gene ``AR`` in three CRPC-RA patients, each normalized to unit area, with a
+    lighter same-color fill spanning the reported 90% credible interval and a
+    dotted point-estimate line.
+    """
+    examples_dir = ensure_dir(str(Path(out_dir)))
+    pdf_path = Path(examples_dir) / _DIST_EXAMPLE_PDF_NAME
+    if pdf_path.exists() and not overwrite:
+        return
+
+    gene = _DIST_EXAMPLE_GENE
+    ci_lo_wide, ci_hi_wide = mdn_quantile_interval_wide(
+        cv_full["p0_wide"],
+        cv_full["pi_gamma_wide"],
+        cv_full["pi_normal_wide"],
+        cv_full["gamma_beta_wide"],
+        cv_full["normal_mean_wide"],
+        cv_full["normal_stdev_wide"],
+        quantiles=_DIST_EXAMPLE_CI,
+    )
+
+    records = []
+    for label, sample, color in _DIST_EXAMPLE_SAMPLES:
+        pi_gamma = _mdn_example_scalar(cv_full.get("pi_gamma_wide"), gene, sample, name="pi_gamma")
+        pi_normal = _mdn_example_scalar(cv_full.get("pi_normal_wide"), gene, sample, name="pi_normal")
+        beta = _mdn_example_scalar(cv_full.get("gamma_beta_wide"), gene, sample, name="gamma_beta")
+        mu = _mdn_example_scalar(cv_full.get("normal_mean_wide"), gene, sample, name="normal_mean")
+        sigma = _mdn_example_scalar(cv_full.get("normal_stdev_wide"), gene, sample, name="normal_stdev")
+        point_estimate = _mdn_example_scalar(cv_full.get("pred_wide"), gene, sample, name="prediction_mean")
+        aor = _mdn_example_scalar(cv_full.get("activity_odds_ratio_wide"), gene, sample, name="activity_odds_ratio")
+        ci_lo = _mdn_example_scalar(ci_lo_wide, gene, sample, name="ci_q5")
+        ci_hi = _mdn_example_scalar(ci_hi_wide, gene, sample, name="ci_q95")
+
+        # Continuous mass = pi_gamma + pi_normal (the hurdle delta carries the rest);
+        # normalize the smooth curve to unit area for cross-example comparison.
+        continuous_mass = pi_gamma + pi_normal
+        if continuous_mass <= _EPS:
+            raise ValueError(
+                f"Continuous MDN mass for {gene} / {sample} is ~0; cannot normalize density"
+            )
+
+        records.append({
+            "label": label,
+            "sample": sample,
+            "color": color,
+            "pi_gamma": pi_gamma,
+            "pi_normal": pi_normal,
+            "beta": beta,
+            "mu": mu,
+            "sigma": sigma,
+            "continuous_mass": continuous_mass,
+            "point_estimate": point_estimate,
+            "ci_lo": ci_lo,
+            "ci_hi": ci_hi,
+            "aor": aor,
+        })
+
+    x_upper = max(
+        max(r["ci_hi"] for r in records),
+        max(r["point_estimate"] for r in records),
+        max(r["mu"] + 3.0 * r["sigma"] for r in records),
+    )
+    x_max = _nice_upper_bound(max(x_upper, 1.0) * 1.05)
+    xvals = np.linspace(1e-6, x_max, 1000)
+
+    fig, (ax, ax_text) = plt.subplots(
+        1, 2, figsize=(12.0, 6.0), gridspec_kw={"width_ratios": [3.0, 1.4]}
+    )
+
+    for r in records:
+        curve = continuous_pdf(
+            xvals,
+            r["pi_gamma"],
+            r["pi_normal"],
+            _MDN_GAMMA_SHAPE,
+            r["beta"],
+            r["mu"],
+            r["sigma"],
+        ) / r["continuous_mass"]
+
+        ci_mask = (xvals >= r["ci_lo"]) & (xvals <= r["ci_hi"])
+        ax.fill_between(xvals, 0.0, curve, where=ci_mask, color=r["color"], alpha=0.18, linewidth=0.0)
+        ax.plot(xvals, curve, color=r["color"], lw=2.4, label=r["label"], zorder=3)
+        ax.axvline(r["point_estimate"], color=r["color"], ls=":", lw=1.8, zorder=2)
+
+    ax.set_xlim(0.0, x_max)
+    ax.set_ylim(0.0, 1.0)
+    ax.set_xlabel("Predicted expression (log2 CPM + 1)", fontsize=14)
+    ax.set_ylabel("Probability density", fontsize=14)
+    ax.set_title(f"MDN Output Distributions: {gene}", fontsize=15)
+    ax.legend(fontsize=12, frameon=False)
+    ax.tick_params(labelsize=12)
+    _set_axis_ticks(ax, x_ticks=_five_ticks(0.0, x_max))
+
+    ax_text.axis("off")
+    text_blocks = []
+    for r in records:
+        text_blocks.append(
+            "\n".join([
+                f"{r['label']}  ({r['sample']})",
+                f"  point est.: {r['point_estimate']:.2f}",
+                f"  90% CI: [{r['ci_lo']:.2f}, {r['ci_hi']:.2f}]",
+                f"  AOR: {r['aor']:.2f}",
+            ])
+        )
+    ax_text.text(
+        0.0,
+        0.98,
+        "\n\n".join(text_blocks),
+        transform=ax_text.transAxes,
+        ha="left",
+        va="top",
+        fontsize=11,
+        family="monospace",
+    )
+
+    plt.tight_layout()
+    plt.savefig(pdf_path, dpi=150)
+    plt.close(fig)
+
+
+def run_examples(
+    output_dir: str,
+    plca_truth_wide: pd.DataFrame,
+    overwrite: bool,
+    cv_full: Optional[Dict[str, Any]] = None,
+) -> None:
     ensure_dir(output_dir)
     generate_naive_example(output_dir, overwrite)
     fit_expression_mixture(plca_truth_wide, output_dir, overwrite)
+    if cv_full is not None:
+        generate_distribution_example(output_dir, cv_full, overwrite)

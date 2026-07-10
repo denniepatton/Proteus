@@ -1,6 +1,6 @@
-"""Data loading and gene-weight utilities for XGBoost baseline.
+"""Data loading and gene-weight utilities for the XGBoost baseline.
 
-Reads from the same Zarr stores and BTS_sample-splits.tsv that Proteus uses,
+Reads from the same Zarr stores and sample-splits TSVs that Proteus uses,
 guaranteeing identical feature values, target values, and CV fold assignments.
 """
 
@@ -35,7 +35,7 @@ def _resolve_zarr_path(cohort: str, sample: str, zarr_base: str) -> str:
 def parse_splits_tsv(
     tsv_path: str,
 ) -> List[Dict[str, Any]]:
-    """Parse BTS_sample-splits.tsv → list of {Cohort, Sample, Fold}."""
+    """Parse a sample-splits TSV into {Cohort, Sample, Fold} rows."""
     rows: List[Dict[str, Any]] = []
     with open(tsv_path, "r", newline="") as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -236,7 +236,7 @@ def default_zarr_base() -> str:
 
 
 def default_splits_tsv() -> str:
-    return str(PROJECT_ROOT / "data" / "BTS_sample-splits.tsv")
+    return str(PROJECT_ROOT / "data" / "TDS_sample-splits.tsv")
 
 
 def default_panft_splits_tsv() -> str:

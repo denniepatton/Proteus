@@ -35,10 +35,8 @@ from interpretation.interpretation_utils import (
     kernel_visualization,
     load_model,
 )
-from proteus_utils.compile_sample_data import (
-    DEFAULT_ZARR_BASE,
-    get_zarr_output_dir,
-)
+from config.runtime_paths import resolve_zarr_base
+from proteus_utils.compile_sample_data import get_zarr_output_dir
 
 
 _INTERPRETATION_PRESETS = {
@@ -387,7 +385,7 @@ def main() -> None:
     # Resolve zarr paths
     # ------------------------------------------------------------------
     if args.use_set is not None:
-        zarr_base = args.zarr_base or DEFAULT_ZARR_BASE
+        zarr_base = resolve_zarr_base(args.zarr_base)
         zarr_paths = _resolve_preset_zarr_paths(args, zarr_base)
         if zarr_paths is None:
             zarr_paths = _resolve_zarr_paths(args.use_set, zarr_base)

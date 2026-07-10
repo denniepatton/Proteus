@@ -113,7 +113,7 @@ from models.models import (  # noqa: E402
     channel_mode_for_model,
     get_model_instance,
 )
-from models.model_utils import mixture_mean  # noqa: E402
+from models.model_utils import mixture_mean, mixture_quantile  # noqa: E402
 from proteus_utils.metrics import pearson_r  # noqa: E402
 
 
@@ -1631,16 +1631,8 @@ def plot_scalar_summary(
     # Bottom-to-top: pn (least→most), fl (least→most), depth
     shared_11_order = np.array(_pn_sorted + _fl_sorted + _depth_idx)
 
-    # Shared x-axis limits for TSS and GB beeswarms.
-    # Keep them symmetric and only as wide as needed to include all points.
-    gb_attr = attributions[3]
-    tss_attr = attributions[2]
-    _xmax = max(np.abs(gb_attr).max(), np.abs(tss_attr).max())
-    if _xmax <= 0:
-        _xmax = 1e-6
-    else:
-        _xmax = np.nextafter(_xmax, np.inf)
-    shared_xlim = (-_xmax, _xmax)
+    # Keep attribution_* beeswarm outputs on a consistent interpretation scale.
+    shared_xlim = (-3.0, 3.0)
 
     for group_name, attr_vals, feat_vals, feat_names in groups:
         n_features = attr_vals.shape[1]
@@ -1708,8 +1700,7 @@ def plot_scalar_summary(
         ax.set_xlabel('Attribution — impact on predicted Log₂(CPM+1)', fontsize=9)
         ax.set_title(f'Attribution Beeswarm — {group_name}', fontsize=12)
         ax.axvline(0, color='grey', linewidth=0.5, linestyle='--')
-        if group_name in ('TSS_features', 'GB_features'):
-            ax.set_xlim(shared_xlim)
+        ax.set_xlim(shared_xlim)
         if sc is not None:
             cbar = fig.colorbar(sc, ax=ax, pad=0.02, aspect=30)
             cbar.solids.set_alpha(1.0)
@@ -3456,14 +3447,41 @@ def _continuum_input_focus_analysis(
         return
 
     bin_df = pd.DataFrame(bin_rows)
+    def _safe_slope_and_corr(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+        """Compute slope/correlation without NumPy divide warnings on constants."""
+        x_arr = np.asarray(x, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64)
+        finite = np.isfinite(x_arr) & np.isfinite(y_arr)
+        if int(finite.sum()) < 2:
+            return 0.0, 0.0
+
+        x_valid = x_arr[finite]
+        y_valid = y_arr[finite]
+        x_centered = x_valid - float(np.mean(x_valid))
+        y_centered = y_valid - float(np.mean(y_valid))
+        x_ss = float(np.dot(x_centered, x_centered))
+        y_ss = float(np.dot(y_centered, y_centered))
+        if x_ss <= 1e-12 or y_ss <= 1e-12:
+            return 0.0, 0.0
+
+        xy = float(np.dot(x_centered, y_centered))
+        slope = xy / x_ss
+        corr = xy / float(np.sqrt(x_ss * y_ss))
+        corr = float(np.clip(corr, -1.0, 1.0))
+        return float(slope), corr
+
     slope_rows: List[Dict[str, float]] = []
     for group_name in group_names:
         share_col = f'{group_name}_share'
         abs_col = f'{group_name}_mean_abs_attr'
-        share_slope = float(np.polyfit(sample_df['_continuum_value'], sample_df[share_col], deg=1)[0]) if len(sample_df) >= 2 else 0.0
-        abs_slope = float(np.polyfit(sample_df['_continuum_value'], sample_df[abs_col], deg=1)[0]) if len(sample_df) >= 2 else 0.0
-        share_corr = float(np.corrcoef(sample_df['_continuum_value'], sample_df[share_col])[0, 1]) if len(sample_df) >= 2 else 0.0
-        abs_corr = float(np.corrcoef(sample_df['_continuum_value'], sample_df[abs_col])[0, 1]) if len(sample_df) >= 2 else 0.0
+        share_slope, share_corr = _safe_slope_and_corr(
+            sample_df['_continuum_value'].to_numpy(dtype=np.float64),
+            sample_df[share_col].to_numpy(dtype=np.float64),
+        )
+        abs_slope, abs_corr = _safe_slope_and_corr(
+            sample_df['_continuum_value'].to_numpy(dtype=np.float64),
+            sample_df[abs_col].to_numpy(dtype=np.float64),
+        )
         slope_rows.append({
             'group': group_name,
             f'share_slope_vs_{continuum_col}': share_slope,
@@ -3808,6 +3826,9 @@ def latent_space_umap(
     6. Absolute error.
     7. Cohort identity (PC-PDX vs SCLC-PDX vs HD-L vs PHT).
     8. Sample identity (top-15 by count, rest as "Other").
+    9. CI90 width (90% predictive interval, the default reported CI).
+    10. Activity odds ratio (raw, signed log2 mixture-weight contrast).
+    11. Activity odds ratio (absolute, |AOR|).
     """
     _ensure_umap()
     import umap
@@ -3821,6 +3842,8 @@ def latent_space_umap(
 
     z_tumor_mean_parts: List[np.ndarray] = []
     tumor_exp_parts: List[np.ndarray] = []
+    tumor_ci90_width_parts: List[np.ndarray] = []
+    tumor_pi_normal_parts: List[np.ndarray] = []
 
     fwd_batch = 32
     n_total = tensors[0].shape[0]
@@ -3843,11 +3866,31 @@ def latent_space_umap(
         z_tumor_mean_parts.append(z_tumor_chunk)
         tumor_exp_parts.append(preds['tumor_exp'].cpu().numpy().squeeze(-1))
 
+        # CI90 width and AOR mixture weight are derived from the tumor MDN so the
+        # latent colourings match the downstream analysis surfaces exactly.
+        tumor_mdn = preds['tumor_mdn']
+        ci_bounds = mixture_quantile(tumor_mdn, quantiles=(0.05, 0.95)).cpu().numpy()
+        tumor_ci90_width_parts.append(ci_bounds[:, 1] - ci_bounds[:, 0])
+        pi_normal = tumor_mdn['log_pi'].exp()[:, 2].cpu().numpy()
+        tumor_pi_normal_parts.append(pi_normal)
+
     del tensors, features
     torch.cuda.empty_cache()
 
     z_tumor_mean = np.concatenate(z_tumor_mean_parts, axis=0)
     tumor_pred = np.concatenate(tumor_exp_parts, axis=0)
+    tumor_ci90_width = np.concatenate(tumor_ci90_width_parts, axis=0)
+    tumor_pi_normal = np.concatenate(tumor_pi_normal_parts, axis=0)
+
+    # Activity odds ratio (raw, signed) via the exact analysis formula:
+    # log2((pi_normal + eps) / (1 - pi_normal + eps)).  eps mirrors
+    # analysis/analysis_utils.py::_AOR_EPSILON (1e-6).
+    _aor_epsilon = 1e-6
+    _normal_mass = np.clip(tumor_pi_normal.astype(np.float64), 0.0, 1.0)
+    _off_mass = np.clip(1.0 - _normal_mass, 0.0, 1.0)
+    tumor_aor = np.log2((_normal_mass + _aor_epsilon) / (_off_mass + _aor_epsilon))
+    tumor_aor_abs = np.abs(tumor_aor)
+
     tumor_truth = sub['tumor_exp']
     sample_names = np.array(sub['sample_names'])
     cohort_names = np.array(sub.get('cohort_names', ['Unknown'] * len(sample_names)))
@@ -4011,6 +4054,27 @@ def latent_space_umap(
             f'{branch_label} Latent Space \u2014 Sample Identity',
             f'umap_{branch}_samples.png',
             max_legend=16,
+        )
+
+        # 9. CI90 width (90% predictive interval — the default reported CI)
+        _plot_continuous(
+            tumor_ci90_width, 'cividis', 'CI90 Width (q95 \u2212 q05)',
+            f'{branch_label} Latent Space \u2014 CI90 Width',
+            f'umap_{branch}_ci90_width.png',
+        )
+
+        # 10. Activity odds ratio (raw, signed; centred at 0)
+        _plot_continuous(
+            tumor_aor, 'RdBu_r', 'Activity Odds Ratio (log\u2082)',
+            f'{branch_label} Latent Space \u2014 Activity Odds Ratio (raw)',
+            f'umap_{branch}_aor_raw.png', vcenter=0.0,
+        )
+
+        # 11. Activity odds ratio (absolute, |AOR|)
+        _plot_continuous(
+            tumor_aor_abs, 'hot_r', '|Activity Odds Ratio| (log\u2082)',
+            f'{branch_label} Latent Space \u2014 Activity Odds Ratio (absolute)',
+            f'umap_{branch}_aor_abs.png',
         )
 
 

@@ -4,7 +4,7 @@
 base:
   project_dir: .
   zarr_base_dir: ${PROTEUS_ZARR_BASE:-/hpc/temp/ha_g/user/rpatton/ProteusZarrs}
-  raw_data_dir: ${PROTEUS_RAW_DATA_DIR:-data/raw_triton}
+  raw_data_dir: ${PROTEUS_RAW_DATA_DIR:-/fh/fast/ha_g/user/rpatton}
   labels_dir: ${project_dir}/labels
   reference_dir: ${project_dir}/reference
 
