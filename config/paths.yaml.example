@@ -1,0 +1,23 @@
+# Optional runtime path defaults for a checkout of Proteus.
+#
+# Copy this file to `config/paths.yaml` and edit the values for your machine.
+# `config/paths.yaml` is gitignored so your local, site-specific paths never
+# get committed. If `config/paths.yaml` is absent, Proteus falls back to the
+# repository-local defaults defined in `config/runtime_paths.py`
+# (data/zarr and data/raw_triton).
+#
+# All values can be overridden by environment variables or CLI arguments.
+# The ${VAR:-default} syntax expands VAR from the environment, using the text
+# after ":-" when VAR is unset.
+
+base:
+  project_dir: .
+  # Where compiled per-sample Zarr stores live (large; typically fast scratch).
+  zarr_base_dir: ${PROTEUS_ZARR_BASE:-./data/zarr}
+  # Where raw Triton output folders live.
+  raw_data_dir: ${PROTEUS_RAW_DATA_DIR:-./data/raw_triton}
+  labels_dir: ${project_dir}/labels
+  reference_dir: ${project_dir}/reference
+
+reference:
+  universal_ref: ${reference_dir}/MANE.GRCh38.v1.3.UniversalReference.tsv

@@ -40,11 +40,11 @@ from proteus_utils.compile_sample_data import get_zarr_output_dir
 
 
 _INTERPRETATION_PRESETS = {
-    # Note: this preset interprets the finalized full-train PLCA model on a
-    # capped slice of the full PLCA sample pool, not on CV-held-out folds.
-    'plca-full': {
-        'model_dir': str(_PROJECT_ROOT / 'trained_models' / 'proteus_plca-model' / 'full_train'),
-        'use_set': 'PLCA',
+    # Note: this preset interprets the finalized full-train TDS model on a
+    # capped slice of the full TDS sample pool, not on CV-held-out folds.
+    'tds-full': {
+        'model_dir': str(_PROJECT_ROOT / 'trained_models' / 'proteus_tds-model' / 'full_train'),
+        'use_set': 'TDS',
         'cohorts': ['CRPC-RA', 'SCLC', 'PC-PDX', 'SCLC-PDX'],
         'max_paths_per_cohort': 12,
         'max_genes': 50_000,
@@ -260,7 +260,7 @@ def main() -> None:
     )
     parser.add_argument(
         '--preset', type=str, choices=sorted(_INTERPRETATION_PRESETS), default=None,
-        help='Named interpretation preset that fills model/data defaults (e.g. plca-full)',
+        help='Named interpretation preset that fills model/data defaults (e.g. tds-full)',
     )
     parser.add_argument(
         '--model_dir', type=str, default=None,
@@ -390,8 +390,8 @@ def main() -> None:
         if zarr_paths is None:
             zarr_paths = _resolve_zarr_paths(args.use_set, zarr_base)
         print(f'Resolved --use_set {args.use_set!r} → {len(zarr_paths)} zarr stores')
-        if args.preset == 'plca-full':
-            print('Note: plca-full interpretation uses the finalized full-train PLCA model and a capped full-PLCA sample slice, not CV-held-out folds.')
+        if args.preset == 'tds-full':
+            print('Note: tds-full interpretation uses the finalized full-train TDS model and a capped full-TDS sample slice, not CV-held-out folds.')
     else:
         zarr_paths = args.zarr_paths
 

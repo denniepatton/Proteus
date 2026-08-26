@@ -42,7 +42,7 @@ Method
      Component uncertainty:
        f9  mean_u_normal:    mean_i(π_n · σ_n²)
        f10 mean_u_gamma:     mean_i(π_γ · k/β²)  — Gamma variance weighted
-                             by mixing weight, k = K_GAMMA = 0.80
+                             by mixing weight, k = K_GAMMA = 0.75
 
      Epistemic (fold-to-fold, requires all-fold inference):
        f11 mean_d_mu:        mean_i(SD_m(μ^(m)_ig))
@@ -99,6 +99,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr, spearmanr
 
+from proteus_constants import K_GAMMA
 from .analysis_utils import MIN_CORRELATION_N
 
 
@@ -120,9 +121,6 @@ def _inv_fisher_z(z: float) -> float:
 
 
 # ── Constants ────────────────────────────────────────────────────────────
-
-# Fixed Gamma shape parameter (must match models/model_utils.py)
-K_GAMMA: float = 0.75
 
 # Minimum value for log to avoid log(0)
 _LOG_EPS: float = 1e-12
@@ -413,34 +411,48 @@ def _fit_ridge(
 ) -> Tuple[np.ndarray, float]:
     """Fit ridge regression: y = X @ w + b.
 
-    Uses the closed-form solution:
-        w = (X^T X + α I)^{-1} X^T y
+    Features are z-score standardized (per column) before fitting so the L₂
+    penalty acts uniformly across features that live on very different scales
+    (interval widths, entropies, variances). The closed-form solution is
+    computed in standardized space::
 
-    Features are centred and target is de-meaned before fitting.
+        w_std = (Z^T Z + α I)^{-1} Z^T (y − ȳ),   Z = (X − X̄) / σ_X
+
+    and then rescaled back into raw-feature space so that
+    ``_predict_ridge`` can operate directly on unstandardized features:
+
+        w = w_std / σ_X
+        b = ȳ − X̄ · w
+
+    Constant columns (σ_X = 0) are assigned σ = 1 so they contribute nothing
+    after centering rather than producing a divide-by-zero.
 
     Parameters
     ----------
     X : (n, p) feature matrix.
     y : (n,) target vector.
-    alpha : L₂ penalty strength.
+    alpha : L₂ penalty strength (applied in standardized feature space).
 
     Returns
     -------
-    (weights, intercept) where weights is (p,) and intercept is scalar.
+    (weights, intercept) in raw-feature space: weights is (p,), intercept scalar.
     """
     n, p = X.shape
-    # Centre features
     X_mean = X.mean(axis=0)
+    X_std = X.std(axis=0)
+    X_std = np.where(X_std == 0.0, 1.0, X_std)
     y_mean = y.mean()
-    Xc = X - X_mean
+
+    Z = (X - X_mean) / X_std
     yc = y - y_mean
 
-    # Closed-form: w = (X^T X + alpha * I)^{-1} X^T y
-    A = Xc.T @ Xc + alpha * np.eye(p)
-    b_vec = Xc.T @ yc
-    weights = np.linalg.solve(A, b_vec)
+    # Closed-form ridge in standardized space: w_std = (Z^T Z + alpha I)^{-1} Z^T yc
+    A = Z.T @ Z + alpha * np.eye(p)
+    b_vec = Z.T @ yc
+    weights_std = np.linalg.solve(A, b_vec)
 
-    # Intercept accounts for centering
+    # Fold the standardization back into raw-feature-space weights/intercept.
+    weights = weights_std / X_std
     intercept = y_mean - X_mean @ weights
     return weights, float(intercept)
 

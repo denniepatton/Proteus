@@ -2,7 +2,7 @@
 #
 # Canonical full environment: micromamba create -f proteus.env
 # Install a compatible PyTorch build separately, then install this file.
-# Optional analysis and interpretation extras: pip install -r requirements-extra.txt
+# Analysis + interpretation extras: pip install -r requirements-analysis.txt
 
 zarr>=2.18
 numcodecs>=0.12

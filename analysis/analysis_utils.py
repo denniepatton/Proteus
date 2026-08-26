@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
+from proteus_constants import K_GAMMA
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MIN_CORRELATION_N = 5
@@ -55,6 +57,49 @@ def benjamini_hochberg(p_values: Union[pd.Series, np.ndarray, Sequence[float]]) 
     if is_series:
         return pd.Series(adjusted, index=index)
     return adjusted
+
+
+def exact_paired_wilcoxon_pvalue(
+    values_a: np.ndarray,
+    values_b: np.ndarray,
+) -> float:
+    """Return an exact two-sided Wilcoxon signed-rank p-value for paired values."""
+    from scipy.stats import rankdata
+
+    paired_a = np.asarray(values_a, dtype=float)
+    paired_b = np.asarray(values_b, dtype=float)
+    if paired_a.shape != paired_b.shape:
+        raise ValueError(
+            "Paired Wilcoxon inputs must have identical shapes; "
+            f"received {paired_a.shape} and {paired_b.shape}"
+        )
+    finite_mask = np.isfinite(paired_a) & np.isfinite(paired_b)
+    differences = paired_b[finite_mask] - paired_a[finite_mask]
+    differences = differences[differences != 0.0]
+    if differences.size == 0:
+        return 1.0
+
+    # Doubling average ranks makes every tied rank integral, allowing an exact
+    # sign-permutation distribution without floating-point comparisons.
+    doubled_ranks = np.rint(2.0 * rankdata(np.abs(differences), method="average")).astype(int)
+    observed_positive_sum = int(doubled_ranks[differences > 0.0].sum())
+    total_rank_sum = int(doubled_ranks.sum())
+    observed_statistic = min(observed_positive_sum, total_rank_sum - observed_positive_sum)
+
+    subset_sum_counts: Dict[int, int] = {0: 1}
+    for doubled_rank in doubled_ranks:
+        updated_counts = dict(subset_sum_counts)
+        for rank_sum, count in subset_sum_counts.items():
+            signed_rank_sum = rank_sum + int(doubled_rank)
+            updated_counts[signed_rank_sum] = updated_counts.get(signed_rank_sum, 0) + count
+        subset_sum_counts = updated_counts
+
+    extreme_count = sum(
+        count
+        for positive_sum, count in subset_sum_counts.items()
+        if min(positive_sum, total_rank_sum - positive_sum) <= observed_statistic
+    )
+    return float(extreme_count / (2 ** differences.size))
 
 
 def _augment_missing_gene_aliases(expr_df: pd.DataFrame) -> pd.DataFrame:
@@ -1434,7 +1479,8 @@ def generate_null_predictions(
 
 
 # Keep these analysis-side MDN constants aligned with the stored model outputs.
-_MDN_GAMMA_SHAPE = 0.75
+# Sourced from the single shared constant so it can never drift from the model.
+_MDN_GAMMA_SHAPE = K_GAMMA
 _AOR_EPSILON = 1e-6
 
 
@@ -1842,8 +1888,8 @@ def build_study_var_map() -> Dict[str, float]:
     return compute_gene_variance(build_study_truth_pool())
 
 
-def _build_plca_training_truth_by_source() -> Dict[str, pd.DataFrame]:
-    """Return the direct truth matrices for the four PLCA training sources."""
+def _build_tds_training_truth_by_source() -> Dict[str, pd.DataFrame]:
+    """Return the direct truth matrices for the four TDS training sources."""
     truth_by_source: Dict[str, pd.DataFrame] = {}
     for cohort in ("CRPC-RA", "SCLC", "PC-PDX", "SCLC-PDX"):
         truth_wide = load_truth(cohort)
@@ -1872,10 +1918,10 @@ def _compute_truth_dispersion_table(truth_wide: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def export_plca_training_truth_dispersion_table(
+def export_tds_training_truth_dispersion_table(
     out_path: Optional[Union[str, Path]] = None,
 ) -> pd.DataFrame:
-    """Export direct truth-data dispersion stats for the PLCA training pool.
+    """Export direct truth-data dispersion stats for the TDS training pool.
 
     The aggregate `training` columns combine all truth samples from CRPC-RA,
     SCLC, PC-PDX, and SCLC-PDX. The PDX cohorts are restricted to the
@@ -1884,13 +1930,13 @@ def export_plca_training_truth_dispersion_table(
 
     Args:
         out_path: Optional output TSV path. Defaults to
-            ``analysis/results/plca_training_truth_dispersion.tsv``.
+            ``analysis/results/tds_training_truth_dispersion.tsv``.
 
     Returns:
         DataFrame with one row per gene and per-group columns for
         standard deviation, variance, range, and mid-quartile range.
     """
-    truth_by_source = _build_plca_training_truth_by_source()
+    truth_by_source = _build_tds_training_truth_by_source()
     training_truth = pd.concat(
         [truth_by_source[cohort] for cohort in ("CRPC-RA", "SCLC", "PC-PDX", "SCLC-PDX")],
         axis=1,
@@ -1915,7 +1961,7 @@ def export_plca_training_truth_dispersion_table(
     table = table.reset_index()
 
     if out_path is None:
-        out_path = PROJECT_ROOT / "analysis" / "results" / "plca_training_truth_dispersion.tsv"
+        out_path = PROJECT_ROOT / "analysis" / "results" / "tds_training_truth_dispersion.tsv"
     out_path = Path(out_path)
     ensure_dir(str(out_path.parent))
     table.to_csv(out_path, sep="\t", index=False)
@@ -1923,20 +1969,20 @@ def export_plca_training_truth_dispersion_table(
     return table
 
 
-def export_plca_training_variance_table(
+def export_tds_training_variance_table(
     out_path: Optional[Union[str, Path]] = None,
 ) -> pd.DataFrame:
-    """Export the exact PLCA tumor-expression variance table used in training.
+    """Export the exact TDS tumor-expression variance table used in training.
 
-    This follows the full-train PLCA recipe in
-    ``config/experiments/plca_final-training.yaml``:
-    non-PHT PLCA samples are collected from the splits TSV, tumor-expression
+    This follows the full-train TDS recipe in
+    ``config/experiments/tds_final-training.yaml``:
+    non-PHT TDS samples are collected from the splits TSV, tumor-expression
     variance is computed from ``flat/tumor_exp``, and the loss weights are the
     same variances clipped to ``[0.1, 10.0]``.
 
     Args:
         out_path: Optional output TSV path. Defaults to
-            ``analysis/results/plca_training_gene_variance.tsv``.
+            ``analysis/results/tds_training_gene_variance.tsv``.
 
     Returns:
         DataFrame with columns ``gene``, ``variance_raw``, and
@@ -1946,7 +1992,7 @@ def export_plca_training_variance_table(
     from proteus_utils.data_helpers import collect_zarr_paths
     from proteus_utils.proteus_utils import _compute_gene_variances
 
-    spec = load_experiment_spec(str(PROJECT_ROOT / "config" / "experiments" / "plca_final-training.yaml"))
+    spec = load_experiment_spec(str(PROJECT_ROOT / "config" / "experiments" / "tds_final-training.yaml"))
     training_set_tsv = PROJECT_ROOT / spec.data.training_set
     zarr_base = spec.data.zarr_base
 
@@ -1957,7 +2003,7 @@ def export_plca_training_variance_table(
     )
     if not zarr_paths:
         raise FileNotFoundError(
-            "No PLCA training zarr stores were found for variance export under "
+            "No TDS training zarr stores were found for variance export under "
             f"{zarr_base} using {training_set_tsv}"
         )
 
@@ -1977,7 +2023,7 @@ def export_plca_training_variance_table(
     )
 
     if out_path is None:
-        out_path = PROJECT_ROOT / "analysis" / "results" / "plca_training_gene_variance.tsv"
+        out_path = PROJECT_ROOT / "analysis" / "results" / "tds_training_gene_variance.tsv"
     out_path = Path(out_path)
     ensure_dir(str(out_path.parent))
     table.to_csv(out_path, sep="\t", index=False)

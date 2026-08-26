@@ -3714,7 +3714,7 @@ def _build_sample_metadata() -> pd.DataFrame:
     """Build a lookup table mapping ``(cohort, sample_name)`` to subtype and TFx.
 
     Scans all ``data/*_sample-splits.tsv`` files so cohort/sample metadata is
-    available for PLCA, BTS, and other composite datasets rather than being
+    available for TDS, BTS, and other composite datasets rather than being
     hard-wired to BTS only.
     """
     import csv

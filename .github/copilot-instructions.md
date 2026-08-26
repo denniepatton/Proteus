@@ -79,7 +79,7 @@
 - **`models/model_utils.py`** (~1165 lines) — MDN heads, CRPS loss, β-TCVAE components.
   - `MixtureDensityHead` — 3-component mixture: hurdle (point mass at 0) + gamma + normal.
   - `mixture_crps()` — analytical CRPS (Gneiting & Raftery 2007) with Gauss-Laguerre quadrature for the gamma component.
-  - `K_GAMMA = 0.80` (fixed gamma shape, empirical) — used throughout CRPS calculations.
+  - `K_GAMMA = 0.75` (fixed gamma shape, empirical) — used throughout CRPS calculations. Defined once in the top-level `proteus_constants.py` module and imported by both `models/model_utils.py` and the analysis pipeline so it can never drift.
   - `InternalLossComputer` — β-TCVAE decomposition + contrastive + reconstruction losses.
   - `total_correlation()` — minibatch-weighted TC estimator (Chen et al., 2018), clamped [-100, 100].
   - `BioDVNMDNLoss` — combines external CRPS loss with internal VAE losses.
@@ -141,7 +141,7 @@
 - **Balanced metrics**: Per-cohort/source metrics are averaged with equal weight regardless of sample count, preventing large cohorts from dominating.
 - **Epoch-level GVW-r**: Computed via Welford online accumulators (O(1) memory per gene per source) during the validation loop. Per-gene Pearson r is variance-weighted and averaged across sources.
 - **MDN clamp bounds**: `log_gamma_beta ∈ [-6, 4]` bounds gamma mean K/β ∈ [0.015, 320] — well beyond biological expression range [0, ~20] but numerically safe.
-- **K_GAMMA = 0.80**: Fixed gamma shape parameter (empirical). Hardcoded as a module-level constant in `model_utils.py`. Not a tunable hyperparameter.
+- **K_GAMMA = 0.75**: Fixed gamma shape parameter (empirical). Defined once in the top-level `proteus_constants.py` module and imported by `models/model_utils.py` and the analysis pipeline. Not a tunable hyperparameter.
 
 ## Common workflows (CLI)
 - Process Triton → Zarr:

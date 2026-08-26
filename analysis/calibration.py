@@ -8,6 +8,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from proteus_constants import K_GAMMA
 from analysis.analysis_utils import (
 	EXPRESSION_CEIL,
 	EXPRESSION_FLOOR,
@@ -40,7 +41,7 @@ _MDN_PARAM_KEYS = (
 	"normal_stdev_wide",
 )
 _CALIBRATION_ACTIVITY_THRESHOLD = 2.0
-_CALIBRATION_GAMMA_SHAPE = 0.75
+_CALIBRATION_GAMMA_SHAPE = K_GAMMA
 _CALIBRATION_INTERVAL_ALPHA = 0.10
 _CALIBRATION_TAIL_ALPHA = _CALIBRATION_INTERVAL_ALPHA * 0.5
 _CALIBRATION_AOR_EPSILON = 1e-6

@@ -1,0 +1,26 @@
+# Proteus analysis + interpretation dependencies.
+#
+# These are the extra packages needed to run the downstream analysis pipeline
+# (analysis/) and the model-interpretation utilities (interpretation/), on top
+# of the core requirements in requirements.txt.
+#
+# The canonical, fully reproducible environment is the micromamba spec
+# proteus.env (micromamba create -f proteus.env); these pip requirements mirror
+# its analysis/interpretation packages for convenience. Version bounds are lower
+# bounds only — proteus.env is authoritative for exact, reproducible pins.
+#
+# The analysis workflow additionally requires an R installation with the
+# Bioconductor packages `limma` and `genefu` available for the rpy2 bridges
+# (analysis/limma_de.R and the PAM50 caller).
+
+# Analysis pipeline
+seaborn>=0.13
+lifelines>=0.28
+gseapy>=1.1
+rpy2>=3.5
+
+# Model interpretation (Captum attribution, SHAP, UMAP embeddings, sequence logos)
+captum>=0.7
+shap>=0.46
+umap-learn>=0.5
+logomaker>=0.8

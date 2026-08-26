@@ -643,11 +643,25 @@ def _variance_decomposition_for_outcome(
     technical_contrib = X[:, technical_cols] @ beta[technical_cols]
     boundary_contrib = X[:, boundary_cols] @ beta[boundary_cols]
 
+    # The technical and truth/boundary predictors are collinear (e.g. TFx,
+    # depth, truth expression, dynamic range covary), so var(technical) and
+    # var(boundary) individually double-count the shared 2·Cov(·,·) cross-term
+    # and do not sum to the total fixed-effect variance. Split the total
+    # fixed-effect variance between the two blocks with a Shapley (LMG)
+    # decomposition — the average over both sequential (Type-I) orderings — which
+    # is order-independent and sums exactly to var(technical + boundary):
+    #   φ_A = ½·var(A) + ½·(var(A+B) − var(B))
+    var_technical = float(np.var(technical_contrib))
+    var_boundary = float(np.var(boundary_contrib))
+    var_fixed_total = float(np.var(technical_contrib + boundary_contrib))
+    shapley_technical = 0.5 * var_technical + 0.5 * (var_fixed_total - var_boundary)
+    shapley_boundary = 0.5 * var_boundary + 0.5 * (var_fixed_total - var_technical)
+
     components = {
         "sample identity": max(fit["var_s"], 0.0),
         "gene identity": max(fit["var_g"], 0.0),
-        "technical covariates": float(np.var(technical_contrib)),
-        "truth/boundary covariates": float(np.var(boundary_contrib)),
+        "technical covariates": max(shapley_technical, 0.0),
+        "truth/boundary covariates": max(shapley_boundary, 0.0),
         "unexplained": max(fit["var_e"], 0.0),
     }
     total = sum(components.values())

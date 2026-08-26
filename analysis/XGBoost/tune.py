@@ -1,7 +1,7 @@
 """Optuna-based HP tuning for the XGBoost baseline.
 
 Runs TPE-guided search over XGBoost HPs using 5-fold CV.  The default
-baseline objective is GVW-MSE, while PLCA runs can switch to the
+baseline objective is GVW-MSE, while TDS runs can switch to the
 Proteus-aligned weighted source-balanced GVW-MAE surrogate.
 
 Usage
@@ -28,7 +28,7 @@ import optuna
 import xgboost as xgb
 
 from proteus_utils.data_helpers import (
-    PLCA_WEIGHTED_SOURCE_WEIGHTS,
+    DEFAULT_SOURCE_WEIGHTED_SELECTION_GROUP_WEIGHTS as TDS_WEIGHTED_SOURCE_WEIGHTS,
     build_source_map_from_tsv,
     compute_source_variance,
     weighted_group_mean,
@@ -105,7 +105,7 @@ def _resolve_parallelism(cpu_count: int) -> tuple[int, int]:
 # Objective helpers
 # ---------------------------------------------------------------------------
 
-PLCA_SOURCE_GROUPS: Dict[str, List[str]] = {
+TDS_SOURCE_GROUPS: Dict[str, List[str]] = {
     "CRPC-RA": ["CRPC-RA"],
     "SCLC": ["SCLC"],
     "Prostate-Synthetic": ["PC-PDX"],
@@ -113,14 +113,14 @@ PLCA_SOURCE_GROUPS: Dict[str, List[str]] = {
 }
 
 
-def _is_plca_tsv(tsv_path: str) -> bool:
-    return Path(tsv_path).name == "PLCA_sample-splits.tsv"
+def _is_tds_splits_tsv(tsv_path: str) -> bool:
+    return Path(tsv_path).name == "TDS_sample-splits.tsv"
 
 
 def _resolve_metric_name(metric_name: str, tsv_path: str) -> str:
     if metric_name != "auto":
         return metric_name
-    if _is_plca_tsv(tsv_path):
+    if _is_tds_splits_tsv(tsv_path):
         return "weighted_source_gvw_mae"
     return "gvw_mse"
 
@@ -128,8 +128,8 @@ def _resolve_metric_name(metric_name: str, tsv_path: str) -> str:
 def _resolve_search_profile(search_profile: str, tsv_path: str) -> str:
     if search_profile != "auto":
         return search_profile
-    if _is_plca_tsv(tsv_path):
-        return "plca"
+    if _is_tds_splits_tsv(tsv_path):
+        return "tds"
     return "baseline"
 
 
@@ -150,7 +150,7 @@ def _suggest_params(
     trial: optuna.Trial,
     search_profile: str,
 ) -> Dict[str, Any]:
-    if search_profile == "plca":
+    if search_profile == "tds":
         return {
             "max_depth": trial.suggest_int("max_depth", 10, 14),
             "learning_rate": trial.suggest_float(
@@ -255,17 +255,17 @@ def _prepare_weighted_source_eval_data(
 
     prepared: Dict[str, tuple[np.ndarray, np.ndarray]] = {}
     per_source: Dict[str, float] = {}
-    for source_name in PLCA_WEIGHTED_SOURCE_WEIGHTS:
+    for source_name in TDS_WEIGHTED_SOURCE_WEIGHTS:
         idx = np.flatnonzero(row_sources == source_name)
         if idx.size == 0:
             raise RuntimeError(
-                f'No validation rows found for PLCA source "{source_name}"',
+                f'No validation rows found for TDS source "{source_name}"',
             )
 
         source_weight_map = source_variance.get(source_name)
         if source_weight_map is None:
             raise RuntimeError(
-                f'Missing source variance map for PLCA source "{source_name}"',
+                f'Missing source variance map for TDS source "{source_name}"',
             )
 
         w_src = np.fromiter(
@@ -287,7 +287,7 @@ def _score_weighted_source_gvw_mae_prepared(
     for source_name, (idx, w_src) in prepared.items():
         per_source[source_name] = _weighted_mae(pred[idx], truth[idx], w_src)
 
-    return weighted_group_mean(per_source, PLCA_WEIGHTED_SOURCE_WEIGHTS), per_source
+    return weighted_group_mean(per_source, TDS_WEIGHTED_SOURCE_WEIGHTS), per_source
 
 
 def _weighted_source_gvw_mae_eval_fn(
@@ -450,12 +450,12 @@ def _build_objective(
     if metric_name == "weighted_source_gvw_mae":
         sample_to_source, source_variance_paths = build_source_map_from_tsv(
             tsv_path,
-            PLCA_SOURCE_GROUPS,
+            TDS_SOURCE_GROUPS,
             zarr_base,
         )
         sample_to_source = _augment_sample_source_aliases(sample_to_source)
         source_variance = compute_source_variance(
-            PLCA_SOURCE_GROUPS,
+            TDS_SOURCE_GROUPS,
             source_variance_paths,
             lambda paths, label_key: compute_gene_variances(
                 paths,
@@ -481,7 +481,7 @@ def _build_objective(
         if metric_name == "weighted_source_gvw_mae":
             if sample_to_source is None or source_variance is None:
                 raise RuntimeError(
-                    "weighted_source_gvw_mae requires PLCA source metadata",
+                    "weighted_source_gvw_mae requires TDS source metadata",
                 )
             prepared_source_eval = _prepare_weighted_source_eval_data(
                 genes_val,
@@ -563,7 +563,7 @@ def _build_objective(
             if metric_name == "weighted_source_gvw_mae":
                 if sample_to_source is None or source_variance is None:
                     raise RuntimeError(
-                        "weighted_source_gvw_mae requires PLCA source metadata",
+                        "weighted_source_gvw_mae requires TDS source metadata",
                     )
                 metric_profiler = _MetricProfiler("python_weighted_source_eval")
                 train_kwargs["callbacks"] = [
@@ -595,7 +595,7 @@ def _build_objective(
             if metric_name == "weighted_source_gvw_mae":
                 if fd["prepared_source_eval"] is None:
                     raise RuntimeError(
-                        "weighted_source_gvw_mae requires prepared PLCA eval data",
+                        "weighted_source_gvw_mae requires prepared TDS eval data",
                     )
                 fold_score, per_source = _score_weighted_source_gvw_mae_prepared(
                     pred,
@@ -679,14 +679,14 @@ def main(argv: Optional[List[str]] = None) -> None:
         type=str,
         choices=["auto", "gvw_mse", "weighted_source_gvw_mae"],
         default="auto",
-        help="Trial objective metric. 'auto' uses the Proteus-aligned PLCA metric for PLCA splits.",
+        help="Trial objective metric. 'auto' uses the Proteus-aligned TDS metric for TDS splits.",
     )
     parser.add_argument(
         "--search_profile",
         type=str,
-        choices=["auto", "baseline", "plca"],
+        choices=["auto", "baseline", "tds"],
         default="auto",
-        help="Hyperparameter search profile. 'auto' switches to the narrowed PLCA ranges for PLCA splits.",
+        help="Hyperparameter search profile. 'auto' switches to the narrowed TDS ranges for TDS splits.",
     )
     parser.add_argument("--tsv", type=str, default=None)
     parser.add_argument("--zarr_base", type=str, default=None)

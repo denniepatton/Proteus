@@ -15,7 +15,7 @@
   "patience": 100,
   "min_delta": 0.0,
   "selection_metric": "min_cohort_soft_objective",
-  "checkpoint_dir": "/fh/fast/ha_g/user/rpatton/TritonCNN/Proteus/trained_models/proteus_tds-model_no-seq/full_train",
+  "checkpoint_dir": "trained_models/proteus_tds-model_no-seq/full_train",
   "save_best_only": true,
   "log_interval": 100,
   "progress_bar": false,

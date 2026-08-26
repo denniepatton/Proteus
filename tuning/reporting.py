@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import optuna
 
+from tuning._io_utils import write_json_atomic as _write_json_atomic
 from tuning.metrics import nanmean, nanstd
 
 __all__ = [
@@ -26,13 +27,6 @@ __all__ = [
     "compute_fold_stability",
     "narrow_search_space_from_study",
 ]
-
-
-def _write_json_atomic(path: str, obj: Any) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, 'w') as f:
-        json.dump(obj, f, indent=2)
-    os.replace(tmp, path)
 
 
 def compute_fold_stability(

@@ -228,16 +228,17 @@ def gene_weight_vector(
 # ---------------------------------------------------------------------------
 
 def default_zarr_base() -> str:
-    """Return the default zarr_base from env or paths.yaml."""
+    """Return the default zarr_base from ``PROTEUS_ZARR_BASE`` or the repo-local default.
+
+    Mirrors the repository-local default used by ``config/runtime_paths.py`` so the
+    XGBoost baseline reads from the same Zarr location as Proteus without any
+    site-specific hardcoded path.
+    """
     env_val = os.environ.get("PROTEUS_ZARR_BASE")
     if env_val:
         return env_val
-    return "/hpc/temp/ha_g/user/rpatton/ProteusZarrs"
+    return str(PROJECT_ROOT / "data" / "zarr")
 
 
 def default_splits_tsv() -> str:
     return str(PROJECT_ROOT / "data" / "TDS_sample-splits.tsv")
-
-
-def default_panft_splits_tsv() -> str:
-    return str(PROJECT_ROOT / "data" / "PAN-FT_sample-splits.tsv")

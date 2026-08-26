@@ -1922,7 +1922,7 @@ def benchmark_cohort_boxplots(
         all_positions = []
         all_data = []
         all_colors = []
-        cohort_color_alpha = {c: 0.55 + 0.15 * i for i, c in enumerate(cohort_order)}
+        _cohort_markers = ["o", "D", "s", "^", "v"]  # circle, diamond, square, ...
         tick_positions = []
         tick_labels = []
 
@@ -1952,19 +1952,18 @@ def benchmark_cohort_boxplots(
                 medianprops=dict(color="black", linewidth=1.2),
                 flierprops=dict(markersize=2),
             )
-            for pi, (patch, c) in enumerate(zip(bp["boxes"], all_colors)):
-                ci_idx = pi % n_cohorts
-                alpha = cohort_color_alpha.get(cohort_order[ci_idx], 0.7)
+            for patch, c in zip(bp["boxes"], all_colors):
                 patch.set_facecolor(c)
-                patch.set_alpha(alpha)
-                # Hatch second cohort for visual distinction
-                if ci_idx > 0:
-                    patch.set_hatch("//")
+                patch.set_alpha(0.7)
             for flier in bp.get("fliers", []):
                 flier.set_markersize(4)
 
             rng = np.random.default_rng(42)
-            for pos, vals, color in zip(all_positions, all_data, all_colors):
+            for pt_idx, (pos, vals, color) in enumerate(
+                zip(all_positions, all_data, all_colors)
+            ):
+                ci_idx = pt_idx % n_cohorts
+                marker = _cohort_markers[ci_idx % len(_cohort_markers)]
                 numeric_vals = np.asarray(vals, dtype=float)
                 numeric_vals = numeric_vals[np.isfinite(numeric_vals)]
                 if numeric_vals.size == 0:
@@ -1974,6 +1973,7 @@ def benchmark_cohort_boxplots(
                     float(pos) + jitter,
                     numeric_vals,
                     color=color,
+                    marker=marker,
                     edgecolor="black",
                     linewidth=0.4,
                     s=28,
@@ -1984,14 +1984,13 @@ def benchmark_cohort_boxplots(
             ax.set_xticks(tick_positions)
             ax.set_xticklabels(tick_labels, rotation=55, ha="right", fontsize=7)
 
-            # Legend for cohorts (using proxy patches)
-            from matplotlib.patches import Patch
+            # Legend for cohorts (using proxy markers)
             legend_patches = []
             for ci_idx, cohort in enumerate(cohort_order):
-                p = Patch(facecolor="#888888",
-                          alpha=cohort_color_alpha.get(cohort, 0.7),
-                          hatch="//" if ci_idx > 0 else "",
-                          label=cohort)
+                marker = _cohort_markers[ci_idx % len(_cohort_markers)]
+                p = ax.plot([], [], marker=marker, markersize=9,
+                            color="#888888", markeredgecolor="black",
+                            linestyle="none", label=cohort)[0]
                 legend_patches.append(p)
             ax.legend(handles=legend_patches, fontsize=8, loc="best",
                       framealpha=0.8)
@@ -3006,6 +3005,150 @@ def clinical_correlation_scatter(
     fig.tight_layout()
     fig.savefig(f"{name}.pdf", bbox_inches="tight")
     plt.close(fig)
+
+
+def colored_status_scatter(
+    x_vals: pd.Series | Sequence[float] | np.ndarray,
+    y_vals: pd.Series | Sequence[float] | np.ndarray,
+    status: pd.Series | Sequence[float] | np.ndarray,
+    name: str,
+    *,
+    xlabel: str = "",
+    ylabel: str = "",
+    title: str = "",
+    label_pos: str = "Positive",
+    label_neg: str = "Negative",
+    pos_color: str = "#CC3311",
+    neg_color: str = "#0077BB",
+    min_n: int = 3,
+) -> None:
+    """Scatter of two continuous variables colored by a binary status.
+
+    Points are colored positive/negative/unknown from ``status`` (1/0/NaN), a
+    least-squares line is fit over all finite pairs, and the panel title carries
+    the Spearman rank correlation. Designed for small paired cohorts where the
+    standard cohort scatter's minimum-n gate would suppress the plot entirely.
+    """
+    _ensure_dir(name)
+    x = pd.to_numeric(pd.Series(x_vals), errors="coerce")
+    y = pd.to_numeric(pd.Series(y_vals), errors="coerce")
+    st = pd.to_numeric(pd.Series(status), errors="coerce")
+    if isinstance(x_vals, pd.Series):
+        x.index = x_vals.index
+    if isinstance(y_vals, pd.Series):
+        y.index = y_vals.index
+    if isinstance(status, pd.Series):
+        st.index = status.index
+
+    shared = x.index.intersection(y.index)
+    x, y = x.loc[shared], y.loc[shared]
+    st = st.reindex(shared)
+    mask = np.isfinite(x.to_numpy()) & np.isfinite(y.to_numpy())
+    if int(mask.sum()) < min_n:
+        return
+    x, y, st = x[mask], y[mask], st[mask]
+
+    rho, pval = spearmanr(x.to_numpy(), y.to_numpy())
+
+    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    st_arr = st.to_numpy()
+    colors = np.where(
+        st_arr == 1.0, pos_color, np.where(st_arr == 0.0, neg_color, "#999999")
+    )
+    ax.scatter(
+        x.to_numpy(), y.to_numpy(), c=colors, s=90,
+        edgecolors="black", linewidths=0.5, alpha=0.85,
+    )
+
+    from scipy.stats import linregress as _lr
+    slope, intercept, _, _, _ = _lr(x.to_numpy(), y.to_numpy())
+    x_line = np.linspace(float(x.min()), float(x.max()), 100)
+    ax.plot(x_line, slope * x_line + intercept, color="black", lw=1.8, alpha=0.85)
+
+    handles = [
+        Line2D([0], [0], marker="o", color="w", label=label_pos,
+               markerfacecolor=pos_color, markeredgecolor="black", markersize=9),
+        Line2D([0], [0], marker="o", color="w", label=label_neg,
+               markerfacecolor=neg_color, markeredgecolor="black", markersize=9),
+    ]
+    ax.legend(handles=handles, loc="best", fontsize=8, frameon=True)
+
+    ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_ylabel(ylabel, fontsize=11)
+    subtitle = f"Spearman ρ = {rho:.2f}  {format_pval(float(pval))}  (n = {int(mask.sum())})"
+    ax.set_title(f"{title}\n{subtitle}" if title else subtitle, fontsize=11)
+    ax.set_box_aspect(1)
+
+    fig.tight_layout()
+    fig.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(fig)
+
+
+def marker_gene_clustermap(
+    expr_df: pd.DataFrame,
+    genes: Sequence[str],
+    name: str,
+    *,
+    phenotype: Optional[pd.Series] = None,
+    phenotype_colors: Optional[Dict[str, str]] = None,
+    title: str = "",
+    value_label: str = r"log$_2$(CPM+1)",
+) -> None:
+    """Clustered marker-gene heatmap (samples clustered, genes in supplied order).
+
+    ``expr_df`` is genes × samples. Genes are drawn in the requested order
+    (no row clustering) while columns are hierarchically clustered. An optional
+    categorical ``phenotype`` (indexed by sample) is rendered as a top color
+    bar. Genes with any missing value across the retained samples are dropped so
+    the linkage is computed on a finite matrix.
+    """
+    _ensure_dir(name)
+    df = expr_df.apply(pd.to_numeric, errors="coerce")
+    ordered = [g for g in genes if g in df.index]
+    if len(ordered) < 3:
+        return
+    df = df.loc[ordered].dropna(axis=0, how="any")
+    if df.shape[0] < 3 or df.shape[1] < 3:
+        return
+
+    col_colors = None
+    legend_handles: List[Line2D] = []
+    if phenotype is not None:
+        pheno = phenotype.reindex(df.columns).astype(str)
+        if phenotype_colors is None:
+            base = ["#0077BB", "#CC3311", "#009988", "#EE7733", "#AA3377"]
+            uniq = [u for u in sorted(pheno.dropna().unique())]
+            phenotype_colors = {u: base[i % len(base)] for i, u in enumerate(uniq)}
+        col_colors = pheno.map(phenotype_colors).fillna("#DDDDDD")
+        legend_handles = [
+            Line2D([0], [0], marker="s", color="w", label=lab,
+                   markerfacecolor=col, markeredgecolor="black", markersize=9)
+            for lab, col in phenotype_colors.items()
+        ]
+
+    cmap = sns.color_palette("RdBu_r", as_cmap=True)
+    grid = sns.clustermap(
+        df,
+        cmap=cmap,
+        col_colors=col_colors,
+        row_cluster=False,
+        col_cluster=True,
+        linewidths=0.1,
+        linecolor="black",
+        cbar_kws={"label": value_label},
+        figsize=(max(6.0, df.shape[1] * 0.5 + 2.0), max(4.0, df.shape[0] * 0.4 + 2.0)),
+    )
+    grid.ax_heatmap.set_xlabel("")
+    grid.ax_heatmap.set_ylabel("")
+    if legend_handles:
+        grid.ax_heatmap.legend(
+            handles=legend_handles, title="Phenotype",
+            bbox_to_anchor=(1.28, 1.0), loc="upper left", fontsize=8,
+        )
+    if title:
+        grid.fig.suptitle(title, y=1.02, fontsize=12)
+    grid.savefig(f"{name}.pdf", bbox_inches="tight")
+    plt.close(grid.fig)
 
 
 # ---------------------------------------------------------------------------

@@ -24,7 +24,9 @@ CONFIGS_PER_ROUND="${CONFIGS_PER_ROUND:-4}"
 BASE_SAMPLER_SEED="${BASE_SAMPLER_SEED:-7200}"
 PYTHON_BIN="${HOME}/.local/share/mamba/envs/${ENV_NAME}/bin/python"
 JOB_PREFIX="${JOB_PREFIX:-tds_v2_finalize}"
-DEFAULT_PROTEUS_ZARR_BASE="/hpc/temp/ha_g/user/rpatton/ProteusZarrs"
+# Site-specific Zarr location. Override by exporting PROTEUS_ZARR_BASE before
+# launching (e.g. a fast-scratch path on your cluster).
+DEFAULT_PROTEUS_ZARR_BASE="${DEFAULT_PROTEUS_ZARR_BASE:-./data/zarr}"
 RTX_PARTITION="${RTX_PARTITION:-campus-new}"
 RTX_GPU="${RTX_GPU:-rtx2080ti:1}"
 RTX_TIME="${RTX_TIME:-24:00:00}"

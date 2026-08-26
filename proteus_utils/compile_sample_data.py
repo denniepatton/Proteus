@@ -79,8 +79,8 @@ def _get_default_zarr_base() -> str:
     except (FileNotFoundError, KeyError, OSError) as e:
         logging.debug('Config-based zarr_base_dir lookup failed: %s', e)
     
-    # Fallback to hardcoded default
-    return "/hpc/temp/ha_g/user/rpatton/ProteusZarrs"
+    # Fallback to repository-local default
+    return str(Path(__file__).resolve().parent.parent / 'data' / 'zarr')
 
 
 def _get_default_raw_data_dir() -> str:
@@ -107,8 +107,8 @@ def _get_default_raw_data_dir() -> str:
     except (FileNotFoundError, KeyError, OSError) as e:
         logging.debug('Config-based raw_data_dir lookup failed: %s', e)
     
-    # Fallback to hardcoded default
-    return "/fh/fast/ha_g/user/rpatton"
+    # Fallback to repository-local default
+    return str(Path(__file__).resolve().parent.parent / 'data' / 'raw_triton')
 
 
 # Default Zarr output directory (loaded from config or environment)

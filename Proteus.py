@@ -14,13 +14,13 @@ Usage:
     python Proteus.py --process_data --use_set PC-PDX
     
     # Train with cross-validation (requires experiment YAML with training_set TSV)
-    python Proteus.py --run_mode train --experiment config/experiments/plca_cv.yaml
+    python Proteus.py --run_mode train --experiment config/experiments/tds_cv.yaml
     
     # Train specific fold (for HPC parallelization)
-    python Proteus.py --run_mode train --experiment config/experiments/plca_cv.yaml --test_fold 1
+    python Proteus.py --run_mode train --experiment config/experiments/tds_cv.yaml --test_fold 1
     
     # Full training (all data, no CV holdout)
-    python Proteus.py --run_mode full-train --experiment config/experiments/plca_final-training.yaml
+    python Proteus.py --run_mode full-train --experiment config/experiments/tds_final-training.yaml
     
     # Optuna HP tuning
     python Proteus.py --run_mode tune --experiment config/experiments/TDS_tuning/biodvn_tune-tds-v2_finalize.yaml --n_trials 50
@@ -32,24 +32,22 @@ Usage:
 
 # Standard library imports
 import argparse
-import json
 import os
-import re
 import sys
 from pathlib import Path
-from typing import Optional, Dict, List, Any, Callable
+from typing import Optional
 
-import numpy as np
-import pandas as pd
 import torch
 
+# cuDNN autotuning selects the fastest convolution kernels for the pipeline's
+# fixed input shapes, improving training/inference throughput. It makes kernel
+# selection nondeterministic, so runs are not guaranteed to be bit-for-bit
+# reproducible even with a fixed seed; seeding still controls data ordering,
+# weight initialization, and stochastic augmentation.
 torch.backends.cudnn.benchmark = True
 
 # Local imports
-from models import BioDVNConfig
-from proteus_utils.trainer import TrainingConfig
 from config import (
-    PROJECT_ROOT,
     resolve_labels_dir,
     resolve_raw_data_dir,
     resolve_reference_path,
@@ -57,13 +55,21 @@ from config import (
 )
 from config.dataset_config import load_dataset_config, list_datasets
 from config.experiment_spec import load_experiment_spec
-from proteus_workflows.data import verify_dataset_stores
+from proteus_workflows.data import (
+    ensure_datasets_exist,
+    generate_data,
+    verify_dataset_stores,
+)
+from proteus_workflows.train import (
+    apply_cli_training_overrides,
+    build_training_configs_from_spec,
+    full_train_from_splits,
+    train_model_cv,
+)
 from proteus_workflows.inference import run_saved_model_on_dataset
-from proteus_utils import compute_regression_metrics
 
 
 DEFAULT_OPTUNA_STORAGE = 'sqlite:///results_training/optuna.db'
-DEFAULT_OPTUNA_SAMPLER_SEED = 42
 
 
 def _configure_streaming_stdout() -> None:
@@ -71,251 +77,6 @@ def _configure_streaming_stdout() -> None:
         sys.stdout.reconfigure(line_buffering=True)
     if hasattr(sys.stderr, 'reconfigure'):
         sys.stderr.reconfigure(line_buffering=True)
-
-
-def ensure_datasets_exist(
-    dataset_names: List[str],
-    zarr_base: str,
-    raw_data_base: str,
-    labels_dir: str,
-    ref_path: str,
-    n_workers: int = 0
-) -> Dict[str, bool]:
-    from proteus_workflows.data import ensure_datasets_exist as _workflow_impl
-
-    return _workflow_impl(
-        dataset_names=dataset_names,
-        zarr_base=zarr_base,
-        raw_data_base=raw_data_base,
-        labels_dir=labels_dir,
-        ref_path=ref_path,
-        n_workers=n_workers,
-    )
-
-
-def generate_data(
-    dataset: str,
-    tss_dir: str,
-    gb_dir: str,
-    labels_dir: str,
-    ref_path: str,
-    tfx_file: Optional[str],
-    zarr_base_dir: Optional[str] = None,
-    tumor_exp_file: Optional[str] = None,
-    background_exp_file: Optional[str] = None,
-    overwrite: bool = False,
-):
-    from proteus_workflows.data import generate_data as _workflow_impl
-
-    return _workflow_impl(
-        dataset=dataset,
-        tss_dir=tss_dir,
-        gb_dir=gb_dir,
-        labels_dir=labels_dir,
-        ref_path=ref_path,
-        tfx_file=tfx_file,
-        zarr_base_dir=zarr_base_dir,
-        tumor_exp_file=tumor_exp_file,
-        background_exp_file=background_exp_file,
-        overwrite=overwrite,
-    )
-
-
-def train_model_cv(
-    model_name: str,
-    training_set_tsv: str,
-    zarr_base: str,
-    test_fold: Optional[int] = None,
-    out_dir: Optional[str] = None,
-    model_config: Optional[BioDVNConfig] = None,
-    training_config: Optional[TrainingConfig] = None,
-    seed: int = 42,
-    subsample_frac: Optional[float] = None,
-    epoch_end_callback: Optional[Callable[..., None]] = None,
-    external_stop_check: Optional[Callable[..., bool]] = None,
-    train_only_cohorts: Optional[List[str]] = None,
-    source_groups: Optional[Dict[str, List[str]]] = None,
-    steps_per_epoch: int = 4000,
-    batch_mode: str = 'multi_source',
-    fixed_schedule_oof: bool = False,
-):
-    from proteus_workflows.train import train_model_cv as _workflow_impl
-
-    return _workflow_impl(
-        model_name=model_name,
-        training_set_tsv=training_set_tsv,
-        zarr_base=zarr_base,
-        test_fold=test_fold,
-        out_dir=out_dir,
-        model_config=model_config,
-        training_config=training_config,
-        seed=seed,
-        subsample_frac=subsample_frac,
-        epoch_end_callback=epoch_end_callback,
-        external_stop_check=external_stop_check,
-        train_only_cohorts=train_only_cohorts,
-        source_groups=source_groups,
-        steps_per_epoch=steps_per_epoch,
-        batch_mode=batch_mode,
-        fixed_schedule_oof=fixed_schedule_oof,
-    )
-
-
-def _summarize_cv_results(out_dir: str) -> None:
-    """Aggregate per-fold prediction TSVs into a deterministic CV metrics summary."""
-    fold_metrics: List[Dict[str, float]] = []
-    for entry in sorted(os.listdir(out_dir)):
-        if not entry.startswith('CV-fold_'):
-            continue
-        fold_dir = os.path.join(out_dir, entry)
-        if not os.path.isdir(fold_dir):
-            continue
-        # fold number is suffix after underscore
-        try:
-            fold_num = int(entry.split('_')[-1])
-        except ValueError:
-            fold_num = -1
-
-        metrics_path = os.path.join(fold_dir, f'validation-fold_{fold_num}_metrics.json')
-        fold_metrics_json: Optional[Dict[str, Any]] = None
-        if os.path.exists(metrics_path):
-            try:
-                with open(metrics_path, 'r') as f:
-                    fold_metrics_json = json.load(f)
-            except (json.JSONDecodeError, OSError) as e:
-                print(f'  Warning: could not load {metrics_path}: {e}')
-                fold_metrics_json = None
-
-        # Prefer metrics.json (includes GVW-CRPS + R² summaries). Fall back to TSV recomputation.
-        if fold_metrics_json is not None:
-            t_metrics = dict(fold_metrics_json.get('tumor', {}))
-            b_metrics = dict(fold_metrics_json.get('background', {}))
-        else:
-            tumor_path = os.path.join(fold_dir, f'validation-fold_{fold_num}_predictions_tumor.tsv')
-            bg_path = os.path.join(fold_dir, f'validation-fold_{fold_num}_predictions_background.tsv')
-            if not (os.path.exists(tumor_path) and os.path.exists(bg_path)):
-                continue
-            df_t = pd.read_csv(tumor_path, sep='\t', index_col=0)
-            df_b = pd.read_csv(bg_path, sep='\t', index_col=0)
-            t_metrics = compute_regression_metrics(df_t['truth'].to_numpy(), df_t['prediction_mean'].to_numpy())
-            b_metrics = compute_regression_metrics(df_b['truth'].to_numpy(), df_b['prediction_mean'].to_numpy())
-
-        weighted_tumor_gvw_crps = (
-            float(fold_metrics_json.get('weighted_tumor_gvw_crps', float('nan')))
-            if fold_metrics_json is not None else float('nan')
-        )
-        score = weighted_tumor_gvw_crps
-        if not np.isfinite(score):
-            score = float(t_metrics.get('gvw_crps', float('nan')))
-
-        row = {
-            'fold': int(fold_num),
-            # Primary selection metric
-            'score': score,
-            'weighted_tumor_gvw_crps': weighted_tumor_gvw_crps,
-            'tumor_gvw_crps': float(t_metrics.get('gvw_crps', float('nan'))),
-
-            # Tumor regression summary
-            'tumor_n': int(t_metrics.get('n', 0)),
-            'tumor_mae': float(t_metrics.get('mae', float('nan'))),
-            'tumor_rmse': float(t_metrics.get('rmse', float('nan'))),
-            'tumor_r2': float(t_metrics.get('r2', float('nan'))),
-            'tumor_gene_r2_mean': float(t_metrics.get('gene_r2_mean', float('nan'))),
-            'tumor_gene_r2_median': float(t_metrics.get('gene_r2_median', float('nan'))),
-            'tumor_sample_r2_mean': float(t_metrics.get('sample_r2_mean', float('nan'))),
-            'tumor_sample_r2_median': float(t_metrics.get('sample_r2_median', float('nan'))),
-
-            # Background regression summary
-            'background_n': int(b_metrics.get('n', 0)),
-            'background_mae': float(b_metrics.get('mae', float('nan'))),
-            'background_rmse': float(b_metrics.get('rmse', float('nan'))),
-            'background_r2': float(b_metrics.get('r2', float('nan'))),
-            'background_gvw_crps': float(b_metrics.get('gvw_crps', float('nan'))),
-        }
-        fold_metrics.append(row)
-
-    if not fold_metrics:
-        return
-
-    summary_df = pd.DataFrame(fold_metrics).sort_values('fold')
-    summary_df.to_csv(os.path.join(out_dir, 'cv_metrics_summary.tsv'), sep='\t', index=False)
-
-    # Also write a small JSON with mean/std across folds for quick comparison.
-    numeric_cols = [c for c in summary_df.columns if c not in ('fold',)]
-    primary_metric_name = 'weighted_tumor_gvw_crps'
-    if not np.isfinite(pd.to_numeric(summary_df[primary_metric_name], errors='coerce').to_numpy(dtype=np.float64)).any():
-        primary_metric_name = 'tumor_gvw_crps'
-
-    agg: Dict[str, Any] = {
-        'primary_metric': {'name': primary_metric_name, 'direction': 'minimize'},
-    }
-    for c in numeric_cols:
-        vals = pd.to_numeric(summary_df[c], errors='coerce').to_numpy(dtype=np.float64)
-        agg[c] = {
-            'mean': float(np.nanmean(vals)),
-            'std': float(np.nanstd(vals)),
-        }
-
-    # Best fold by primary metric
-    if primary_metric_name in summary_df.columns:
-        s = pd.to_numeric(summary_df[primary_metric_name], errors='coerce')
-        if np.isfinite(s.to_numpy(dtype=np.float64)).any():
-            best_idx = int(np.nanargmin(s.to_numpy(dtype=np.float64)))
-            best_row = summary_df.iloc[best_idx].to_dict()
-            agg['best'] = {
-                'fold': int(best_row.get('fold', -1)),
-                primary_metric_name: float(best_row.get(primary_metric_name, float('nan'))),
-            }
-    with open(os.path.join(out_dir, 'cv_metrics_summary.json'), 'w') as f:
-        json.dump(agg, f, indent=2)
-
-
-def full_train_from_splits(
-    model_name: str = 'BioDVN',
-    training_set_tsv: str = '',
-    zarr_base: str = '',
-    out_dir: str = 'final_models/',
-    model_config: Optional[BioDVNConfig] = None,
-    training_config: Optional[TrainingConfig] = None,
-    seed: int = 42,
-    subsample_frac: Optional[float] = None,
-    train_only_cohorts: Optional[List[str]] = None,
-    source_groups: Optional[Dict[str, List[str]]] = None,
-    steps_per_epoch: int = 4000,
-    batch_mode: str = 'multi_source',
-):
-    from proteus_workflows.train import full_train_from_splits as _workflow_impl
-
-    return _workflow_impl(
-        model_name=model_name,
-        training_set_tsv=training_set_tsv,
-        zarr_base=zarr_base,
-        out_dir=out_dir,
-        model_config=model_config,
-        training_config=training_config,
-        seed=seed,
-        subsample_frac=subsample_frac,
-        train_only_cohorts=train_only_cohorts,
-        source_groups=source_groups,
-        steps_per_epoch=steps_per_epoch,
-        batch_mode=batch_mode,
-    )
-
-
-def run_model(
-    model_path: str,
-    sample_files: List[str],
-    out_dir: str,
-    model_name: str = 'BioDVN',
-):
-    from proteus_workflows.inference import run_model as _workflow_impl
-
-    return _workflow_impl(
-        model_path=model_path,
-        sample_files=sample_files,
-        out_dir=out_dir,
-        model_name=model_name,
-    )
 
 
 def _build_configs_from_spec(
@@ -326,10 +87,7 @@ def _build_configs_from_spec(
     runtime_device_banner: bool = False,
     base_weights_override: Optional[str] = None,
 ) -> tuple:
-    from proteus_workflows.train import build_training_configs_from_spec as _workflow_impl
-    from proteus_workflows.train import apply_cli_training_overrides
-
-    model_cfg, train_cfg = _workflow_impl(
+    model_cfg, train_cfg = build_training_configs_from_spec(
         experiment_spec,
         model_name=model_name,
         runtime_device_banner=runtime_device_banner,
@@ -380,41 +138,6 @@ def _resolve_optuna_storage(
     return f'sqlite:///results_training/optuna_{phase_name}.db'
 
 
-def _resolve_sampler_seed(
-    experiment_path: Optional[str],
-    sampler_seed: int,
-) -> int:
-    if int(sampler_seed) != DEFAULT_OPTUNA_SAMPLER_SEED or experiment_path is None:
-        return int(sampler_seed)
-
-    experiment_rel = Path(experiment_path).as_posix()
-    runs_dir = Path(PROJECT_ROOT) / 'runs'
-    if not runs_dir.is_dir():
-        return int(sampler_seed)
-
-    experiment_re = re.compile(r'EXPERIMENT="\$\{EXPERIMENT:-([^"]+)\}"')
-    seed_re = re.compile(r'BASE_SAMPLER_SEED="\$\{BASE_SAMPLER_SEED:-([0-9]+)\}"')
-
-    for script_path in sorted(runs_dir.glob('*.sh')):
-        try:
-            script_text = script_path.read_text(encoding='utf-8')
-        except OSError:
-            continue
-
-        experiment_match = experiment_re.search(script_text)
-        if experiment_match is None:
-            continue
-        if Path(experiment_match.group(1)).as_posix() != experiment_rel:
-            continue
-
-        seed_match = seed_re.search(script_text)
-        if seed_match is None:
-            return int(sampler_seed)
-        return int(seed_match.group(1))
-
-    return int(sampler_seed)
-
-
 def main():
     """Main entry point for Proteus PyTorch pipeline."""
     _configure_streaming_stdout()
@@ -431,10 +154,10 @@ def main():
     python Proteus.py --verify_data --use_set PC-PDX
     
     # Train with cross-validation from an experiment YAML
-    python Proteus.py --run_mode train --experiment config/experiments/plca_cv.yaml
+    python Proteus.py --run_mode train --experiment config/experiments/tds_cv.yaml
 
     # Full training with an optional fine-tune warm start
-    python Proteus.py --run_mode full-train --experiment config/experiments/plca_final-training.yaml --base_weights trained_models/proteus_plca-model/full_train/final_model.pt
+    python Proteus.py --run_mode full-train --experiment config/experiments/tds_final-training.yaml --base_weights trained_models/proteus_tds-model/full_train/final_model.pt
 
     # Optuna CV tuning
     python Proteus.py --run_mode tune --experiment config/experiments/TDS_tuning/biodvn_tune-tds-v2_finalize.yaml --n_trials 50
@@ -482,7 +205,7 @@ def main():
     experiment_spec = load_experiment_spec(args.experiment) if args.experiment is not None else None
     resolved_optuna_storage = _resolve_optuna_storage(experiment_spec, args.optuna_storage)
     resolved_study_name = _resolve_optuna_study_name(experiment_spec, args.study_name)
-    resolved_sampler_seed = _resolve_sampler_seed(args.experiment, int(args.sampler_seed))
+    resolved_sampler_seed = int(args.sampler_seed)
     zarr_base = resolve_zarr_base(args.zarr_output_dir)
     labels_dir = resolve_labels_dir()
     reference_path = resolve_reference_path(args.scalars_reference_path)

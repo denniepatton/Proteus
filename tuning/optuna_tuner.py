@@ -43,6 +43,10 @@ from config.experiment_spec import (
     ParamSpec,
     load_experiment_spec,
 )
+from tuning._io_utils import (
+    folds_from_tsv as _folds_from_tsv,
+    write_json_atomic as _write_json_atomic,
+)
 from tuning.metrics import (
     collect_fold_metrics,
     compute_soft_objective,
@@ -343,22 +347,6 @@ def _infer_pruner_warmup_epochs(exp: ExperimentSpec) -> int:
             max(HYPERBAND_MIN_RESOURCE, first_post_warmup_validation),
         ),
     )
-
-
-def _folds_from_tsv(training_set_tsv: str) -> List[int]:
-    folds: set[int] = set()
-    with open(training_set_tsv, 'r', newline='') as f:
-        reader = csv.DictReader(f, delimiter='\t')
-        for row in reader:
-            folds.add(int(row['Fold']))
-    return sorted(folds)
-
-
-def _write_json_atomic(path: str, obj: Any) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, 'w') as f:
-        json.dump(obj, f, indent=2)
-    os.replace(tmp, path)
 
 
 def _read_json(path: str) -> Any:

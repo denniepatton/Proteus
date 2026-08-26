@@ -16,9 +16,9 @@ from proteus_utils import create_inference_loader, get_zarr_output_dir
 
 
 DEFAULT_SHIPPED_MODEL_DIRS: Dict[str, str] = {
-    'BioDVN': 'trained_models/proteus_plca-model/full_train',
-    'BioDVN_NoSeq': 'trained_models/proteus_plca-model_no-seq/full_train',
-    'BioDVN_OnlySeq': 'trained_models/proteus_plca-model_only-seq/full_train',
+    'BioDVN': 'trained_models/proteus_tds-model/full_train',
+    'BioDVN_NoSeq': 'trained_models/proteus_tds-model_no-seq/full_train',
+    'BioDVN_OnlySeq': 'trained_models/proteus_tds-model_only-seq/full_train',
 }
 
 

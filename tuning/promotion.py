@@ -23,6 +23,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import optuna
 
 from config.experiment_spec import ExperimentSpec, ExperimentSpecError
+from tuning._io_utils import (
+    folds_from_tsv as _folds_from_tsv,
+    write_json_atomic as _write_json_atomic,
+)
 from tuning.metrics import nanmean, nanstd, objective_value
 from tuning.param_resolution import (
     FixedParamTrial,
@@ -35,22 +39,6 @@ __all__ = [
     "identify_top_configs",
     "run_promotion_phase",
 ]
-
-
-def _folds_from_tsv(training_set_tsv: str) -> List[int]:
-    folds: set[int] = set()
-    with open(training_set_tsv, 'r', newline='') as f:
-        reader = csv.DictReader(f, delimiter='\t')
-        for row in reader:
-            folds.add(int(row['Fold']))
-    return sorted(folds)
-
-
-def _write_json_atomic(path: str, obj: Any) -> None:
-    tmp = f"{path}.tmp"
-    with open(tmp, 'w') as f:
-        json.dump(obj, f, indent=2)
-    os.replace(tmp, path)
 
 
 class PromotionManager:

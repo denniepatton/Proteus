@@ -15,22 +15,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Hard upper bound on expression values in log2(CPM+1) space.
-# Derived from the data ceiling; this will never be exceeded.
-Y_MAX: float = 19.93
-
-# Fixed Gamma shape parameter for the MDN mixture component.
-# Determined by empirical fitting of RNA-seq expression distributions.
-K_GAMMA: float = 0.75
+from .constants import K_GAMMA, Y_MAX
 
 # Mixture prior used to seed the MDN logits so the Normal component starts
 # as the dominant active-expression branch instead of relying on symmetric
 # zero-bias initialization.
 MDN_MIXTURE_PRIORS: Tuple[float, float, float] = (0.10, 0.30, 0.60)
 
-# Smooth bounded supports for the MDN component parameters.
-# Temporary TDS scout widening: keep this isolated here so the bound change
-# can be reverted by restoring the two 2.0 values below.
+# Smooth bounded supports for the MDN component parameters. NORMAL_MU spans the
+# expression range the TDS production models were trained against.
 NORMAL_MU_MIN: float = 2.5
 NORMAL_MU_MAX: float = 19.0
 NORMAL_SIGMA_MIN: float = 0.10

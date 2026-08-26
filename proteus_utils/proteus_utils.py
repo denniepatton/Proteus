@@ -525,10 +525,6 @@ class ProteusMultiSourceBatchDataset(IterableDataset):
         self._epoch_counter = 0
         self.val_mask = val_mask  # shape [n_samples, n_union_genes] or None
 
-        # Temporary narrower multi-source panel default: 2 genes × 32 rows/gene
-        # = 64 rows total, which preserves the prior batch size while halving
-        # the number of genes represented in each stochastic batch.
-
         # Build gene universe: union of all sources' gene sets.
         all_paths = [p for paths in self.sample_paths_by_source.values()
                      for p in paths]

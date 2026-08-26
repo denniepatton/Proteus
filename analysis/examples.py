@@ -289,7 +289,7 @@ def fit_expression_mixture(
     raw_data = raw_data[np.isfinite(raw_data)]
     raw_data = raw_data[raw_data >= 0.0]
     if raw_data.size == 0:
-        raise ValueError("PLCA truth pool is empty; cannot fit RNA-seq mixture")
+        raise ValueError("TDS truth pool is empty; cannot fit RNA-seq mixture")
 
     fit = _fit_mixture(raw_data)
     gof = compute_gof(
@@ -942,12 +942,12 @@ def generate_distribution_example(out_dir: str, cv_full: Dict[str, Any], overwri
 
 def run_examples(
     output_dir: str,
-    plca_truth_wide: pd.DataFrame,
+    tds_truth_wide: pd.DataFrame,
     overwrite: bool,
     cv_full: Optional[Dict[str, Any]] = None,
 ) -> None:
     ensure_dir(output_dir)
     generate_naive_example(output_dir, overwrite)
-    fit_expression_mixture(plca_truth_wide, output_dir, overwrite)
+    fit_expression_mixture(tds_truth_wide, output_dir, overwrite)
     if cv_full is not None:
         generate_distribution_example(output_dir, cv_full, overwrite)
